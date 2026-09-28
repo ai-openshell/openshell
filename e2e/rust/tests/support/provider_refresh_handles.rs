@@ -9,6 +9,8 @@
 //! retains its original environment while the gateway rotates the provider 12
 //! times. The shell must continue reaching the resource with the newest token,
 //! and explicit refresh reconfiguration must revoke its old handle.
+//! Declared non-secret defaults must reach the shell as literal values, while
+//! caller environment takes precedence in both main and exec processes.
 
 use std::io::Write;
 use std::process::Stdio;
@@ -75,6 +77,13 @@ fn write_profile(
         r"id: {PROFILE_ID}
 display_name: Stable refresh handle E2E
 category: other
+environment:
+  config:
+    REFRESH_E2E_PROJECT: project
+    REFRESH_E2E_DEFAULT_PROJECT: project
+  fixed:
+    REFRESH_E2E_MODE: native
+    REFRESH_E2E_DEFAULT_MODE: native
 credentials:
   - name: access_token
     env_vars: [{TOKEN_ENV}]
@@ -194,6 +203,8 @@ async fn configure_refresh(
             "--type",
             PROFILE_ID,
             "--runtime-credentials",
+            "--config",
+            "project=custom-profile-project",
         ],
         &[(TOKEN_ENV, "bootstrap-token")],
     )
@@ -396,6 +407,10 @@ fi"#
   *) exit 64 ;;
 esac
 test -z "${{REFRESH_E2E_PRIVATE_KEY+x}}" || exit 65
+test "$REFRESH_E2E_PROJECT" = caller-project || exit 66
+test "${{REFRESH_E2E_MODE+x}}" = x && test -z "$REFRESH_E2E_MODE" || exit 67
+test "$REFRESH_E2E_DEFAULT_PROJECT" = custom-profile-project || exit 68
+test "$REFRESH_E2E_DEFAULT_MODE" = native || exit 69
 echo {READY_MARKER}
 while true; do
   if [ -f /sandbox/probe-trigger ]; then
@@ -415,6 +430,12 @@ done"#
         &policy_path,
         "--from",
         tools.as_ref().map_or(E2E_WORKLOAD_IMAGE, ImageGuard::tag),
+        "--env",
+        "REFRESH_E2E_PROJECT=caller-project",
+        "--env",
+        "REFRESH_E2E_MODE=",
+        "--env",
+        &format!("{TOKEN_ENV}=caller-token"),
     ];
     let mut sandbox = SandboxGuard::create_keep_with_args(
         &create_args,
@@ -424,6 +445,20 @@ done"#
     .await?;
 
     let result = async {
+        sandbox
+            .exec(&[
+                "sh",
+                "-c",
+                &format!(
+                    r#"test "$REFRESH_E2E_PROJECT" = caller-project &&
+test "${{REFRESH_E2E_MODE+x}}" = x && test -z "$REFRESH_E2E_MODE" &&
+test "$REFRESH_E2E_DEFAULT_PROJECT" = custom-profile-project &&
+test "$REFRESH_E2E_DEFAULT_MODE" = native &&
+case "${TOKEN_ENV}" in openshell:resolve:env:s*_{TOKEN_ENV}) true;; *) false;; esac"#,
+                ),
+            ])
+            .await?;
+
         let initial = trigger_probe(&sandbox).await?;
         if initial != "ok" {
             return Err(format!(
