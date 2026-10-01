@@ -1,13 +1,8 @@
 # CI
 
-This document describes the current OpenShell continuous integration system,
-with a focus on what contributors need to do to get a pull request tested. It
-documents implemented workflow behavior rather than the complete desired test
-architecture.
+This document describes how OpenShell's continuous integration works for pull requests, with a focus on what contributors need to do to get their PR tested.
 
-For the target testing model and canonical local entry points, see
-[TESTING.md](TESTING.md). For pull request conventions, see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Overview
 
