@@ -246,6 +246,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         8443,
         &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl --proxy"),
         "proxy_compatibility",
+        5,
         true,
     ))
     .unwrap();
@@ -260,6 +261,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     assert_eq!(connect["actor"]["process"]["name"], "/usr/bin/curl");
     assert_eq!(connect["firewall_rule"]["name"], "proxy_compatibility");
     assert_eq!(connect["firewall_rule"]["type"], "opa");
+    assert_eq!(connect["firewall_rule"]["version"], "5");
     assert_eq!(connect["message"], "CONNECT_L7 allowed target.example:8443");
 
     let forward = serde_json::to_value(build_forward_allow_ocsf_event(
@@ -270,6 +272,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         "/v1/items",
         &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl --proxy"),
         "proxy_compatibility",
+        5,
     ))
     .unwrap();
     assert_eq!(forward["class_name"], "HTTP Activity");
@@ -283,6 +286,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     assert_eq!(forward["http_request"]["http_method"], "GET");
     assert_eq!(forward["firewall_rule"]["name"], "proxy_compatibility");
     assert_eq!(forward["firewall_rule"]["type"], "opa");
+    assert_eq!(forward["firewall_rule"]["version"], "5");
     assert_eq!(
         forward["message"],
         "FORWARD allowed GET target.example:8080/v1/items"
