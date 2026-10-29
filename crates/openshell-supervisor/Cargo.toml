@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 openshell-policy-cedar-runtime = { path = "../openshell-policy-cedar-runtime", optional = true }
 openshell-policy-runtime-interface = { path = "../openshell-policy-runtime-interface" }
-openshell-crypto = { workspace = true }
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt", "trace-context"] }
 openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }

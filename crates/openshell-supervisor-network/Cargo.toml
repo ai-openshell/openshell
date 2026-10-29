@@ -74,6 +74,7 @@ bundled-ca-roots = ["dep:webpki-roots"]
 experimental = ["openshell-policy/experimental"]
 
 [dev-dependencies]
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 openshell-policy-cedar-runtime = { path = "../openshell-policy-cedar-runtime" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 
