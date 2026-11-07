@@ -10,6 +10,7 @@ use crate::policy_types::{NetworkAction, PolicyGenerationGuard};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
 use openshell_core::endpoint_status::EndpointObservationSender;
+use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::SecretResolver;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -50,12 +51,18 @@ pub(super) struct RelaySignals {
 /// Build the request-processing context shared by CONNECT and forward HTTP.
 pub(super) fn http_context(
     decision: &EgressDecision,
-    provider_credentials: Option<openshell_core::provider_credentials::ProviderCredentialState>,
+    provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
     policy_local: Option<&crate::policy_local::PolicyLocalContext>,
     agent_proposals: openshell_core::proposals::AgentProposals,
     signals: RelaySignals,
 ) -> L7EvalContext {
+    // One use record per connection: every resolver and grant derived from
+    // this context reports to it, and the relay's credential pin reads it.
+    // Idempotent, so an adapter that already tracked the handle keeps it.
+    let provider_credentials = provider_credentials
+        .as_ref()
+        .map(ProviderCredentialState::with_use_tracking);
     // Provider-backed credentials must be acquired from the live state for
     // each request after middleware/token-grant awaits. Keep only the legacy
     // resolver fallback when no live provider state exists.
@@ -109,7 +116,14 @@ pub(super) fn http_context(
     }
 }
 
-/// Pin a generation for a relay or the forward HTTP single-request path.
+/// Pin the generation that authorized `decision` for a relay, CONNECT setup,
+/// or the forward HTTP single-request path.
+///
+/// The pin fails if the policy changed after authorization. Once pinned, the
+/// guard follows later changes that leave the connection's contract intact;
+/// see [`crate::opa::PolicyRevalidator`]. `credentials` is the connection's
+/// tracked provider handle when the guarded path may inject credentials, or
+/// `None` when it never does.
 pub(super) fn pin_policy_generation(
     network_engine: &PolicyEngine,
     expected_generation: u64,
@@ -124,6 +138,7 @@ pub(super) fn pin_policy_generation(
 pub(super) fn pin_l7_evaluator(
     network_engine: &PolicyEngine,
     expected_generation: u64,
+    credentials: Option<&ProviderCredentialState>,
 ) -> Result<TunnelPolicyEngine> {
     network_engine.tunnel_engine(expected_generation)
 }
@@ -165,6 +180,8 @@ pub(super) fn prepare_http_relay<'a>(
         return None;
     }
 
+    // HTTP relays can inject provider credentials, so they also pin them.
+    let credentials = request.provider_credentials.as_ref();
     let policy = if let Some(route) = route.filter(|route| !route.configs.is_empty()) {
         let evaluator = match pin_l7_evaluator(network_engine, decision.policy_generation) {
             Ok(evaluator) => evaluator,
@@ -219,9 +236,11 @@ pub(super) fn prepare_http_relay<'a>(
     Some(RelayContext { request, policy })
 }
 
-/// Pin the generation used by a raw relay so policy activation or quarantine
-/// closes streams that otherwise have no request boundary at which to notice
-/// a stale decision.
+/// Pin the generation used by a raw relay so a policy change that affects the
+/// connection, or any quarantine, closes streams that otherwise have no
+/// request boundary at which to notice a stale decision.
+///
+/// Raw relays never inject provider credentials, so they do not pin them.
 pub(super) fn prepare_raw_relay(
     route: Option<&L7RouteSnapshot>,
     network_engine: &PolicyEngine,
