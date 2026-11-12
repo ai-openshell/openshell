@@ -193,9 +193,6 @@ mod tests {
     // legacy payload decoding. The provider-environment file map and peer
     // configuration notification are public-only. Older supervisors ignore the
     // additive file map while retaining the rest of the response.
-    // ProviderProfile's adapter requirement is removed with its field number
-    // and name reserved. Prior payloads ignore that field while preserving
-    // environment declarations at field 15; storage.v1 remains unchanged.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
     // Existing rows decode with both absent and retain their active deadline;
     // no stored attempt gains another phase or time budget on upgrade.
@@ -255,11 +252,11 @@ mod tests {
     // The service backend HTTP version is part of both schemas. Legacy
     // endpoint records omit it and continue to use HTTP/1.1.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "84519d838f62d91cc96435fab73712e82afb8c9e3d4609f783864106f816b599";
+        "53a460ef7819f2ee7aed2206d8be4e2fda498ccc8a36f04692544fe96c9ddf5b";
     // The storage.v2 refresh root adds retired handles and the first mint's
     // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
-        "992d5bcda4ea3c098ca7725607e644049fdf858eec539f860f77e19ed5d9f967";
+        "0b7ec2cd0cb26321ab1a02845edc9415958733abed1a3311199cbb8e4a4b1c95";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "54f756fdf95b7aac166ed289c6e50002c4ad6a113db6aa73ba77031aa769d6fd";
     // Encoded with the schema that omitted stable_placeholder. Keep these
