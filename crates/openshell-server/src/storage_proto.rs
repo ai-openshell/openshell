@@ -252,13 +252,13 @@ mod tests {
     // The service backend HTTP version is part of both schemas. Legacy
     // endpoint records omit it and continue to use HTTP/1.1.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "edfc80ad192e77e1a9d1e1d6e3342280e4438f8bf7cb49969f580060df9a056a";
+        "ec62cf27991c17f920046176b25e32ef51ee3466a46e4d69efeba8967089d5bb";
     // The storage.v2 refresh root adds retired handles and the first mint's
     // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
-        "ca31950286327bc385fae933bbb9e34d3c9191214f9b549c558bba40957fcc65";
+        "154de48ec57d3928064e9650543f5c74593944eaaa613093d6b05a2b627ab8f3";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "d0eead2cd403f6f52ecd9b7df73ca7db15e84dd847e11bc9d50469970204e589";
+        "36719727c7cb1c9fdfbd3d1db627414063faa4d28f36542b83a370476f874919";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -817,9 +817,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (369, 32),
-                (104, 23),
-                (88, 23),
+                (370, 32),
+                (105, 23),
+                (89, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -908,6 +908,16 @@ mod tests {
         assert!(credential.required);
         assert_eq!(credential.auth_style, "bearer");
         assert!(!credential.stable_placeholder);
+    }
+
+    #[test]
+    fn sandbox_payload_without_parent_decodes_as_root() {
+        use openshell_core::proto::Sandbox;
+
+        let sandbox = Sandbox::decode(legacy_bytes(SANDBOX_WITHOUT_ENDPOINT_STATUS).as_slice())
+            .expect("stored sandbox without a parent must decode");
+        assert!(sandbox.parent.is_none());
+        assert!(sandbox.created_by.is_empty());
     }
 
     #[test]
