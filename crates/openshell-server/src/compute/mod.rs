@@ -7284,7 +7284,7 @@ pub async fn connect_remote_compute_driver(
     ))
 }
 
-fn driver_sandbox_from_public(
+pub fn driver_sandbox_from_public(
     sandbox: &Sandbox,
     driver_name: &str,
 ) -> Result<DriverSandbox, Box<Status>> {
