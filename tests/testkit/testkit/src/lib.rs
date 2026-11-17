@@ -60,6 +60,7 @@ pub use logs::{LOGS_TIMEOUT, Logs};
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until, with_deadline};
 pub use program::main;
+pub use provider::ProviderBuilder;
 pub use ready::check as check_ready;
 pub use registry::Test;
 pub use run::{TestInfo, run};
