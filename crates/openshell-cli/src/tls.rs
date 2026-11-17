@@ -332,7 +332,7 @@ fn sdk_client_config(server: &str, tls: &TlsOptions) -> Result<ClientConfig> {
 /// filesystem-aware certificate discovery.
 pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
     let config = sdk_client_config(server, tls)?;
-    openshell_sdk::transport::build_channel(&config)
+    openshell_sdk::transport::build_channel_with_source(&config)
         .await
         .into_diagnostic()
 }

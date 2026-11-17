@@ -67,7 +67,31 @@ async fn edge_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
 
 // ── Channel construction ─────────────────────────────────────────────
 
+/// A failure while preparing or opening a gateway channel.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ChannelBuildError {
+    /// Endpoint, authentication tunnel, or TLS setup failed.
+    #[error(transparent)]
+    Setup(#[from] SdkError),
+    /// The transport failed to connect after setup.
+    #[error("gateway transport failed")]
+    Transport(#[from] tonic::transport::Error),
+}
+
+/// Open a gRPC channel using the SDK's standard error type.
+pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
+    build_channel_with_source(config)
+        .await
+        .map_err(|error| match error {
+            ChannelBuildError::Setup(error) => error,
+            ChannelBuildError::Transport(source) => SdkError::connect(source.to_string()),
+        })
+}
+
 /// Open a gRPC channel to the gateway described by `config`.
+///
+/// Transport failures retain the underlying error chain for diagnostics.
 ///
 /// Routing is determined by `gateway` scheme + `auth` variant +
 /// `insecure_skip_verify`.
@@ -80,7 +104,9 @@ async fn edge_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
 /// | `https://` | `Some(EdgeJwt)` | (any) | tunnel proxy + plaintext to local proxy |
 /// | `https://` | (any) | `true` | `InsecureTlsConnector`, no verification |
 /// | `https://` | `Some(Oidc)` or `None` | `false` | tonic TLS, optionally pin `ca_cert` and present `client_identity` |
-pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
+pub async fn build_channel_with_source(
+    config: &ClientConfig,
+) -> std::result::Result<Channel, ChannelBuildError> {
     let gateway = &config.gateway;
 
     // Branch 1 — plaintext.
@@ -88,13 +114,14 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
         return standard_endpoint(gateway.clone())?
             .connect()
             .await
-            .map_err(|e| SdkError::connect(format!("{e}")));
+            .map_err(ChannelBuildError::from);
     }
 
     if !gateway.starts_with("https://") {
         return Err(SdkError::invalid_config(format!(
             "gateway URL must start with http:// or https://: {gateway}"
-        )));
+        ))
+        .into());
     }
 
     // Branch 2 — Cloudflare Access edge JWT: tunnel proxy + plaintext-to-local.
@@ -103,7 +130,7 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
         return standard_endpoint(format!("http://{local_addr}"))?
             .connect()
             .await
-            .map_err(|e| SdkError::connect(format!("{e}")));
+            .map_err(ChannelBuildError::from);
     }
 
     // Branch 3 — insecure TLS (skip cert verification): swap the scheme to
@@ -118,7 +145,7 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
         return standard_endpoint(http_uri)?
             .connect_with_connector(connector)
             .await
-            .map_err(|e| SdkError::connect(format!("{e}")));
+            .map_err(ChannelBuildError::from);
     }
 
     // Branch 4 — anonymous TLS or OIDC bearer over HTTPS: pin `ca_cert` when
@@ -141,7 +168,7 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
         .map_err(|e| SdkError::tls(format!("{e}")))?
         .connect()
         .await
-        .map_err(|e| SdkError::connect(format!("{e}")))
+        .map_err(ChannelBuildError::from)
 }
 
 /// rustls verifier that accepts any server certificate.
