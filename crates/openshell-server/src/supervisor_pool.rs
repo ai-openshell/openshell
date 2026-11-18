@@ -1033,6 +1033,7 @@ impl SupervisorPool {
                         pool.cancel_abandoned_warm_claims(&records).await;
                         pool.fence_stale_reservations(&records).await;
                         pool.sweep_ended_instances(&records).await;
+                        pool.remove_retired_assignments(&records).await;
                         pool.remove_withdrawn().await;
                     }
                     continue;
@@ -1867,7 +1868,9 @@ impl SupervisorPool {
                 // outlives this is released by collection.
                 self.release_candidate(&record.payload.route, &candidate)
                     .await;
-                lock(&self.materials).insert(record.payload.route.clone(), assignment.clone());
+                if !self.dedicated {
+                    lock(&self.materials).insert(record.payload.route.clone(), assignment.clone());
+                }
                 Ok(Recording {
                     record,
                     candidate: None,
