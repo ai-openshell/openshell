@@ -4781,7 +4781,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "indicatif",
- "jiff",
+ "jiff 1.0.2",
  "miette",
  "nix 0.29.0",
  "noyalib",
@@ -4827,7 +4827,7 @@ dependencies = [
  "glob",
  "h2",
  "ipnet",
- "jiff",
+ "jiff 1.0.2",
  "jsonwebtoken",
  "libc",
  "miette",
@@ -5267,7 +5267,7 @@ dependencies = [
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
- "jiff",
+ "jiff 1.0.2",
  "openshell-ocsf-validate",
  "serde",
  "serde_json",
@@ -5637,7 +5637,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "ipnet",
- "jiff",
+ "jiff 1.0.2",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
