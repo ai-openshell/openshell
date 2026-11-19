@@ -212,6 +212,7 @@ async fn ensure_image(
                 Path::new("unused"),
                 client,
                 &RegistryAuth::Anonymous,
+                false,
             )
             .await
             .map(|prepared| prepared.image_identity)
@@ -291,6 +292,54 @@ async fn rejects_unbound_manifest(bootstrap: bool) {
 #[tokio::test]
 async fn prepared_registry_cache_rejects_manifest_identity_mismatch() {
     rejects_unbound_manifest(false).await;
+}
+
+#[tokio::test]
+async fn registry_workspace_workdir_is_bound_to_the_cached_image() {
+    let config = r#"{"config":{"WorkingDir":"/home/app"}}"#;
+    let trusted = manifest(config);
+    let image_digest = sha256(&trusted);
+    let config_digest = sha256(config.as_bytes());
+    let registry = Registry::start(
+        image_digest.clone(),
+        HashMap::from([
+            (
+                "latest".to_string(),
+                manifest(r#"{"config":{"WorkingDir":"/other"}}"#),
+            ),
+            (image_digest.clone(), trusted),
+            (config_digest.clone(), config.as_bytes().to_vec()),
+        ]),
+        None,
+        false,
+    )
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let driver = driver(root.path());
+    let identity = prepared_image_cache_identity(&image_digest, &driver.config);
+    let path = image_cache_rootfs_image(root.path(), &identity);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, b"cached disk").unwrap();
+
+    let reference = registry.reference(None);
+    let client = client();
+    let prepared = driver
+        .ensure_prepared_registry_image_disk(
+            "test",
+            &reference,
+            Path::new("unused"),
+            &client,
+            &RegistryAuth::Anonymous,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.working_dir.as_deref(), Some("/home/app"));
+
+    let requests = registry.requests();
+    assert!(requests.contains(&format!("GET /v2/test/image/manifests/{image_digest}")));
+    assert!(requests.contains(&format!("GET /v2/test/image/blobs/{config_digest}")));
+    assert!(!requests.contains(&"GET /v2/test/image/manifests/latest".to_string()));
 }
 
 #[tokio::test]
