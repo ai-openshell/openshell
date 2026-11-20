@@ -4787,6 +4787,7 @@ dependencies = [
 name = "openshell-driver-sdk"
 version = "0.0.0"
 dependencies = [
+ "openshell-core",
  "serde",
  "thiserror 2.0.20",
  "toml",
