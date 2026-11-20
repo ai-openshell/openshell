@@ -265,10 +265,7 @@ issuer and authenticated HTTPS API/Git fixture. It checks both clients across
 replacement handle. No live GitHub app or installation is required. It needs
 the wrapper-managed gateway so it can temporarily trust the fixture CA; the
 original gateway configuration is restored afterward. The OAuth counterpart
-remains separately selectable as `provider_refresh_handles`. It uses an HTTP
-fixture and the standard workload image, and supports both wrapper-managed
-gateways and existing gateways selected with `OPENSHELL_GATEWAY_ENDPOINT`.
-It does not install CA trust or restart the gateway.
+is the `features/provider-refresh` testkit suite.
 
 ## Informational security reports
 

@@ -149,19 +149,9 @@ path = "tests/podman_resource_limits.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
-name = "provider_refresh_handles"
-path = "tests/provider_refresh_handles.rs"
-required-features = ["e2e-podman"]
-
-[[test]]
 name = "provider_github_app"
 path = "tests/provider_github_app.rs"
 required-features = ["e2e-podman"]
-
-[[test]]
-name = "provider_readiness"
-path = "tests/provider_readiness.rs"
-required-features = ["e2e-docker"]
 
 [[test]]
 name = "vm_gateway_start"
