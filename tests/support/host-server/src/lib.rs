@@ -12,7 +12,8 @@
 //!
 //! - [`HttpRecorder`] answers HTTP requests with a fixed body or a handler's
 //!   [`Response`], and records each parsed [`Request`]. It serves HTTPS with
-//!   a certificate from a [`TestCa`].
+//!   a certificate from a [`TestCa`], and listens on a random free port unless
+//!   [`HttpRecorder::builder`] names one.
 //! - [`WebSocketRecorder`] completes the WebSocket handshake and records the
 //!   frames that arrive.
 //! - [`TcpServer`] records raw bytes, and echoes them or answers once the
@@ -34,7 +35,7 @@ use testkit::{PYTHON_BINARIES, Result, ResultExt as _, policy};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-pub use http::{HttpRecorder, Request, Response};
+pub use http::{HttpRecorder, HttpRecorderBuilder, Request, Response};
 pub use tcp::{TcpServer, exchange};
 pub use tls::{ADDITIONAL_CA_CERT_ENV, ADDITIONAL_CA_KEY_ENV, Identity, TestCa};
 pub use websocket::{TEXT_REPLY, WebSocketRecorder};
@@ -57,10 +58,15 @@ const WAIT_INTERVAL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST: usize = 1024 * 1024;
 
-async fn bind() -> Result<(TcpListener, u16)> {
-    let listener = TcpListener::bind(("0.0.0.0", 0))
+/// Listen on every host address at `port`, or at a random free port for 0.
+async fn bind(port: u16) -> Result<(TcpListener, u16)> {
+    let listener = TcpListener::bind(("0.0.0.0", port))
         .await
-        .context("bind a host server")?;
+        .context(if port == 0 {
+            "bind a host server".to_string()
+        } else {
+            format!("bind a host server on port {port}")
+        })?;
     let port = listener
         .local_addr()
         .context("read the host server's address")?
@@ -77,12 +83,12 @@ struct Server {
 }
 
 impl Server {
-    async fn start<F, Fut>(serve: F) -> Result<Self>
+    async fn start<F, Fut>(port: u16, serve: F) -> Result<Self>
     where
         F: Fn(TcpStream) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let (listener, port) = bind().await?;
+        let (listener, port) = bind(port).await?;
         let connections = Arc::new(AtomicUsize::new(0));
         let task_connections = Arc::clone(&connections);
         let task = tokio::spawn(async move {
@@ -111,7 +117,7 @@ impl Drop for Server {
 
 /// A port that nothing on the test host listened on when this returned.
 pub async fn free_port() -> Result<u16> {
-    let (_listener, port) = bind().await?;
+    let (_listener, port) = bind(0).await?;
     Ok(port)
 }
 

@@ -35,8 +35,10 @@ impl WebSocketRecorder {
     pub async fn start() -> Result<Self> {
         let state = Arc::new(WebSocketState::default());
         let task_state = Arc::clone(&state);
-        let server =
-            Server::start(move |stream| accept_websocket(stream, Arc::clone(&task_state))).await?;
+        let server = Server::start(0, move |stream| {
+            accept_websocket(stream, Arc::clone(&task_state))
+        })
+        .await?;
         Ok(Self {
             port: server.port,
             state,
