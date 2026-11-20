@@ -102,10 +102,6 @@ let
     "provider_auto_create"
     # Needs the SPIFFE fixtures that the wrapper sets up. Wrapper lane.
     "provider_token_exchange"
-    # Holds only the on-failure restart test until #5507; the rest moved to
-    # testkit. Nextest archive filters cannot select individual tests, so keep
-    # the complete binary in the follow-up bucket.
-    "sandbox_lifecycle"
     # Needs a prebuilt musl DNS probe in guest artifact mode; tracked in #3009.
     "transparent_tcp"
   ];
