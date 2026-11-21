@@ -94,7 +94,6 @@ from sandbox runtimes)",
             std::path::Path::new("/var/log"),
             console_filter,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(std::sync::Mutex::new(String::new())),
         );
         tracing_subscriber::registry()
             .with(logging_layers)
@@ -116,9 +115,15 @@ from sandbox runtimes)",
         let mut interrupt =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                 .into_diagnostic()?;
+        let limits = openshell_supervisor_control::PoolLimits::new(
+            args.pool_max_instances as usize,
+            openshell_supervisor_control::DEFAULT_MAX_MEMBERS_PER_GATEWAY,
+        )
+        .into_diagnostic()?;
         let link = openshell_supervisor::shared_host::GatewayLink {
             endpoint: gateway_endpoint.clone(),
             token_file,
+            limits,
         };
         let host = openshell_supervisor::shared_host::SharedHost::start(
             openshell_supervisor::shared_host::SharedHostConfig {
@@ -126,7 +131,11 @@ from sandbox runtimes)",
                 instance_root,
                 runtime_listen,
                 removal_grace: openshell_supervisor_control::INSTANCE_REMOVAL_GRACE,
+                attach_request_timeout: std::time::Duration::from_secs(
+                    args.attach_request_timeout_seconds,
+                ),
                 pool,
+                limits,
             },
         )?;
         let health = tokio::net::TcpListener::bind(address)
@@ -137,6 +146,7 @@ from sandbox runtimes)",
             runtime = %host.runtime_addr(),
             health = %address,
             pool_member = %host.pool().member_id,
+            max_instances = args.pool_max_instances,
             "Shared supervisor ready for sandbox instance assignments"
         );
         let (stop, stopped) = tokio::sync::watch::channel(false);
