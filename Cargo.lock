@@ -4418,6 +4418,7 @@ version = "0.0.0"
 dependencies = [
  "openshell-crypto",
  "openshell-isolation-interface",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -4545,6 +4546,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-sts",
+ "chrono",
  "futures",
  "hyper-util",
  "jsonwebtoken",
@@ -4554,12 +4556,15 @@ dependencies = [
  "openshell-driver-kubernetes-secrets",
  "openshell-driver-vault",
  "prost-types",
+ "rcgen",
  "reqwest 0.12.28",
  "rustix 1.1.6",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tonic",
  "tower",
@@ -5137,6 +5142,8 @@ dependencies = [
  "openshell-core",
  "openshell-crypto",
  "openshell-isolation-interface",
+ "openshell-otel",
+ "openshell-otel-test-support",
  "prost",
  "prost-types",
  "rcgen",
@@ -5154,6 +5161,7 @@ dependencies = [
  "tonic-prost",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -5378,6 +5386,7 @@ dependencies = [
  "openshell-core",
  "openshell-otel",
  "openshell-sandbox-backend",
+ "prost",
  "prost-types",
  "serde",
  "serde_json",

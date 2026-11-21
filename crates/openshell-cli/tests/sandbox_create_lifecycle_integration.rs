@@ -166,6 +166,8 @@ impl OpenShell for TestOpenShell {
             },
         );
         Ok(Response::new(SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(sandbox),
             service_urls,
         }))
@@ -209,6 +211,8 @@ impl OpenShell for TestOpenShell {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         Ok(Response::new(SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
         }))
@@ -427,6 +431,8 @@ impl OpenShell for TestOpenShell {
             .push(request.into_inner());
         Ok(Response::new(
             openshell_core::proto::ServiceEndpointResponse {
+                application_url: String::new(),
+                gateway_url: String::new(),
                 url: "https://default--sandbox.openshell.localhost:17670/".to_string(),
                 ..Default::default()
             },
@@ -439,6 +445,8 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
         Ok(Response::new(
             openshell_core::proto::ServiceEndpointResponse {
+                application_url: String::new(),
+                gateway_url: String::new(),
                 url: "https://default--sandbox.openshell.localhost:17670/".to_string(),
                 ..Default::default()
             },
@@ -3550,8 +3558,14 @@ async fn sandbox_template_create_warns_for_credential_env_vars() {
         "template create should warn for credential-looking --env values: {stderr}"
     );
     assert!(
-        stderr.contains("To hide it from the agent, use a provider instead"),
-        "warning should point users toward providers: {stderr}"
+        stderr.contains(
+            "openshell provider create --name my-openai --type openai --credential OPENAI_API_KEY"
+        ),
+        "warning should recommend existing-credential provider setup: {stderr}"
+    );
+    assert!(
+        !stderr.contains("plain-secret"),
+        "warning must not expose the credential value"
     );
 
     let requests = template_create_requests(&server).await;

@@ -30,10 +30,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage_proto_dir = manifest_dir.join("proto");
     let public_proto_dir = manifest_dir.join("../../proto");
     let storage_proto = storage_proto_dir.join("storage.proto");
+    let refresh_proto = storage_proto_dir.join("provider_refresh.proto");
     let image_proto = storage_proto_dir.join("sandbox_image.proto");
+    let secret_proto = storage_proto_dir.join("workspace_secret.proto");
 
     println!("cargo:rerun-if-changed={}", storage_proto.display());
+    println!("cargo:rerun-if-changed={}", refresh_proto.display());
     println!("cargo:rerun-if-changed={}", image_proto.display());
+    println!("cargo:rerun-if-changed={}", secret_proto.display());
     for imported_proto in [
         "datamodel.proto",
         "openshell.proto",
@@ -73,7 +77,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "::openshell_core::proto::sandbox::v1",
         )
         .file_descriptor_set_path(&descriptor_path)
-        .compile_with_config(proto_config, &[storage_proto, image_proto], &include_dirs)?;
+        .compile_with_config(
+            proto_config,
+            &[storage_proto, refresh_proto, image_proto, secret_proto],
+            &include_dirs,
+        )?;
 
     if env::var_os("CARGO_FEATURE_TEST_SUPPORT").is_some() {
         let output = PathBuf::from(env::var("OUT_DIR")?).join("test_grpc");
