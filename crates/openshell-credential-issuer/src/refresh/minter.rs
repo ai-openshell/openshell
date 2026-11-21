@@ -5,6 +5,7 @@
 
 #![allow(clippy::result_large_err)]
 
+use crate::endpoint::is_loopback_host;
 use async_trait::async_trait;
 use openshell_core::proto::{
     ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStrategy,
@@ -16,9 +17,13 @@ use std::time::Duration;
 use tonic::{Code, Status};
 use tracing::warn;
 
+#[path = "github_app.rs"]
+mod github_app;
+pub use github_app::validate_configuration as validate_github_app_configuration;
+
 const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
-const MAX_OAUTH_ERROR_RESPONSE_BYTES: usize = 8 * 1024;
+const MAX_ERROR_RESPONSE_BYTES: usize = 8 * 1024;
 
 /// Owned, resolved input for one upstream exchange. Intentionally has no Debug
 /// or serialization implementation because material contains plaintext secrets.
@@ -30,6 +35,9 @@ pub struct MintRequest {
     pub scopes: Vec<String>,
     pub max_lifetime: Option<prost_types::Duration>,
     pub additional_output_keys: HashMap<String, String>,
+    /// Endpoint allowlists of every workspace secret this request carries. The
+    /// effective token endpoint must appear in each, and redirects are refused.
+    pub secret_endpoint_allowlists: Vec<Vec<String>>,
 }
 
 /// Transient mint output. Intentionally has no Debug or serialization implementation.
@@ -96,6 +104,7 @@ pub struct RefreshFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefreshRetrySchedule {
     Short,
+    NotBefore(i64),
     Configuration,
     Parked,
 }
@@ -243,6 +252,7 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => "github_app_installation",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -257,7 +267,8 @@ pub fn strategy_secret_material_keys(
             &["refresh_token", "client_secret"]
         }
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => &["client_secret"],
-        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => &["private_key"],
+        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+        | ProviderCredentialRefreshStrategy::GithubAppInstallation => &["private_key"],
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
             &["aws_secret_access_key", "aws_session_token"]
         }
@@ -278,6 +289,14 @@ struct OAuth2RefreshToken;
 struct OAuth2ClientCredentials;
 struct GoogleServiceAccountJwt;
 struct AwsStsAssumeRole;
+struct GithubAppInstallation;
+
+#[async_trait]
+impl TokenMinter for GithubAppInstallation {
+    async fn mint(&self, request: &MintRequest) -> Result<MintedCredential, RefreshFailure> {
+        github_app::mint(request).await
+    }
+}
 
 #[async_trait]
 impl TokenMinter for OAuth2RefreshToken {
@@ -309,7 +328,7 @@ impl TokenMinter for AwsStsAssumeRole {
 
 /// Immutable built-in-only registry. There is deliberately no registration API.
 pub struct BuiltInMinterRegistry {
-    entries: [(&'static str, &'static dyn TokenMinter); 4],
+    entries: [(&'static str, &'static dyn TokenMinter); 5],
 }
 
 static BUILT_IN_MINTERS: BuiltInMinterRegistry = BuiltInMinterRegistry {
@@ -318,6 +337,7 @@ static BUILT_IN_MINTERS: BuiltInMinterRegistry = BuiltInMinterRegistry {
         ("oauth2_client_credentials", &OAuth2ClientCredentials),
         ("google_service_account_jwt", &GoogleServiceAccountJwt),
         ("aws_sts_assume_role", &AwsStsAssumeRole),
+        ("github_app_installation", &GithubAppInstallation),
     ],
 };
 
@@ -373,6 +393,7 @@ async fn mint_oauth2_refresh_token(
         &request,
         max_lifetime_seconds(state),
         OAuthGrantKind::UserRefreshToken,
+        &state.secret_endpoint_allowlists,
     )
     .await
 }
@@ -389,6 +410,7 @@ async fn mint_oauth2_client_credentials(
         &request,
         max_lifetime_seconds(state),
         OAuthGrantKind::NonInteractive,
+        &state.secret_endpoint_allowlists,
     )
     .await
 }
@@ -442,11 +464,21 @@ async fn mint_google_service_account_jwt(
         &request,
         lifetime_secs,
         OAuthGrantKind::NonInteractive,
+        &state.secret_endpoint_allowlists,
     )
     .await
 }
 
 async fn mint_aws_sts_assume_role(state: &MintRequest) -> Result<MintedCredential, RefreshFailure> {
+    // The STS client does not enforce workspace-secret endpoint constraints.
+    if !state.secret_endpoint_allowlists.is_empty() {
+        return Err(RefreshFailure::fix_configuration(
+            Status::failed_precondition(
+                "aws_sts_assume_role does not support workspace secret material",
+            ),
+            "secret_reference_unsupported",
+        ));
+    }
     let role_arn = required_material(&state.material, "role_arn")?;
     let session_name = material_value(&state.material, &["session_name"])
         .unwrap_or_else(|| "openshell-sandbox".to_string());
@@ -570,6 +602,7 @@ async fn request_token(
     request: &TokenRequest,
     max_lifetime_seconds: i64,
     grant_kind: OAuthGrantKind,
+    endpoint_allowlists: &[Vec<String>],
 ) -> Result<MintedCredential, RefreshFailure> {
     let parsed = reqwest::Url::parse(token_url)
         .map_err(|_| Status::invalid_argument("token_url must be an absolute URL"))?;
@@ -584,9 +617,19 @@ async fn request_token(
         }
     }
 
+    // A request carrying a workspace secret may reach only endpoints that every
+    // referenced secret allows, and never by redirect: a 307 or 308 would resend
+    // the body to the new location.
+    let secret_bound = !endpoint_allowlists.is_empty();
+    if secret_bound {
+        ensure_endpoint_allowed(token_url, endpoint_allowlists)?;
+    }
     openshell_crypto::tls::ensure_default_provider();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+    let mut client = reqwest::Client::builder().timeout(Duration::from_secs(30));
+    if secret_bound {
+        client = client.redirect(reqwest::redirect::Policy::none());
+    }
+    let client = client
         .build()
         .map_err(|e| Status::internal(format!("build refresh HTTP client failed: {e}")))?;
     // GitHub returns form-encoded bodies unless JSON is requested.
@@ -597,7 +640,7 @@ async fn request_token(
     if let Some((id, secret)) = &request.basic_auth {
         builder = builder.basic_auth(id, Some(secret));
     }
-    let response = builder.send().await.map_err(|error| {
+    let mut response = builder.send().await.map_err(|error| {
         let error_kind = if error.is_timeout() {
             "timeout"
         } else if error.is_connect() {
@@ -628,8 +671,16 @@ async fn request_token(
         }
     })?;
     let status = response.status();
+    if secret_bound && status.is_redirection() {
+        return Err(RefreshFailure::fix_configuration(
+            Status::failed_precondition(
+                "token endpoint redirected a request carrying a workspace secret; redirects are not followed",
+            ),
+            "secret_endpoint_redirected",
+        ));
+    }
     if !status.is_success() {
-        let body = read_bounded_oauth_error_body(response).await;
+        let body = read_bounded_error_body(&mut response).await;
         return Err(classify_oauth_token_error(status, &body, grant_kind));
     }
     let token = response.json::<TokenResponse>().await.map_err(|_| {
@@ -683,13 +734,13 @@ async fn request_token(
     })
 }
 
-async fn read_bounded_oauth_error_body(mut response: reqwest::Response) -> Vec<u8> {
+async fn read_bounded_error_body(response: &mut reqwest::Response) -> Vec<u8> {
     let mut body = Vec::new();
-    while body.len() < MAX_OAUTH_ERROR_RESPONSE_BYTES {
+    while body.len() < MAX_ERROR_RESPONSE_BYTES {
         let Ok(Some(chunk)) = response.chunk().await else {
             break;
         };
-        let remaining = MAX_OAUTH_ERROR_RESPONSE_BYTES.saturating_sub(body.len());
+        let remaining = MAX_ERROR_RESPONSE_BYTES.saturating_sub(body.len());
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
         if chunk.len() >= remaining {
             break;
@@ -935,6 +986,64 @@ pub fn parse_material_i64<S: std::hash::BuildHasher>(
         .map_err(|_| Status::invalid_argument(format!("{key} material must be a signed integer")))
 }
 
+fn ensure_endpoint_allowed(
+    token_url: &str,
+    endpoint_allowlists: &[Vec<String>],
+) -> Result<(), RefreshFailure> {
+    let allowed = crate::endpoint::normalize_token_endpoint(token_url).is_ok_and(|normalized| {
+        endpoint_allowlists
+            .iter()
+            .all(|allowlist| allowlist.contains(&normalized))
+    });
+    if allowed {
+        Ok(())
+    } else {
+        Err(RefreshFailure::fix_configuration(
+            Status::failed_precondition(
+                "token endpoint is not allowed by a referenced workspace secret",
+            ),
+            "secret_endpoint_not_allowed",
+        ))
+    }
+}
+
+/// The token endpoint a mint for this request will call, for strategies whose
+/// request goes to a single token endpoint.
+///
+/// # Errors
+///
+/// Returns `FAILED_PRECONDITION` for strategies without such an endpoint, and
+/// `INVALID_ARGUMENT` when the endpoint cannot be determined.
+pub fn effective_token_endpoint(request: &MintRequest) -> Result<String, Status> {
+    match ProviderCredentialRefreshStrategy::try_from(request.strategy)
+        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified)
+    {
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+        | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => oauth2_token_url(request),
+        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => Ok(google_token_url(request)),
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => {
+            github_app::installation_url(&request.token_url, &request.material)
+                .map(|url| url.to_string())
+        }
+        strategy => Err(Status::failed_precondition(format!(
+            "refresh strategy '{}' does not support workspace secret material",
+            refresh_strategy_name(strategy as i32)
+        ))),
+    }
+}
+
+/// Material keys a strategy writes back after a successful mint. They belong
+/// to one provider and cannot be supplied by a shared workspace secret.
+#[must_use]
+pub fn strategy_rotated_material_keys(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> &'static [&'static str] {
+    match strategy {
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken => &["refresh_token"],
+        _ => &[],
+    }
+}
+
 fn oauth2_token_url(state: &MintRequest) -> Result<String, Status> {
     if let Some(tenant_id) = material_value(&state.material, &["tenant_id"]) {
         return Ok(format!(
@@ -957,7 +1066,10 @@ fn google_token_url(state: &MintRequest) -> String {
     }
 }
 
-fn required_material(material: &HashMap<String, String>, key: &str) -> Result<String, Status> {
+fn required_material<S: std::hash::BuildHasher>(
+    material: &HashMap<String, String, S>,
+    key: &str,
+) -> Result<String, Status> {
     material_value(material, &[key])
         .ok_or_else(|| Status::invalid_argument(format!("{key} material is required")))
 }
@@ -974,10 +1086,6 @@ fn material_value<S: std::hash::BuildHasher>(
         }
     }
     None
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// Test-only STS endpoint override. Reads the `sts_endpoint_url` material and
@@ -1012,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_contains_exactly_four_canonical_strategies() {
+    fn built_in_registry_contains_exactly_five_canonical_strategies() {
         let registry = built_in_minters();
         assert_eq!(
             registry.strategy_names().collect::<Vec<_>>(),
@@ -1021,6 +1129,7 @@ mod tests {
                 "oauth2_client_credentials",
                 "google_service_account_jwt",
                 "aws_sts_assume_role",
+                "github_app_installation",
             ]
         );
         for strategy in [
@@ -1028,6 +1137,7 @@ mod tests {
             ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
             ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt,
             ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+            ProviderCredentialRefreshStrategy::GithubAppInstallation,
         ] {
             assert!(registry.can_mint(strategy as i32));
             assert!(
@@ -1298,19 +1408,19 @@ mod tests {
             .and(path("/oversized"))
             .respond_with(ResponseTemplate::new(400).set_body_bytes(vec![
                 b'x';
-                MAX_OAUTH_ERROR_RESPONSE_BYTES
+                MAX_ERROR_RESPONSE_BYTES
                     + 512
             ]))
             .mount(&mock_server)
             .await;
 
         openshell_crypto::tls::ensure_default_provider();
-        let response = reqwest::get(format!("{}/oversized", mock_server.uri()))
+        let mut response = reqwest::get(format!("{}/oversized", mock_server.uri()))
             .await
             .unwrap();
         let status = response.status();
-        let body = read_bounded_oauth_error_body(response).await;
-        assert_eq!(body.len(), MAX_OAUTH_ERROR_RESPONSE_BYTES);
+        let body = read_bounded_error_body(&mut response).await;
+        assert_eq!(body.len(), MAX_ERROR_RESPONSE_BYTES);
 
         let failure = classify_oauth_token_error(status, &body, OAuthGrantKind::UserRefreshToken);
         assert_eq!(
@@ -1341,6 +1451,7 @@ mod tests {
             },
             60,
             OAuthGrantKind::UserRefreshToken,
+            &[],
         )
         .await
         .unwrap();
@@ -1385,6 +1496,7 @@ mod tests {
             .await;
 
         let state = MintRequest {
+            secret_endpoint_allowlists: Vec::new(),
             additional_output_keys: HashMap::from([
                 ("secret_access_key".to_string(), "CUSTOM_SECRET".to_string()),
                 ("session_token".to_string(), "CUSTOM_SESSION".to_string()),
@@ -1434,6 +1546,7 @@ mod tests {
     #[tokio::test]
     async fn aws_sts_mint_rejects_partial_source_credentials() {
         let state = MintRequest {
+            secret_endpoint_allowlists: Vec::new(),
             additional_output_keys: HashMap::from([
                 (
                     "secret_access_key".to_string(),
@@ -1488,6 +1601,7 @@ mod tests {
             .await;
 
         let state = MintRequest {
+            secret_endpoint_allowlists: Vec::new(),
             additional_output_keys: HashMap::from([
                 (
                     "secret_access_key".to_string(),
@@ -1523,6 +1637,7 @@ mod tests {
     #[tokio::test]
     async fn aws_sts_mint_rejects_session_token_without_source_pair() {
         let state = MintRequest {
+            secret_endpoint_allowlists: Vec::new(),
             additional_output_keys: HashMap::from([
                 (
                     "secret_access_key".to_string(),
@@ -1788,6 +1903,7 @@ mod tests {
                     &TokenRequest::default(),
                     60,
                     grant_kind,
+                    &[],
                 )
                 .await
                 .err()
@@ -1848,7 +1964,7 @@ mod tests {
         assert!(minted.expires_at_ms <= current_time_ms().saturating_add(1_800_000));
     }
 
-    const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----
+    pub(super) const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCvCoZ0mVHpCHsF
 zeeqw2caNIe/eb4BQUccFPhZfRnF7sCfyB84zTBmuwG2umRBdjFnVsfIIZRp2HcD
 OESrRYYiE1RGfjBXImGVg2Wtza0HYhL1sLyX1eaEefylxoilmApAgWDh9p36h8J2
@@ -1876,4 +1992,177 @@ KfNSI8uuA8PLqmUY30I9KFWzN6VDLu00eKa90F4w3CeWRRQWXW1+007tTz3V1mNw
 20A24Fi3HGQmXc7NyuLDODTJsWBICuOemCnRkvcxIlxb+ec7jp+XRmzDwKkzSnVN
 pM2zFU8SeVkvHKlEuoHaP0s=
 -----END PRIVATE KEY-----";
+
+    fn secret_bound_refresh_request(token_url: String, allowed: &str) -> MintRequest {
+        MintRequest {
+            strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+            material: HashMap::from([
+                ("client_id".into(), "client-id".into()),
+                ("client_secret".into(), "shared-client-secret".into()),
+                ("refresh_token".into(), "refresh-token".into()),
+            ]),
+            token_url,
+            secret_endpoint_allowlists: vec![vec![
+                crate::endpoint::normalize_token_endpoint(allowed).unwrap(),
+            ]],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_bound_mint_reaches_an_allowed_endpoint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("client_secret=shared-client-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let token_url = format!("{}/token", mock_server.uri());
+        let request = secret_bound_refresh_request(token_url.clone(), &token_url);
+        let minted = mint_credential(&request).await.unwrap();
+        assert_eq!(minted.access_token, "minted-token");
+    }
+
+    #[tokio::test]
+    async fn secret_bound_mint_never_contacts_a_disallowed_endpoint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let request = secret_bound_refresh_request(
+            format!("{}/token", mock_server.uri()),
+            "https://login.example.com/token",
+        );
+        let failure = mint_credential(&request).await.err().unwrap();
+        assert_eq!(failure.failure_code, "secret_endpoint_not_allowed");
+        assert_eq!(
+            failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_bound_mint_refuses_redirects_without_contacting_the_target() {
+        let approved = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "stolen",
+                "expires_in": 3600
+            })))
+            .expect(0)
+            .mount(&target)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/token", target.uri()).as_str()),
+            )
+            .expect(1)
+            .mount(&approved)
+            .await;
+        let token_url = format!("{}/token", approved.uri());
+        let request = secret_bound_refresh_request(token_url.clone(), &token_url);
+        let failure = mint_credential(&request).await.err().unwrap();
+        assert_eq!(failure.failure_code, "secret_endpoint_redirected");
+        assert_eq!(
+            failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_to_ipv6_loopback_is_accepted_like_endpoint_normalization() {
+        let token_url = "http://[::1]:1/token";
+        crate::endpoint::normalize_token_endpoint(token_url).unwrap();
+        // Nothing listens on port 1. A connection failure, not a scheme
+        // rejection, shows the URL passed the loopback check.
+        let failure = request_token(
+            token_url,
+            &TokenRequest::default(),
+            60,
+            OAuthGrantKind::NonInteractive,
+            &[],
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(failure.failure_code, "oauth_token_endpoint_unavailable");
+    }
+
+    #[tokio::test]
+    async fn an_empty_allowlist_allows_no_endpoint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let mut request = secret_bound_refresh_request(
+            format!("{}/token", mock_server.uri()),
+            &mock_server.uri(),
+        );
+        // A reveal-only secret contributes an empty list.
+        request.secret_endpoint_allowlists = vec![Vec::new()];
+        let failure = mint_credential(&request).await.err().unwrap();
+        assert_eq!(failure.failure_code, "secret_endpoint_not_allowed");
+    }
+
+    #[tokio::test]
+    async fn aws_sts_refuses_workspace_secret_material() {
+        let request = MintRequest {
+            strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+            secret_endpoint_allowlists: vec![vec!["https://sts.amazonaws.com/".into()]],
+            ..Default::default()
+        };
+        let failure = mint_credential(&request).await.err().unwrap();
+        assert_eq!(failure.failure_code, "secret_reference_unsupported");
+    }
+
+    #[test]
+    fn effective_token_endpoint_covers_supported_strategies() {
+        let oauth = MintRequest {
+            strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+            material: HashMap::from([("tenant_id".into(), "tenant".into())]),
+            token_url: "https://ignored.example.com/token".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_token_endpoint(&oauth).unwrap(),
+            "https://login.microsoftonline.com/tenant/oauth2/v2.0/token"
+        );
+        let google = MintRequest {
+            strategy: ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_token_endpoint(&google).unwrap(),
+            "https://oauth2.googleapis.com/token"
+        );
+        let github = MintRequest {
+            strategy: ProviderCredentialRefreshStrategy::GithubAppInstallation as i32,
+            material: HashMap::from([("installation_id".into(), "123".into())]),
+            token_url:
+                "https://github.example/api/v3/app/installations/{installation_id}/access_tokens"
+                    .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_token_endpoint(&github).unwrap(),
+            "https://github.example/api/v3/app/installations/123/access_tokens"
+        );
+        let aws = MintRequest {
+            strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+            ..Default::default()
+        };
+        assert!(effective_token_endpoint(&aws).is_err());
+    }
 }
