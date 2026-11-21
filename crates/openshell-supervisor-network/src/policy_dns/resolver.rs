@@ -80,13 +80,12 @@ pub(crate) enum ResolveError {
     CnameLimit,
 }
 
-#[allow(async_fn_in_trait)]
 pub(crate) trait TrustedResolver: Send + Sync {
-    async fn resolve(
+    fn resolve(
         &self,
         name: &NormalizedName,
         family: AddressFamily,
-    ) -> Result<TrustedAnswer, ResolveError>;
+    ) -> impl Future<Output = Result<TrustedAnswer, ResolveError>> + Send;
 }
 
 /// A DNS client for operator-supplied upstream servers.
