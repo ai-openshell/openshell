@@ -19,6 +19,7 @@ use hyper_util::{
 use metrics::{counter, histogram};
 use openshell_core::proto::open_shell_server::OpenShellServer;
 use openshell_core::proto::sandbox_updates_server::SandboxUpdatesServer;
+use openshell_core::proto::service_discovery_server::ServiceDiscoveryServer;
 use openshell_core::proto::supervisor_host::v1::supervisor_host_server::SupervisorHostServer;
 use openshell_core::{
     Config,
@@ -302,7 +303,14 @@ impl MultiplexService {
             SupervisorHostServer::new(crate::grpc::supervisor_host::SupervisorHostService::new(
                 self.state.clone(),
             ))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE),
+            .max_decoding_message_size(
+                self.state
+                    .compute
+                    .supervisor_host()
+                    .map_or(MAX_GRPC_DECODE_SIZE, |controller| {
+                        controller.pool_limits().max_host_message_bytes()
+                    }),
+            ),
             openshell,
         );
         let reflection = self.state.reflection_service.clone();
@@ -313,6 +321,13 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
+        let discovery = ServiceDiscoveryServer::new(OpenShellService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let discovery = GatewayInterceptorGrpcService::new(
+            discovery,
+            self.state.gateway_interceptors.clone(),
+            Some(self.state.clone()),
+        );
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -320,7 +335,9 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, reflection).with_sandbox_updates(sandbox_updates),
+            GrpcRouter::new(openshell, reflection)
+                .with_sandbox_updates(sandbox_updates)
+                .with_discovery(discovery),
             authenticator_chain,
             authz_policy,
             self.state
@@ -336,8 +353,9 @@ impl MultiplexService {
         .with_operator(operator)
         .with_connection_source(source)
         .with_logons(self.state.logons.clone());
-        let grpc_service =
+        let mut grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
+        grpc_service.provider_token_limiter = self.state.provider_token_rate_limiter.clone();
         let http_service = http_router(self.state.clone());
 
         let grpc_service = request_id_middleware!(grpc_service);
@@ -535,7 +553,7 @@ where
             if grpc_status_from_response(&response) != "0"
                 || response
                     .headers()
-                    .get("openshell-replayed")
+                    .get(crate::grpc::mutation_replay::REPLAYED_HEADER)
                     .is_some_and(|value| value == "true")
                 || !interceptors.has_post_commit(&intercepted)
             {
@@ -918,6 +936,7 @@ impl GrpcRateLimiter {
 struct GrpcRateLimitService<S> {
     inner: S,
     limiter: Option<GrpcRateLimiter>,
+    provider_token_limiter: Option<GrpcRateLimiter>,
     /// Set by `poll_ready` when it reports synthetic readiness for an
     /// exhausted limiter without polling the inner service. The paired `call`
     /// must then reject with `RESOURCE_EXHAUSTED` instead of forwarding to an
@@ -932,6 +951,7 @@ impl<S> GrpcRateLimitService<S> {
         Self {
             inner,
             limiter,
+            provider_token_limiter: None,
             rate_limited: false,
         }
     }
@@ -962,6 +982,10 @@ where
             .limiter
             .as_ref()
             .is_some_and(|limiter| !limiter.has_capacity())
+            && self
+                .provider_token_limiter
+                .as_ref()
+                .is_none_or(|limiter| !limiter.has_capacity())
         {
             self.rate_limited = true;
             return Poll::Ready(Ok(()));
@@ -981,11 +1005,15 @@ where
                 tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
             return Box::pin(async move { Ok(response) });
         }
-        if self
-            .limiter
-            .as_ref()
-            .is_some_and(|limiter| !limiter.allow())
+        let limiter = if req.uri().path() == "/openshell.v1.OpenShell/GetSandboxProviderAccessToken"
         {
+            self.provider_token_limiter
+                .as_ref()
+                .or(self.limiter.as_ref())
+        } else {
+            self.limiter.as_ref()
+        };
+        if limiter.is_some_and(|limiter| !limiter.allow()) {
             let response =
                 tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
             return Box::pin(async move { Ok(response) });
@@ -997,10 +1025,11 @@ where
 
 /// Combined gRPC service for public gateway services and reflection.
 #[derive(Clone)]
-pub struct GrpcRouter<N, R, U = N> {
+pub struct GrpcRouter<N, R, U = N, D = N> {
     openshell: N,
     reflection: R,
     sandbox_updates: Option<U>,
+    discovery: Option<D>,
 }
 
 impl<N, R> GrpcRouter<N, R> {
@@ -1009,6 +1038,7 @@ impl<N, R> GrpcRouter<N, R> {
             openshell,
             reflection,
             sandbox_updates: None,
+            discovery: None,
         }
     }
 
@@ -1017,13 +1047,25 @@ impl<N, R> GrpcRouter<N, R> {
             openshell: self.openshell,
             reflection: self.reflection,
             sandbox_updates: Some(sandbox_updates),
+            discovery: self.discovery,
+        }
+    }
+}
+
+impl<N, R, U, D> GrpcRouter<N, R, U, D> {
+    fn with_discovery<T>(self, discovery: T) -> GrpcRouter<N, R, U, T> {
+        GrpcRouter {
+            openshell: self.openshell,
+            reflection: self.reflection,
+            sandbox_updates: self.sandbox_updates,
+            discovery: Some(discovery),
         }
     }
 }
 
 pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
 
-impl<N, R, U, B> tower::Service<Request<B>> for GrpcRouter<N, R, U>
+impl<N, R, U, D, B> tower::Service<Request<B>> for GrpcRouter<N, R, U, D>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
@@ -1039,6 +1081,11 @@ where
         + Send
         + 'static,
     U::Future: Send,
+    D: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    D::Future: Send,
     B: Send + 'static,
 {
     type Response = N::Response;
@@ -1058,6 +1105,13 @@ where
             .path()
             .starts_with("/openshell.v1.SandboxUpdates/")
             && let Some(mut svc) = self.sandbox_updates.clone()
+        {
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if req
+            .uri()
+            .path()
+            .starts_with("/openshell.v1.ServiceDiscovery/")
+            && let Some(mut svc) = self.discovery.clone()
         {
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
@@ -1276,7 +1330,7 @@ where
                     )));
                 }
                 Principal::Operator(operator)
-            } else if let Some(chain) = chain {
+            } else if let Some(chain) = &chain {
                 match chain.authenticate(req.headers(), &path).await {
                     Ok(Authentication::Accepted(p)) => p,
                     Ok(outcome) => match (mtls_auth_enabled, peer_identity) {
@@ -1397,6 +1451,18 @@ where
                 return Ok(status_response(status));
             }
 
+            if path.starts_with("/openshell.v1.ServiceDiscovery/")
+                && req.headers().contains_key(http::header::AUTHORIZATION)
+                && let Some(chain) = &chain
+            {
+                let recheck = crate::grpc::service_discovery::BearerRecheck {
+                    chain: chain.clone(),
+                    headers: req.headers().clone(),
+                    policy: authz_policy.clone(),
+                    path: path.clone(),
+                };
+                req.extensions_mut().insert(recheck);
+            }
             req.extensions_mut().insert(principal.clone());
             let call = inner.ready().await?.call(req);
             audit::with_audited_request(path, origin, &principal, call).await
@@ -2378,6 +2444,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_token_budget_is_shared_across_connections_and_isolated_from_control() {
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let control = GrpcRateLimiter::from_config(&config);
+        let tokens = GrpcRateLimiter::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = GrpcRateLimitService::new(CountingGrpcService { calls }, control);
+        service.provider_token_limiter = tokens;
+        let mut other_connection = service.clone();
+        let token_request = || {
+            Request::builder()
+                .uri("/openshell.v1.OpenShell/GetSandboxProviderAccessToken")
+                .body(())
+                .unwrap()
+        };
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(token_request())
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&first), "0");
+        let exhausted = other_connection
+            .ready()
+            .await
+            .unwrap()
+            .call(token_request())
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&exhausted), "8");
+        let control = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&control), "0");
+        let exhausted = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&exhausted), "8");
+    }
+
+    #[tokio::test]
     async fn grpc_rate_limit_returns_resource_exhausted_after_limit() {
         let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
         let limiter = GrpcRateLimiter::from_config(&config);
@@ -2945,11 +3060,14 @@ mod tests {
             calls: calls.clone(),
         };
         let mut router = GrpcRouter::new(service("openshell"), service("reflection"))
-            .with_sandbox_updates(service("sandbox_updates"));
+            .with_sandbox_updates(service("sandbox_updates"))
+            .with_discovery(service("discovery"));
 
         for path in [
             "/openshell.v1.OpenShell/Health",
             "/openshell.v1.SandboxUpdates/UpdateSandbox",
+            "/openshell.v1.ServiceDiscovery/GetServiceRouteSnapshot",
+            "/openshell.v1.ServiceDiscovery/WatchServiceRoutes",
             "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
         ] {
             router
@@ -2965,7 +3083,13 @@ mod tests {
 
         assert_eq!(
             *calls.lock().unwrap(),
-            vec!["openshell", "sandbox_updates", "reflection"]
+            vec![
+                "openshell",
+                "sandbox_updates",
+                "discovery",
+                "discovery",
+                "reflection"
+            ]
         );
     }
 
@@ -3064,7 +3188,11 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+            vec![
+                "openshell.v1.OpenShell",
+                "openshell.v1.SandboxUpdates",
+                "openshell.v1.ServiceDiscovery"
+            ]
         );
 
         let descriptor_response = responses.message().await.unwrap().unwrap();
@@ -4378,6 +4506,39 @@ mod tests {
             assert_boundary_finding(&events[0], &events[1]);
         }
 
+        /// Answers every request with `status` and its details, in the
+        /// response headers, or in the trailers of a stream when `streamed`.
+        #[derive(Clone)]
+        struct DetailedStatusHandler {
+            status: tonic::Status,
+            streamed: bool,
+        }
+
+        impl<B: Send + 'static> Service<Request<B>> for DetailedStatusHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                use http_body::Frame;
+                use http_body_util::StreamBody;
+                let response = self.status.clone().into_http::<tonic::body::Body>();
+                if !self.streamed {
+                    return Box::pin(async move { Ok(response) });
+                }
+                let trailers = response.headers().clone();
+                let body = tonic::body::Body::new(StreamBody::new(tokio_stream::iter([
+                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"frame"))),
+                    Ok(Frame::trailers(trailers)),
+                ])));
+                Box::pin(async move { Ok(Response::new(body)) })
+            }
+        }
+
         /// Answers every request with `code`.
         #[derive(Clone)]
         struct StatusHandler(tonic::Code);
@@ -4632,6 +4793,70 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn failed_mutation_records_the_gateway_error_reason() {
+            use http_body_util::BodyExt;
+            use openshell_core::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
+            let with_reason = |reason: &str, domain: &str| {
+                tonic::Status::with_error_details(
+                    tonic::Code::Aborted,
+                    "refused",
+                    ErrorDetails::with_error_info(reason, domain, std::collections::HashMap::new()),
+                )
+            };
+            let cases = [
+                (
+                    openshell_core::rpc_error::resource_version_conflict("stale", Some(7)),
+                    "rejected:aborted:RESOURCE_VERSION_CONFLICT",
+                ),
+                (
+                    openshell_core::rpc_error::failed_precondition(
+                        "REQUEST_OUTCOME_UNCERTAIN",
+                        "uncertain",
+                    ),
+                    "rejected:failed_precondition:REQUEST_OUTCOME_UNCERTAIN",
+                ),
+                (
+                    with_reason("UPSTREAM_REASON", "example.com"),
+                    "rejected:aborted",
+                ),
+                (
+                    with_reason("not a reason", ERROR_DOMAIN),
+                    "rejected:aborted",
+                ),
+                (
+                    with_reason(&"A".repeat(65), ERROR_DOMAIN),
+                    "rejected:aborted",
+                ),
+            ];
+            for streamed in [false, true] {
+                for (status, detail) in &cases {
+                    let capture = OcsfCapture::default();
+                    let _guard = capture.install();
+
+                    let handler = DetailedStatusHandler {
+                        status: status.clone(),
+                        streamed,
+                    };
+                    let res = user_router(handler)
+                        .call(request_with_id("/openshell.v1.OpenShell/UpdateConfig"))
+                        .await
+                        .unwrap();
+                    res.into_body().collect().await.unwrap();
+
+                    let events = authorization_events(&capture);
+                    assert_eq!(events.len(), 1, "{events:?}");
+                    let event = &events[0];
+                    assert_eq!(event["status_id"], 2, "{event}");
+                    assert_eq!(
+                        event["status_detail"], *detail,
+                        "streamed={streamed} {event}"
+                    );
+                    assert_eq!(event["message"], format!("mutation failed: {detail}"));
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn dropped_stream_records_an_unknown_outcome() {
             let capture = OcsfCapture::default();
             let _guard = capture.install();
@@ -4713,6 +4938,52 @@ mod tests {
                 .unwrap();
 
             assert!(authorization_events(&capture).is_empty());
+        }
+
+        /// Answers every request with a stored result replayed by request ID.
+        #[derive(Clone)]
+        struct ReplayHandler;
+
+        impl<B: Send + 'static> Service<Request<B>> for ReplayHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                Box::pin(async move {
+                    let mut response = Response::new(tonic::body::Body::empty());
+                    response.headers_mut().insert(
+                        crate::grpc::mutation_replay::REPLAYED_HEADER,
+                        "true".parse().unwrap(),
+                    );
+                    Ok(response)
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn replayed_mutation_records_a_no_op() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+
+            user_router(ReplayHandler)
+                .call(request_with_id("/openshell.v1.OpenShell/CreateWorkspace"))
+                .await
+                .unwrap();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_mutation(&events[0], "CreateWorkspace", 1);
+            assert_eq!(events[0]["status_id"], 1, "{}", events[0]);
+            assert_eq!(
+                events[0]["status_detail"], "no_op:replayed",
+                "{}",
+                events[0]
+            );
         }
 
         /// Assert that `event` is a gateway mutation record for `operation`.
