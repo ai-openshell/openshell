@@ -135,6 +135,7 @@ impl NetworkPeer {
                         snapshot: SessionSnapshotWire {
                             generation: "test-generation".into(),
                             processes: Vec::new(),
+                            bound_policy: None,
                         },
                     }
                 }
@@ -242,6 +243,7 @@ fn network_response() -> Response {
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            process: None,
         },
         destination: "203.0.113.1:443".parse().unwrap(),
         socket: Some(NetworkSocketMetadata {
@@ -345,6 +347,8 @@ impl Fixture {
                 .call_idempotent(Request::Attach {
                     supervisor_instance_id: client.supervisor_instance_id,
                     policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+                    supervisor_takeover: None,
+                    supervisor_recovery_timeout_secs: None,
                 })
                 .await
                 .unwrap();

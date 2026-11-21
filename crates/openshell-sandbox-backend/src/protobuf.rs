@@ -134,6 +134,14 @@ fn duration(micros: u64) -> Result<prost_types::Duration, FrameError> {
         nanos: number((micros % 1_000_000) * 1000)?,
     })
 }
+/// A whole number of seconds that fits `u32`, such as an offered recovery
+/// deadline.
+fn whole_seconds(v: prost_types::Duration) -> Result<u32, FrameError> {
+    if v.nanos != 0 {
+        return Err(invalid("duration is not a whole number of seconds"));
+    }
+    u32::try_from(v.seconds).map_err(|_| invalid("duration outside the accepted range"))
+}
 fn micros(v: Option<prost_types::Duration>) -> Result<u64, FrameError> {
     let v = v.unwrap_or_default();
     if !(0..=315_576_000_000).contains(&v.seconds)
@@ -164,6 +172,7 @@ impl WireMessage for w::AgentSpecWire {
                 nanos: 0,
             }),
             interactive: self.interactive,
+            otlp_relay_active: self.otlp_relay_active,
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
@@ -177,6 +186,7 @@ impl WireMessage for w::AgentSpecWire {
             workdir: v.workdir,
             timeout_secs: u64::try_from(timeout.seconds).map_err(invalid)?,
             interactive: v.interactive,
+            otlp_relay_active: v.otlp_relay_active,
         })
     }
 }
@@ -251,6 +261,7 @@ impl WireMessage for w::BinaryIdentityWire {
                     executable,
                     ancestors,
                     cmdline_paths,
+                    process,
                 } => R::Resolved(p::ResolvedBinaryIdentity {
                     executable: Some(executable.to_proto()?),
                     ancestors: ancestors
@@ -261,6 +272,17 @@ impl WireMessage for w::BinaryIdentityWire {
                         .iter()
                         .map(|v| path(v))
                         .collect::<Result<_, _>>()?,
+                    process: process
+                        .map(|v| -> Result<_, FrameError> {
+                            Ok(p::ProcessInstance {
+                                pid: v.pid,
+                                parent_pid: v.parent_pid,
+                                start_time: Some(timestamp(
+                                    u64::try_from(v.start_time_ms).map_err(invalid)?,
+                                )?),
+                            })
+                        })
+                        .transpose()?,
                 }),
                 Self::Failed { message } => R::Failed(message.clone()),
             }),
@@ -277,6 +299,17 @@ impl WireMessage for w::BinaryIdentityWire {
                     .map(w::ExecutableIdentityWire::from_proto)
                     .collect::<Result<_, _>>()?,
                 cmdline_paths: v.cmdline_paths.into_iter().map(PathBuf::from).collect(),
+                process: v
+                    .process
+                    .map(|v| -> Result<_, FrameError> {
+                        Ok(c::ProcessInstance {
+                            pid: v.pid,
+                            parent_pid: v.parent_pid,
+                            start_time_ms: i64::try_from(millis(required(v.start_time)?)?)
+                                .map_err(invalid)?,
+                        })
+                    })
+                    .transpose()?,
             },
             R::Failed(message) => Self::Failed { message },
         })
@@ -385,11 +418,20 @@ impl WireMessage for w::SessionSnapshotWire {
                     })
                 })
                 .collect::<Result<_, FrameError>>()?,
+            bound_policy: self
+                .bound_policy
+                .as_ref()
+                .map(|policy| policy.to_proto())
+                .transpose()?,
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
         Ok(Self {
             generation: v.generation,
+            bound_policy: v
+                .bound_policy
+                .map(|policy| w::SandboxPolicyWire::from_proto(policy).map(Box::new))
+                .transpose()?,
             processes: v
                 .processes
                 .into_iter()
@@ -441,9 +483,18 @@ impl WireMessage for w::RequestEnvelope {
             W::Attach {
                 supervisor_instance_id,
                 policy,
+                supervisor_takeover,
+                supervisor_recovery_timeout_secs,
             } => P::Attach(p::Attach {
                 supervisor_instance_id: supervisor_instance_id.to_string(),
                 policy: Some(policy.to_proto()?),
+                supervisor_takeover: supervisor_takeover.clone(),
+                supervisor_recovery_timeout: supervisor_recovery_timeout_secs.map(|seconds| {
+                    prost_types::Duration {
+                        seconds: i64::from(seconds),
+                        nanos: 0,
+                    }
+                }),
             }),
             W::Confirm => P::Confirm(p::Confirm {}),
             W::StartAgent {
@@ -525,6 +576,11 @@ impl WireMessage for w::RequestEnvelope {
             P::Attach(v) => W::Attach {
                 supervisor_instance_id: parse(&v.supervisor_instance_id)?,
                 policy: Box::new(w::SandboxPolicyWire::from_proto(required(v.policy)?)?),
+                supervisor_takeover: v.supervisor_takeover,
+                supervisor_recovery_timeout_secs: v
+                    .supervisor_recovery_timeout
+                    .map(whole_seconds)
+                    .transpose()?,
             },
             P::Confirm(_) => W::Confirm,
             P::StartAgent(v) => W::StartAgent {
@@ -794,6 +850,8 @@ mod tests {
             request: Some(p::request_envelope::Request::Attach(p::Attach {
                 supervisor_instance_id: uuid::Uuid::new_v4().to_string(),
                 policy: None,
+                supervisor_takeover: None,
+                supervisor_recovery_timeout: None,
             })),
         };
         assert!(w::RequestEnvelope::from_proto(attach).is_err());
@@ -805,6 +863,53 @@ mod tests {
             })),
         };
         assert!(w::RequestEnvelope::from_proto(signal).is_err());
+    }
+
+    #[test]
+    fn attach_carries_an_offered_recovery_deadline_only_when_present() {
+        for offered in [None, Some(60)] {
+            let request = w::RequestEnvelope::new(w::Request::Attach {
+                supervisor_instance_id: w::SupervisorInstanceId::new(),
+                policy: Box::new(w::SandboxPolicyWire::from(
+                    openshell_core::policy::SandboxPolicy {
+                        version: 1,
+                        filesystem: openshell_core::policy::FilesystemPolicy::default(),
+                        network: openshell_core::policy::NetworkPolicy::default(),
+                        landlock: openshell_core::policy::LandlockPolicy::default(),
+                        process: openshell_core::policy::ProcessPolicy::default(),
+                    },
+                )),
+                supervisor_takeover: None,
+                supervisor_recovery_timeout_secs: offered,
+            })
+            .unwrap();
+            let encoded = request.to_proto().unwrap();
+            let Some(p::request_envelope::Request::Attach(attach)) = &encoded.request else {
+                unreachable!()
+            };
+            assert_eq!(
+                attach.supervisor_recovery_timeout,
+                offered.map(|seconds| prost_types::Duration {
+                    seconds: i64::from(seconds),
+                    nanos: 0,
+                })
+            );
+            let mut fractional = encoded.clone();
+            let decoded = w::RequestEnvelope::from_proto(encoded).unwrap();
+            assert!(matches!(
+                decoded.request,
+                w::Request::Attach { supervisor_recovery_timeout_secs, .. }
+                    if supervisor_recovery_timeout_secs == offered
+            ));
+            // An offer that is not whole seconds is not a valid frame.
+            if let Some(p::request_envelope::Request::Attach(attach)) = &mut fractional.request {
+                attach.supervisor_recovery_timeout = Some(prost_types::Duration {
+                    seconds: 60,
+                    nanos: 1,
+                });
+            }
+            assert!(w::RequestEnvelope::from_proto(fractional).is_err());
+        }
     }
 
     #[test]
@@ -841,6 +946,56 @@ mod tests {
         let changed = w::RequestEnvelope::from_proto(value).unwrap();
         assert_eq!(changed.request_id, request.request_id);
         assert_ne!(changed.payload_digest, request.payload_digest);
+    }
+
+    #[test]
+    fn agent_spec_carries_the_otlp_relay_flag() {
+        let mut spec = w::AgentSpecWire {
+            program: "/bin/true".into(),
+            args: vec![],
+            workdir: None,
+            timeout_secs: 0,
+            interactive: false,
+            otlp_relay_active: false,
+        };
+        let inactive = spec.to_proto().unwrap();
+        assert_eq!(w::AgentSpecWire::from_proto(inactive).unwrap(), spec);
+
+        spec.otlp_relay_active = true;
+        let decoded = w::AgentSpecWire::from_proto(spec.to_proto().unwrap()).unwrap();
+        assert!(decoded.otlp_relay_active);
+    }
+
+    #[test]
+    fn binary_identity_carries_the_owning_process_only_when_present() {
+        let resolved = |process| {
+            w::BinaryIdentityWire::from(Ok(c::BinaryIdentity {
+                executable: c::ExecutableIdentity {
+                    path: "/usr/bin/curl".into(),
+                    digest: Some("a".repeat(64).parse().unwrap()),
+                },
+                ancestors: vec![],
+                cmdline_paths: vec![],
+                process,
+            }))
+        };
+        let process = c::ProcessInstance {
+            pid: 57,
+            parent_pid: 42,
+            start_time_ms: 1_793_750_400_123,
+        };
+        for identity in [resolved(Some(process)), resolved(None)] {
+            let decoded = w::BinaryIdentityWire::from_proto(identity.to_proto().unwrap()).unwrap();
+            assert_eq!(decoded, identity);
+        }
+
+        let mut missing_start = resolved(Some(process)).to_proto().unwrap();
+        let Some(p::binary_identity::Result::Resolved(resolved)) = missing_start.result.as_mut()
+        else {
+            panic!("resolved identity");
+        };
+        resolved.process.as_mut().unwrap().start_time = None;
+        assert!(w::BinaryIdentityWire::from_proto(missing_start).is_err());
     }
 
     #[test]

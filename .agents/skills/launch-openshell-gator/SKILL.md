@@ -7,7 +7,7 @@ metadata:
 
 # Launch OpenShell Gator
 
-Launch and supervise the repository's headless gator sandbox agent through OpenShell. This skill covers the operator workflow around `scripts/agents/run.sh`; the in-sandbox review and state-machine policy remains the `gator-gate` skill baked into the gator payload.
+Launch and supervise the repository's headless gator sandbox agent through OpenShell. This skill covers the operator workflow around `.agents/agents/gator/run.sh`; the in-sandbox review and state-machine policy remains the `gator-gate` skill baked into the gator payload.
 
 For gator's PR/issue validation policy, load `gator-gate` inside the launched sandbox. For generic sandbox CLI usage, use `openshell-cli`. For unhealthy gateways or sandbox startup failures, use `debug-openshell-cluster` after the launch preflight identifies a gateway/runtime problem.
 
@@ -15,8 +15,8 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 
 - Keep normal gator launches supervised: use `--watch` and let the in-sandbox supervisor own sleeping and relaunching bounded cycles.
 - Do not add passive `sleep` loops in the operator session to watch gator. Check logs or status once, then report the current state or launch a proper watcher outside the model session only when explicitly asked.
-- Do not change the default gator model in `scripts/agents/gator/agent.yaml` for experiments. Use `CODEX_MODEL=...` and, if needed, a temporary `--from` Docker context or `--codex-bin` override.
-- Do not push to contributor branches, approve, merge, post `/ok to test`, or broaden gator scope unless the operator explicitly authorized that action.
+- Do not change the default gator model in `.agents/agents/gator/agent.yaml` for experiments. Use `CODEX_MODEL=...` and, if needed, a temporary `--from` Docker context or `--codex-bin` override.
+- Do not push to contributor branches, approve PRs or workflow runs, merge, or broaden gator scope unless the operator explicitly authorized that action.
 - Scope each launch prompt to the requested issue/PR set. Avoid repo-wide gator scans unless the operator asked for repo-wide processing.
 - Leave unrelated local files alone, including `.opencode/` artifacts and old gator logs unless the user asks for cleanup.
 
@@ -24,16 +24,16 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 
 | Path | Purpose |
 |---|---|
-| `scripts/agents/run.sh` | Manifest-driven OpenShell agent launcher. |
-| `scripts/agents/gator/agent.yaml` | Gator manifest: immutable payload version, default gateway, harness, providers, runtime, skills, and subagents. |
-| `scripts/agents/gator/Dockerfile` | Gator sandbox image source. Local launches build it in gateway's Docker or Podman image store. |
-| `scripts/agents/gator/policy.yaml` | Sandbox policy for the gator agent. |
-| `scripts/agents/gator/bin/gh` | Gator-specific `gh` wrapper and same-SHA duplicate-post guard. |
-| `scripts/agents/gator/bin/review-feedback-ledger` | Builds tree-aware review scope, durable findings, convergence telemetry, and review-budget state. |
-| `scripts/agents/gator/bin/resolve-gator-review-threads` | Resolves addressed Gator-owned inline review threads by ledger finding ID. |
-| `scripts/agents/gator/bin/validate-review-findings` | Enforces the blocker evidence schema and downgrades unsupported hypotheses. |
-| `scripts/agents/gator/prompts/gator.md` | Rendered top-level prompt template baked into the payload. |
-| `scripts/agents/gator/skills/gator-gate/SKILL.md` | In-sandbox gator state-machine skill. |
+| `.agents/agents/gator/run.sh` | Manifest-driven OpenShell agent launcher. |
+| `.agents/agents/gator/agent.yaml` | Gator manifest: immutable payload version, default gateway, harness, providers, runtime, skills, and subagents. |
+| `.agents/agents/gator/Dockerfile` | Gator sandbox image source. Local launches build it in gateway's Docker or Podman image store. |
+| `.agents/agents/gator/policy.yaml` | Sandbox policy for the gator agent. |
+| `.agents/agents/gator/bin/gh` | Gator-specific `gh` wrapper and same-SHA duplicate-post guard. |
+| `.agents/agents/gator/bin/review-feedback-ledger` | Builds tree-aware review scope, durable findings, convergence telemetry, and review-budget state. |
+| `.agents/agents/gator/bin/resolve-gator-review-threads` | Resolves addressed Gator-owned inline review threads by ledger finding ID. |
+| `.agents/agents/gator/bin/validate-review-findings` | Enforces the blocker evidence schema and downgrades unsupported hypotheses. |
+| `.agents/agents/gator/prompts/gator.md` | Rendered top-level prompt template baked into the payload. |
+| `.agents/agents/gator/skills/gator-gate/SKILL.md` | In-sandbox gator state-machine skill. |
 
 ## Preflight
 
@@ -65,7 +65,7 @@ Use `gh api user` as the health check. It works with provider-scoped tokens and 
 
 ```bash
 gh api user --jq '.login'
-gh api repos/NVIDIA/OpenShell --jq '{full_name,default_branch}'
+gh api repos/ai-openshell/openshell --jq '{full_name,default_branch}'
 ```
 
 If this fails, refresh host `gh` auth before launching. Do not rely on `gh auth status` alone inside provider-backed sandboxes.
@@ -81,6 +81,22 @@ jq -e '.tokens.access_token and .tokens.refresh_token and .tokens.account_id' "$
 If this fails, run the local Codex login flow outside the gator launch. If Codex was recently reauthenticated and gateway refresh fails later, relaunch with `--reset-refresh` once.
 
 The launcher passes the non-secret host account ID as literal `CODEX_ACCOUNT_ID` for Codex's local workspace routing. The harness must not use the opaque `CODEX_AUTH_ACCOUNT_ID` credential placeholder for that comparison. Access tokens remain placeholders, and refresh material remains gateway-only.
+
+The image contains task-independent tooling and a prompt template, not the run's PR assignment or test authorization. The launcher supplies those instructions at runtime through `OPENSHELL_AGENT_TASK` in the canonical process command. The supervisor captures the assembled prompt in memory and supplies it on stdin for every cycle. Task text is non-secret and may appear in runtime command metadata; never put credentials in the task. Task-only changes reuse the same tooling build inputs, although the launcher still builds/tags an image per invocation.
+
+For Kubernetes gateways, select image delivery explicitly: `--k3d-cluster NAME`
+builds with Docker and imports into a running local cluster with the matching
+current kube context; `--publish-image REGISTRY/REPOSITORY:TAG` builds and pushes,
+then launches by resolved digest; `--image REGISTRY/REPOSITORY@sha256:DIGEST`
+reuses trusted compatible tooling without local image tools. Do not infer
+locality from a loopback endpoint. The k3d selection asserts which cluster
+serves the gateway; imported images require `if_not_present` or `never` pull
+policy. Registry builds use the builder's platform and existing registry auth;
+nodes need their own pull access. `--build-only` builds/delivers without
+gateway mutations, provider credential reads, or a sandbox launch. Reused
+images must match the local manifest's agent ID and payload version and support
+the runtime task contract; legacy baked-task images fail startup. See
+`.agents/agents/gator/README.md` for examples and option compatibility.
 
 ### Step 5: Verify Gateway Is Registered And Alive
 
@@ -155,15 +171,14 @@ pr_number="<digits-only>"
 sandbox_name="gtr-pr-${pr_number}-watch"
 [[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
-./scripts/agents/run.sh \
-  --agent gator \
+./.agents/agents/gator/run.sh \
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
-The launcher queries the gateway's selected compute driver, builds the gator image in the matching Docker or Podman image store, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, and starts the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the canonical main process exits and its terminal result is finalized. `CONTAINER_ENGINE`, when set, must match the gateway driver.
+The launcher queries the gateway's selected compute driver and prepares the image through the selected build/import/publish or prebuilt path before importing provider profiles, configuring provider credentials and refresh, and starting the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the canonical main process exits and its terminal result is finalized. `CONTAINER_ENGINE`, when set, must match Docker/Podman gateways or Docker for k3d imports; registry builds for Kubernetes may use either local engine.
 
 The launcher streams image-build and provisioning output until the detached workload is ready, then exits. Use `openshell logs <sandbox-name>` or the TUI for runtime output.
 
@@ -177,8 +192,7 @@ issue_number="<digits-only>"
 sandbox_name="gtr-i-${issue_number}-watch"
 [[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
-./scripts/agents/run.sh \
-  --agent gator \
+./.agents/agents/gator/run.sh \
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
@@ -197,8 +211,7 @@ issue_number="<digits-only>"
 sandbox_name="gtr-pr-${pr_number}-watch"
 [[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
-./scripts/agents/run.sh \
-  --agent gator \
+./.agents/agents/gator/run.sh \
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
@@ -217,13 +230,22 @@ pr_number="<digits-only>"
 sandbox_name="gtr-pr-${pr_number}-watch"
 [[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
-./scripts/agents/run.sh \
-  --agent gator \
+./.agents/agents/gator/run.sh \
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label, posting /ok to test with the full 40-character current head SHA, and rerunning the relevant current-head workflow when the E2E Label Help bot says that is required."
+  "Review and monitor PR #${pr_number} in ai-openshell/openshell through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying relevant test labels and approving current-head GitHub Actions workflow runs through approve-gator-workflow. Do not approve PRs, merge, push, rerun workflows, or dispatch workflows."
 ```
+
+Native GitHub Actions approval replaces `/ok to test`; a test label selects the
+suite but does not approve an external contributor's run. The guarded helper
+refuses PRs changing `.github/`, which need manual inspection and approval.
+Do not reuse an old launch assignment's `/ok to test` authorization as permission
+to approve workflow runs. Request explicit workflow-approval authorization.
+
+When payload 15 is published, replace still-active older watchers after checking
+their current state. Baked skills cannot update in place. Keep private-advisory
+watchers scoped to their private repository and review-only authorization.
 
 ## Model Or Image Experiments
 
@@ -238,15 +260,14 @@ sandbox_name="gtr-pr-${pr_number}-exp"
 [[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 CODEX_MODEL=gpt-5.6-sol \
-./scripts/agents/run.sh \
-  --agent gator \
+./.agents/agents/gator/run.sh \
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. This launch is intentionally testing Codex model gpt-5.6-sol via the CLI launcher."
 ```
 
-If the installed Codex CLI is too old for a model, create a temporary copy of `scripts/agents/gator/`, adjust only that temporary Dockerfile, and launch with that generated context. Keep the repo Dockerfile unchanged unless the version bump is the intended code change.
+If the installed Codex CLI is too old for a model, create a temporary copy of `.agents/agents/gator/`, adjust only that temporary Dockerfile, and launch with that generated context. Keep the repo Dockerfile unchanged unless the version bump is the intended code change.
 The short `-exp` suffix below identifies an experimental watcher; keep its full
 name within 19 characters.
 
@@ -260,11 +281,10 @@ pr_number="<digits-only>"
 sandbox_name="gtr-pr-${pr_number}-exp"
 [[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 tmp_context="$(mktemp -d "${TMPDIR:-/tmp}/gator-codex-XXXXXX")"
-cp -R scripts/agents/gator/. "$tmp_context"/
+cp -R .agents/agents/gator/. "$tmp_context"/
 
 CODEX_MODEL=gpt-5.6-sol \
-./scripts/agents/run.sh \
-  --agent gator \
+./.agents/agents/gator/run.sh \
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --from "$tmp_context" \
@@ -330,7 +350,7 @@ transport diagnostics.
 
 Restart when the payload must change, the sandbox is wedged without a sentinel, the model/tooling version changed, or a transient failure repeats past the useful retry point.
 
-Increment `payload_version` in `scripts/agents/gator/agent.yaml` whenever a
+Increment `payload_version` in `.agents/agents/gator/agent.yaml` whenever a
 merged change alters the Gator prompt, gate skill, reviewer contract, write
 guard, ledger, thread resolver, or bundled validator. Existing immutable
 watchers cannot replace their own payload. New-version watchers detect later
@@ -346,8 +366,7 @@ sandbox_name="<safe-sandbox-name>"
 [[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 openshell --gateway "$gateway_name" sandbox delete "$sandbox_name"
-./scripts/agents/run.sh \
-  --agent gator \
+./.agents/agents/gator/run.sh \
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
@@ -370,7 +389,7 @@ Symptoms: Dockerfile step failure, missing package, incompatible Codex CLI, regi
 
 Actions:
 
-- Confirm the build context is `scripts/agents/gator/` or the intended temporary `--from` context.
+- Confirm the build context is `.agents/agents/gator/` or the intended temporary `--from` context.
 - Confirm Docker or the selected gateway runtime can pull `nvcr.io/nvidia/base/ubuntu:noble-20251013`.
 - For Codex CLI version experiments, adjust a temporary Docker context first.
 - Do not commit Dockerfile version changes unless the repo should permanently use that version.
@@ -382,7 +401,7 @@ Symptoms: host `gh` auth fails, Codex refresh fails, in-sandbox GitHub calls rep
 Actions:
 
 - Re-run the GitHub and Codex preflight checks.
-- Existing refresh-managed providers are reused without an ordinary credential update; the launcher rotates their gateway-managed credential instead.
+- Existing refresh-managed providers are reused without reading host refresh material or forcing rotation. Errors fail closed; the launcher never automatically reseeds from host auth.
 - If host Codex auth changed, relaunch with `--reset-refresh` once.
 - `--reset-refresh` removes the old refresh ownership before rediscovering host credentials, then configures and rotates the replacement refresh state.
 - If Entra or Microsoft auth is involved in a future provider, use the relevant auth skill. Gator's default providers are GitHub and Codex.

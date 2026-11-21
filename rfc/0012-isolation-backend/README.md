@@ -3,14 +3,14 @@ authors:
   - "@jganoff"
 state: review
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/1737
-  - https://github.com/NVIDIA/OpenShell/pull/2048
-  - https://github.com/NVIDIA/OpenShell/issues/899
-  - https://github.com/NVIDIA/OpenShell/issues/981
-  - https://github.com/NVIDIA/OpenShell/issues/1511
-  - https://github.com/NVIDIA/OpenShell/issues/1650
-  - https://github.com/NVIDIA/OpenShell/issues/1680
-  - https://github.com/NVIDIA/OpenShell/pull/2606
+  - https://github.com/ai-openshell/openshell/issues/1737
+  - https://github.com/ai-openshell/openshell/pull/2048
+  - https://github.com/ai-openshell/openshell/issues/899
+  - https://github.com/ai-openshell/openshell/issues/981
+  - https://github.com/ai-openshell/openshell/issues/1511
+  - https://github.com/ai-openshell/openshell/issues/1650
+  - https://github.com/ai-openshell/openshell/issues/1680
+  - https://github.com/ai-openshell/openshell/pull/2606
 ---
 
 # RFC 0012 - Isolation Backend Interface
@@ -108,6 +108,18 @@ Transport recovery is scoped to the same logical supervisor process. A backend
 may reconnect that process and re-confirm its binding, but a replacement
 supervisor process cannot resume an existing runtime generation with launch
 credentials. Planned upgrades stop the sandbox and start a fresh generation.
+
+> **Implementation note ([#4860](https://github.com/ai-openshell/openshell/issues/4860)).**
+> The built-in OpenShell runtime adds an explicit, capability-gated exception
+> for highly available shared supervisors
+> (`openshell.sandbox.supervisor-takeover`, protocol 1.1). A replacement
+> process may resume a generation only with a gateway-signed takeover grant
+> for a later credential epoch, which the gateway issues after it has advanced
+> the sandbox's persisted epoch and revoked every credential of the previous
+> owner. The runtime stages the replacement, promotes it at confirmation, and
+> fences the previous owner; launch credentials alone still never resume a
+> generation, and backends without the capability keep this contract. See
+> the `openshell-sandbox` and `openshell-sandbox-backend` READMEs.
 
 ### Provisioning
 

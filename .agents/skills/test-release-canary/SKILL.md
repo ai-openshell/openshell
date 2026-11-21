@@ -43,11 +43,6 @@ The host-package jobs exercise fresh installs, not upgrades from a persisted
 schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
 the release-tooling and package lifecycle tests before relying on the canary.
 
-The canary does not install or import `@nvidia/openshell-sdk`. TypeScript SDK
-validation lives in the `TypeScript SDK` branch check, including a publish
-dry-run. The tagged release workflow publishes the package to GitHub Packages;
-verify that job directly when diagnosing SDK publication failures.
-
 ## Trigger paths
 
 The workflow has two triggers:
@@ -91,11 +86,11 @@ gh run view <run-id> --log-failed
 
 When you change `release-canary.yml` on a branch, a manual dispatch on that branch tests *your branch's workflow logic* against *main's published dev artifacts* (`0.0.0-dev` chart, `:dev` images, and the `dev` GitHub release). This is what you want for iterating on the canary — you're validating that the canary still works against known-good artifacts.
 
-Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though packages come from the latest public dev release and the snap comes from `latest/edge`.
+Note `install.sh` is pulled from `raw.githubusercontent.com/ai-openshell/openshell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though packages come from the latest public dev release and the snap comes from `latest/edge`.
 
 ## Testing artifacts from a specific SHA
 
-`Release Dev` publishes two chart versions for every dev build (see `.github/actions/release-helm-oci/action.yml:89-102`):
+`Release Dev` publishes two chart versions for every dev build (see the push steps in `.github/actions/release-helm-oci/action.yml`):
 
 - `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` — floating, overwritten on every main push.
 - `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls the matching `gateway`, `sandbox`, and `supervisor` images.

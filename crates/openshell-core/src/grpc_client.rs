@@ -370,7 +370,25 @@ impl tonic::service::Interceptor for AuthInterceptor {
     }
 }
 
-/// Build the plain (un-intercepted) gRPC channel.
+/// Configure server-authenticated TLS for the gateway control-plane endpoint.
+///
+/// Trust only the configured gateway CA. Destination, system, and proxy
+/// trust are intentionally not parameters to this control-plane boundary.
+fn configure_gateway_tls(
+    ep: Endpoint,
+    ca_pem: Vec<u8>,
+    server_name: Option<&str>,
+) -> Result<Endpoint> {
+    let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
+    if let Some(server_name) = server_name.filter(|name| !name.is_empty()) {
+        tls_config = tls_config.domain_name(server_name);
+    }
+    ep.tls_config(tls_config)
+        .into_diagnostic()
+        .wrap_err("failed to configure TLS")
+}
+
+/// Configure the plain (un-intercepted) gRPC endpoint.
 ///
 /// When the endpoint uses `https://`, server-authenticated TLS is configured
 /// using this env var:
@@ -378,7 +396,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
 ///
 /// When the endpoint uses `http://`, a plaintext connection is used (for
 /// deployments where TLS is disabled, e.g. behind a Cloudflare Tunnel).
-async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
+fn build_plain_endpoint(endpoint: &str) -> Result<Endpoint> {
     let mut ep = Endpoint::from_shared(endpoint.to_string())
         .into_diagnostic()
         .wrap_err("invalid gRPC endpoint")?
@@ -405,30 +423,20 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read CA cert from {ca_path}"))?;
 
-        // Trust only the configured CA — this is the chart's internal CA
-        // that signs the gateway's internal server certificate. The gateway uses SNI-based
-        // certificate selection to present this internal cert to supervisor
-        // connections, so no public root trust is needed here.
-        //
-        // Do NOT add `.with_native_roots()` or `.with_webpki_roots()` here:
-        // the supervisor runs inside the user-selected sandbox image
-        // (Docker/Podman drivers), and broadening the trust store would let
-        // an attacker who controls the image + DNS present a publicly valid
-        // certificate and intercept the supervisor→gateway TLS connection.
-        let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
-        if let Ok(server_name) = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME)
-            && !server_name.is_empty()
-        {
-            tls_config = tls_config.domain_name(server_name);
-        }
-
-        ep = ep
-            .tls_config(tls_config)
-            .into_diagnostic()
-            .wrap_err("failed to configure TLS")?;
+        // The gateway uses SNI-based certificate selection to present its
+        // internal cert to supervisor connections. Do not add native,
+        // webpki, destination, or child-process roots here: an image that can
+        // influence DNS must not broaden supervisor→gateway authentication.
+        let server_name = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME).ok();
+        ep = configure_gateway_tls(ep, ca_pem, server_name.as_deref())?;
     }
 
-    ep.connect()
+    Ok(ep)
+}
+
+async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
+    build_plain_endpoint(endpoint)?
+        .connect()
         .await
         .into_diagnostic()
         .wrap_err("failed to connect to OpenShell server")
@@ -459,6 +467,127 @@ impl Drop for ClientSpanStatus {
         if !self.finished {
             self.span.record("otel.status_code", "ERROR");
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_tls_isolation_tests {
+    use super::*;
+    use rcgen::{CertificateParams, IsCa};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use std::io::Cursor;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    #[allow(clippy::struct_field_names)]
+    struct TestPki {
+        ca_pem: Vec<u8>,
+        server_cert_pem: Vec<u8>,
+        server_key_pem: Vec<u8>,
+    }
+
+    fn test_pki(server_name: &str) -> TestPki {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
+
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let server_params = CertificateParams::new(vec![server_name.to_string()]).unwrap();
+        let server =
+            openshell_crypto::pki::signed_by(server_params, &server_key, &ca, &ca_key).unwrap();
+        TestPki {
+            ca_pem: ca.pem().into_bytes(),
+            server_cert_pem: server.pem().into_bytes(),
+            server_key_pem: server_key.serialize_pem().unwrap().into_bytes(),
+        }
+    }
+
+    async fn start_h2_tls_server(pki: &TestPki) -> std::net::SocketAddr {
+        let certificates = CertificateDer::pem_reader_iter(&mut Cursor::new(&pki.server_cert_pem))
+            .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
+            .unwrap();
+        let key: PrivateKeyDer<'static> =
+            PrivateKeyDer::pem_reader_iter(&mut Cursor::new(&pki.server_key_pem))
+                .next()
+                .transpose()
+                .unwrap()
+                .unwrap();
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            if let Ok(mut connection) = h2::server::handshake(stream).await {
+                while let Some(request) = connection.accept().await {
+                    if request.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        address
+    }
+
+    async fn connect_with_gateway_ca(
+        address: std::net::SocketAddr,
+        pki: &TestPki,
+        server_name: &str,
+    ) -> Result<Channel> {
+        let endpoint = Endpoint::from_shared(format!("https://{address}")).into_diagnostic()?;
+        configure_gateway_tls(endpoint, pki.ca_pem.clone(), Some(server_name))?
+            .connect()
+            .await
+            .into_diagnostic()
+    }
+
+    #[tokio::test]
+    async fn destination_ca_cannot_authenticate_gateway() {
+        const GATEWAY_NAME: &str = "gateway.internal.test";
+        let gateway = test_pki(GATEWAY_NAME);
+        let destination = test_pki(GATEWAY_NAME);
+
+        let real_address = start_h2_tls_server(&gateway).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_with_gateway_ca(real_address, &gateway, GATEWAY_NAME),
+        )
+        .await
+        .expect("real gateway connection timed out")
+        .expect("configured gateway CA should authenticate the gateway");
+
+        let fake_address = start_h2_tls_server(&destination).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_with_gateway_ca(fake_address, &gateway, GATEWAY_NAME),
+        )
+        .await
+        .expect("fake gateway rejection timed out")
+        .expect_err("destination-signed fake gateway must be rejected");
+        assert!(format!("{error:?}").contains("certificate"), "{error:?}");
+
+        let mismatch_address = start_h2_tls_server(&gateway).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_with_gateway_ca(mismatch_address, &gateway, "wrong.internal.test"),
+        )
+        .await
+        .expect("hostname mismatch rejection timed out")
+        .expect_err("normal server-name verification must remain enabled");
     }
 }
 
@@ -1578,6 +1707,106 @@ pub async fn exchange_provider_subject_token(
     ))
 }
 
+/// Final provider access tokens for one sandbox instance over one reused
+/// gateway channel.
+///
+/// The lazy channel connects when used, so initialization never waits on a
+/// network connection. Concurrent requests share it without holding a
+/// lock across the call, and tonic reconnects it after transport loss. Each
+/// request reads the instance's current bearer, so renewal and revocation
+/// apply without reconnecting, and the gateway authorizes every request.
+pub struct SandboxProviderTokenClient {
+    // The validated endpoint shares the instance's rotating credentials.
+    gateway: std::result::Result<(url::Url, GatewayEndpoint), TokenGrantFailure>,
+    client: tokio::sync::OnceCell<OpenShellClient<AuthedChannel>>,
+    deadline: Duration,
+}
+
+impl SandboxProviderTokenClient {
+    #[must_use]
+    pub fn new(gateway: GatewayEndpoint) -> Self {
+        Self::with_deadline(
+            gateway,
+            crate::token_grant_failure::BROKERED_TOKEN_CLIENT_DEADLINE,
+        )
+    }
+
+    fn with_deadline(gateway: GatewayEndpoint, deadline: Duration) -> Self {
+        Self {
+            gateway: token_grant_gateway_endpoint(gateway.url()).map(|endpoint| {
+                let gateway = gateway.with_url(endpoint.as_str());
+                (endpoint, gateway)
+            }),
+            client: tokio::sync::OnceCell::new(),
+            deadline,
+        }
+    }
+
+    /// Obtain only the final access token; the gateway selects and verifies
+    /// the sandbox identity and resolves all grant parameters from its
+    /// configuration.
+    ///
+    /// One deadline bounds connection readiness and the call. Network failures
+    /// do not serialize channel initialization for concurrent requests.
+    #[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
+    pub async fn get_access_token(
+        &self,
+        credential_key: &str,
+        request_id: Option<&str>,
+    ) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
+        let (endpoint, gateway) = self.gateway.as_ref().map_err(|failure| *failure)?;
+        // Like connect(), refuse locally revoked sandbox instance credentials
+        // before the call; the response boundary rejects them again.
+        let unavailable = || gateway_grant_failure(TokenGrantFailureKind::Unavailable);
+        if gateway.credentials().is_revoked() {
+            return Err(unavailable());
+        }
+        let key = crate::dynamic_credential_key::unscoped_owned_key(credential_key)
+            .ok_or_else(|| gateway_grant_failure(TokenGrantFailureKind::Configuration))?;
+        let mut request = tonic::Request::new(crate::proto::GetSandboxProviderAccessTokenRequest {
+            credential_key: key,
+        });
+        if let Some(value) = request_id.and_then(|value| value.parse().ok()) {
+            request.metadata_mut().insert("x-request-id", value);
+        }
+        let response = tokio::time::timeout(self.deadline, async {
+            let mut client = self
+                .client
+                .get_or_try_init(|| async {
+                    let channel = build_plain_endpoint(gateway.url())?.connect_lazy();
+                    let intercepted = InterceptedService::new(
+                        channel.clone(),
+                        AuthInterceptor::new(gateway.credentials.inner.bearer.clone()),
+                    );
+                    gateway
+                        .credentials
+                        .start_renewal(&intercepted, &channel, gateway.url());
+                    Ok::<_, miette::Report>(OpenShellClient::new(intercepted))
+                })
+                .await
+                .map_err(|_| unavailable())?
+                .clone();
+            client
+                .get_sandbox_provider_access_token(request)
+                .await
+                .map_err(|status| provider_subject_token_exchange_status(&status, endpoint))
+        })
+        .await
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))??
+        .into_inner();
+        if gateway.credentials().is_revoked() {
+            return Err(gateway_grant_failure(
+                TokenGrantFailureKind::WorkloadIdentityRejected,
+            ));
+        }
+        provider_subject_token_exchange_result(crate::proto::ExchangeProviderSubjectTokenResponse {
+            access_token: response.access_token,
+            expires_after: response.expires_after,
+            token_type: response.token_type,
+        })
+    }
+}
+
 /// Attach the exchange's request ID as `x-request-id` gRPC metadata.
 ///
 /// A value that is not valid metadata is omitted, never rewritten.
@@ -1704,6 +1933,53 @@ mod token_grant_exchange_tests {
         assert!(token_grant_gateway_endpoint("https://localhost:8443").is_ok());
     }
 
+    #[tokio::test]
+    async fn access_token_deadline_bounds_connection_and_call_for_each_request() {
+        // The gateway accepts connections but never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let credentials = GatewayCredentials::new(
+            AsciiMetadataValue::from_static("Bearer test"),
+            TokenSource::Env,
+        );
+        let deadline = Duration::from_millis(300);
+        let client = SandboxProviderTokenClient::with_deadline(
+            GatewayEndpoint::new(format!("http://{address}"), credentials),
+            deadline,
+        );
+        let started = tokio::time::Instant::now();
+        let results: [_; 2] = tokio::join!(
+            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None),
+            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None),
+        )
+        .into();
+        for result in results {
+            let failure = result.err().expect("unanswered gateway times out");
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Timeout);
+        }
+        assert!(
+            client.client.get().is_some(),
+            "an unresponsive gateway must not prevent channel initialization"
+        );
+        // Concurrent requests share one budget rather than queueing behind it.
+        assert!(started.elapsed() < deadline * 3);
+        held.abort();
+
+        let invalid = SandboxProviderTokenClient::new(GatewayEndpoint::new(
+            "https://localhost/SECRET",
+            GatewayCredentials::new(
+                AsciiMetadataValue::from_static("Bearer test"),
+                TokenSource::Env,
+            ),
+        ));
+        let failure = invalid.get_access_token("key", None).await.err().unwrap();
+        assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
+    }
+
     #[test]
     fn gateway_response_keeps_expiration_and_rejects_invalid_duration() {
         let response = |seconds, nanos| crate::proto::ExchangeProviderSubjectTokenResponse {
@@ -1741,6 +2017,7 @@ pub struct CachedOpenShellClient {
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
 #[derive(Clone, Debug)]
 pub struct SettingsPollResult {
+    pub service_routes: Vec<crate::proto::SandboxServiceRoute>,
     pub configuration_instance_id: String,
     pub configuration_admitted: bool,
     pub configuration_error: String,
@@ -1768,6 +2045,7 @@ pub struct SettingsPollResult {
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
     SettingsPollResult {
+        service_routes: inner.service_routes,
         configuration_instance_id: inner.configuration_instance_id,
         configuration_admitted: inner.configuration_admitted,
         configuration_error: inner.configuration_error,
@@ -1797,6 +2075,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
 impl From<crate::proto::SandboxConfigSnapshot> for SettingsPollResult {
     fn from(snapshot: crate::proto::SandboxConfigSnapshot) -> Self {
         settings_poll_result(crate::proto::GetSandboxConfigResponse {
+            service_routes: snapshot.service_routes,
             policy: snapshot.policy,
             version: snapshot.version,
             policy_hash: snapshot.policy_hash,

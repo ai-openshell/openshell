@@ -150,6 +150,23 @@ when a placeholder is present but requests receive
 `credential_endpoint_mismatch`. A profileless static provider fails closed
 because the gateway cannot construct a binding.
 
+Usable credential placement is enforced automatically when both gateway and
+supervisor support it. `credential_placement_mismatch` means a placeholder is
+outside its declared header, query parameter, or path-template slot. Match the
+profile. Explicit body/WebSocket rewrite policies retain their documented
+behavior for ordinary credentials. Without placement metadata, a supporting
+supervisor permits only `Authorization` and those explicit rewrite policies;
+malformed metadata is rejected. For custom headers, query parameters, or path
+slots, update the imported profile with explicit placement and upgrade the
+gateway before the supervisor. Older gateways cannot forward placement metadata;
+older supervisors retain their previous behavior. Updating example YAML does not
+update an imported profile. Check provider readiness after changing placement and
+launch a new process if retained references were revoked. For path-based APIs
+that use one token across multiple methods, select `auth_style: path_subtree`
+and set `path_template` to the base path, such as `/bot{credential}`. This
+authorizes the base and its descendants at the bound endpoint. With
+`auth_style: path`, the template matches exactly, including literal stars.
+
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port
 must match. For a tunnel to `api.example.com:8443`, send
@@ -231,6 +248,31 @@ openshell provider refresh rotate my-provider --credential-key ACCESS_TOKEN
 ```
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
+
+When many providers share one OAuth client secret, store it once as a workspace secret and reference it with `--material-secret client_secret=NAME`. Rotating it with `openshell secret update` reaches every referencing provider at its next refresh. A secret only reaches the token endpoints it was created with (`--allowed-endpoint`); one created without them is reveal-only and cannot be referenced. and `openshell secret delete` fails while a refresh references it; run `openshell provider refresh inline-secrets` to copy the value into the provider first. The gateway operator must set `enable_workspace_secrets`. See `openshell secret --help`.
+
+For GitHub App installations, check installed refresh help for
+`github-app-installation` and read the
+[provider profile documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles#github-app-installation-tokens).
+Use explicit repository IDs and permissions, keep the app private key in secret
+refresh material, and check refresh status before attaching the provider. Token
+permissions do not grant API writes or Git push through a read-only sandbox policy.
+Use `--material-secret private_key=NAME` to reference a workspace secret; allow
+the concrete installation token endpoint when creating it. Updating that secret
+applies at the next refresh without reconfiguration. Inline key or scope
+replacement withdraws the old token from gateway delivery. After reconfiguring,
+rotate and restart processes holding the old workload handle.
+Use one refresh configuration for the GitHub App token credential. The logical
+name selects its configured environment alias; use status without a credential
+filter and exact-key deletion to clean up legacy alias conflicts. Clear any
+static sibling alias before configuring refresh. For `gh` on GitHub Enterprise
+Server, declare and configure `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN`.
+
+Do not infer GitHub App installation access from `GITHUB_TOKEN` or `GH_TOKEN`.
+These aliases also carry personal access and OAuth tokens. Choose the provider
+profile for the user's authentication method: existing tokens use static provider
+setup, while App installations use `--runtime-credentials` followed by refresh
+configuration. A static installation token does not rotate automatically.
 
 The gateway stores secret refresh material through its active credential driver.
 With Vault selected, refresh tokens, client secrets, and private keys live in
@@ -527,6 +569,12 @@ stopped or completed. Starting a retained `Completed` or
 invalidates SSH sessions from the previous runtime generation. Delete remains
 the operation that removes retained state.
 
+Before updating a retained `Completed` or `Error/MainProcessFailed` sandbox,
+run `sandbox stop`. It cleans up compute and transitions to `Stopped`, retaining
+the exit code until the next start. If the terminal sandbox's compute resource
+is already gone, stop succeeds and preserves its terminal phase and exit code;
+configuration updates require retained compute.
+
 The sandbox's SSH host identity survives stop/start and runtime restarts.
 API clients can read its public fingerprint from the sandbox resource or
 SSH-session response and pin it to the sandbox ID. Recreating a deleted
@@ -535,6 +583,77 @@ sandbox, even under the same name, creates a different identity. See the
 for verification behavior and release compatibility.
 
 For an infrastructure `Error` on a backend that supports restarting stopped sandboxes, fix the reported cause, run `sandbox stop`, and wait for it to succeed before running `sandbox start`. This retains the sandbox and persistent workspace but cannot recover deleted resources or storage. For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
+
+### Suspend and resume sandboxes
+
+On a gateway whose compute driver and isolation backend support it, suspend
+freezes a `Ready` sandbox and retains its memory state:
+
+```bash
+openshell sandbox suspend [name]
+openshell sandbox resume [name]
+```
+
+Suspend waits for `Suspended`, then stops background forwards. A rejected
+suspend leaves forwards running. Resume restores the state in a new runtime
+generation and waits for `Ready`. A gateway without
+support rejects suspend with `FAILED_PRECONDITION`. Resume fails when retained
+state cannot be restored; use `sandbox start` for an explicit clean boot. `sandbox start`,
+`sandbox stop`, and `sandbox delete` on a suspended sandbox discard the
+retained memory state.
+
+### Change a stopped sandbox's workload image
+
+Do not invent a `sandbox update` command or use delete/create to change an
+existing sandbox's configuration. The separate
+`openshell.v1.SandboxUpdates/UpdateSandbox` RPC uses the same gateway listener
+and authentication as `OpenShell`. It defaults to disabled; the operator must
+complete the published
+[activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates)
+before enabling `enable_sandbox_updates`. Keep it false during a rolling
+upgrade and never enable it merely to bypass a failed compatibility check.
+After activation, stopped Kubernetes sandboxes support image, command, and
+environment updates. Docker supports image-only updates for workspaces created
+with the driver's opt-in `persist_workspace` setting: both images must be cached,
+the target must declare a numeric `USER UID:GID` matching the recorded non-root
+identity, and neither image may declare volumes. Existing Docker writable-layer
+workspaces are not migrated; command and environment updates remain unsupported.
+Other drivers return `UNIMPLEMENTED` for configuration fields. Metadata-only
+updates also support stopped sandboxes on other drivers. Stop and
+wait for `Stopped`, read the sandbox's current resource version through
+`GetSandbox`, call raw `UpdateSandbox` with the named workspace, sandbox name,
+selected image, command, environment overrides, labels or annotations, and required nonzero `expected_resource_version`, then start after
+success. Rust SDK callers use `client.raw_sandbox_updates_fresh()`; generated
+clients use `SandboxUpdates`, not the unchanged `OpenShell` service. There is no
+curated SDK update method. The sandbox identity and persistent workspace remain;
+Kubernetes retains its custom resource and PVC, while Docker replaces the stopped
+workload container and retains its owned `/sandbox` volume. The existing workspace is
+not reseeded and trusted runtime images do not change. Omitted update fields are
+unchanged; supplied lists and maps replace their user-owned values, including
+explicitly empty values. Template environment defaults still apply. System metadata
+is protected; top-level labels and annotations do not update pod metadata.
+Combined configuration changes require the configuration-update driver capability
+and a uniformly upgraded gateway deployment. Metadata-only updates need no
+driver capability and preserve the retention annotation.
+
+For an image that fails to start and reaches a provisioning timeout, wait for
+cleanup completion and settlement of the original driver operation, then run
+`sandbox stop` to obtain `Stopped` before correcting the image. This retains the
+timeout diagnostic and storage and does not bypass pending cleanup.
+
+An operation-pending error blocks start, stop, and provisioning retry. The gateway
+limits preflight and each accepted update attempt to one minute each. A timeout
+after acceptance preserves pending intent for recovery; it does not imply rollback.
+The gateway retries automatically even when new updates are disabled. Repeated automatic
+failures back off up to 15 minutes per gateway; restarting a gateway resets the delay.
+To resume immediately,
+read a fresh resource version and call `UpdateSandbox` with no selected fields;
+the gateway loads the stored targets. Use a new request ID or no ID for this
+explicit resume. An unresolved original ID returns uncertainty, and its payload
+must not change. Explicit delete can reclaim a sandbox whose update cannot
+complete, including its storage. See the published
+[image update workflow](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox)
+and [API errors](https://docs.nvidia.com/openshell/latest/sdk/api-errors).
 
 ---
 
@@ -549,7 +668,7 @@ repair the complete policy or provider set through the gateway. The workload
 has not started on its first activation, so static fields can also be replaced
 during this initial repair. A previously activated sandbox retains static-field
 restrictions while restart admission is pending or rejected.
-Before the gateway's 300-second repair window expires, successful validation
+Before the gateway's configured repair window expires (300 seconds by default), successful validation
 completes startup in place. Effective stored configuration changes and their
 first failed load reset that window; repeated failures do not. After
 `ProvisioningTimedOut`, inspect the retained record and cleanup status, repair
@@ -585,6 +704,10 @@ Create sandbox with initial policy
         ▼                          │
   Verify reload succeeded ─────────┘
 ```
+
+Validate an authored policy offline with `openshell policy lint policy.yaml`
+before creating or updating a sandbox. Gateway-dependent provider, middleware
+registration, image and driver checks are deferred until application.
 
 ### Step 1: Create sandbox with initial policy
 
@@ -854,7 +977,12 @@ openshell sandbox exec work-session -- <client-command>
 The application owns the native base URL, model, request shape, and timeout.
 Launch a new process after attachment readiness so it inherits the installed provider environment. Use the `debug-inference` skill for endpoint, policy, credential-binding, or migration failures.
 
-For an ordinary static provider update, wait for the update and launch a new client process to obtain the new reference. Do not claim that readiness updates the environment of an existing process or retargets its old reference. Acknowledged detach revokes retained references and removes them from future process environments.
+For an ordinary static provider update, wait for the update and launch a new
+client process to obtain the new reference. Readiness does not update an
+existing process's environment or guarantee that it uses the replacement value.
+See [Runtime Limitations](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles#runtime-limitations)
+for retained revision and stable-placeholder behavior. Acknowledged detach
+revokes retained references and removes them from future process environments.
 
 ## Workflow 8: Gateway Management
 
@@ -904,9 +1032,6 @@ openshell settings delete work-session --key ocsf_json_enabled
 
 openshell settings get --global --json
 openshell settings set --global --key ocsf_json_enabled --value true
-
-# OCSF schema version downgrade for SIEM compatibility (allowed: "1.1", "1.3")
-openshell settings set --global --key ocsf_schema_version --value "1.1"
 ```
 
 Enabling `ocsf_json_enabled` adds compact `OCSF-JSON` records to the supervisor's stderr, alongside shorthand, and to its JSONL file when file storage is available. Collect these records through the supervisor's platform logs (`docker logs`, `podman logs`, or `kubectl logs`); `openshell logs` still serves shorthand. Match the `OCSF-JSON` marker after the timestamp and parse the remainder as JSON. See the published [OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export) for delivery and retention limits.

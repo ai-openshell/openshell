@@ -18,6 +18,7 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
         endpoint: EndpointDecision::default(),
         binary: Some(PathBuf::from("/usr/bin/curl")),
         binary_pid: Some(42),
+        process: None,
         ancestors: vec![PathBuf::from("/usr/bin/sh")],
         cmdline_paths: vec![],
     }
@@ -25,7 +26,7 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
 
 async fn tcp_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap())
+    let client = connect_tcp_nodelay_best_effort(listener.local_addr().unwrap())
         .await
         .unwrap();
     let (server, _) = listener.accept().await.unwrap();
@@ -37,6 +38,7 @@ fn assert_json_response(
     expected_status: &str,
     expected_error: &str,
     expected_detail: &str,
+    expected_request_id: Option<&str>,
 ) {
     let (headers, body) = response
         .windows(4)
@@ -48,12 +50,16 @@ fn assert_json_response(
     assert!(headers.contains("Content-Type: application/json\r\n"));
     assert!(headers.contains(&format!("Content-Length: {}\r\n", body.len())));
     assert!(headers.contains("Connection: close\r\n"));
+    if let Some(request_id) = expected_request_id {
+        assert!(headers.contains(&format!("x-openshell-request-id: {request_id}\r\n")));
+    }
+    let expected = serde_json::json!({
+        "error": expected_error,
+        "detail": expected_detail,
+    });
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(body).unwrap(),
-        serde_json::json!({
-            "error": expected_error,
-            "detail": expected_detail,
-        })
+        expected
     );
 }
 
@@ -94,9 +100,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             "target.example",
             8443,
             "/usr/bin/curl",
-            "42",
-            "/usr/bin/sh",
-            "curl",
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl"),
             &allowed_decision(EgressIntent::connect("target.example".to_string(), 8443)),
             &None,
             &None,
@@ -111,11 +115,29 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             "HTTP/1.1 403 Forbidden\r\n",
             "ssrf_denied",
             &format!("CONNECT target.example:8443 blocked: {detail}"),
+            None,
         );
 
         let (mut app, mut proxy) = tcp_pair().await;
+        let request = crate::l7::provider::L7Request {
+            action: "POST".to_string(),
+            target: "/v1/items".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"POST /v1/items HTTP/1.1\r\nHost: target.example:8080\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let correlation = crate::l7::correlation::RequestCorrelation::with_request_id(
+            &request,
+            &crate::l7::relay::L7EvalContext {
+                host: "target.example".to_string(),
+                port: 8080,
+                ..Default::default()
+            },
+            "test-request-id".to_string(),
+        );
         deny_forward_destination(
             &mut proxy,
+            &tracing::Span::none(),
             &denial,
             peer,
             "POST",
@@ -123,9 +145,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             8080,
             "/v1/items",
             "/usr/bin/curl",
-            "42",
-            "/usr/bin/sh",
-            "curl",
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl"),
             "proxy_compatibility",
             &allowed_decision(EgressIntent::forward_http(
                 "target.example".to_string(),
@@ -133,6 +153,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             )),
             None,
             None,
+            Some(&correlation),
         )
         .await
         .unwrap();
@@ -144,6 +165,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             "HTTP/1.1 403 Forbidden\r\n",
             "ssrf_denied",
             &format!("POST target.example:8080 blocked: {detail}"),
+            Some("test-request-id"),
         );
     }
 }
@@ -165,10 +187,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
         peer,
         "target.example",
         8443,
-        "/usr/bin/curl",
-        "42",
-        "/usr/bin/sh",
-        "curl --proxy",
+        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl --proxy"),
     ))
     .unwrap();
     assert_eq!(connect["class_name"], "Network Activity");
@@ -196,10 +215,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
         "target.example",
         8080,
         "/v1/items",
-        "/usr/bin/curl",
-        "42",
-        "/usr/bin/sh",
-        "curl --proxy",
+        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl --proxy"),
         "proxy_compatibility",
     ))
     .unwrap();
@@ -228,10 +244,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         peer,
         "target.example",
         8443,
-        "/usr/bin/curl",
-        "42",
-        "/usr/bin/sh",
-        "curl --proxy",
+        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl --proxy"),
         "proxy_compatibility",
         true,
     ))
@@ -255,10 +268,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         "target.example",
         8080,
         "/v1/items",
-        "/usr/bin/curl",
-        "42",
-        "/usr/bin/sh",
-        "curl --proxy",
+        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl --proxy"),
         "proxy_compatibility",
     ))
     .unwrap();
@@ -470,7 +480,7 @@ async fn forward_https_absolute_form_rejection_is_snapshotted() {
 }
 
 async fn exercise_benchmark_request(proxy_addr: SocketAddr, target: SocketAddr, connect: bool) {
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut client = connect_tcp_nodelay_best_effort(proxy_addr).await.unwrap();
     let authority = target.to_string();
     let request = if connect {
         format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n")

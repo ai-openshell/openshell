@@ -4,6 +4,7 @@
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
 pub mod driver_config;
+mod image_update;
 pub mod lease;
 mod mutation_guard;
 pub mod provisioning_deadline;
@@ -40,8 +41,8 @@ use openshell_core::proto::compute::v1::{
     GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
     ResourceCapabilities as DriverResourceCapabilities,
     ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
-    StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    WorkloadIdentityRequest, compute_driver_client::ComputeDriverClient,
+    StopSandboxRequest, SuspendSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
+    WatchSandboxesRequest, WorkloadIdentityRequest, compute_driver_client::ComputeDriverClient,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
@@ -71,19 +72,43 @@ pub const COMPUTE_DRIVER_ANNOTATION: &str = "internal.openshell.ai/compute-drive
 const ISOLATION_BACKEND_ANNOTATION: &str = "internal.openshell.ai/isolation-backend";
 pub const COMPUTE_RUNTIME_IDENTITY_ANNOTATION: &str =
     "internal.openshell.ai/compute-runtime-identity";
+/// Durable intent of an in-flight `Starting` transition that resumes retained
+/// state. Bound to the runtime generation it was written for so retries and
+/// gateway-restart recovery send the same driver request, and so a stale value
+/// can never turn a later start into a resume.
+const RESUME_INTENT_ANNOTATION: &str = "internal.openshell.ai/resume-intent";
+
+#[cfg(test)]
+use openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints as _;
 #[cfg(unix)]
 use tower::service_fn;
 use tracing::{Instrument as _, debug, info, warn};
 
 pub type DriverWatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
+/// Optional application endpoint resolver, independent of the baseline driver.
+pub type SharedComputeDriverAppEndpoints = Arc<dyn openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints + Send + Sync>;
+
 pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+
+/// Optional configuration-update registration, independent of the baseline driver object.
+pub type SharedComputeDriverConfigurationUpdates = Arc<
+    dyn openshell_core::compute::ComputeDriver<WatchSandboxesStream = DriverWatchStream>
+        + Send
+        + Sync,
+>;
 
 fn supports_isolation_registration(capabilities: &[String]) -> bool {
     capabilities.iter().any(|capability| {
         capability == openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND
     })
+}
+
+fn supports_suspend_resume(capabilities: &[String]) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability == openshell_core::extension_protocol::COMPUTE_SUSPEND_RESUME)
 }
 
 use provisioning_operation::ProvisioningOperationError;
@@ -353,6 +378,127 @@ enum BeginDelete {
     AlreadyDeleting,
 }
 
+/// Explicit lifecycle operations that quiesce a running sandbox: an ordinary
+/// stop, or a suspend whose driver retains the workload's memory state.
+///
+/// Both share one durable shape: an in-flight phase committed before the
+/// owned driver call, and a gateway-owned settled phase committed after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuiesceOperation {
+    Stop,
+    Suspend,
+}
+
+/// What an explicit quiesce request does with the current durable phase.
+enum QuiesceAdmission {
+    /// The requested state is already durable.
+    Settled,
+    /// Retry the idempotent driver call for the persisted transition.
+    Retry,
+    /// Persist a new transition.
+    Begin,
+}
+
+impl QuiesceOperation {
+    const fn verb(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Suspend => "suspend",
+        }
+    }
+
+    const fn in_flight_phase(self) -> SandboxPhase {
+        match self {
+            Self::Stop => SandboxPhase::Stopping,
+            Self::Suspend => SandboxPhase::Suspending,
+        }
+    }
+
+    const fn settled_phase(self) -> SandboxPhase {
+        match self {
+            Self::Stop => SandboxPhase::Stopped,
+            Self::Suspend => SandboxPhase::Suspended,
+        }
+    }
+
+    const fn requested_condition(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Stop => ("Stopping", "Sandbox stop requested"),
+            Self::Suspend => ("Suspending", "Sandbox suspend requested"),
+        }
+    }
+
+    const fn settled_condition(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Stop => ("Stopped", "Sandbox compute is stopped"),
+            Self::Suspend => (
+                "Suspended",
+                "Sandbox is suspended; its memory state is retained for resume",
+            ),
+        }
+    }
+
+    fn admit(self, sandbox: &Sandbox) -> Result<QuiesceAdmission, Status> {
+        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+        match self {
+            Self::Stop => {
+                if phase == SandboxPhase::Stopped {
+                    return Ok(QuiesceAdmission::Settled);
+                }
+                // Timeout cleanup owns reclamation until it completes. Once
+                // reclaimed, explicit stop can expose Stopped for image repair
+                // while preserving the timeout record for a later start.
+                if phase == SandboxPhase::Error
+                    && provisioning_deadline::timed_out(sandbox)
+                    && sandbox
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.provisioning.as_ref())
+                        .is_none_or(|record| record.cleanup_completed_time.is_none())
+                {
+                    return Err(Status::failed_precondition(
+                        "sandbox provisioning timed out; wait for timeout cleanup before stop or start",
+                    ));
+                }
+                // Neither a main-process exit nor an infrastructure Error
+                // proves compute has stopped. Use the normal
+                // driver stop and session cleanup before a subsequent start
+                // renews authentication and repeats configuration admission
+                // for the retained sandbox. Stopping a suspended sandbox
+                // discards its retained state; an unresolved suspend may be
+                // abandoned the same way.
+                if !matches!(
+                    phase,
+                    SandboxPhase::Ready
+                        | SandboxPhase::Completed
+                        | SandboxPhase::Stopping
+                        | SandboxPhase::Error
+                        | SandboxPhase::Suspending
+                        | SandboxPhase::Suspended
+                ) && !is_automatic_restart_transition(sandbox)
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "sandbox must be Ready, Completed, Suspended, Error, or in an automatic restart to stop (current phase: {phase:?})"
+                    )));
+                }
+                Ok(if phase == SandboxPhase::Stopping {
+                    QuiesceAdmission::Retry
+                } else {
+                    QuiesceAdmission::Begin
+                })
+            }
+            Self::Suspend => match phase {
+                SandboxPhase::Suspended => Ok(QuiesceAdmission::Settled),
+                SandboxPhase::Suspending => Ok(QuiesceAdmission::Retry),
+                SandboxPhase::Ready => Ok(QuiesceAdmission::Begin),
+                _ => Err(Status::failed_precondition(format!(
+                    "sandbox must be Ready to suspend (current phase: {phase:?})"
+                ))),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ComputeDriverInfoSnapshot {
@@ -543,6 +689,8 @@ impl AcquiredRemoteDriverEndpoint {
 #[derive(Debug, Clone)]
 struct RemoteComputeDriver {
     client: RemoteComputeDriverClient,
+    app_endpoints_client: openshell_core::proto::compute::v1::compute_driver_app_endpoints_client::ComputeDriverAppEndpointsClient<tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>>,
+    configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient<tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>>,
     admission_acknowledgement: Arc<StdMutex<Option<String>>>,
 }
 
@@ -553,7 +701,9 @@ type RemoteComputeDriverClient = ComputeDriverClient<
 impl RemoteComputeDriver {
     fn new(channel: Channel) -> Self {
         Self {
-            client: ComputeDriverClient::with_interceptor(channel, TraceContextInterceptor),
+            client: ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor),
+            app_endpoints_client: openshell_core::proto::compute::v1::compute_driver_app_endpoints_client::ComputeDriverAppEndpointsClient::with_interceptor(channel.clone(), TraceContextInterceptor),
+            configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient::with_interceptor(channel, TraceContextInterceptor),
             admission_acknowledgement: Arc::new(StdMutex::new(None)),
         }
     }
@@ -591,6 +741,23 @@ impl RemoteComputeDriver {
             ));
         }
         Ok(())
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for RemoteComputeDriver {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        self.verify_admission_policy(false).await?;
+        self.configuration_updates_client
+            .clone()
+            .update_sandbox_configuration(request)
+            .await
     }
 }
 
@@ -699,6 +866,15 @@ impl ComputeDriver for RemoteComputeDriver {
         client.start_sandbox(request).await
     }
 
+    async fn suspend_sandbox(
+        &self,
+        request: Request<SuspendSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::SuspendSandboxResponse>, Status>
+    {
+        let mut client = self.client();
+        client.suspend_sandbox(request).await
+    }
+
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
@@ -735,17 +911,36 @@ impl ComputeDriver for RemoteComputeDriver {
     }
 }
 
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for RemoteComputeDriver {
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        self.app_endpoints_client.clone().resolve_supervisor_app_endpoint(request).await
+    }
+}
+
 #[derive(Clone)]
 pub struct ComputeRuntime {
     isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
     admission: openshell_core::resource_admission::DriverAdmissionConfig,
     admission_acknowledgement: String,
     driver: TracedDriver,
+    image_update_driver: Option<SharedComputeDriverConfigurationUpdates>,
+    app_endpoint_resolver: Option<SharedComputeDriverAppEndpoints>,
     driver_info: ComputeDriverInfoSnapshot,
     telemetry_compute_driver: TelemetryComputeDriver,
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     image_preparation_timeout_seconds: u32,
+    provisioning_repair_window_ms: i64,
+    sandbox_updates_enabled: bool,
+    update_recovery_sweep: Arc<tokio::sync::Semaphore>,
+    update_recovery_backoff: Arc<Mutex<HashMap<String, image_update::UpdateRecoveryBackoff>>>,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -762,10 +957,12 @@ pub struct ComputeRuntime {
         Arc<OnceLock<Option<Arc<crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>>>>,
     restart_notify: Arc<Notify>,
     ssh_identities: Arc<OnceLock<crate::ssh_identity::SshIdentityStore>>,
-    supervisor_ocsf_headers: Arc<OnceLock<openshell_core::jwt::SecretOtlpHeaders>>,
+    supervisor_otlp_headers: Arc<OnceLock<crate::otel_tracing::SupervisorOtlpHeaders>>,
+    supervisor_otlp_tls: Arc<OnceLock<crate::otel_tracing::SupervisorOtlpTls>>,
     /// Desired assignments of the shared supervisor host, when the gateway
     /// coordinates one for the in-process driver.
     supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
+    service_route_index: Arc<OnceLock<Arc<crate::service_routing::ServiceRouteIndex>>>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -854,6 +1051,8 @@ impl ComputeRuntime {
         Ok(Self {
             isolation_backend: None,
             driver: TracedDriver::new(driver, driver_name),
+            image_update_driver: None,
+            app_endpoint_resolver: None,
             admission: openshell_core::resource_admission::DriverAdmissionConfig::default(),
             admission_acknowledgement: capabilities.resource_admission_policy,
             driver_info,
@@ -861,6 +1060,10 @@ impl ComputeRuntime {
             driver_process,
             default_image,
             image_preparation_timeout_seconds: 1800,
+            provisioning_repair_window_ms: 300_000,
+            sandbox_updates_enabled: false,
+            update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
+            update_recovery_backoff: Arc::default(),
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -873,8 +1076,10 @@ impl ComputeRuntime {
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
-            supervisor_ocsf_headers: Arc::new(OnceLock::new()),
+            supervisor_otlp_headers: Arc::new(OnceLock::new()),
+            supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
+            service_route_index: Arc::new(OnceLock::new()),
         })
     }
 
@@ -910,13 +1115,25 @@ impl ComputeRuntime {
 
     /// Collector headers that launch bundles carry to supervisors for OCSF
     /// export.
-    pub(crate) fn configure_supervisor_ocsf_headers(
+    pub(crate) fn configure_service_route_index(
         &self,
-        headers: Option<openshell_core::jwt::SecretOtlpHeaders>,
+        index: Arc<crate::service_routing::ServiceRouteIndex>,
     ) {
-        if let Some(headers) = headers {
-            let _ = self.supervisor_ocsf_headers.set(headers);
-        }
+        let _ = self.service_route_index.set(index);
+    }
+
+    pub(crate) fn configure_supervisor_otlp_headers(
+        &self,
+        headers: crate::otel_tracing::SupervisorOtlpHeaders,
+    ) {
+        let _ = self.supervisor_otlp_headers.set(headers);
+    }
+
+    pub(crate) fn configure_supervisor_otlp_tls(
+        &self,
+        tls: crate::otel_tracing::SupervisorOtlpTls,
+    ) {
+        let _ = self.supervisor_otlp_tls.set(tls);
     }
 
     pub(crate) async fn prepare_ssh_identity(
@@ -945,7 +1162,12 @@ impl ComputeRuntime {
         let mut with_identity = sandbox.clone();
         self.prepare_ssh_identity(&mut with_identity, &mut authentication)
             .await?;
-        authentication.supervisor.ocsf_otlp_headers = self.supervisor_ocsf_headers.get().cloned();
+        if let Some(headers) = self.supervisor_otlp_headers.get() {
+            headers.apply(&mut authentication.supervisor);
+        }
+        if let Some(tls) = self.supervisor_otlp_tls.get() {
+            tls.apply(&mut authentication.supervisor);
+        }
         serialize_launch_authentication(authentication)
     }
 
@@ -984,10 +1206,10 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(endpoint.channel));
+        let driver = Arc::new(RemoteComputeDriver::new(endpoint.channel));
         Self::from_driver(
             endpoint.name,
-            driver,
+            driver.clone(),
             endpoint.driver_process,
             store,
             sandbox_index,
@@ -996,6 +1218,27 @@ impl ComputeRuntime {
             supervisor_sessions,
         )
         .await
+        .map(|runtime| {
+            runtime
+                .with_image_update_driver(Some(driver.clone()))
+                .with_app_endpoint_resolver(Some(driver))
+        })
+    }
+
+    pub(crate) fn with_app_endpoint_resolver(
+        mut self,
+        resolver: Option<SharedComputeDriverAppEndpoints>,
+    ) -> Self {
+        self.app_endpoint_resolver = resolver;
+        self
+    }
+
+    pub(crate) fn with_image_update_driver(
+        mut self,
+        driver: Option<SharedComputeDriverConfigurationUpdates>,
+    ) -> Self {
+        self.image_update_driver = driver;
+        self
     }
 
     #[must_use]
@@ -1068,6 +1311,14 @@ impl ComputeRuntime {
         if self.isolation_backend.is_some() {
             self.validate_launch_signer_configured(!launch_authentication.is_empty())?;
         }
+        // Every start path derives resume from the durable transition, so a
+        // retried or recovered start repeats the request that was committed.
+        let resume = in_flight_resume_intent(sandbox);
+        // Starts may need to replace a stopped local workload/supervisor
+        // pair. Always reconstruct that input from the gateway's durable
+        // record; never let a driver derive provisioning input from mutable
+        // runtime inspection output.
+        let driver_sandbox = self.driver_sandbox_for_launch(sandbox)?;
         Ok(StartSandboxRequest {
             sandbox_id: sandbox.object_id().to_string(),
             name: sandbox.object_name().to_string(),
@@ -1077,6 +1328,9 @@ impl ComputeRuntime {
             launch_authentication,
             expected_runtime_identity,
             isolation_backend: self.isolation_backend.clone(),
+            resume: resume.is_some(),
+            restart_if_restore_fails: resume.unwrap_or(false),
+            sandbox: Some(driver_sandbox),
         })
     }
 
@@ -1087,6 +1341,20 @@ impl ComputeRuntime {
             return Err("image_preparation_timeout_seconds must be between 1 and 86400".into());
         }
         self.image_preparation_timeout_seconds = seconds;
+        Ok(self)
+    }
+
+    /// Validate the repair window once at startup. Persisted attempts keep
+    /// their original deadline even if the operator changes this value on
+    /// restart.
+    pub(crate) fn with_provisioning_repair_window_seconds(
+        mut self,
+        window: i64,
+    ) -> Result<Self, String> {
+        if !(1..=86_400).contains(&window) {
+            return Err("provisioning_repair_window_seconds must be between 1 and 86400".into());
+        }
+        self.provisioning_repair_window_ms = window * 1000;
         Ok(self)
     }
 
@@ -1475,8 +1743,10 @@ impl ComputeRuntime {
             metadata.resource_version = result.resource_version;
         }
         // The parent now owns any staged key, including if this request is
-        // cancelled. Keep the creation guard until its public identity and
-        // protected launch bundle have been committed.
+        // cancelled. Release the creation guard before the SSH identity step:
+        // its per-sandbox lock fences a concurrent delete on its own, and a
+        // guard held across it would cap concurrent creates at the lock pool.
+        drop(mutation_guard);
         let prepared = async {
             if let Some(encoded) = runtime_inputs.launch_authentication {
                 let authentication = serde_json::from_slice(&encoded)
@@ -1496,7 +1766,6 @@ impl ComputeRuntime {
             }
         }
         .await;
-        drop(mutation_guard);
         let launch_authentication = match prepared {
             Ok(authentication) => authentication,
             Err(status) => {
@@ -1652,14 +1921,15 @@ impl ComputeRuntime {
                     Some(guard) => guard,
                     None => runtime.lock_sandbox_for_lifecycle(&lifecycle_guard).await,
                 };
-                runtime
-                    .compensate_failed_create_inner(
-                        &created,
-                        lifecycle_guard,
-                        sandbox_guard,
-                        original,
-                    )
-                    .await
+                // Keep compensation's future bounded as the persisted sandbox
+                // status grows (including image-update reconciliation state).
+                Box::pin(runtime.compensate_failed_create_inner(
+                    &created,
+                    lifecycle_guard,
+                    sandbox_guard,
+                    original,
+                ))
+                .await
             }
             .instrument(request_span),
         )
@@ -1809,6 +2079,44 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
     ) -> Result<Sandbox, Status> {
+        self.quiesce_sandbox(QuiesceOperation::Stop, workspace, name)
+            .await
+    }
+
+    /// Whether the configured compute driver retains sandbox memory state
+    /// across `SuspendSandbox` and a resuming `StartSandbox`.
+    #[must_use]
+    pub fn supports_suspend_resume(&self) -> bool {
+        supports_suspend_resume(&self.driver_info.negotiated_extension.supported_capabilities)
+    }
+
+    fn require_suspend_resume(&self) -> Result<(), Status> {
+        if self.supports_suspend_resume() {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(
+                "compute driver does not support sandbox suspend",
+            ))
+        }
+    }
+
+    pub(crate) async fn suspend_sandbox(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<Sandbox, Status> {
+        self.require_suspend_resume()?;
+        self.quiesce_sandbox(QuiesceOperation::Suspend, workspace, name)
+            .await
+    }
+
+    async fn quiesce_sandbox(
+        &self,
+        operation: QuiesceOperation,
+        workspace: &str,
+        name: &str,
+    ) -> Result<Sandbox, Status> {
+        let verb = operation.verb();
         let candidate = self
             .store
             .get_message_by_name::<Sandbox>(workspace, name)
@@ -1826,64 +2134,55 @@ impl ComputeRuntime {
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         if current.object_name() != sandbox_name {
-            return Err(Status::aborted(
-                "sandbox name changed while the stop request was waiting; retry explicitly",
-            ));
+            return Err(Status::aborted(format!(
+                "sandbox name changed while the {verb} request was waiting; retry explicitly"
+            )));
         }
 
         let mut attempt = 1;
-        let (previous, stopping) = loop {
+        let (previous, transition) = loop {
             provisioning_operation::ensure_operation_settled(&current)?;
-            let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-            if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
-                || is_failed_main_process_result(&current)
-            {
-                self.cleanup_stopped_sandbox_sessions(&current)
-                    .await
-                    .map_err(Status::internal)?;
-                return Ok(current);
-            }
-            let automatic_restart = is_automatic_restart_transition(&current);
-            // Timeout cleanup owns reclamation while the record remains Error.
-            // Its later start may recreate missing compute; an ordinary stop must
-            // not replace that recovery state with Stopping or Stopped.
-            if phase == SandboxPhase::Error && provisioning_deadline::timed_out(&current) {
-                return Err(Status::failed_precondition(
-                    "sandbox provisioning timed out; retry start after timeout cleanup completes",
-                ));
-            }
-            // Error does not prove compute has stopped. Use the normal driver stop
-            // and session cleanup before a subsequent start renews authentication
-            // and repeats configuration admission for the retained sandbox.
-            if !matches!(
-                phase,
-                SandboxPhase::Ready | SandboxPhase::Stopping | SandboxPhase::Error
-            ) && !automatic_restart
-            {
-                return Err(Status::failed_precondition(format!(
-                    "sandbox must be Ready, Error, or in an automatic restart to stop (current phase: {phase:?})"
-                )));
+            match operation.admit(&current)? {
+                QuiesceAdmission::Settled => {
+                    self.cleanup_stopped_sandbox_sessions(&current)
+                        .await
+                        .map_err(Status::internal)?;
+                    return Ok(current);
+                }
+                // Acquiring the lifecycle gate proves that no local worker
+                // still owns this transition. Retry the idempotent driver
+                // operation.
+                QuiesceAdmission::Retry => break (current.clone(), current),
+                QuiesceAdmission::Begin => {}
             }
 
-            if phase == SandboxPhase::Stopping {
-                // Acquiring the lifecycle gate proves that no local worker still
-                // owns this transition. Retry the idempotent driver operation.
-                break (current.clone(), current);
-            }
-
-            match self
-                .write_lifecycle_phase(
-                    &current,
-                    SandboxPhase::Stopping,
-                    "Stopping",
-                    "Sandbox stop requested",
+            let reclaimed_timeout = operation == QuiesceOperation::Stop
+                && current.phase() == SandboxPhase::Error as i32
+                && provisioning_deadline::timed_out(&current);
+            let (next_phase, reason, message) = if reclaimed_timeout {
+                (
+                    SandboxPhase::Stopped,
+                    "StoppedAfterProvisioningTimeout",
+                    "Timed-out compute has been reclaimed; sandbox stopped for repair",
                 )
+            } else {
+                let (reason, message) = operation.requested_condition();
+                (operation.in_flight_phase(), reason, message)
+            };
+            match self
+                .write_lifecycle_phase(&current, next_phase, reason, message)
                 .await
             {
-                Ok(stopping) => {
-                    self.sandbox_index.update_from_sandbox(&stopping);
+                Ok(transition) => {
+                    self.sandbox_index.update_from_sandbox(&transition);
                     self.sandbox_watch_bus.notify(&sandbox_id);
-                    break (current, stopping);
+                    if reclaimed_timeout {
+                        self.cleanup_stopped_sandbox_sessions(&transition)
+                            .await
+                            .map_err(Status::internal)?;
+                        return Ok(transition);
+                    }
+                    break (current, transition);
                 }
                 Err(crate::persistence::PersistenceError::Conflict { .. })
                     if attempt < STOP_PHASE_CAS_RETRY_LIMIT =>
@@ -1894,13 +2193,15 @@ impl ComputeRuntime {
                         .get_message::<Sandbox>(&sandbox_id)
                         .await
                         .map_err(|error| {
-                            Status::internal(format!("fetch sandbox after stop conflict: {error}"))
+                            Status::internal(format!(
+                                "fetch sandbox after {verb} conflict: {error}"
+                            ))
                         })?
                         .ok_or_else(|| Status::not_found("sandbox not found"))?;
                     if current.object_name() != sandbox_name {
-                        return Err(Status::aborted(
-                            "sandbox name changed during stop; retry explicitly",
-                        ));
+                        return Err(Status::aborted(format!(
+                            "sandbox name changed during {verb}; retry explicitly"
+                        )));
                     }
                 }
                 Err(error) => {
@@ -1914,18 +2215,19 @@ impl ComputeRuntime {
         drop(sandbox_guard);
 
         // Once the durable transition is committed, request cancellation must
-        // not cancel the driver operation and strand the sandbox in
-        // `Stopping`. Keep the lifecycle gate in an owned worker, matching
-        // the delete path's cancellation semantics.
+        // not cancel the driver operation and strand the sandbox in its
+        // in-flight phase. Keep the lifecycle gate in an owned worker,
+        // matching the delete path's cancellation semantics.
         let runtime = self.clone();
         let request_span = tracing::Span::current();
         tokio::spawn(
             async move {
-                Box::pin(runtime.complete_sandbox_stop(
+                Box::pin(runtime.complete_sandbox_quiesce(
+                    operation,
                     sandbox_id,
                     sandbox_name,
                     previous,
-                    stopping,
+                    transition,
                     lifecycle_guard,
                 ))
                 .await
@@ -1935,58 +2237,91 @@ impl ComputeRuntime {
         .await
         .map_err(|err| {
             Status::internal(format!(
-                "sandbox stop worker terminated unexpectedly: {err}"
+                "sandbox {verb} worker terminated unexpectedly: {err}"
             ))
         })?
     }
 
-    async fn complete_sandbox_stop(
+    async fn complete_sandbox_quiesce(
         &self,
+        operation: QuiesceOperation,
         sandbox_id: String,
         sandbox_name: String,
         previous: Sandbox,
-        stopping: Sandbox,
+        transition: Sandbox,
         lifecycle_guard: SandboxLifecycleGuard,
     ) -> Result<Sandbox, Status> {
-        let result = self
-            .driver
-            .call(
-                openshell_otel::rpc::STOP_SANDBOX,
-                Some(&sandbox_id),
-                |driver| {
-                    let sandbox_id = sandbox_id.clone();
-                    let sandbox_name = sandbox_name.clone();
-                    async move {
-                        driver
-                            .stop_sandbox(Request::new(StopSandboxRequest {
-                                sandbox_id,
-                                name: sandbox_name,
-                            }))
-                            .await
-                    }
-                },
-            )
-            .await;
-
-        match result {
-            Ok(_) => {
+        match self
+            .call_quiesce_driver(operation, &sandbox_id, &sandbox_name)
+            .await
+        {
+            Ok(()) => {
                 let _sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
-                let stopped = self.commit_sandbox_stopped(&sandbox_id).await?;
-                self.cleanup_stopped_sandbox_sessions(&stopped)
+                let settled = self.commit_sandbox_quiesced(operation, &sandbox_id).await?;
+                self.cleanup_stopped_sandbox_sessions(&settled)
                     .await
                     .map_err(Status::internal)?;
-                self.sandbox_index.update_from_sandbox(&stopped);
+                self.sandbox_index.update_from_sandbox(&settled);
                 self.sandbox_watch_bus.notify(&sandbox_id);
-                Ok(stopped)
+                Ok(settled)
             }
             Err(err) => {
-                self.recover_failed_lifecycle(&lifecycle_guard, &stopping, &previous, true)
-                    .await;
+                if let Some(terminal) = self
+                    .recover_failed_lifecycle(&lifecycle_guard, &transition, &previous, true)
+                    .await
+                {
+                    return Ok(terminal);
+                }
                 Err(Status::new(
                     err.code(),
-                    format!("stop sandbox failed: {}", err.message()),
+                    format!("{} sandbox failed: {}", operation.verb(), err.message()),
                 ))
             }
+        }
+    }
+
+    /// Issue the idempotent driver operation that settles a quiesce
+    /// transition.
+    async fn call_quiesce_driver(
+        &self,
+        operation: QuiesceOperation,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<(), Status> {
+        let request_id = sandbox_id.to_string();
+        let name = sandbox_name.to_string();
+        match operation {
+            QuiesceOperation::Stop => self
+                .driver
+                .call(
+                    openshell_otel::rpc::STOP_SANDBOX,
+                    Some(sandbox_id),
+                    move |driver| async move {
+                        driver
+                            .stop_sandbox(Request::new(StopSandboxRequest {
+                                sandbox_id: request_id,
+                                name,
+                            }))
+                            .await
+                    },
+                )
+                .await
+                .map(drop),
+            QuiesceOperation::Suspend => self
+                .driver
+                .call(
+                    openshell_otel::rpc::SUSPEND_SANDBOX,
+                    Some(sandbox_id),
+                    move |driver| async move {
+                        driver
+                            .suspend_sandbox(Request::new(SuspendSandboxRequest {
+                                sandbox: request_id,
+                            }))
+                            .await
+                    },
+                )
+                .await
+                .map(drop),
         }
     }
 
@@ -2006,6 +2341,54 @@ impl ComputeRuntime {
         name: &str,
         authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
     ) -> Result<Sandbox, Status> {
+        self.start_sandbox_with_intent(workspace, name, authority, StartIntent::Start)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn resume_sandbox(
+        &self,
+        workspace: &str,
+        name: &str,
+        restart_if_restore_fails: bool,
+    ) -> Result<Sandbox, Status> {
+        self.resume_sandbox_authenticated(workspace, name, restart_if_restore_fails, None)
+            .await
+    }
+
+    /// Restore a suspended sandbox in a new runtime generation.
+    pub(crate) async fn resume_sandbox_authenticated(
+        &self,
+        workspace: &str,
+        name: &str,
+        restart_if_restore_fails: bool,
+        authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+    ) -> Result<Sandbox, Status> {
+        self.require_suspend_resume().map_err(|_| {
+            Status::failed_precondition("compute driver does not support sandbox resume")
+        })?;
+        self.start_sandbox_with_intent(
+            workspace,
+            name,
+            authority,
+            StartIntent::Resume {
+                restart_if_restore_fails,
+            },
+        )
+        .await
+    }
+
+    async fn start_sandbox_with_intent(
+        &self,
+        workspace: &str,
+        name: &str,
+        authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+        intent: StartIntent,
+    ) -> Result<Sandbox, Status> {
+        let verb = match intent {
+            StartIntent::Start => "start",
+            StartIntent::Resume { .. } => "resume",
+        };
         let candidate = self
             .store
             .get_message_by_name::<Sandbox>(workspace, name)
@@ -2017,6 +2400,7 @@ impl ComputeRuntime {
             self.validate_launch_signer_configured(authority.is_some())?;
         }
         provisioning_operation::ensure_operation_settled(&candidate)?;
+        self.ensure_no_pending_image_update(&candidate).await?;
         if provisioning_deadline::timed_out(&candidate)
             && candidate
                 .status
@@ -2039,9 +2423,9 @@ impl ComputeRuntime {
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         if current.object_name() != sandbox_name {
-            return Err(Status::aborted(
-                "sandbox name changed while the start request was waiting; retry explicitly",
-            ));
+            return Err(Status::aborted(format!(
+                "sandbox name changed while the {verb} request was waiting; retry explicitly"
+            )));
         }
 
         self.validate_caller_driver_config(
@@ -2054,7 +2438,19 @@ impl ComputeRuntime {
         let mut attempts = 0;
         let (previous, starting, launch_authentication) = loop {
             provisioning_operation::ensure_operation_settled(&current)?;
+            self.ensure_no_pending_image_update(&current).await?;
             let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+            if let StartIntent::Resume { .. } = intent {
+                // Resume restores only retained state. A Starting record may
+                // be retried only when it is the same in-flight resume.
+                let resuming =
+                    phase == SandboxPhase::Starting && in_flight_resume_intent(&current).is_some();
+                if phase != SandboxPhase::Suspended && !resuming {
+                    return Err(Status::failed_precondition(format!(
+                        "sandbox must be Suspended to resume (current phase: {phase:?})"
+                    )));
+                }
+            }
             if phase == SandboxPhase::Ready {
                 return Ok(current);
             }
@@ -2071,9 +2467,14 @@ impl ComputeRuntime {
                     "provisioning timeout cleanup is still pending; retry start after compute is reclaimed",
                 ));
             }
+            // Starting a suspended sandbox discards its retained state: the
+            // driver receives `resume=false` and boots the workload fresh.
             if !matches!(
                 phase,
-                SandboxPhase::Stopped | SandboxPhase::Completed | SandboxPhase::Starting
+                SandboxPhase::Stopped
+                    | SandboxPhase::Completed
+                    | SandboxPhase::Starting
+                    | SandboxPhase::Suspended
             ) && !is_failed_main_process_result(&current)
                 && !provisioning_timeout
             {
@@ -2083,7 +2484,7 @@ impl ComputeRuntime {
                     ""
                 };
                 return Err(Status::failed_precondition(format!(
-                    "sandbox must be Stopped, Completed, or a failed main-process Error to start (current phase: {phase:?}){recovery_hint}"
+                    "sandbox must be Stopped, Suspended, Completed, or a failed main-process Error to start (current phase: {phase:?}){recovery_hint}"
                 )));
             }
             if phase == SandboxPhase::Completed || is_failed_main_process_result(&current) {
@@ -2095,7 +2496,8 @@ impl ComputeRuntime {
             if phase == SandboxPhase::Starting {
                 // Acquiring the lifecycle gate proves that no local worker still
                 // owns this transition. Retry the idempotent driver operation
-                // with the identity committed by the original transition.
+                // with the identity and resume intent committed by the original
+                // transition.
                 let authentication = self
                     .encode_persisted_launch_authentication(authority, &current)
                     .await?;
@@ -2127,16 +2529,26 @@ impl ComputeRuntime {
                     &sandbox_id,
                     expected_resource_version,
                     move |sandbox| {
-                        if let Some(metadata) = sandbox.metadata.as_mut() {
-                            next_identity_for_update.write(&mut metadata.annotations);
-                        }
+                        let (reason, message) = match intent {
+                            StartIntent::Start => ("Starting", "Sandbox start requested"),
+                            StartIntent::Resume { .. } => ("Resuming", "Sandbox resume requested"),
+                        };
                         apply_lifecycle_phase(
                             sandbox,
                             SandboxPhase::Starting,
-                            "Starting",
-                            "Sandbox start requested",
+                            reason,
+                            message,
                             self.image_preparation_timeout_seconds,
+                            self.provisioning_repair_window_ms,
                         );
+                        if let Some(metadata) = sandbox.metadata.as_mut() {
+                            next_identity_for_update.write(&mut metadata.annotations);
+                            write_start_intent(
+                                &mut metadata.annotations,
+                                next_identity_for_update.runtime_generation.as_str(),
+                                intent,
+                            );
+                        }
                     },
                 )
                 .await
@@ -2155,13 +2567,15 @@ impl ComputeRuntime {
                         .get_message::<Sandbox>(&sandbox_id)
                         .await
                         .map_err(|error| {
-                            Status::internal(format!("fetch sandbox after start conflict: {error}"))
+                            Status::internal(format!(
+                                "fetch sandbox after {verb} conflict: {error}"
+                            ))
                         })?
                         .ok_or_else(|| Status::not_found("sandbox not found"))?;
                     if current.object_name() != sandbox_name {
-                        return Err(Status::aborted(
-                            "sandbox name changed during start; retry explicitly",
-                        ));
+                        return Err(Status::aborted(format!(
+                            "sandbox name changed during {verb}; retry explicitly"
+                        )));
                     }
                 }
                 Err(error) => {
@@ -2194,7 +2608,7 @@ impl ComputeRuntime {
         .await
         .map_err(|err| {
             Status::internal(format!(
-                "sandbox start worker terminated unexpectedly: {err}"
+                "sandbox {verb} worker terminated unexpectedly: {err}"
             ))
         })?
     }
@@ -2226,6 +2640,10 @@ impl ComputeRuntime {
         } else {
             None
         };
+        // Starts may need to replace a stopped local workload/supervisor pair.
+        // The request (including its durable provisioning snapshot) is always
+        // reconstructed from the gateway's record; never let a driver derive
+        // provisioning input from mutable runtime inspection output.
         let request =
             self.driver_start_request(&starting, launch_authentication, expected_runtime_identity)?;
         let driver = self.driver.clone();
@@ -2317,6 +2735,7 @@ impl ComputeRuntime {
                     provisioning_operation::ensure_current_result(&latest, &starting)?;
                     latest
                 };
+                let latest = self.clear_resume_intent(latest).await;
                 self.sandbox_index.update_from_sandbox(&latest);
                 self.sandbox_watch_bus.notify(&sandbox_id);
                 Ok(latest)
@@ -2330,7 +2749,8 @@ impl ComputeRuntime {
                 settled,
             }) => {
                 provisioning_operation::ensure_current_result(&settled, &settled)?;
-                self.recover_failed_lifecycle(&lifecycle_guard, &settled, &previous, false)
+                let _ = self
+                    .recover_failed_lifecycle(&lifecycle_guard, &settled, &previous, false)
                     .await;
                 Err(Status::new(
                     err.code(),
@@ -2414,6 +2834,39 @@ impl ComputeRuntime {
         unreachable!("runtime identity persistence retry loop always returns")
     }
 
+    /// Clear a resume intent once the driver accepted the resume.
+    ///
+    /// The driver consumed the retained state, so a later idempotent start of
+    /// the same generation must not ask it to restore that state again.
+    async fn clear_resume_intent(&self, sandbox: Sandbox) -> Sandbox {
+        let Some(intent) = sandbox
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.annotations.get(RESUME_INTENT_ANNOTATION))
+            .cloned()
+        else {
+            return sandbox;
+        };
+        let sandbox_id = sandbox.object_id().to_string();
+        match self
+            .store
+            .update_message_cas::<Sandbox, _>(&sandbox_id, 0, |current| {
+                if let Some(metadata) = current.metadata.as_mut()
+                    && metadata.annotations.get(RESUME_INTENT_ANNOTATION) == Some(&intent)
+                {
+                    metadata.annotations.remove(RESUME_INTENT_ANNOTATION);
+                }
+            })
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                warn!(sandbox_id, %error, "Failed to clear completed sandbox resume intent");
+                sandbox
+            }
+        }
+    }
+
     async fn compensate_successful_start(
         &self,
         lifecycle_guard: &SandboxLifecycleGuard,
@@ -2421,6 +2874,47 @@ impl ComputeRuntime {
         previous: &Sandbox,
         original: Status,
     ) -> Status {
+        // A supervisor can reach Ready before the driver returns. The intent
+        // still identifies a successful resume until its binding is committed.
+        let resuming = persisted_resume_intent(starting).is_some_and(|intent| {
+            sandbox_runtime_generation(starting)
+                .is_ok_and(|generation| intent.generation == generation.as_str())
+        });
+        // Once restoration succeeded, a subsequent STOP may consume the only
+        // remaining state even if its response is lost. Persist that the
+        // reference was consumed before attempting cleanup, so recovery never
+        // retries restoration or rolls back to Suspended after an ambiguous STOP.
+        let starting = if resuming {
+            let consumed = match self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    starting.object_id(),
+                    sandbox_resource_version(starting),
+                    |current| {
+                        if let Some(metadata) = current.metadata.as_mut() {
+                            metadata.annotations.remove(RESUME_INTENT_ANNOTATION);
+                        }
+                    },
+                )
+                .await
+            {
+                Ok(consumed) => consumed,
+                Err(error) => {
+                    return Status::new(
+                        original.code(),
+                        format!(
+                            "{}; could not record successful resume; cleanup deferred: {error}",
+                            original.message()
+                        ),
+                    );
+                }
+            };
+            self.sandbox_index.update_from_sandbox(&consumed);
+            self.sandbox_watch_bus.notify(consumed.object_id());
+            consumed
+        } else {
+            starting.clone()
+        };
         let sandbox_id = starting.object_id().to_string();
         let sandbox_name = starting.object_name().to_string();
         let request_id = sandbox_id.clone();
@@ -2428,7 +2922,7 @@ impl ComputeRuntime {
         // A newer operation or timeout must reject it without touching compute.
         let stop_result = self
             .await_provisioning_operation(
-                starting,
+                &starting,
                 self.driver.call_owned(
                     openshell_otel::rpc::STOP_SANDBOX,
                     Some(&sandbox_id),
@@ -2465,7 +2959,26 @@ impl ComputeRuntime {
         };
 
         let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
-        if self.restore_lifecycle_snapshot(&settled, previous).await {
+        // A successful resume consumed the retained state. STOP discards
+        // the restored workload, so rolling back to Suspended would advertise
+        // a snapshot that no longer exists. Keep this attempt's generation
+        // and credentials and record the confirmed stopped runtime instead.
+        let mut rollback = previous.clone();
+        if resuming {
+            rollback = (*settled).clone();
+            apply_lifecycle_phase(
+                &mut rollback,
+                SandboxPhase::Stopped,
+                "ResumeRolledBack",
+                "Resumed workload stopped after its runtime binding could not be committed",
+                self.image_preparation_timeout_seconds,
+                self.provisioning_repair_window_ms,
+            );
+        }
+        if self.restore_lifecycle_snapshot(&settled, &rollback).await {
+            if resuming && let Err(error) = self.cleanup_stopped_sandbox_sessions(&rollback).await {
+                warn!(sandbox_id, %error, "Failed to clean up stopped sandbox after start compensation");
+            }
             original
         } else {
             Status::new(
@@ -2491,7 +3004,7 @@ impl ComputeRuntime {
         transition: &Sandbox,
         previous: &Sandbox,
         expected_stopped: bool,
-    ) {
+    ) -> Option<Sandbox> {
         let sandbox_id = transition.object_id();
         let sandbox_name = transition.object_name();
         let observed = tokio::time::timeout(
@@ -2503,6 +3016,14 @@ impl ComputeRuntime {
         let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
 
         match observed {
+            Ok(None) if terminal_stop_exit_code(transition).is_some() => {
+                match self.restore_missing_terminal_stop(transition).await {
+                    Ok(terminal) => return Some(terminal),
+                    Err(error) => {
+                        warn!(sandbox_id, %error, "Failed to restore terminal result after stop");
+                    }
+                }
+            }
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
                 let backend_phase = derive_phase(snapshot.status.as_ref());
                 let observed_stopped = backend_phase == SandboxPhase::Stopped
@@ -2511,7 +3032,31 @@ impl ComputeRuntime {
                     expected_stopped && driver_snapshot_confirms_stopping(&snapshot);
                 let runtime_restart_during_stop =
                     expected_stopped && driver_snapshot_reports_runtime_restart(&snapshot);
-                if suspension_progressing || runtime_restart_during_stop {
+                // A suspended runtime looks exited or failed to the driver.
+                // Only a confirmed stopped runtime permits retrying retained
+                // state. An unknown or still-starting runtime remains ambiguous.
+                let resume_not_running = !expected_stopped
+                    && in_flight_resume_intent(transition).is_some()
+                    && backend_phase != SandboxPhase::Ready;
+                if resume_not_running {
+                    if observed_stopped {
+                        // Recovery and explicit retries may have Starting as
+                        // their previous snapshot. Keep the current generation
+                        // and credentials, but restore the retained-state phase.
+                        let mut suspended = transition.clone();
+                        apply_lifecycle_phase(
+                            &mut suspended,
+                            SandboxPhase::Suspended,
+                            "Suspended",
+                            "Sandbox remains suspended after failed resume",
+                            self.image_preparation_timeout_seconds,
+                            self.provisioning_repair_window_ms,
+                        );
+                        let _ = self
+                            .restore_lifecycle_snapshot(transition, &suspended)
+                            .await;
+                    }
+                } else if suspension_progressing || runtime_restart_during_stop {
                     // The backend has accepted the stop but has not finished
                     // terminating the sandbox. A runtime restart can likewise
                     // be the expected exit from an in-flight stop. Preserve the
@@ -2548,6 +3093,38 @@ impl ComputeRuntime {
                 );
             }
         }
+        None
+    }
+
+    /// Called under the sandbox mutation lock after an authoritative lookup
+    /// confirms absent compute. The persisted exit code survives a gateway
+    /// restart; Stopping only retains it when stop began from a terminal result.
+    async fn restore_missing_terminal_stop(&self, transition: &Sandbox) -> Result<Sandbox, Status> {
+        let exit_code = terminal_stop_exit_code(transition)
+            .ok_or_else(|| Status::failed_precondition("stop has no terminal result to restore"))?;
+        let instance_id = transition
+            .status
+            .as_ref()
+            .unwrap()
+            .main_process_instance_id
+            .clone();
+        let restored = self
+            .store
+            .update_message_cas::<Sandbox, _>(
+                transition.object_id(),
+                sandbox_resource_version(transition),
+                |sandbox| apply_main_process_exit(sandbox, &instance_id, exit_code),
+            )
+            .await
+            .map_err(|error| {
+                crate::grpc::persistence_error_to_status(error, "restore terminal sandbox result")
+            })?;
+        self.sandbox_index.update_from_sandbox(&restored);
+        self.sandbox_watch_bus.notify(restored.object_id());
+        self.cleanup_stopped_sandbox_sessions(&restored)
+            .await
+            .map_err(Status::internal)?;
+        Ok(restored)
     }
 
     async fn reconcile_lifecycle_snapshot(
@@ -2614,18 +3191,24 @@ impl ComputeRuntime {
                         &reason,
                         &message,
                         self.image_preparation_timeout_seconds,
+                        self.provisioning_repair_window_ms,
                     );
                 },
             )
             .await
     }
 
-    /// Commit `Stopped` after the driver confirmed the stop.
+    /// Commit the settled phase after the driver confirmed a stop or
+    /// suspend.
     ///
-    /// Other replicas apply watch events for the terminating runtime without
+    /// Other replicas apply watch events for the quiescing runtime without
     /// this replica's lifecycle gate, so the CAS can lose to an unrelated
-    /// status write. Re-read and retry while the record is still `Stopping`.
-    async fn commit_sandbox_stopped(&self, sandbox_id: &str) -> Result<Sandbox, Status> {
+    /// status write. Re-read and retry while the record is still in flight.
+    async fn commit_sandbox_quiesced(
+        &self,
+        operation: QuiesceOperation,
+        sandbox_id: &str,
+    ) -> Result<Sandbox, Status> {
         let mut attempt = 1;
         loop {
             let latest = self
@@ -2634,25 +3217,22 @@ impl ComputeRuntime {
                 .await
                 .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
-            match SandboxPhase::try_from(latest.phase()).unwrap_or(SandboxPhase::Unknown) {
-                SandboxPhase::Stopped => return Ok(latest),
-                SandboxPhase::Stopping => {}
-                _ => {
-                    return Err(Status::aborted(
-                        "sandbox lifecycle changed while stop completed",
-                    ));
-                }
+            let phase = SandboxPhase::try_from(latest.phase()).unwrap_or(SandboxPhase::Unknown);
+            if phase == operation.settled_phase() {
+                return Ok(latest);
             }
+            if phase != operation.in_flight_phase() {
+                return Err(Status::aborted(format!(
+                    "sandbox lifecycle changed while {} completed",
+                    operation.verb()
+                )));
+            }
+            let (reason, message) = operation.settled_condition();
             match self
-                .write_lifecycle_phase(
-                    &latest,
-                    SandboxPhase::Stopped,
-                    "Stopped",
-                    "Sandbox compute is stopped",
-                )
+                .write_lifecycle_phase(&latest, operation.settled_phase(), reason, message)
                 .await
             {
-                Ok(stopped) => return Ok(stopped),
+                Ok(settled) => return Ok(settled),
                 Err(crate::persistence::PersistenceError::Conflict {
                     current_resource_version,
                 }) if attempt < STOP_PHASE_CAS_RETRY_LIMIT => {
@@ -2660,7 +3240,8 @@ impl ComputeRuntime {
                         sandbox_id,
                         attempt,
                         current_resource_version,
-                        "Retrying sandbox stop completion after a concurrent sandbox update"
+                        operation = operation.verb(),
+                        "Retrying sandbox lifecycle completion after a concurrent sandbox update"
                     );
                     attempt += 1;
                 }
@@ -3008,7 +3589,23 @@ impl ComputeRuntime {
                     .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
                     .ok_or_else(|| Status::not_found("sandbox not found"))?,
             };
-            provisioning_operation::ensure_operation_settled(&sandbox)?;
+            // Explicit deletion can supersede a configuration update: the
+            // driver only patches an existing immutable resource and cannot
+            // recreate it after deletion. Keep the interlock until removal so
+            // a failed delete can safely restore the pending update.
+            let pending_update = self
+                .store
+                .get_sandbox_image_state(sandbox_id)
+                .await
+                .map_err(|_| Status::unavailable("cannot read pending sandbox update"))?
+                .and_then(|state| state.pending);
+            if failed_create.is_none()
+                && let Some(intent) = pending_update
+            {
+                image_update::ensure_image_update_interlock(&sandbox, &intent)?;
+            } else {
+                provisioning_operation::ensure_operation_settled(&sandbox)?;
+            }
 
             // Failed-create compensation owns only its original attempt.
             // Preserve its timeout diagnosis and any replacement attempt on
@@ -3164,7 +3761,10 @@ impl ComputeRuntime {
 
         let mut delete_resource_version = record.resource_version;
         let mut sandbox = decode_sandbox_record(&record)?;
-        if provisioning_deadline::driver_operation_pending(&sandbox) {
+        if self
+            .pending_driver_operation_blocks_cleanup(&sandbox)
+            .await?
+        {
             return Ok(false);
         }
         if sandbox.phase() != SandboxPhase::Deleting as i32 {
@@ -3190,10 +3790,11 @@ impl ComputeRuntime {
             return Err(error);
         }
 
-        match self
-            .store
-            .delete_if(Sandbox::object_type(), sandbox_id, delete_resource_version)
-            .await
+        match Box::pin(
+            self.store
+                .delete_sandbox_with_image_state_if(sandbox_id, delete_resource_version),
+        )
+        .await
         {
             Ok(true) => {
                 self.cleanup_removed_sandbox_state(sandbox_id);
@@ -3560,7 +4161,12 @@ impl ComputeRuntime {
 
                 let phase =
                     SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                if !sandbox_phase_should_be_running(phase) {
+                // A driver stop discards retained suspend state. An unresolved
+                // resume still needs that state when startup recovery repeats
+                // it, and an idempotent restart reconciles any runtime it left.
+                if !sandbox_phase_should_be_running(phase)
+                    || in_flight_resume_intent(&sandbox).is_some()
+                {
                     return (0, 0);
                 }
                 let sandbox_name = sandbox.object_name().to_string();
@@ -3641,11 +4247,13 @@ impl ComputeRuntime {
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-start state on its first poll.
     pub async fn start_persisted_sandboxes(&self) -> Result<(), String> {
-        self.start_persisted_sandboxes_with_authentication(
+        // The reconciliation futures carry full persisted sandbox records;
+        // keep them off the caller's stack (clippy::large_futures).
+        Box::pin(self.start_persisted_sandboxes_with_authentication(
             |_| async { Ok(Vec::new()) },
             |_| async { Ok(()) },
             |_| {},
-        )
+        ))
         .await
     }
 
@@ -3664,15 +4272,15 @@ impl ComputeRuntime {
         authentication_failed: Failed,
     ) -> Result<(), String>
     where
-        Authentication: Fn(&Sandbox) -> AuthenticationFuture,
-        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>>,
-        Committed: Fn(&str) -> CommittedFuture,
-        CommittedFuture: Future<Output = Result<(), String>>,
-        Failed: Fn(&str),
+        Authentication: Fn(&Sandbox) -> AuthenticationFuture + Send + Sync,
+        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>> + Send,
+        Committed: Fn(&str) -> CommittedFuture + Send + Sync,
+        CommittedFuture: Future<Output = Result<(), String>> + Send,
+        Failed: Fn(&str) + Send + Sync,
     {
-        self.recover_persisted_lifecycle_transitions().await?;
+        Box::pin(self.recover_persisted_lifecycle_transitions()).await?;
         if !self.driver_info.gateway_manages_lifecycle {
-            return Ok(());
+            return self.recover_pending_sandbox_updates().await;
         }
 
         let sandbox_ids = self.list_persisted_sandbox_ids("gateway startup").await?;
@@ -3698,7 +4306,9 @@ impl ComputeRuntime {
                 }
             };
 
-            if provisioning_deadline::driver_operation_pending(&sandbox) {
+            if provisioning_deadline::driver_operation_pending(&sandbox)
+                || in_flight_resume_intent(&sandbox).is_some()
+            {
                 warn!(
                     sandbox_id,
                     "Retaining pending driver operation during gateway recovery"
@@ -3765,6 +4375,9 @@ impl ComputeRuntime {
                     continue;
                 }
             };
+            // Recovery is allowed to reconstruct provisioning inputs only
+            // from the persisted gateway record (the request snapshot is
+            // rebuilt by `driver_start_request`).
             let request = match self.driver_start_request(
                 &sandbox,
                 launch_authentication,
@@ -3831,6 +4444,8 @@ impl ComputeRuntime {
                             }
                         }
                     }
+                    *recovered_sandbox =
+                        self.clear_resume_intent((*recovered_sandbox).clone()).await;
                     if let Err(err) = authentication_committed(sandbox.object_id()).await {
                         warn!(
                             sandbox_id = %sandbox.object_id(),
@@ -3925,7 +4540,7 @@ impl ComputeRuntime {
                 "Sandbox start sweep complete"
             );
         }
-        Ok(())
+        self.recover_pending_sandbox_updates().await
     }
 
     async fn recover_persisted_lifecycle_transitions(&self) -> Result<(), String> {
@@ -3933,7 +4548,7 @@ impl ComputeRuntime {
             .list_persisted_sandbox_ids("lifecycle recovery")
             .await?;
         for sandbox_id in sandbox_ids {
-            let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+            let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
             let sandbox = match self.store.get_message::<Sandbox>(&sandbox_id).await {
                 Ok(Some(sandbox)) => sandbox,
                 Ok(None) => continue,
@@ -3946,7 +4561,10 @@ impl ComputeRuntime {
                     continue;
                 }
             };
-            if provisioning_deadline::driver_operation_pending(&sandbox) {
+            if self
+                .pending_driver_operation_blocks_cleanup(&sandbox)
+                .await?
+            {
                 warn!(
                     sandbox_id,
                     "Retaining pending driver operation during gateway recovery"
@@ -3955,7 +4573,7 @@ impl ComputeRuntime {
             }
             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
             match phase {
-                SandboxPhase::Stopped | SandboxPhase::Completed => {
+                SandboxPhase::Stopped | SandboxPhase::Suspended | SandboxPhase::Completed => {
                     if let Err(err) = self.cleanup_stopped_sandbox_sessions(&sandbox).await {
                         warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to complete recovered sandbox session cleanup");
                     }
@@ -3966,43 +4584,20 @@ impl ComputeRuntime {
                     }
                 }
                 SandboxPhase::Stopping => {
-                    let sandbox_id = sandbox.object_id().to_string();
-                    let sandbox_name = sandbox.object_name().to_string();
-                    let driver_sandbox_id = sandbox_id.clone();
-                    match self
-                        .driver
-                        .call(
-                            openshell_otel::rpc::STOP_SANDBOX,
-                            Some(&sandbox_id),
-                            |driver| async move {
-                                driver
-                                    .stop_sandbox(Request::new(StopSandboxRequest {
-                                        sandbox_id: driver_sandbox_id,
-                                        name: sandbox_name,
-                                    }))
-                                    .await
-                            },
-                        )
-                        .await
-                    {
-                        Ok(_) => match self.commit_sandbox_stopped(&sandbox_id).await {
-                            Ok(updated) => {
-                                self.sandbox_index.update_from_sandbox(&updated);
-                                self.sandbox_watch_bus.notify(updated.object_id());
-                                if let Err(err) =
-                                    self.cleanup_stopped_sandbox_sessions(&updated).await
-                                {
-                                    warn!(sandbox_id = %updated.object_id(), error = %err, "Failed to complete recovered sandbox session cleanup");
-                                }
-                            }
-                            Err(err) => {
-                                warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to persist recovered stop");
-                            }
-                        },
-                        Err(err) => {
-                            warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to recover sandbox stop");
-                        }
-                    }
+                    self.recover_quiesce_transition(
+                        QuiesceOperation::Stop,
+                        &sandbox,
+                        &lifecycle_guard,
+                    )
+                    .await;
+                }
+                SandboxPhase::Suspending => {
+                    self.recover_quiesce_transition(
+                        QuiesceOperation::Suspend,
+                        &sandbox,
+                        &lifecycle_guard,
+                    )
+                    .await;
                 }
                 SandboxPhase::Starting => {
                     if let Err(error) = self.validate_isolation_backend_binding(&sandbox) {
@@ -4054,8 +4649,8 @@ impl ComputeRuntime {
                     // Recovery retains the original attempt and deadline. A
                     // stalled driver must release this lifecycle gate after
                     // expiry so the deadline worker can reclaim its compute.
-                    if let Err(err) = self
-                        .await_provisioning_operation(
+                    match Box::pin(
+                        self.await_provisioning_operation(
                             &sandbox,
                             self.driver.call_owned(
                                 openshell_otel::rpc::START_SANDBOX,
@@ -4064,16 +4659,71 @@ impl ComputeRuntime {
                                     driver.start_sandbox(Request::new(request)).await
                                 },
                             ),
-                        )
-                        .await
+                        ),
+                    )
+                    .await
                     {
-                        warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to recover sandbox start");
+                        Ok((_, settled)) => {
+                            let updated = self.clear_resume_intent(*settled).await;
+                            self.sandbox_index.update_from_sandbox(&updated);
+                        }
+                        Err(err) => {
+                            warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to recover sandbox start");
+                            if let ProvisioningOperationError::Driver { settled, .. } = err
+                                && in_flight_resume_intent(&settled).is_some()
+                            {
+                                let _ = Box::pin(self.recover_failed_lifecycle(
+                                    &lifecycle_guard,
+                                    &settled,
+                                    &sandbox,
+                                    false,
+                                ))
+                                .await;
+                            }
+                        }
                     }
                 }
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// Re-issue the idempotent driver call of a stop or suspend interrupted
+    /// by a gateway restart, then commit its settled phase.
+    async fn recover_quiesce_transition(
+        &self,
+        operation: QuiesceOperation,
+        sandbox: &Sandbox,
+        lifecycle_guard: &SandboxLifecycleGuard,
+    ) {
+        let sandbox_id = sandbox.object_id();
+        if let Err(err) = self
+            .call_quiesce_driver(operation, sandbox_id, sandbox.object_name())
+            .await
+        {
+            if terminal_stop_exit_code(sandbox).is_some()
+                && Box::pin(self.recover_failed_lifecycle(lifecycle_guard, sandbox, sandbox, true))
+                    .await
+                    .is_some()
+            {
+                return;
+            }
+            warn!(sandbox_id, operation = operation.verb(), error = %err, "Failed to recover sandbox lifecycle transition");
+            return;
+        }
+        match self.commit_sandbox_quiesced(operation, sandbox_id).await {
+            Ok(updated) => {
+                self.sandbox_index.update_from_sandbox(&updated);
+                self.sandbox_watch_bus.notify(updated.object_id());
+                if let Err(err) = self.cleanup_stopped_sandbox_sessions(&updated).await {
+                    warn!(sandbox_id, error = %err, "Failed to complete recovered sandbox session cleanup");
+                }
+            }
+            Err(err) => {
+                warn!(sandbox_id, operation = operation.verb(), error = %err, "Failed to persist recovered sandbox lifecycle transition");
+            }
+        }
     }
 
     async fn list_persisted_sandbox_ids(&self, operation: &str) -> Result<Vec<String>, String> {
@@ -4084,6 +4734,11 @@ impl ComputeRuntime {
             .map_err(|err| format!("failed to list sandboxes for {operation}: {err}"))
     }
 
+    /// Fail closed when a start/recovery cannot reconstruct a driver's durable
+    /// provisioning snapshot.  This is intentionally distinct from an
+    /// ambiguous transport failure: no start RPC has been issued, so keeping
+    /// `Starting` for a blind retry would allow a local reconciliation path to
+    /// fall back to mutable platform state.
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
         let _guard = self.lock_sandbox_local(sandbox.object_id()).await;
         let sandbox_id = sandbox.object_id().to_string();
@@ -4338,6 +4993,9 @@ impl ComputeRuntime {
 
     async fn reconcile_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
+            if let Err(error) = self.recover_pending_sandbox_updates().await {
+                warn!(%error, "Sandbox update recovery sweep failed");
+            }
             if let Err(err) = self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD).await {
                 warn!(error = %err, "Store reconciliation sweep failed");
             }
@@ -4885,7 +5543,7 @@ impl ComputeRuntime {
                 continue;
             }
 
-            self.prune_missing_sandbox(record, sweep_started_at_ms, grace_ms)
+            Box::pin(self.prune_missing_sandbox(record, sweep_started_at_ms, grace_ms))
                 .await
                 .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?;
         }
@@ -4938,6 +5596,7 @@ impl ComputeRuntime {
                 }
             }
             Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
+                info!(sandbox_id = %deleted.sandbox_id, "Compute driver reported sandbox deleted");
                 self.apply_deleted(&deleted.sandbox_id).await?;
             }
             Some(watch_sandboxes_event::Payload::PlatformEvent(platform_event)) => {
@@ -4978,7 +5637,9 @@ impl ComputeRuntime {
         let ready_container_exit = existing_phase == SandboxPhase::Ready
             && (driver_snapshot_confirms_stopped(&incoming)
                 || driver_snapshot_reports_runtime_restart(&incoming));
-        if existing_phase != SandboxPhase::Starting && !ready_container_exit {
+        let stopped_bootstrap =
+            existing_phase == SandboxPhase::Stopped && driver_snapshot_confirms_starting(&incoming);
+        if existing_phase != SandboxPhase::Starting && !ready_container_exit && !stopped_bootstrap {
             return self.apply_sandbox_update_locked(incoming, existing).await;
         }
 
@@ -4988,6 +5649,8 @@ impl ComputeRuntime {
         // stop the new generation before the replacement supervisor connects.
         // The replacement may already be Ready when the old exit arrives, so
         // terminal container snapshots need the same check after readiness.
+        // A bootstrap event queued before Stop reached Stopped must also be
+        // revalidated so it cannot undo the completed stop.
         // Release this sandbox's local mutation lock, wait for that lifecycle
         // operation, and then reread both the driver and store before applying
         // an authoritative observation. Taking the per-sandbox gate only for
@@ -5017,7 +5680,10 @@ impl ComputeRuntime {
         match observed {
             Ok(Some(live)) if live.id == incoming.id && live.status.is_some() => incoming = live,
             Ok(Some(_) | None) | Err(_)
-                if matches!(current_phase, SandboxPhase::Starting | SandboxPhase::Ready) =>
+                if matches!(
+                    current_phase,
+                    SandboxPhase::Starting | SandboxPhase::Ready | SandboxPhase::Stopped
+                ) =>
             {
                 warn!(
                     sandbox_id = %incoming.id,
@@ -5278,7 +5944,11 @@ impl ComputeRuntime {
                 && (provisioning_deadline::timed_out(&current)
                     || matches!(
                         current_phase,
-                        SandboxPhase::Deleting | SandboxPhase::Stopping | SandboxPhase::Stopped
+                        SandboxPhase::Deleting
+                            | SandboxPhase::Stopping
+                            | SandboxPhase::Stopped
+                            | SandboxPhase::Suspending
+                            | SandboxPhase::Suspended
                     ))
             {
                 return Err(format!(
@@ -5298,6 +5968,8 @@ impl ComputeRuntime {
                     | SandboxPhase::Error
                     | SandboxPhase::Stopping
                     | SandboxPhase::Stopped
+                    | SandboxPhase::Suspending
+                    | SandboxPhase::Suspended
                     | SandboxPhase::Completed
             ) {
                 return Ok(());
@@ -5315,7 +5987,9 @@ impl ComputeRuntime {
                 return Err("restarting sandbox requires a fresh supervisor instance".into());
             }
             let provisioning = admission
-                .map(|admission| admitted_provisioning(&current, admission))
+                .map(|admission| {
+                    admitted_provisioning(&current, admission, self.provisioning_repair_window_ms)
+                })
                 .transpose()?
                 .flatten();
             let expected_resource_version = sandbox_resource_version(&current);
@@ -5435,7 +6109,10 @@ impl ComputeRuntime {
         let phase = SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
         if matches!(
             phase,
-            SandboxPhase::Deleting | SandboxPhase::Stopping | SandboxPhase::Stopped
+            SandboxPhase::Deleting
+                | SandboxPhase::Stopping
+                | SandboxPhase::Stopped
+                | SandboxPhase::Suspended
         ) {
             return Ok(());
         }
@@ -5526,7 +6203,10 @@ impl ComputeRuntime {
         let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
         if matches!(
             phase,
-            SandboxPhase::Deleting | SandboxPhase::Stopping | SandboxPhase::Stopped
+            SandboxPhase::Deleting
+                | SandboxPhase::Stopping
+                | SandboxPhase::Stopped
+                | SandboxPhase::Suspended
         ) {
             // Lifecycle shutdown intentionally discards the canonical process
             // result. Finalization must still acknowledge that discarded
@@ -5636,16 +6316,43 @@ impl ComputeRuntime {
     }
 
     async fn apply_deleted_locked(&self, sandbox_id: &str) -> Result<(), String> {
-        let sandbox = self
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(sandbox) = sandbox.as_ref() {
-            if provisioning_deadline::driver_operation_pending(sandbox)
-                || (provisioning_deadline::timed_out(sandbox)
-                    && sandbox.phase() == i32::from(SandboxPhase::Error))
+        // This event is the only signal that removes the record after a
+        // driver-confirmed delete; the orphan sweep waits out its grace
+        // period. Other replicas keep writing the record until it is gone,
+        // e.g. the endpoint-status reset when the supervisor session ends, so
+        // retry the removal against a fresh snapshot after such a write.
+        for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
+            let Some(sandbox) = self
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                let _ = self
+                    .store
+                    .delete(Sandbox::object_type(), sandbox_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.cleanup_removed_sandbox_state(sandbox_id);
+                return Ok(());
+            };
+            // Timeout cleanup can emit Deleted before an explicit stop exposes
+            // Stopped for repair. A delayed (or repeated) event must retain that
+            // recovery record too; explicit deletion still transitions to Deleting.
+            if self
+                .pending_driver_operation_blocks_cleanup(&sandbox)
+                .await?
+                || (provisioning_deadline::timed_out(&sandbox)
+                    && matches!(
+                        SandboxPhase::try_from(sandbox.phase()),
+                        Ok(SandboxPhase::Error | SandboxPhase::Stopped)
+                    ))
             {
+                info!(
+                    sandbox_id,
+                    phase = ?SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown),
+                    "Retaining sandbox record after driver deletion for pending recovery"
+                );
                 return Ok(());
             }
             // The watcher told us this sandbox's compute resource is gone, so
@@ -5657,21 +6364,27 @@ impl ComputeRuntime {
             if self
                 .remove_sandbox_record_if_version_locked(
                     sandbox_id,
-                    sandbox_resource_version(sandbox),
+                    sandbox_resource_version(&sandbox),
                 )
                 .await?
             {
                 self.spawn_driver_sandbox_cleanup(sandbox.object_id(), sandbox.object_name());
+                return Ok(());
             }
-            return Ok(());
+            if attempt < DELETE_PHASE_CAS_RETRY_LIMIT {
+                info!(
+                    sandbox_id,
+                    attempt,
+                    expected_resource_version = sandbox_resource_version(&sandbox),
+                    "Sandbox removal after driver deletion did not complete; retrying"
+                );
+                tokio::task::yield_now().await;
+            }
         }
-
-        let _ = self
-            .store
-            .delete(Sandbox::object_type(), sandbox_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.cleanup_removed_sandbox_state(sandbox_id);
+        warn!(
+            sandbox_id,
+            "Sandbox removal after driver deletion did not complete; leaving it to reconciliation"
+        );
         Ok(())
     }
 
@@ -5680,7 +6393,10 @@ impl ComputeRuntime {
         sandbox: &Sandbox,
         expected_resource_version: u64,
     ) -> Result<(), String> {
-        if provisioning_deadline::driver_operation_pending(sandbox) {
+        if self
+            .pending_driver_operation_blocks_cleanup(sandbox)
+            .await?
+        {
             return Ok(());
         }
         let sandbox_id = sandbox.object_id();
@@ -5690,6 +6406,8 @@ impl ComputeRuntime {
     }
 
     async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) -> Result<(), String> {
+        // Keep private update intent until atomic sandbox removal: a cleanup
+        // failure or CAS conflict must leave evidence for the deletion retry.
         self.cleanup_ssh_identity(sandbox)
             .await
             .map_err(|error| error.to_string())?;
@@ -5889,12 +6607,16 @@ impl ComputeRuntime {
             if let Ok(endpoint) = ServiceEndpoint::decode(record.payload.as_slice())
                 && endpoint.sandbox_id == sandbox_id
             {
-                self.store
+                let deleted = self
+                    .store
                     .delete(ServiceEndpoint::object_type(), endpoint.object_id())
                     .await
                     .map_err(|e| {
                         format!("delete service endpoint {}: {e}", endpoint.object_id())
                     })?;
+                if deleted && let Some(index) = self.service_route_index.get() {
+                    index.remove(workspace, &endpoint.sandbox, &endpoint.name);
+                }
             }
         }
 
@@ -5907,6 +6629,12 @@ impl ComputeRuntime {
         sandbox_id: &str,
     ) -> Result<bool, Status> {
         let _guard = self.lock_sandbox_for_lifecycle(delete_guard).await;
+        // A missing sandbox row means the sandbox is gone. Several readers make
+        // that inference with their own error policy -- this teardown, the
+        // push-log handler's store recheck (`ensure_log_stream_sandbox_exists`
+        // in grpc/policy.rs), and the `WatchSandbox` producer in
+        // grpc/sandbox.rs -- so a change to deletion semantics (soft delete,
+        // migration windows, record recreation) must update every one of them.
         let record = self
             .store
             .get(Sandbox::object_type(), sandbox_id)
@@ -5925,10 +6653,31 @@ impl ComputeRuntime {
     }
 
     fn cleanup_sandbox_state(&self, sandbox_id: &str) {
-        // `tracing_log_bus.remove` also clears the platform event bus and resets
-        // the shared cursor allocator last (see its docs).
-        self.tracing_log_bus.remove(sandbox_id);
+        // `tracing_log_bus.close` also clears the platform event bus and leaves
+        // a terminal tombstone in the shared cursor allocator, so late
+        // publishers cannot re-create the buffers this frees (see its docs).
+        self.tracing_log_bus.close(sandbox_id);
         self.sandbox_watch_bus.remove(sandbox_id);
+    }
+
+    /// Whether a sweep observes a `Starting` sandbox with an active start.
+    ///
+    /// `StartSandbox` holds the gate for the whole driver call, during which
+    /// the workload can still show its previous exit. The sweep skips the
+    /// sandbox instead of waiting, and the next tick or watch event
+    /// reports the settled state. The gate is probed, never retained, so
+    /// Deleted watches can still dispatch cleanup.
+    ///
+    /// The gate is local to this replica. A start owned by another replica is
+    /// visible through its durable driver-operation claim.
+    fn sweep_start_in_progress(&self, record: &ObjectRecord) -> Result<bool, String> {
+        let sandbox = decode_sandbox_record(record)?;
+        Ok(sandbox.phase() == SandboxPhase::Starting as i32
+            && (provisioning_deadline::driver_operation_pending(&sandbox)
+                || self
+                    .lifecycle_gates
+                    .try_lock_for(sandbox.object_id())
+                    .is_none()))
     }
 
     async fn reconcile_snapshot_sandbox(
@@ -5971,6 +6720,7 @@ impl ComputeRuntime {
         };
         if existing.resource_version != expected_resource_version
             || existing.updated_at_ms > sweep_started_at_ms
+            || self.sweep_start_in_progress(&existing)?
         {
             return Ok(());
         }
@@ -6001,7 +6751,10 @@ impl ComputeRuntime {
             }
 
             let sandbox = decode_sandbox_record(&current_record)?;
-            if provisioning_deadline::driver_operation_pending(&sandbox) {
+            if self
+                .pending_driver_operation_blocks_cleanup(&sandbox)
+                .await?
+            {
                 return Ok(());
             }
             let age_ms = openshell_core::time::now_ms()
@@ -6044,6 +6797,13 @@ impl ComputeRuntime {
 
         let sandbox = decode_sandbox_record(&current_record)?;
         let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+        if terminal_stop_exit_code(&sandbox).is_some() {
+            return self
+                .restore_missing_terminal_stop(&sandbox)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+        }
         if phase == SandboxPhase::Completed
             || is_failed_main_process_result(&sandbox)
             || provisioning_deadline::timed_out(&sandbox)
@@ -6054,7 +6814,11 @@ impl ComputeRuntime {
         }
         if matches!(
             phase,
-            SandboxPhase::Stopping | SandboxPhase::Stopped | SandboxPhase::Starting
+            SandboxPhase::Stopping
+                | SandboxPhase::Stopped
+                | SandboxPhase::Starting
+                | SandboxPhase::Suspending
+                | SandboxPhase::Suspended
         ) {
             let updated = self
                 .store
@@ -6092,6 +6856,7 @@ impl ComputeRuntime {
             sandbox_id = %sandbox_id,
             sandbox_name = %sandbox_name,
             age_secs = age_ms / 1000,
+            phase = ?phase,
             "Removing sandbox from store after it disappeared from the compute driver snapshot"
         );
         // The driver's own snapshot never reported this sandbox, so no
@@ -6104,6 +6869,44 @@ impl ComputeRuntime {
         self.spawn_driver_sandbox_cleanup(&sandbox_id, &sandbox_name);
         self.apply_deleted_if_version_locked(&sandbox, expected_resource_version)
             .await
+    }
+
+    /// Resolve app endpoints independently of ordinary sandbox observation.
+    pub(crate) async fn supervisor_app_endpoint(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>, Status> {
+        let Some(resolver) = self.app_endpoint_resolver.clone() else {
+            return Ok(None);
+        };
+        let id = sandbox.object_id().to_string();
+        let request = openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest {
+            sandbox_id: id.clone(),
+            name: sandbox.object_name().to_string(),
+        };
+        let response = match self
+            .driver
+            .call(
+                openshell_otel::rpc::RESOLVE_SUPERVISOR_APP_ENDPOINT,
+                Some(&id),
+                |_driver| async move {
+                    resolver
+                        .resolve_supervisor_app_endpoint(Request::new(request))
+                        .await
+                },
+            )
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == Code::Unimplemented => return Ok(None),
+            Err(status) => return Err(status),
+        };
+        if response.sandbox_id != id {
+            return Err(Status::failed_precondition(
+                "driver returned a different sandbox",
+            ));
+        }
+        Ok(response.supervisor_app_endpoint)
     }
 
     async fn get_driver_sandbox(
@@ -6233,6 +7036,16 @@ fn has_specific_infrastructure_error(sandbox: &Sandbox) -> bool {
                 condition.r#type == "Ready" && condition.reason == "ContainerExited"
             })
         })
+}
+
+fn terminal_stop_exit_code(sandbox: &Sandbox) -> Option<i32> {
+    if sandbox.phase() != SandboxPhase::Stopping as i32
+        || provisioning_deadline::timed_out(sandbox)
+        || provisioning_deadline::driver_operation_pending(sandbox)
+    {
+        return None;
+    }
+    sandbox.status.as_ref()?.exit_code
 }
 
 fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
@@ -6925,8 +7738,19 @@ fn apply_driver_snapshot(
     // sticky until an explicit lifecycle operation changes desired state. A
     // late signal-exit snapshot must also not overwrite the terminal reason
     // recorded by a completed explicit stop.
-    if matches!(old_phase, SandboxPhase::Error | SandboxPhase::Completed)
-        || (old_phase == SandboxPhase::Stopped && driver_snapshot_reports_runtime_restart(incoming))
+    // Suspension is gateway-owned like an explicit stop, but a suspended
+    // runtime has no driver state that can describe it: the frozen workload
+    // looks exited, stopped, or even still running while the driver captures
+    // it. Only the explicit suspend result and later lifecycle requests may
+    // move these phases.
+    if matches!(
+        old_phase,
+        SandboxPhase::Error
+            | SandboxPhase::Completed
+            | SandboxPhase::Suspending
+            | SandboxPhase::Suspended
+    ) || (old_phase == SandboxPhase::Stopped
+        && driver_snapshot_reports_runtime_restart(incoming))
     {
         if let Some(metadata) = sandbox.metadata.as_mut() {
             metadata.name.clone_from(sandbox_name);
@@ -7122,6 +7946,7 @@ fn record_session_admission(
 fn admitted_provisioning(
     sandbox: &Sandbox,
     admission: &openshell_core::proto::SandboxConfigurationAdmission,
+    repair_window_ms: i64,
 ) -> Result<Option<openshell_core::proto::SandboxProvisioning>, String> {
     let Some(mut record) = sandbox
         .status
@@ -7134,9 +7959,9 @@ fn admitted_provisioning(
     if !provisioning_deadline::allows_admission(&record, now_ms) {
         return Err("provisioning deadline expired".to_string());
     }
-    provisioning_deadline::record_admission_start(&mut record, now_ms)?;
+    provisioning_deadline::record_admission_start(&mut record, now_ms, repair_window_ms)?;
     if admission.state == i32::from(openshell_core::proto::ConfigurationAdmissionState::Rejected) {
-        provisioning_deadline::record_rejection(&mut record, now_ms)?;
+        provisioning_deadline::record_rejection(&mut record, now_ms, repair_window_ms)?;
     }
     Ok(Some(record))
 }
@@ -7490,13 +8315,31 @@ fn apply_lifecycle_phase(
     reason: &str,
     message: &str,
     image_preparation_timeout_seconds: u32,
+    provisioning_repair_window_ms: i64,
 ) {
+    let preserve_exit_code = phase == SandboxPhase::Stopping
+        && (sandbox.phase() == SandboxPhase::Completed as i32
+            || is_failed_main_process_result(sandbox));
     sandbox.set_phase(phase as i32);
-    if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
+    // Every explicit lifecycle write ends the previous transition's resume
+    // intent. A resuming start records a new one after this write.
+    if let Some(metadata) = sandbox.metadata.as_mut() {
+        metadata.annotations.remove(RESUME_INTENT_ANNOTATION);
+    }
+    // Explicit quiesce and start requests cancel any gateway-managed
+    // automatic restart.
+    if matches!(
+        phase,
+        SandboxPhase::Stopping | SandboxPhase::Starting | SandboxPhase::Suspending
+    ) {
         let status = sandbox.status.get_or_insert_with(Default::default);
         // Retain the previous instance id as a tombstone until the restarted
         // supervisor registers its new id.
-        status.exit_code = None;
+        // Explicit stop preserves an already-recorded terminal result for
+        // diagnosis while the sandbox is repaired. A fresh start clears it.
+        if !preserve_exit_code {
+            status.exit_code = None;
+        }
         status.restart_count = 0;
         set_next_restart_at_ms(status, 0);
         set_main_process_started_at_ms(status, 0);
@@ -7504,6 +8347,7 @@ fn apply_lifecycle_phase(
             status.provisioning = Some(provisioning_deadline::new_preparation_record(
                 openshell_core::time::now_ms(),
                 image_preparation_timeout_seconds,
+                provisioning_repair_window_ms,
             ));
             status.configuration_admission =
                 Some(openshell_core::proto::SandboxConfigurationAdmission {
@@ -7524,6 +8368,70 @@ fn apply_lifecycle_phase(
             transition_time: None,
         },
     );
+}
+
+/// Whether a `Starting` transition boots fresh or restores retained state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartIntent {
+    Start,
+    Resume { restart_if_restore_fails: bool },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedResumeIntent {
+    generation: String,
+    restart_if_restore_fails: bool,
+}
+
+/// Record the intent of a new `Starting` transition for `generation`.
+///
+/// Plain starts remove any prior intent so the driver discards retained
+/// state instead of restoring it.
+fn write_start_intent(
+    annotations: &mut HashMap<String, String>,
+    generation: &str,
+    intent: StartIntent,
+) {
+    match intent {
+        StartIntent::Start => {
+            annotations.remove(RESUME_INTENT_ANNOTATION);
+        }
+        StartIntent::Resume {
+            restart_if_restore_fails,
+        } => {
+            let value = serde_json::to_string(&PersistedResumeIntent {
+                generation: generation.to_string(),
+                restart_if_restore_fails,
+            })
+            .expect("resume intent serialization is infallible");
+            annotations.insert(RESUME_INTENT_ANNOTATION.to_string(), value);
+        }
+    }
+}
+
+/// The persisted resume intent of the sandbox's current `Starting`
+/// transition, returning its cold-start fallback choice.
+///
+/// Only an explicit, not yet completed transition for the current runtime
+/// generation counts. Automatic restarts always boot fresh.
+fn in_flight_resume_intent(sandbox: &Sandbox) -> Option<bool> {
+    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Starting)
+        || is_automatic_restart_transition(sandbox)
+    {
+        return None;
+    }
+    let intent = persisted_resume_intent(sandbox)?;
+    let generation = sandbox_runtime_generation(sandbox).ok()?;
+    (intent.generation == generation.as_str()).then_some(intent.restart_if_restore_fails)
+}
+
+fn persisted_resume_intent(sandbox: &Sandbox) -> Option<PersistedResumeIntent> {
+    let value = sandbox
+        .metadata
+        .as_ref()?
+        .annotations
+        .get(RESUME_INTENT_ANNOTATION)?;
+    serde_json::from_str(value).ok()
 }
 
 fn next_runtime_identity(
@@ -7573,6 +8481,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct NoopTestDriver {
+    app_endpoint: Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>,
     workspace_delete_failures: std::sync::atomic::AtomicUsize,
     sandbox_authentication: Option<Result<(String, String), (Code, String)>>,
 }
@@ -7580,8 +8489,19 @@ pub struct NoopTestDriver {
 #[cfg(any(test, feature = "test-support"))]
 impl NoopTestDriver {
     #[cfg(test)]
+    pub fn with_app_endpoint(
+        endpoint: openshell_core::proto::compute::v1::SupervisorAppEndpoint,
+    ) -> Self {
+        Self {
+            app_endpoint: Some(endpoint),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
     pub fn failing_workspace_deletes(count: usize) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(count),
             sandbox_authentication: None,
         }
@@ -7590,6 +8510,7 @@ impl NoopTestDriver {
     #[cfg(test)]
     pub fn authenticating_sandbox(sandbox_id: impl Into<String>) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Ok((sandbox_id.into(), "test-runtime".to_string()))),
         }
@@ -7601,6 +8522,7 @@ impl NoopTestDriver {
         runtime_identity: impl Into<String>,
     ) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Ok((sandbox_id.into(), runtime_identity.into()))),
         }
@@ -7609,6 +8531,7 @@ impl NoopTestDriver {
     #[cfg(test)]
     pub fn failing_sandbox_authentication(code: Code, message: impl Into<String>) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Err((code, message.into()))),
         }
@@ -7619,6 +8542,7 @@ impl NoopTestDriver {
 impl Default for NoopTestDriver {
     fn default() -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: None,
         }
@@ -7758,6 +8682,16 @@ impl ComputeDriver for NoopTestDriver {
         ))
     }
 
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::SuspendSandboxResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "test driver does not support sandbox suspend",
+        ))
+    }
+
     async fn delete_sandbox(
         &self,
         _request: Request<DeleteSandboxRequest>,
@@ -7802,6 +8736,25 @@ impl ComputeDriver for NoopTestDriver {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for NoopTestDriver {
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse {
+                sandbox_id: request.into_inner().sandbox_id,
+                supervisor_app_endpoint: self.app_endpoint.clone(),
+            },
+        ))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     new_test_runtime_for_driver(store, "test").await
 }
@@ -7838,6 +8791,8 @@ pub fn new_test_runtime_with_driver(
     ComputeRuntime {
         isolation_backend: None,
         driver: TracedDriver::new(driver, "test".to_string()),
+        image_update_driver: None,
+        app_endpoint_resolver: None,
         admission: openshell_core::resource_admission::DriverAdmissionConfig {
             allow_driver_config: true,
             ..Default::default()
@@ -7859,6 +8814,10 @@ pub fn new_test_runtime_with_driver(
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
         image_preparation_timeout_seconds: 1800,
+        provisioning_repair_window_ms: 300_000,
+        sandbox_updates_enabled: false,
+        update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
+        update_recovery_backoff: Arc::default(),
         store,
         sandbox_index: SandboxIndex::new(),
         sandbox_watch_bus: SandboxWatchBus::new(),
@@ -7871,14 +8830,17 @@ pub fn new_test_runtime_with_driver(
         restart_authority: Arc::new(OnceLock::new()),
         restart_notify: Arc::new(Notify::new()),
         ssh_identities: Arc::new(OnceLock::new()),
-        supervisor_ocsf_headers: Arc::new(OnceLock::new()),
+        supervisor_otlp_headers: Arc::new(OnceLock::new()),
+        supervisor_otlp_tls: Arc::new(OnceLock::new()),
         supervisor_host: None,
+        service_route_index: Arc::new(OnceLock::new()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     mod error_recovery;
+    mod suspend_resume;
 
     use super::*;
     use crate::policy_store::PolicyStoreExt;
@@ -7887,7 +8849,8 @@ mod tests {
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
         GetSandboxResponse, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
-        ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesSandboxEvent,
+        SuspendSandboxResponse, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+        WatchSandboxesSandboxEvent,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -8241,6 +9204,9 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct TestDriver {
+        endpoint_resolution: Option<
+            Result<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse, Code>,
+        >,
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
         workspace_rpcs_unimplemented: bool,
@@ -8387,6 +9353,13 @@ mod tests {
             Ok(tonic::Response::new(StartSandboxResponse::default()))
         }
 
+        async fn suspend_sandbox(
+            &self,
+            _request: Request<SuspendSandboxRequest>,
+        ) -> Result<tonic::Response<SuspendSandboxResponse>, Status> {
+            Ok(tonic::Response::new(SuspendSandboxResponse {}))
+        }
+
         async fn delete_sandbox(
             &self,
             _request: Request<DeleteSandboxRequest>,
@@ -8424,6 +9397,27 @@ mod tests {
         }
     }
 
+    #[tonic::async_trait]
+    impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for TestDriver {
+        async fn resolve_supervisor_app_endpoint(
+            &self,
+            _request: Request<
+                openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest,
+            >,
+        ) -> Result<
+            tonic::Response<
+                openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse,
+            >,
+            Status,
+        > {
+            match self.endpoint_resolution.clone() {
+                Some(Ok(response)) => Ok(tonic::Response::new(response)),
+                Some(Err(code)) => Err(Status::new(code, "endpoint lookup failed")),
+                None => Err(Status::unimplemented("endpoint resolution unsupported")),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn workspace_lifecycle_allows_legacy_driver_without_workspace_rpcs() {
         let runtime = test_runtime(Arc::new(TestDriver {
@@ -8434,6 +9428,75 @@ mod tests {
 
         runtime.ensure_workspace("legacy").await.unwrap();
         runtime.delete_workspace("legacy").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_endpoint_resolution_is_independent_of_sandbox_observation() {
+        use openshell_core::proto::compute::v1::{
+            ResolveSupervisorAppEndpointResponse, SupervisorAppEndpoint,
+        };
+        let endpoint = SupervisorAppEndpoint {
+            host: "10.0.0.7".into(),
+            port: 9443,
+            runtime_identity: "runtime-a".into(),
+            ..Default::default()
+        };
+        let sandbox = sandbox_record("sandbox", "demo", SandboxPhase::Ready);
+        let cases = [
+            (None, Ok(None)),
+            (Some(Err(Code::Unimplemented)), Ok(None)),
+            (Some(Err(Code::Unavailable)), Err(Code::Unavailable)),
+            (
+                Some(Ok(ResolveSupervisorAppEndpointResponse {
+                    sandbox_id: "sandbox".into(),
+                    supervisor_app_endpoint: None,
+                })),
+                Ok(None),
+            ),
+            (
+                Some(Ok(ResolveSupervisorAppEndpointResponse {
+                    sandbox_id: "other-sandbox".into(),
+                    supervisor_app_endpoint: Some(endpoint.clone()),
+                })),
+                Err(Code::FailedPrecondition),
+            ),
+            (
+                Some(Ok(ResolveSupervisorAppEndpointResponse {
+                    sandbox_id: "sandbox".into(),
+                    supervisor_app_endpoint: Some(endpoint.clone()),
+                })),
+                Ok(Some(endpoint)),
+            ),
+        ];
+        for (resolution, expected) in cases {
+            let driver = Arc::new(TestDriver {
+                endpoint_resolution: resolution,
+                current_sandboxes: vec![DriverSandbox {
+                    id: "sandbox".into(),
+                    name: "demo".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let runtime = test_runtime(driver.clone())
+                .await
+                .with_app_endpoint_resolver(Some(driver));
+            assert_eq!(
+                runtime
+                    .supervisor_app_endpoint(&sandbox)
+                    .await
+                    .map_err(|s| s.code()),
+                expected
+            );
+            // An unsupported, failed, or invalid endpoint lookup must never fail
+            // ordinary sandbox observation.
+            let observed = runtime
+                .get_driver_sandbox("sandbox", "demo")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.id, "sandbox");
+        }
     }
 
     #[derive(Clone)]
@@ -8491,6 +9554,12 @@ mod tests {
         start_generations: TestMutex<Vec<String>>,
         start_expected_runtime_identities: TestMutex<Vec<String>>,
         start_outcome: TestMutex<ControlledLifecycleOutcome>,
+        start_resume_requests: TestMutex<Vec<(bool, bool)>>,
+        suspend_started: Notify,
+        suspend_release: Semaphore,
+        suspend_blocked: AtomicBool,
+        suspend_calls: AtomicUsize,
+        suspend_outcome: TestMutex<ControlledLifecycleOutcome>,
         runtime_identity: TestMutex<String>,
         get_started: Notify,
         get_release: Semaphore,
@@ -8536,6 +9605,12 @@ mod tests {
                 start_generations: TestMutex::new(Vec::new()),
                 start_expected_runtime_identities: TestMutex::new(Vec::new()),
                 start_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
+                start_resume_requests: TestMutex::new(Vec::new()),
+                suspend_started: Notify::new(),
+                suspend_release: Semaphore::new(0),
+                suspend_blocked: AtomicBool::new(false),
+                suspend_calls: AtomicUsize::new(0),
+                suspend_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 runtime_identity: TestMutex::new(String::new()),
                 get_started: Notify::new(),
                 get_release: Semaphore::new(0),
@@ -8605,6 +9680,32 @@ mod tests {
                 .expect("start outcome lock poisoned") = outcome;
         }
 
+        fn set_suspend_outcome(&self, outcome: ControlledLifecycleOutcome) {
+            *self
+                .suspend_outcome
+                .lock()
+                .expect("suspend outcome lock poisoned") = outcome;
+        }
+
+        fn suspend_calls(&self) -> usize {
+            self.suspend_calls.load(Ordering::SeqCst)
+        }
+
+        /// `(resume, restart_if_restore_fails)` for every start request.
+        fn start_resume_requests(&self) -> Vec<(bool, bool)> {
+            self.start_resume_requests
+                .lock()
+                .expect("start resume requests lock poisoned")
+                .clone()
+        }
+
+        fn start_generations(&self) -> Vec<String> {
+            self.start_generations
+                .lock()
+                .expect("start generations lock poisoned")
+                .clone()
+        }
+
         fn set_runtime_identity(&self, runtime_identity: impl Into<String>) {
             *self
                 .runtime_identity
@@ -8669,6 +9770,9 @@ mod tests {
                 .expect("watch loop should still be receiving events");
         }
     }
+
+    #[tonic::async_trait]
+    impl openshell_core::compute::ComputeDriver for ControlledDriver {}
 
     #[tonic::async_trait]
     impl ComputeDriver for ControlledDriver {
@@ -8841,6 +9945,10 @@ mod tests {
             request: Request<StartSandboxRequest>,
         ) -> Result<tonic::Response<StartSandboxResponse>, Status> {
             let request = request.into_inner();
+            self.start_resume_requests
+                .lock()
+                .expect("start resume requests lock poisoned")
+                .push((request.resume, request.restart_if_restore_fails));
             self.start_requests
                 .lock()
                 .expect("start requests lock poisoned")
@@ -8880,6 +9988,29 @@ mod tests {
                         .expect("runtime identity lock poisoned")
                         .clone(),
                 })),
+                ControlledLifecycleOutcome::NotFound => Err(Status::not_found("sandbox not found")),
+                ControlledLifecycleOutcome::Error(message) => Err(Status::internal(message)),
+            }
+        }
+
+        async fn suspend_sandbox(
+            &self,
+            _request: Request<SuspendSandboxRequest>,
+        ) -> Result<tonic::Response<SuspendSandboxResponse>, Status> {
+            self.suspend_calls.fetch_add(1, Ordering::SeqCst);
+            self.suspend_started.notify_one();
+            if self.suspend_blocked.load(Ordering::SeqCst) {
+                self.suspend_release.acquire().await.unwrap().forget();
+            }
+            let outcome = self
+                .suspend_outcome
+                .lock()
+                .expect("suspend outcome lock poisoned")
+                .clone();
+            match outcome {
+                ControlledLifecycleOutcome::Ok => {
+                    Ok(tonic::Response::new(SuspendSandboxResponse {}))
+                }
                 ControlledLifecycleOutcome::NotFound => Err(Status::not_found("sandbox not found")),
                 ControlledLifecycleOutcome::Error(message) => Err(Status::internal(message)),
             }
@@ -8959,6 +10090,8 @@ mod tests {
         ComputeRuntime {
             isolation_backend: None,
             driver: TracedDriver::new(driver, "test-driver".to_string()),
+            image_update_driver: None,
+            app_endpoint_resolver: None,
             admission: openshell_core::resource_admission::DriverAdmissionConfig {
                 allow_driver_config: true,
                 ..Default::default()
@@ -8980,6 +10113,10 @@ mod tests {
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             image_preparation_timeout_seconds: 1800,
+            provisioning_repair_window_ms: 300_000,
+            sandbox_updates_enabled: false,
+            update_recovery_sweep: Arc::new(Semaphore::new(1)),
+            update_recovery_backoff: Arc::default(),
             store,
             sandbox_index: SandboxIndex::new(),
             sandbox_watch_bus: SandboxWatchBus::new(),
@@ -8992,8 +10129,10 @@ mod tests {
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
-            supervisor_ocsf_headers: Arc::new(OnceLock::new()),
+            supervisor_otlp_headers: Arc::new(OnceLock::new()),
+            supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
+            service_route_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -9249,6 +10388,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
+        assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn create_releases_its_mutation_guard_before_the_ssh_identity_step() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("test-runtime");
+        let mut runtime = test_runtime(driver.clone()).await;
+        let credentials = configure_test_ssh_credentials(&mut runtime);
+        let sandbox = sandbox_record(
+            "sb-guard-release",
+            "guard-release",
+            SandboxPhase::Provisioning,
+        );
+        let (entered, release) = credentials.gate_next_store();
+        let creating = {
+            let runtime = runtime.clone();
+            let sandbox = sandbox.clone();
+            tokio::spawn(async move {
+                runtime
+                    .create_sandbox_authenticated(
+                        sandbox.clone(),
+                        None,
+                        Some(test_launch_authentication(&sandbox)),
+                        false,
+                    )
+                    .await
+            })
+        };
+        entered.await.unwrap();
+
+        let guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.mutation_guard(MutationScope::sandbox("default", sandbox.object_id())),
+        )
+        .await
+        .expect("the SSH identity step must not hold the sandbox mutation guard")
+        .unwrap();
+        drop(guard);
+
+        release.send(()).unwrap();
+        let created = creating.await.unwrap().unwrap();
+        assert!(!created.host_key_fingerprint.is_empty());
         assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -11936,6 +13118,9 @@ mod tests {
         struct FailingDriver(TestDriver);
 
         #[tonic::async_trait]
+        impl openshell_core::compute::ComputeDriver for FailingDriver {}
+
+        #[tonic::async_trait]
         impl ComputeDriver for FailingDriver {
             async fn authenticate_sandbox(
                 &self,
@@ -12001,6 +13186,13 @@ mod tests {
                 request: Request<StartSandboxRequest>,
             ) -> Result<tonic::Response<StartSandboxResponse>, Status> {
                 self.0.start_sandbox(request).await
+            }
+
+            async fn suspend_sandbox(
+                &self,
+                request: Request<SuspendSandboxRequest>,
+            ) -> Result<tonic::Response<SuspendSandboxResponse>, Status> {
+                self.0.suspend_sandbox(request).await
             }
 
             async fn delete_sandbox(
@@ -12157,6 +13349,7 @@ mod tests {
                 provisioning_deadline::record_admission_start(
                     status.provisioning.as_mut().unwrap(),
                     openshell_core::time::now_ms(),
+                    runtime.provisioning_repair_window_ms,
                 )
                 .unwrap();
                 status.configuration_admission.as_mut().unwrap().state =
@@ -12790,17 +13983,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_bundles_carry_supervisor_ocsf_headers() {
+    async fn launch_bundles_carry_each_supervisor_exports_headers_and_tls() {
+        use openshell_core::jwt::SecretOtlpHeaders;
+
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
-        runtime.configure_supervisor_ocsf_headers(Some(
-            openshell_core::jwt::SecretOtlpHeaders::new(
-                "authorization=Bearer%20secret".to_string(),
-            ),
-        ));
+        let secret = |value: &str| Some(SecretOtlpHeaders::new(value.to_string()));
+        runtime.configure_supervisor_otlp_headers(crate::otel_tracing::SupervisorOtlpHeaders {
+            traces: secret("authorization=traces"),
+            ocsf: secret("authorization=Bearer%20secret"),
+            agent: secret("x-mlflow-experiment-id=0"),
+        });
+        runtime.configure_supervisor_otlp_tls(crate::otel_tracing::SupervisorOtlpTls {
+            materials: vec![openshell_core::jwt::OtlpTlsMaterial {
+                ca_pem: Some("agent-ca".to_string()),
+                ..Default::default()
+            }],
+            agent: Some(0),
+            ..Default::default()
+        });
         let sandbox = sandbox_record(
-            "sb-ocsf-headers",
-            "sandbox-ocsf-headers",
+            "sb-otlp-headers",
+            "sandbox-otlp-headers",
             SandboxPhase::Stopped,
         );
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -12817,13 +14021,32 @@ mod tests {
         let authentications = driver.start_authentications();
         let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
             serde_json::from_slice(&authentications[0]).unwrap();
-        assert_eq!(
-            authentication
-                .supervisor
-                .ocsf_otlp_headers
+        let exposed = |headers: &Option<SecretOtlpHeaders>| {
+            headers
                 .as_ref()
-                .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret),
-            Some("authorization=Bearer%20secret")
+                .map(SecretOtlpHeaders::expose_secret)
+                .map(str::to_string)
+        };
+        let bundle = &authentication.supervisor;
+        assert_eq!(
+            [
+                exposed(&bundle.traces_otlp_headers),
+                exposed(&bundle.ocsf_otlp_headers),
+                exposed(&bundle.agent_otlp_headers),
+            ],
+            [
+                Some("authorization=traces".to_string()),
+                Some("authorization=Bearer%20secret".to_string()),
+                Some("x-mlflow-experiment-id=0".to_string()),
+            ]
+        );
+        assert!(bundle.traces_otlp_tls.is_none() && bundle.ocsf_otlp_tls.is_none());
+        assert_eq!(
+            bundle
+                .agent_otlp()
+                .tls
+                .and_then(|tls| tls.ca_pem.as_deref()),
+            Some("agent-ca")
         );
     }
 
@@ -13181,6 +14404,129 @@ mod tests {
         );
     }
 
+    // Regression for #5258. The reconcile sweep polls the driver without
+    // waiting for a start, and a restarting workload still shows its previous
+    // exit until the driver starts it. The sweep skips a sandbox whose start
+    // holds the lifecycle gate; the settled state is reported afterwards.
+    // Another replica cannot see that gate, so it relies on the start's
+    // durable driver-operation claim.
+    #[tokio::test]
+    async fn reconcile_sweep_skips_a_sandbox_while_its_start_is_in_progress() {
+        for other_replica in [false, true] {
+            let driver = ControlledDriver::new();
+            driver.block_start();
+            let sandbox = sandbox_record(
+                "sb-start-reconcile",
+                "sandbox-start-reconcile",
+                SandboxPhase::Stopped,
+            );
+            let mut polled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            polled.status = Some(make_driver_status(make_driver_condition(
+                "ContainerExited",
+                "Container exited with code 0",
+            )));
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(polled.clone())));
+            let runtime = test_runtime(driver.clone()).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            let start_runtime = runtime.clone();
+            let sandbox_name = sandbox.object_name().to_string();
+            let start =
+                tokio::spawn(
+                    async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+                .await
+                .expect("start did not reach the driver");
+
+            let mut observer = runtime.clone();
+            if other_replica {
+                // Replicas share the store but not lifecycle gates.
+                observer.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
+            }
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                observer.reconcile_snapshot_sandbox(polled.clone(), i64::MAX),
+            )
+            .await
+            .expect("reconciliation must not wait for the start")
+            .unwrap();
+            let phase_during_start = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .phase();
+            assert_eq!(
+                phase_during_start,
+                SandboxPhase::Starting as i32,
+                "other_replica={other_replica}"
+            );
+
+            driver.release_start();
+            start.await.unwrap().unwrap();
+
+            // Once the start settles, a genuine exit of the restarted
+            // workload still surfaces through the sweep.
+            observer
+                .reconcile_snapshot_sandbox(polled, i64::MAX)
+                .await
+                .unwrap();
+            let settled = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !provisioning_deadline::driver_operation_pending(&settled),
+                "other_replica={other_replica}"
+            );
+            assert_eq!(
+                settled.phase(),
+                SandboxPhase::Error as i32,
+                "other_replica={other_replica}"
+            );
+        }
+    }
+
+    // A start writes `Starting` before it records its driver-operation claim.
+    // In between, only the local lifecycle gate defers this replica's sweep.
+    #[tokio::test]
+    async fn reconcile_sweep_skips_a_starting_sandbox_whose_gate_is_held_before_its_claim() {
+        let driver = ControlledDriver::new();
+        let sandbox = sandbox_record(
+            "sb-start-gate",
+            "sandbox-start-gate",
+            SandboxPhase::Starting,
+        );
+        let mut polled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        polled.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "Container exited with code 0",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(polled.clone())));
+        let runtime = test_runtime(driver).await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let gate = runtime.lifecycle_gates.lock_for(sandbox.object_id()).await;
+        runtime
+            .reconcile_snapshot_sandbox(polled, i64::MAX)
+            .await
+            .unwrap();
+        drop(gate);
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!provisioning_deadline::driver_operation_pending(&stored));
+        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+    }
+
     #[tokio::test]
     async fn live_container_exit_during_start_still_transitions_to_error() {
         for reason in [
@@ -13411,8 +14757,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_bootstrap_snapshot_waits_for_stop_and_revalidates() {
+        let sandbox = sandbox_record("sb-stop-race", "sandbox-stop-race", SandboxPhase::Ready);
+        let mut stopped = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopped.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "container stopped by request",
+        )));
+        let mut bootstrapping = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        let mut status = make_driver_status(make_driver_condition(
+            "DependenciesNotReady",
+            "old bootstrap snapshot queued before stop",
+        ));
+        status.conditions.push(DriverCondition {
+            r#type: "Bootstrapping".to_string(),
+            status: "True".to_string(),
+            reason: "GenerationStarting".to_string(),
+            ..Default::default()
+        });
+        bootstrapping.status = Some(status);
+
+        for (observation, outcome) in [
+            (
+                "stopped",
+                ControlledGetOutcome::Sandbox(Box::new(stopped.clone())),
+            ),
+            ("missing", ControlledGetOutcome::Missing),
+            (
+                "unavailable",
+                ControlledGetOutcome::Error("driver unavailable"),
+            ),
+            (
+                "wrong sandbox",
+                ControlledGetOutcome::Sandbox(Box::new(DriverSandbox {
+                    id: "other-sandbox".to_string(),
+                    ..stopped.clone()
+                })),
+            ),
+            (
+                "missing status",
+                ControlledGetOutcome::Sandbox(Box::new(DriverSandbox {
+                    status: None,
+                    ..stopped.clone()
+                })),
+            ),
+        ] {
+            let driver = ControlledDriver::new();
+            driver.block_stop();
+            driver.set_get_outcome(outcome);
+            let runtime = test_runtime(driver.clone()).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            let stop_runtime = runtime.clone();
+            let sandbox_name = sandbox.object_name().to_string();
+            let stop =
+                tokio::spawn(
+                    async move { stop_runtime.stop_sandbox("default", &sandbox_name).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), driver.stop_started.notified())
+                .await
+                .expect("stop did not reach the driver");
+            runtime.apply_sandbox_update(stopped.clone()).await.unwrap();
+
+            let gate = runtime.lifecycle_gates.gate_for(sandbox.object_id());
+            let update_runtime = runtime.clone();
+            let stale_bootstrap = bootstrapping.clone();
+            let update =
+                tokio::spawn(
+                    async move { update_runtime.apply_sandbox_update(stale_bootstrap).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while Arc::strong_count(&gate) < 3 {
+                    assert!(
+                        !update.is_finished(),
+                        "{observation}: queued bootstrap must wait for the active stop"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bootstrap update did not wait on the lifecycle gate");
+
+            driver.release_stop();
+            stop.await.unwrap().unwrap();
+            update.await.unwrap().unwrap();
+            let current = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                current.phase(),
+                SandboxPhase::Stopped as i32,
+                "{observation}: stale bootstrap must not revive the stopped sandbox"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn active_bootstrap_snapshot_recovers_stale_stopped_view() {
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
         let sandbox = sandbox_record("sb-restart", "sandbox-restart", SandboxPhase::Stopped);
         runtime.store.put_message(&sandbox).await.unwrap();
         let mut bootstrapping = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
@@ -13429,6 +14875,9 @@ mod tests {
         });
         bootstrapping.status = Some(status);
 
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            bootstrapping.clone(),
+        )));
         runtime.apply_sandbox_update(bootstrapping).await.unwrap();
 
         let current = runtime
@@ -13438,6 +14887,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.phase(), SandboxPhase::Provisioning as i32);
+    }
+
+    // Gateway side of the Kubernetes stop contract. While a stop holds its
+    // bootstrap annotations, the driver withdraws readiness and reports
+    // neither Bootstrapping nor Suspended. Such a snapshot keeps the stop in
+    // Stopping, never Provisioning or Error, and cannot revive the sandbox
+    // after the stop settles. This passes without the #5195 fix; the driver
+    // test stop_snapshot_does_not_report_a_starting_generation covers the
+    // regression.
+    #[tokio::test]
+    async fn kubernetes_stop_snapshots_settle_without_reviving_the_sandbox() {
+        for session_connected in [false, true] {
+            let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+            let sandbox = sandbox_record("sb-stopping", "sandbox-stopping", SandboxPhase::Stopping);
+            runtime.store.put_message(&sandbox).await.unwrap();
+            if session_connected {
+                register_test_supervisor_session(&runtime, sandbox.object_id());
+            }
+
+            let mut in_flight = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            in_flight.status = Some(make_driver_status(make_driver_condition(
+                "DependenciesNotReady",
+                "sandbox-runtime enforcement dependencies are not ready",
+            )));
+            let mut settled_status = make_driver_status(make_driver_condition(
+                "SandboxSuspended",
+                "Sandbox is suspended",
+            ));
+            settled_status.conditions.push(DriverCondition {
+                r#type: "Suspended".to_string(),
+                status: "True".to_string(),
+                reason: "PodTerminated".to_string(),
+                message: "Pod terminated".to_string(),
+                transition_time: None,
+            });
+            let mut settled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            settled.status = Some(settled_status);
+
+            for (step, snapshot, expected) in [
+                ("in-flight stop", &in_flight, SandboxPhase::Stopping),
+                ("completed stop", &settled, SandboxPhase::Stopped),
+                ("late in-flight stop", &in_flight, SandboxPhase::Stopped),
+            ] {
+                runtime
+                    .apply_sandbox_update(snapshot.clone())
+                    .await
+                    .unwrap();
+                let current = runtime
+                    .store
+                    .get_message::<Sandbox>(sandbox.object_id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    current.phase(),
+                    expected as i32,
+                    "{step} (session_connected={session_connected})"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -14371,6 +15880,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_tombstones_sandbox_log_and_event_buses() {
+        // #5402: cleanup frees the sandbox's log and platform-event buffers.
+        // Resetting the cursor space (`remove`) lets a late publisher re-create
+        // both, and nothing ever frees them again. The delete path must leave a
+        // terminal tombstone in the shared allocator instead.
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let log_line = |message: &str| openshell_core::proto::SandboxLogLine {
+            sandbox_id: "sb-1".to_string(),
+            event_time: openshell_core::time::timestamp_from_millis(1_000).ok(),
+            level: "INFO".to_string(),
+            target: "delete-tombstone".to_string(),
+            message: message.to_string(),
+            source: "sandbox".to_string(),
+            fields: HashMap::new(),
+        };
+        let platform_event = |message: &str| openshell_core::proto::SandboxStreamEvent {
+            payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Event(
+                PlatformEvent {
+                    source: "test".to_string(),
+                    reason: "Delete".to_string(),
+                    message: message.to_string(),
+                    ..Default::default()
+                },
+            )),
+            cursor: String::new(),
+        };
+
+        // Both buses hold buffers before the delete, so cleanup has memory to
+        // reclaim and the assertions below observe a real transition.
+        runtime
+            .tracing_log_bus
+            .publish_external(log_line("before delete"));
+        runtime
+            .tracing_log_bus
+            .platform_event_bus
+            .publish("sb-1", platform_event("before delete"));
+        assert_eq!(runtime.tracing_log_bus.tail("sb-1", 10).len(), 1);
+        assert_eq!(
+            runtime
+                .tracing_log_bus
+                .platform_event_bus
+                .tail("sb-1", 10)
+                .len(),
+            1
+        );
+
+        // The real delete: request, driver acknowledgement, then the Deleted
+        // watch event that owns gateway-side cleanup.
+        runtime
+            .delete_sandbox("default", "sandbox-a")
+            .await
+            .expect("the delete request is accepted");
+        runtime
+            .apply_deleted("sb-1")
+            .await
+            .expect("the deleted watch event completes cleanup");
+
+        assert!(
+            runtime.tracing_log_bus.is_closed("sb-1"),
+            "delete cleanup must tombstone the sandbox's cursor space, not reset it"
+        );
+        assert!(runtime.tracing_log_bus.tail("sb-1", 10).is_empty());
+        assert!(
+            runtime
+                .tracing_log_bus
+                .platform_event_bus
+                .tail("sb-1", 10)
+                .is_empty()
+        );
+
+        // Late publishers: an open PushSandboxLogs stream, a driver event
+        // queued behind the Deleted event, and the gateway tracing layer.
+        runtime
+            .tracing_log_bus
+            .publish_external(log_line("after delete"));
+        runtime
+            .tracing_log_bus
+            .platform_event_bus
+            .publish("sb-1", platform_event("after delete"));
+
+        assert!(
+            runtime.tracing_log_bus.tail("sb-1", 10).is_empty(),
+            "a late log publish must not re-create the buffers cleanup freed"
+        );
+        assert!(
+            runtime
+                .tracing_log_bus
+                .platform_event_bus
+                .tail("sb-1", 10)
+                .is_empty(),
+            "a late platform event must not re-create the buffers cleanup freed"
+        );
+        assert!(runtime.tracing_log_bus.is_closed("sb-1"));
+    }
+
+    #[tokio::test]
     async fn apply_deleted_releases_driver_resources_for_out_of_band_removal() {
         // Regression test for #2352: a container removed without going
         // through OpenShell's own DeleteSandbox (e.g. `podman rm -f`) must
@@ -14493,7 +16101,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            runtime.reconcile_store_with_backend(Duration::ZERO),
+            Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO)),
         )
         .await
         .expect("prune sweep blocked on the stuck driver delete call")
@@ -14985,6 +16593,49 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+        stop_watch_loop(shutdown_tx, watch_handle).await;
+    }
+
+    // The sweep's start probe must not hold the lifecycle gate across the
+    // driver poll, or a Deleted watch for a `Starting` sandbox could not
+    // dispatch driver cleanup.
+    #[tokio::test]
+    async fn deleted_watch_during_sweep_poll_of_starting_sandbox_dispatches_cleanup() {
+        let driver = ControlledDriver::new();
+        driver.block_get();
+        driver.set_get_outcome(ControlledGetOutcome::Missing);
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-a", "sandbox-a", SandboxPhase::Starting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let (shutdown_tx, watch_handle) = start_watch_loop(&runtime, &driver).await;
+        let mut deleted_rx = runtime.sandbox_watch_bus.subscribe("sb-a");
+        let reconcile_runtime = runtime.clone();
+        let snapshot = ready_driver_sandbox("sb-a", "sandbox-a");
+        let reconcile = tokio::spawn(async move {
+            reconcile_runtime
+                .reconcile_snapshot_sandbox(snapshot, i64::MAX)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.get_started.notified())
+            .await
+            .expect("reconciliation did not reach the driver lookup");
+
+        driver.send_event(deleted_watch_event("sb-a"));
+        tokio::time::timeout(Duration::from_secs(1), deleted_rx.recv())
+            .await
+            .expect("watch event was blocked by reconciliation lookup")
+            .expect("sandbox watch bus closed before notification");
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("the sweep must not suppress deletion-watch driver cleanup");
+        driver.release_get();
+        tokio::time::timeout(Duration::from_secs(1), reconcile)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(driver.delete_calls(), 1);
         stop_watch_loop(shutdown_tx, watch_handle).await;
     }
 
@@ -15879,6 +17530,70 @@ mod tests {
         assert!(stored.spec.as_ref().is_some_and(|spec| {
             openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref())
         }));
+    }
+
+    /// Another replica can write a deleting sandbox while the watch deletion
+    /// removes it, e.g. when the supervisor session ends. The removal must
+    /// retry, not wait for the orphan grace period.
+    #[tokio::test]
+    async fn watch_deletion_retries_after_concurrent_replica_write() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
+        let pool = sqlx::SqlitePool::connect(&database_url)
+            .await
+            .expect("connect conflict injector");
+        sqlx::query("CREATE TABLE injected_conflicts (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create conflict marker table");
+        // Another replica writes the sandbox between the removal's version
+        // check and its delete, once.
+        sqlx::query(
+            "CREATE TRIGGER inject_replica_write \
+             AFTER DELETE ON objects \
+             WHEN OLD.object_type = 'sandbox_settings' \
+               AND NOT EXISTS (SELECT 1 FROM injected_conflicts) \
+             BEGIN \
+               INSERT INTO injected_conflicts (id) VALUES (OLD.id); \
+               UPDATE objects SET resource_version = resource_version + 1 \
+                 WHERE object_type = 'sandbox' AND id = 'sb-race'; \
+             END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install conflict trigger");
+
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.store = store;
+        let sandbox = sandbox_record("sb-race", "race", SandboxPhase::Deleting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_owned_records(&runtime, &sandbox).await;
+
+        runtime.apply_deleted("sb-race").await.unwrap();
+
+        let injected = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM injected_conflicts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(injected, 1, "the removal must hit the injected write");
+        pool.close().await;
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-race")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while driver.delete_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the successful retry must reclaim driver-owned resources");
     }
 
     /// Driver watch events arrive on a background stream, so the store writes
@@ -16911,10 +18626,11 @@ mod tests {
     async fn remote_compute_driver_interceptor_propagates_every_rpc() {
         use crate::otel_tracing::test_exporter;
         use crate::test_support::FakeComputeDriver;
+        use openshell_core::compute::ComputeDriver as _;
 
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("compute-driver.sock");
-        let driver = FakeComputeDriver::new();
+        let driver = FakeComputeDriver::new().with_sandbox_image_updates();
         let _server = driver.serve_uds(&socket_path).unwrap();
         let endpoint = connect_remote_compute_driver("external-test", &socket_path)
             .await
@@ -16953,6 +18669,16 @@ mod tests {
                 }))
                 .await
                 .unwrap();
+            let error = remote
+                .resolve_supervisor_app_endpoint(Request::new(
+                    openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest {
+                        sandbox_id: sandbox.id.clone(),
+                        name: sandbox.name.clone(),
+                    },
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::Unimplemented);
             remote
                 .list_sandboxes(Request::new(ListSandboxesRequest {}))
                 .await
@@ -16966,6 +18692,21 @@ mod tests {
                 .unwrap();
             remote
                 .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+                .await
+                .unwrap();
+            remote
+                .update_sandbox_configuration(Request::new(
+                    openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest {
+                        preconditions: Some(
+                            openshell_core::proto::compute::v1::SandboxUpdatePreconditions {
+                                sandbox_id: sandbox.id.clone(),
+                                image: "example/workload:v2".into(),
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    },
+                ))
                 .await
                 .unwrap();
             remote
@@ -16985,7 +18726,7 @@ mod tests {
         let traceparents = driver.traceparents();
         assert_eq!(
             traceparents.len(),
-            10,
+            13,
             "the client interceptor should cover every RPC"
         );
         assert!(
@@ -17467,11 +19208,31 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         ));
 
         driver.clear_calls();
-        runtime.start_persisted_sandboxes().await.unwrap();
+        runtime
+            .start_persisted_sandboxes_with_authentication(
+                |_| async { Ok(b"test-launch-authentication".to_vec()) },
+                |_| async { Ok(()) },
+                |_| {},
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             driver.calls().as_slice(),
-            [FakeComputeDriverCall::GetCapabilities, FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name, .. }]
-                if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
+            [
+                FakeComputeDriverCall::GetCapabilities,
+                FakeComputeDriverCall::StartSandbox {
+                    sandbox_id,
+                    sandbox_name,
+                    launch_authentication,
+                    sandbox: Some(durable),
+                    ..
+                },
+            ]
+                if sandbox_id == "sb-uds"
+                    && sandbox_name == "uds-sandbox"
+                    && !launch_authentication.is_empty()
+                    && durable.id == "sb-uds"
+                    && durable.name == "uds-sandbox"
         ));
         driver.clear_calls();
         assert!(
@@ -17494,6 +19255,44 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             }
             other => panic!("expected DeleteSandbox call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn start_sandbox_request_uses_optional_wire_field_nine_for_durable_snapshot() {
+        let legacy = StartSandboxRequest {
+            sandbox_id: "sandbox-id".into(),
+            name: "sandbox-name".into(),
+            launch_authentication: b"opaque-auth".to_vec(),
+            generation_id: "generation-id".into(),
+            expected_runtime_identity: String::new(),
+            isolation_backend: None,
+            resume: false,
+            restart_if_restore_fails: false,
+            sandbox: None,
+        };
+        let with_snapshot = StartSandboxRequest {
+            sandbox: Some(DriverSandbox {
+                id: "sandbox-id".into(),
+                name: "sandbox-name".into(),
+                ..Default::default()
+            }),
+            ..legacy.clone()
+        };
+        let legacy_wire = legacy.encode_to_vec();
+        let snapshot_wire = with_snapshot.encode_to_vec();
+        // Field 9 is length-delimited, hence its protobuf key is 0x4a. The
+        // legacy form does not emit it, preserving existing fields 1–8
+        // (fields 7 and 8 are the upstream suspend/resume controls).
+        assert!(!legacy_wire.contains(&0x4a));
+        assert!(snapshot_wire.contains(&0x4a));
+        assert_eq!(
+            StartSandboxRequest::decode(snapshot_wire.as_slice())
+                .unwrap()
+                .sandbox
+                .as_ref()
+                .map(|sandbox| sandbox.id.as_str()),
+            Some("sandbox-id")
+        );
     }
 
     #[tokio::test]
@@ -17538,10 +19337,173 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                 .await
                 .is_err()
         );
+        let status = openshell_core::compute::ComputeDriver::update_sandbox_configuration(
+            &remote,
+            Request::new(
+                openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest::default(),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status.code(), Code::FailedPrecondition);
         assert_eq!(
             driver.calls(),
-            vec![FakeComputeDriverCall::GetCapabilities; 3]
+            vec![FakeComputeDriverCall::GetCapabilities; 4]
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remote_compute_driver_negotiates_optional_image_service() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+        use openshell_core::GetResourceVersion as _;
+        use openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION;
+
+        for supported in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket_path = dir.path().join("image-updates.sock");
+            let driver = FakeComputeDriver::new();
+            let driver = if supported {
+                driver.with_sandbox_image_updates()
+            } else {
+                driver
+            };
+            let _server = driver.serve_uds(&socket_path).unwrap();
+            let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+                .await
+                .unwrap();
+            let store = Arc::new(crate::persistence::test_store().await);
+            crate::ensure_default_workspace(&store).await.unwrap();
+            let mut runtime = ComputeRuntime::new_remote_driver(
+                endpoint,
+                store.clone(),
+                SandboxIndex::new(),
+                SandboxWatchBus::new(),
+                TracingLogBus::new(),
+                Arc::new(SupervisorSessionRegistry::new()),
+            )
+            .await
+            .unwrap();
+            runtime.sandbox_updates_enabled = true;
+            assert!(
+                !runtime
+                    .driver_info
+                    .negotiated_extension
+                    .supported_capabilities
+                    .iter()
+                    .any(|capability| capability
+                        == openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND),
+                "image-only updates do not require external isolation registration"
+            );
+            assert_eq!(
+                runtime
+                    .driver_info
+                    .negotiated_extension
+                    .supported_capabilities
+                    .iter()
+                    .any(|capability| capability == COMPUTE_UPDATE_SANDBOX_CONFIGURATION),
+                supported,
+            );
+            let mut sandbox = sandbox_record("sb-image", "image-sandbox", SandboxPhase::Stopped);
+            sandbox.metadata.as_mut().unwrap().annotations.insert(
+                COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
+                "stable-runtime".into(),
+            );
+            sandbox.spec = Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "example/workload:v1".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            store.put_message(&sandbox).await.unwrap();
+            let sandbox = store
+                .get_message::<Sandbox>("sb-image")
+                .await
+                .unwrap()
+                .unwrap();
+            driver.clear_calls();
+            let result = runtime
+                .update_sandbox_image(
+                    "sb-image",
+                    "example/workload:v2".into(),
+                    sandbox.get_resource_version(),
+                )
+                .await;
+            let requests = driver
+                .calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    FakeComputeDriverCall::UpdateSandboxImage { request } => Some(request),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if supported {
+                let updated = result.unwrap();
+                assert_eq!(
+                    updated.spec.unwrap().template.unwrap().image,
+                    "example/workload:v2"
+                );
+                assert_eq!(
+                    requests.len(),
+                    2,
+                    "preflight and mutation use the optional service"
+                );
+                assert!(requests[0].validate_only);
+                assert!(!requests[1].validate_only);
+                for request in &requests {
+                    assert_eq!(request.sandbox_id, "sb-image");
+                    assert_eq!(request.expected_runtime_identity, "stable-runtime");
+                    assert_eq!(request.expected_image, "example/workload:v1");
+                    assert_eq!(request.image, "example/workload:v2");
+                }
+                assert_eq!(requests[0].operation_id, requests[1].operation_id);
+            } else {
+                assert_eq!(result.unwrap_err().code(), Code::Unimplemented);
+                assert!(
+                    requests.is_empty(),
+                    "capability admission must precede extension calls"
+                );
+                let unchanged = store
+                    .get_message::<Sandbox>("sb-image")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(unchanged, sandbox);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_driver_defaults_image_updates_to_unimplemented() {
+        // NoopTestDriver implements only the baseline generated trait.
+        let mut runtime = test_runtime(Arc::new(NoopTestDriver::default()))
+            .await
+            .with_sandbox_updates(true);
+        runtime
+            .driver_info
+            .negotiated_extension
+            .supported_capabilities
+            .push(openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION.into());
+        let mut sandbox = sandbox_record(
+            "unsupported-update",
+            "unsupported-update",
+            SandboxPhase::Stopped,
+        );
+        sandbox.spec = Some(SandboxSpec {
+            template: Some(SandboxTemplate {
+                image: "example/workload:v1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let error = runtime
+            .update_sandbox_image("unsupported-update", "example/workload:v2".into(), 1)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Unimplemented);
+        assert!(runtime.image_update_driver.is_none());
     }
 
     #[tokio::test]
@@ -17862,7 +19824,10 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
     async fn seed_provisioning_attempt(runtime: &ComputeRuntime) -> Sandbox {
         let mut sandbox = sandbox_record("sb-ttl", "sandbox-ttl", SandboxPhase::Provisioning);
         let status = sandbox.status.as_mut().unwrap();
-        status.provisioning = Some(provisioning_deadline::new_record(0));
+        status.provisioning = Some(provisioning_deadline::new_record(
+            0,
+            runtime.provisioning_repair_window_ms,
+        ));
         status.configuration_activated = Some(false);
         status.configuration_admission =
             Some(openshell_core::proto::SandboxConfigurationAdmission {
@@ -17949,9 +19914,12 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                 "result-owner",
                 SandboxPhase::Provisioning,
             );
-            sandbox.status.as_mut().unwrap().provisioning = Some(
-                provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 1800),
-            );
+            sandbox.status.as_mut().unwrap().provisioning =
+                Some(provisioning_deadline::new_preparation_record(
+                    openshell_core::time::now_ms(),
+                    1800,
+                    300_000,
+                ));
             let creating = runtime.clone();
             let create =
                 tokio::spawn(async move { creating.create_sandbox(sandbox, None, false).await });
@@ -18043,8 +20011,9 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         other.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
         let now = openshell_core::time::now_ms();
         let mut sandbox = sandbox_record("sb-stop-lease", "stop-lease", SandboxPhase::Provisioning);
-        sandbox.status.as_mut().unwrap().provisioning =
-            Some(provisioning_deadline::new_preparation_record(now, 1));
+        sandbox.status.as_mut().unwrap().provisioning = Some(
+            provisioning_deadline::new_preparation_record(now, 1, 300_000),
+        );
         let creating = runtime.clone();
         let create =
             tokio::spawn(async move { creating.create_sandbox(sandbox, None, false).await });
@@ -18141,6 +20110,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         status.provisioning = Some(provisioning_deadline::new_preparation_record(
             openshell_core::time::now_ms(),
             1800,
+            300_000,
         ));
         let creating = runtime.clone();
         let create =
@@ -18247,6 +20217,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         status.main_process_instance_id = "instance-1".into();
         status.provisioning = Some(provisioning_deadline::new_record(
             openshell_core::time::now_ms(),
+            300_000,
         ));
         let old_generation = sandbox_runtime_generation(&sandbox).unwrap();
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -18361,8 +20332,11 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
         let mut previous = sandbox_record("sb-start-owner", "start-owner", SandboxPhase::Stopped);
-        let mut record =
-            provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 1800);
+        let mut record = provisioning_deadline::new_preparation_record(
+            openshell_core::time::now_ms(),
+            1800,
+            300_000,
+        );
         record.driver_operation_id = "old-operation".into();
         previous.status.as_mut().unwrap().provisioning = Some(record);
         runtime.store.put_message(&previous).await.unwrap();
@@ -18433,7 +20407,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                 SandboxPhase::Provisioning,
             );
             sandbox.status.as_mut().unwrap().provisioning = Some(
-                provisioning_deadline::new_record(openshell_core::time::now_ms()),
+                provisioning_deadline::new_record(openshell_core::time::now_ms(), 300_000),
             );
             runtime.store.put_message(&sandbox).await.unwrap();
             let owned = runtime
@@ -18512,6 +20486,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         status.main_process_instance_id = "instance-1".into();
         status.provisioning = Some(provisioning_deadline::new_record(
             openshell_core::time::now_ms(),
+            300_000,
         ));
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime
@@ -18572,8 +20547,9 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let pool = sqlx::SqlitePool::connect(&database_url).await.unwrap();
         let now = openshell_core::time::now_ms();
         let mut sandbox = sandbox_record("sb-monitor", "monitor", SandboxPhase::Provisioning);
-        sandbox.status.as_mut().unwrap().provisioning =
-            Some(provisioning_deadline::new_preparation_record(now, 60));
+        sandbox.status.as_mut().unwrap().provisioning = Some(
+            provisioning_deadline::new_preparation_record(now, 60, 300_000),
+        );
         let creating = runtime.clone();
         let create =
             tokio::spawn(async move { creating.create_sandbox(sandbox, None, false).await });
@@ -18625,8 +20601,9 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let mut runtime = test_runtime(driver.clone()).await;
         let now = openshell_core::time::now_ms();
         let mut sandbox = sandbox_record("sb-owned", "owned", SandboxPhase::Provisioning);
-        sandbox.status.as_mut().unwrap().provisioning =
-            Some(provisioning_deadline::new_preparation_record(now, 60));
+        sandbox.status.as_mut().unwrap().provisioning = Some(
+            provisioning_deadline::new_preparation_record(now, 60, 300_000),
+        );
         let root = tempfile::tempdir().unwrap();
         let upload = stage_create_test_upload(&mut runtime, &mut sandbox, root.path());
         let creating = runtime.clone();
@@ -18705,9 +20682,12 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
         let mut runtime = test_runtime(driver).await;
         let mut sandbox = sandbox_record("sb-rejected", "rejected", SandboxPhase::Provisioning);
-        sandbox.status.as_mut().unwrap().provisioning = Some(
-            provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 60),
-        );
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(provisioning_deadline::new_preparation_record(
+                openshell_core::time::now_ms(),
+                60,
+                300_000,
+            ));
         let root = tempfile::tempdir().unwrap();
         let upload = stage_create_test_upload(&mut runtime, &mut sandbox, root.path());
         let error = runtime
@@ -18785,9 +20765,12 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         runtime.store = Arc::new(Store::connect(&database_url).await.unwrap());
         let pool = sqlx::SqlitePool::connect(&database_url).await.unwrap();
         let mut sandbox = sandbox_record("sb-settlement", "settlement", SandboxPhase::Provisioning);
-        sandbox.status.as_mut().unwrap().provisioning = Some(
-            provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 60),
-        );
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(provisioning_deadline::new_preparation_record(
+                openshell_core::time::now_ms(),
+                60,
+                300_000,
+            ));
         let creating = runtime.clone();
         let create =
             tokio::spawn(async move { creating.create_sandbox(sandbox, None, false).await });
@@ -18845,7 +20828,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         driver.block_create();
         let mut runtime = test_runtime(driver.clone()).await;
         let now = openshell_core::time::now_ms();
-        let preparation = provisioning_deadline::new_preparation_record(now, 1);
+        let preparation = provisioning_deadline::new_preparation_record(now, 1, 300_000);
         let mut sandbox = sandbox_record("sb-create-ttl", "create-ttl", SandboxPhase::Provisioning);
         sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
         let upload_root = tempfile::tempdir().unwrap();
@@ -18977,8 +20960,9 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             "compensation-ttl",
             SandboxPhase::Provisioning,
         );
-        sandbox.status.as_mut().unwrap().provisioning =
-            Some(provisioning_deadline::new_preparation_record(now, 1));
+        sandbox.status.as_mut().unwrap().provisioning = Some(
+            provisioning_deadline::new_preparation_record(now, 1, 300_000),
+        );
         runtime.store.put_message(&sandbox).await.unwrap();
         let stale = runtime
             .store
@@ -19027,8 +21011,9 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             "create-retry",
             SandboxPhase::Provisioning,
         );
-        sandbox.status.as_mut().unwrap().provisioning =
-            Some(provisioning_deadline::new_preparation_record(now, 1));
+        sandbox.status.as_mut().unwrap().provisioning = Some(
+            provisioning_deadline::new_preparation_record(now, 1, 300_000),
+        );
         let original_attempt = sandbox_provisioning_attempt_id(&sandbox)
             .unwrap()
             .to_owned();
@@ -19182,9 +21167,12 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
     async fn failed_create_cleanup_preserves_retry_after_cas_conflict() {
         let runtime = test_runtime(ControlledDriver::new()).await;
         let mut sandbox = sandbox_record("sb-retry-cas", "retry-cas", SandboxPhase::Provisioning);
-        sandbox.status.as_mut().unwrap().provisioning = Some(
-            provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 1),
-        );
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(provisioning_deadline::new_preparation_record(
+                openshell_core::time::now_ms(),
+                1,
+                300_000,
+            ));
         runtime.store.put_message(&sandbox).await.unwrap();
         let stale = runtime
             .store
@@ -19204,6 +21192,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                         "Starting",
                         "Sandbox start requested",
                         runtime.image_preparation_timeout_seconds,
+                        runtime.provisioning_repair_window_ms,
                     );
                 },
             )
@@ -19235,9 +21224,12 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             "binding-retry",
             SandboxPhase::Provisioning,
         );
-        sandbox.status.as_mut().unwrap().provisioning = Some(
-            provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 1),
-        );
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(provisioning_deadline::new_preparation_record(
+                openshell_core::time::now_ms(),
+                1,
+                300_000,
+            ));
         runtime.store.put_message(&sandbox).await.unwrap();
         let stale = runtime
             .store
@@ -19257,6 +21249,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                         "Starting",
                         "Sandbox start requested",
                         runtime.image_preparation_timeout_seconds,
+                        runtime.provisioning_repair_window_ms,
                     );
                     current.set_phase(SandboxPhase::Ready.into());
                     set_compute_runtime_binding(current, "retry-runtime");
@@ -19307,7 +21300,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             let mut runtime = test_runtime(driver.clone()).await;
             runtime.driver_info.supports_sandbox_authentication = true;
             let now = openshell_core::time::now_ms();
-            let preparation = provisioning_deadline::new_preparation_record(now, 1);
+            let preparation = provisioning_deadline::new_preparation_record(now, 1, 300_000);
             let mut sandbox =
                 sandbox_record("sb-late-create", "late-create", SandboxPhase::Provisioning);
             sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
@@ -19380,15 +21373,13 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         driver.block_start();
         let runtime = test_runtime(driver.clone()).await;
         let now = openshell_core::time::now_ms();
-        let preparation = provisioning_deadline::new_preparation_record(now, 1800);
+        let preparation = provisioning_deadline::new_preparation_record(now, 1800, 300_000);
         let mut sandbox = sandbox_record("sb-recovery-ttl", "recovery-ttl", SandboxPhase::Starting);
         sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
         runtime.store.put_message(&sandbox).await.unwrap();
         let recovered_runtime = runtime.clone();
         let mut recovery = tokio::spawn(async move {
-            recovered_runtime
-                .recover_persisted_lifecycle_transitions()
-                .await
+            Box::pin(recovered_runtime.recover_persisted_lifecycle_transitions()).await
         });
         tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
             .await
@@ -19465,8 +21456,9 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
         let mut sandbox = sandbox_record("sb-prepare", "prepare", SandboxPhase::Provisioning);
-        sandbox.status.as_mut().unwrap().provisioning =
-            Some(provisioning_deadline::new_preparation_record(0, 1800));
+        sandbox.status.as_mut().unwrap().provisioning = Some(
+            provisioning_deadline::new_preparation_record(0, 1800, 300_000),
+        );
         runtime.store.put_message(&sandbox).await.unwrap();
         let sandbox = runtime
             .store
@@ -19536,29 +21528,30 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
     #[tokio::test]
     async fn provisioning_timeout_persists_error_before_cleanup_and_preserves_record() {
         let driver = ControlledDriver::new();
-        let runtime = test_runtime(driver.clone()).await;
+        let runtime = test_runtime(driver.clone())
+            .await
+            .with_provisioning_repair_window_seconds(900)
+            .unwrap();
         let sandbox = seed_provisioning_attempt(&runtime).await;
         let gate = runtime.lifecycle_gates.lock_for("sb-ttl").await;
         let sandbox_guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
         assert!(
             runtime
-                .claim_provisioning_timeout(&sandbox, 299_999)
+                .claim_provisioning_timeout(&sandbox, 899_999)
                 .await
                 .unwrap()
                 .is_none()
         );
         let expired = runtime
-            .claim_provisioning_timeout(&sandbox, 300_000)
+            .claim_provisioning_timeout(&sandbox, 900_000)
             .await
             .unwrap()
             .unwrap();
         drop(sandbox_guard);
         assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
-        assert!(
-            ready_condition(&expired)
-                .unwrap()
-                .message
-                .contains("Provider requires an inspected endpoint")
+        assert_eq!(
+            ready_condition(&expired).unwrap().message,
+            "Provisioning repair window expired: Provider requires an inspected endpoint"
         );
         assert_eq!(driver.stop_calls(), 0);
         runtime
@@ -20051,10 +22044,15 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let now = openshell_core::time::now_ms();
         let mut sandbox = sandbox_record("sb-reset", "reset", SandboxPhase::Provisioning);
         sandbox.status.as_mut().unwrap().provisioning =
-            Some(provisioning_deadline::new_record(now - 100_000));
-        provisioning_deadline::refresh_configuration(&runtime.store, &mut sandbox, now - 100_000)
-            .await
-            .unwrap();
+            Some(provisioning_deadline::new_record(now - 100_000, 300_000));
+        provisioning_deadline::refresh_configuration(
+            &runtime.store,
+            &mut sandbox,
+            now - 100_000,
+            300_000,
+        )
+        .await
+        .unwrap();
         runtime.store.put_message(&sandbox).await.unwrap();
         let policy = openshell_policy::restrictive_default_policy();
         let hash = openshell_core::policy_identity::deterministic_policy_hash(&policy);
@@ -20107,7 +22105,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let now = openshell_core::time::now_ms();
         let mut sandbox = sandbox_record("sb-busy-ttl", "busy-ttl", SandboxPhase::Starting);
         sandbox.status.as_mut().unwrap().provisioning =
-            Some(provisioning_deadline::new_record(now));
+            Some(provisioning_deadline::new_record(now, 300_000));
         runtime.store.put_message(&sandbox).await.unwrap();
         let gate = runtime.lifecycle_gates.lock_for("sb-busy-ttl").await;
         runtime

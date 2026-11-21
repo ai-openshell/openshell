@@ -32,8 +32,7 @@ use openshell_core::proto::{
 use openshell_server::{MultiplexedService, Store, TlsAcceptor, health_router};
 use rcgen::{CertificateParams, IsCa};
 use rustls::RootCertStore;
-use rustls::pki_types::CertificateDer;
-use rustls_pemfile::certs;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -53,6 +52,14 @@ pub struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_sandbox_provider_access_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderAccessTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderAccessTokenResponse>, Status>
+    {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn peer_notify_config_update(
         &self,
         _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,
@@ -180,6 +187,20 @@ impl OpenShell for TestOpenShell {
     async fn start_sandbox(
         &self,
         _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ResumeSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
@@ -398,6 +419,55 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn create_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_secrets(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSecretsRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSecretsResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn update_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::UpdateSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn reveal_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RevealSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::RevealSecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn inline_provider_refresh_secrets(
+        &self,
+        _request: tonic::Request<openshell_core::proto::InlineProviderRefreshSecretsRequest>,
+    ) -> Result<Response<openshell_core::proto::InlineProviderRefreshSecretsResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -857,7 +927,7 @@ pub async fn test_health_store() -> Arc<Store> {
 pub fn build_tls_root(cert_pem: &[u8]) -> RootCertStore {
     let mut roots = RootCertStore::empty();
     let mut cursor = std::io::Cursor::new(cert_pem);
-    let parsed = certs(&mut cursor)
+    let parsed = CertificateDer::pem_reader_iter(&mut cursor)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .expect("failed to parse cert pem");
     for cert in parsed {
