@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Gateway, Configu
 position: 5
 ---
 
-The OpenShell gateway reads its configuration from a TOML file when `--config` or `OPENSHELL_GATEWAY_CONFIG` is set. When neither is set, the gateway reads `$XDG_CONFIG_HOME/openshell/gateway.toml` if that file exists. If no config file exists, the gateway starts from built-in defaults. Gateway process flags and gateway `OPENSHELL_*` environment variables override the file. Compute driver settings live in the driver TOML tables. See [RFC 0003](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0003-gateway-configuration/README.md) for the full schema.
+The OpenShell gateway reads its configuration from a TOML file when `--config` or `OPENSHELL_GATEWAY_CONFIG` is set. When neither is set, the gateway reads `$XDG_CONFIG_HOME/openshell/gateway.toml` if that file exists. If no config file exists, the gateway starts from built-in defaults. Gateway process flags and gateway `OPENSHELL_*` environment variables override the file. Compute driver settings live in the driver TOML tables. See [RFC 0003](https://github.com/ai-openshell/openshell/blob/main/rfc/0003-gateway-configuration/README.md) for the full schema.
 
 ## Source Precedence
 
@@ -616,7 +616,9 @@ and `https://<workspace>--<sandbox>.<base-domain>/` for the unnamed endpoint.
 The base domain is the first wildcard DNS SAN in `server_sans`; gateways
 without SANs use the built-in `openshell.localhost`.
 
-`enable_gateway_service_routing` defaults to `true`. Set it to `false` to stop publishing
+The core runtime defaults `enable_gateway_service_routing` to `true`; Docker, Podman,
+and VM gateway behavior is unchanged. The Kubernetes Helm chart defaults it to
+`false`. Set it to `false` to stop publishing
 gateway service URLs and reject gateway-mediated application HTTP requests and
 WebSocket upgrades with `404`. Control-plane APIs, service declarations, direct
 supervisor listeners, and discovery remain available. The setting also accepts
@@ -629,6 +631,26 @@ gatewayConfig:
   openshell.gateway:
     enable_gateway_service_routing: false
 ```
+
+For Kubernetes service ingress directly through supervisors, set
+`[openshell.supervisor.app_listener].enabled = true` and configure the
+[supervisor application listener](#supervisor-application-listener). Pair it with
+an ingress solution, such as a TLS-passthrough proxy or a compatible Kubernetes
+ingress/Gateway API integration, that consumes discovery and routes each
+advertised hostname to the current owning supervisor's app-listener IP and port.
+Preserve the application hostname as Host and TLS SNI. Enabling the listener
+alone does not provision DNS or external ingress routes; the chart does not
+enable either the listener or the ingress integration automatically.
+
+If both routing modes are disabled, startup logs warn that sandbox service
+routing is disabled. Gateway-mediated forwarding does not require the app
+listener.
+
+When upgrading a Helm installation that uses gateway service URLs, explicitly
+set `enable_gateway_service_routing: true` in the canonical table above before the
+upgrade. Missing saved values receive the chart's `false` default; explicit
+`true` values remain enabled. This changes application forwarding only, not
+control-plane API access or the service-authentication default.
 
 With gateway routing disabled, `gateway_url` is empty and `gateway_service_urls`
 is empty. A configured application origin supplies the preferred URL; without
@@ -845,6 +867,25 @@ On Postgres, the gateway holds its mutation advisory locks on a separate lock po
 On Postgres, each replica opens both pools, so plan for `(database_max_connections + database_lock_max_connections) × replicaCount` connections, 14 per replica with the defaults, and keep that total below the server's own `max_connections` (and below any connection-pooler limit in front of it). Rollouts run extra pods; refer to [Size PostgreSQL Connections](/kubernetes/high-availability#size-postgresql-connections). Raising either ceiling past what the server admits moves the failure from a slow acquire to a refused connection.
 
 On SQLite, writers are serialized regardless of pool size, so a larger ceiling buys read concurrency only. A gateway that needs more write throughput wants an external Postgres database (`server.externalDbSecret`), not a larger SQLite pool.
+
+## Shared Supervisor Pool
+
+`[openshell.gateway.supervisor_pool]` tunes the shared supervisor pool used with the Kubernetes driver's `supervisor_topology = "gateway"`. The Helm chart renders this table from `supervisor.*` values and rejects a hand-written one.
+
+```toml
+[openshell.gateway.supervisor_pool]
+recovery_timeout_secs = 60
+max_instances_per_member = 128
+max_members_per_gateway = 32
+```
+
+| Key | Default | Range | Helm value |
+|---|---|---|---|
+| `recovery_timeout_secs` | `60` | `30` to `300` | `supervisor.recoveryTimeoutSeconds` |
+| `max_instances_per_member` | `128` | `1` to `1024` | `supervisor.pool.maxInstancesPerMember` |
+| `max_members_per_gateway` | `32` | `1` or more | `supervisor.pool.maxMembersPerGateway` |
+
+The gateway never places more than `max_instances_per_member` sandboxes on one supervisor and refuses a create when every supervisor is full. The pool runs at most live gateway replicas × `max_members_per_gateway` × `max_instances_per_member` sandboxes, never more than 131,072. Start each supervisor with the same cap through `--pool-max-instances` or `OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES`; the chart sets it. Values outside the ranges fail at startup.
 
 ## OCSF JSONL Output
 
@@ -1746,7 +1787,7 @@ sandbox and 64 per gateway, including when token caching is disabled.
 
 The MXC driver runs native Windows workloads through `wxc-exec`. Use this
 configuration with a build from the
-[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows). Keep
+[`windows` branch](https://github.com/ai-openshell/openshell/tree/windows). Keep
 `openshell-supervisor.exe` and `openshell-windows-sandbox.exe` beside the gateway.
 
 ```toml
@@ -1771,7 +1812,7 @@ etw_audit = true
 or membership in Windows Performance Log Users. See
 [OCSF JSON Export](/observability/ocsf-json-export) for durable audit output.
 
-Follow the [Windows configuration guide](https://github.com/NVIDIA/OpenShell/blob/windows/docs/how-it-works/gateways/configuration.mdx#mxc)
+Follow the [Windows configuration guide](https://github.com/ai-openshell/openshell/blob/windows/docs/how-it-works/gateways/configuration.mdx#mxc)
 for host prerequisites, TLS setup, sandbox creation, and runtime limitations.
 
 ### Docker

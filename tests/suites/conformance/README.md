@@ -31,11 +31,11 @@ target (`harness = false`), so `openshell-conformance run`,
 
 `smoke` is the smallest end-to-end check that the runner can run a real test in a
 tmachine environment on CI. The other suites are ports of the old
-`conformance/cli` scenarios and of Evan Lezar's suites in NVIDIA/OpenShell#4629
+`conformance/cli` scenarios and of Evan Lezar's suites in ai-openshell/openshell#4629
 (credited in each file). `file-transfer` runs `git` on the machine that runs the
 tests, so a test environment needs it installed
 (`tests/tmachine/ansible/playbooks/test-tools.yaml` does that for the tmachine
-environments). `credential-gating`, ported from NVIDIA/OpenShell#5264, starts
+environments). `credential-gating`, ported from ai-openshell/openshell#5264, starts
 servers (`tests/support/host-server`) on the machine that runs the tests and
 reaches them from sandboxes created from `testkit::python_image()` through
 `host.openshell.internal`. `ssh` runs `ssh` and `ssh-keygen` there and needs a named
@@ -62,29 +62,14 @@ tests/suites/conformance/target/debug/openshell-conformance run --junit conforma
 The program runs only this suite: passing it means a gateway meets the
 conformance contract below. The machine that runs it must be reachable from
 sandboxes as `host.openshell.internal`, which rules out a gateway on a remote
-Kubernetes cluster ([#5409](https://github.com/NVIDIA/OpenShell/issues/5409)).
+Kubernetes cluster ([#5409](https://github.com/ai-openshell/openshell/issues/5409)).
 Feature and driver suites are not part of it. The
 [testkit README](../../testkit/README.md#test-programs) describes the commands
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
 
-### Marking a test unsupported in CI
-
-When a test can't pass in one environment yet, for example because of a driver
-bug, keep the test and mark it unsupported there:
-
-1. File an issue for the bug.
-2. Add an entry to [`unsupported.yaml`](unsupported.yaml): the test, the issue,
-   and the environments it fails in, each a tmachine row
-   (`<environment>/<installer>`, such as `ubuntu-k3s/k3s-ha`) or a host lane
-   (`docker`, `podman`, `kubernetes` or `vm`).
-3. Delete the entry in the PR that fixes the bug.
-
-CI turns the entries for an environment into `OPENSHELL_TEST_UNSUPPORTED`; the
-[testkit README](../../testkit/README.md#unsupported-tests) describes what the
-program does with it. Branch Checks runs the program with each environment's
-entries, so an unknown test, a bad issue URL or an unknown environment name
-fails there.
+See [Unsupported tests](../../testkit/README.md#unsupported-tests) to skip a
+test in specific CI environments.
 
 ## Adding a test
 
