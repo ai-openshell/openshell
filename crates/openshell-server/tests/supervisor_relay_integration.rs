@@ -50,6 +50,13 @@ struct RelayGateway {
 
 #[tonic::async_trait]
 impl OpenShell for RelayGateway {
+    async fn get_exec_sandbox_result(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetExecSandboxResultRequest>,
+    ) -> Result<Response<openshell_core::proto::GetExecSandboxResultResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_sandbox_provider_access_token(
         &self,
         _request: tonic::Request<openshell_core::proto::GetSandboxProviderAccessTokenRequest>,

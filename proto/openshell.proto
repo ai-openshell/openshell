@@ -278,6 +278,16 @@ service OpenShell {
     };
   }
 
+  // Read a durably confirmed SSH exit result for the exact original exec
+  // request. This never starts, retries, or reattaches an execution.
+  rpc GetExecSandboxResult(GetExecSandboxResultRequest) returns (GetExecSandboxResultResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
   // Forward one CLI-side TCP connection to a loopback TCP target in a sandbox.
   rpc ForwardTcp(stream TcpForwardFrame) returns (stream TcpForwardFrame) {
     option (openshell.options.v1.authorization) = {
@@ -2143,6 +2153,31 @@ message ExecSandboxRequest {
   // reattach, or replay output/stdin. Unconfirmed executions remain fenced;
   // confirmed terminal executions retain the fence for 24 hours.
   string request_id = 11;
+}
+
+message GetExecSandboxResultRequest {
+  // The exact original request, including its caller-owned request_id.
+  ExecSandboxRequest original_request = 1;
+}
+
+message GetExecSandboxResultResponse {
+  string request_id = 1;
+  string claim_id = 2;
+  uint64 resource_version = 3;
+  uint32 format_version = 4;
+  string method = 5;
+  string original_scope = 6;
+  string original_workspace_id = 7;
+  string original_target_id = 8;
+  string effective_workspace_id = 9;
+  string effective_target_id = 10;
+  string original_payload_fingerprint = 11;
+  string effective_payload_fingerprint = 12;
+  string fingerprint_key_id = 13;
+  int64 admitted_at_ms = 14;
+  int64 terminal_at_ms = 15;
+  int64 expires_at_ms = 16;
+  int32 exit_code = 17;
 }
 
 // One stdout chunk from a sandbox exec.

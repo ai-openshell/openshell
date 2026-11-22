@@ -40,10 +40,11 @@ use openshell_core::proto::{
     ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, ExtensionKind,
     FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse, GatewayMessage,
     GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest, GetDraftHistoryResponse,
-    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
-    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetDraftPolicyRequest, GetDraftPolicyResponse, GetExecSandboxResultRequest,
+    GetExecSandboxResultResponse, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetGatewayInfoRequest, GetGatewayInfoResponse, GetProviderProfileRequest,
+    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
     GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, GetSandboxRequest,
@@ -600,6 +601,13 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
         mutation_audit::record_exec_targets(request.get_ref());
         mutation_replay::run(&self.state, request).await
+    }
+
+    async fn get_exec_sandbox_result(
+        &self,
+        request: Request<GetExecSandboxResultRequest>,
+    ) -> Result<Response<GetExecSandboxResultResponse>, Status> {
+        mutation_replay::get_exec_sandbox_result(&self.state, request).await
     }
 
     type ForwardTcpStream =

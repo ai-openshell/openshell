@@ -15,8 +15,8 @@ use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, CreateSandboxTemplateRequest,
     CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteSandboxTemplateRequest,
     DeleteSandboxTemplateResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, SandboxTemplateResponse,
-    Workspace, WorkspaceSelector,
+    GetExecSandboxResultRequest, GetExecSandboxResultResponse, RemoveWorkspaceMemberRequest,
+    RemoveWorkspaceMemberResponse, SandboxTemplateResponse, Workspace, WorkspaceSelector,
 };
 use openshell_core::{GetResourceVersion, ObjectId, rpc_error};
 use prost::Message;
@@ -81,10 +81,19 @@ pub struct OriginalMutation(pub(crate) Vec<u8>);
 /// Deliberately no serialized requests, responses, tokens, or error messages.
 #[derive(Serialize, Deserialize)]
 pub(super) enum Success {
-    Resource { id: String, version: u64 },
-    Deletion { outcome: i32 },
+    Resource {
+        id: String,
+        version: u64,
+    },
+    Deletion {
+        outcome: i32,
+    },
     Ordinary(ordinary::Outcome),
     StreamTerminal,
+    /// A real SSH ExitStatus committed before the exit event is delivered.
+    StreamTerminalResult {
+        exit_code: i32,
+    },
 }
 
 pub(super) struct Scope {
@@ -410,8 +419,9 @@ impl Completion {
         Ok(())
     }
 
-    pub(super) async fn stream_terminal(&self) -> Result<(), Status> {
-        self.complete(Success::StreamTerminal).await
+    pub(super) async fn stream_terminal(&self, exit_code: i32) -> Result<(), Status> {
+        self.complete(Success::StreamTerminalResult { exit_code })
+            .await
     }
 
     async fn complete(&self, success: Success) -> Result<(), Status> {
@@ -446,6 +456,114 @@ fn replay_window_ms(config: &openshell_core::Config) -> i64 {
             .mutation_replay_window_seconds
             .clamp(*range.start(), *range.end()),
     ) * 1000
+}
+
+/// Observe an existing exec admission without admitting, executing, sweeping,
+/// repairing, or extending it. The caller must supply the exact original request.
+pub(super) async fn get_exec_sandbox_result(
+    state: &Arc<ServerState>,
+    request: Request<GetExecSandboxResultRequest>,
+) -> Result<Response<GetExecSandboxResultResponse>, Status> {
+    let original = request
+        .get_ref()
+        .original_request
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("original_request is required"))?;
+    if original.encoded_len() > 4 * 1024 * 1024 {
+        return Err(Status::resource_exhausted("exec request exceeds 4 MiB"));
+    }
+    let request_id = validate_request_id(&original.request_id)?;
+    let principal = super::extract_principal(&request)?;
+    let Some(identity) = principal.user_identity() else {
+        return Err(crate::auth::audit::deny(
+            &principal,
+            crate::auth::audit::AuthzDenial::MethodNotPermitted,
+            "exec result read requires a user principal",
+        ));
+    };
+    let scope = original.authorize(state, &principal).await?;
+    // A read cannot infer a historical target from its name. Current immutable
+    // workspace and sandbox authorization must still resolve to the claim.
+    let fingerprint_key = fingerprint_key(state).await?;
+    let payload_hash = fingerprint_key.fingerprint(original)?;
+    let protection = Protection {
+        key_id: fingerprint_key.id(),
+        effective_payload_hash: payload_hash.clone(),
+        effective_workspace_id: scope.workspace_id.clone(),
+        effective_target_id: scope.target_id.clone(),
+    };
+    let (provider, issuer) = match identity.provider {
+        IdentityProvider::Oidc => (
+            "oidc",
+            state
+                .config
+                .oidc
+                .as_ref()
+                .map_or("", |config| config.issuer.as_str()),
+        ),
+        IdentityProvider::Mtls => (
+            if matches!(principal, Principal::Operator(_)) {
+                "mtls-operator"
+            } else {
+                "mtls"
+            },
+            "",
+        ),
+        IdentityProvider::CloudflareAccess => ("cloudflare_access", ""),
+        IdentityProvider::LocalDev => ("local_dev", ""),
+    };
+    let caller = hash_json(&serde_json::json!([provider, issuer, identity.subject,]))?;
+    let bucket = format!("_mutation/{caller}");
+    let key = hash_json(&serde_json::json!([
+        caller,
+        <openshell_core::proto::ExecSandboxRequest as Mutation>::REPLAY_METHOD,
+        scope.name,
+        request_id
+    ]))?;
+    let row = state
+        .store
+        .get_by_name(OBJECT_TYPE, &bucket, &key)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(replay_unavailable)?;
+    let admission: Admission = serde_json::from_slice(&row.payload)
+        .map_err(|_| Status::internal("invalid durable mutation admission"))?;
+    if admission.format_version != 1
+        || admission.payload_hash != payload_hash
+        || admission.workspace_id != scope.workspace_id
+        || admission.target_id != scope.target_id
+        || admission.protection.as_ref() != Some(&protection)
+    {
+        return Err(replay_unavailable());
+    }
+    let (Some(Success::StreamTerminalResult { exit_code }), Some(terminal_at_ms)) =
+        (admission.success, admission.completed_at_ms)
+    else {
+        return Err(uncertain());
+    };
+    let expires_at_ms = terminal_at_ms.saturating_add(replay_window_ms(&state.config));
+    if current_time_ms() >= expires_at_ms {
+        return Err(replay_unavailable());
+    }
+    Ok(Response::new(GetExecSandboxResultResponse {
+        request_id,
+        claim_id: row.id,
+        resource_version: row.resource_version,
+        format_version: admission.format_version,
+        method: <openshell_core::proto::ExecSandboxRequest as Mutation>::REPLAY_METHOD.into(),
+        original_scope: scope.name,
+        original_workspace_id: admission.workspace_id.unwrap_or_default(),
+        original_target_id: admission.target_id.unwrap_or_default(),
+        effective_workspace_id: protection.effective_workspace_id.unwrap_or_default(),
+        effective_target_id: protection.effective_target_id.unwrap_or_default(),
+        original_payload_fingerprint: admission.payload_hash,
+        effective_payload_fingerprint: protection.effective_payload_hash,
+        fingerprint_key_id: protection.key_id,
+        admitted_at_ms: row.created_at_ms,
+        terminal_at_ms,
+        expires_at_ms,
+        exit_code,
+    }))
 }
 
 /// Delete expired successful admissions for one bucket, or all buckets, in

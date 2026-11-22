@@ -3929,7 +3929,7 @@ pub(super) async fn wait_for_exec_terminal(
     };
     let exit_code = result?;
     if let Some(completion) = completion {
-        completion.stream_terminal().await?;
+        completion.stream_terminal(exit_code).await?;
     }
     Ok(Some(exit_code))
 }

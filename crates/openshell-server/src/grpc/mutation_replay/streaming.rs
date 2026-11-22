@@ -62,7 +62,10 @@ async fn authorize(
 }
 
 fn stream_unavailable(success: Success) -> Status {
-    if !matches!(success, Success::StreamTerminal) {
+    if !matches!(
+        success,
+        Success::StreamTerminal | Success::StreamTerminalResult { .. }
+    ) {
         return super::replay_unavailable();
     }
     rpc_error::failed_precondition(

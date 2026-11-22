@@ -254,7 +254,23 @@ cannot be submitted through a duplicate stream.
 | Changed start payload | `REQUEST_ID_PAYLOAD_MISMATCH`. The changed command does not run. |
 | Sandbox replaced under the same name | `REQUEST_REPLAY_UNAVAILABLE`. The replacement does not receive the command. |
 
-The terminal receipt contains only a marker and completion time, not commands,
+For a noninteractive `ExecSandbox` request, `GetExecSandboxResult` can read a
+newly recorded terminal result without launching or reattaching the command.
+Supply the exact original `ExecSandboxRequest`, including its request ID. The
+gateway rechecks the current caller, workspace, sandbox identity, protected
+request fingerprint, and retention window. A confirmed result includes the
+immutable claim ID, original and effective request commitments, admission and
+terminal timestamps, and the observed SSH exit code. A nonzero code is a
+terminal failure, not a successful application result. Admission time is not
+the process start time.
+
+The read does not return stdout, stderr, or a replacement stream. It refuses
+pending, expired, mismatched, or legacy terminal-marker records without
+starting a new attempt. Interactive exec has no corresponding terminal-result
+read in this API. Keep the original request ID and reconcile uncertain command
+effects through the owning workflow.
+
+The terminal record stores the observed exit code and completion time, not commands,
 environment values, stdin, stdout, or stderr. Receiving a stream handle is not
 completion. A gateway-generated timeout exit code of `124` does not prove the
 remote process stopped, so it leaves the admission unresolved. A confirmed remote
