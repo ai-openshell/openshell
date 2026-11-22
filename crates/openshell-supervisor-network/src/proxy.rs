@@ -17,7 +17,7 @@ use openshell_sandbox_backend::test_support as rpc_test;
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::correlation::{HttpOutcome, RequestStage};
 use crate::l7::tls::ProxyTlsState;
-use crate::metrics::{ActiveConnection, InspectionType, Outcome, ResultLabel, Scope};
+use crate::metrics::{self, ActiveConnection, InspectionType, Outcome, ResultLabel, Scope};
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 #[cfg(test)]
 use crate::policy_dns::SocketTrustedResolver;
@@ -825,7 +825,7 @@ async fn preauthorize_transparent_open(
     });
     let mut decision = supplied_authorization.decision;
     if let NetworkAction::Deny { reason } = &decision.action {
-        decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
+        metrics::decision(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
         let (denial, status_detail) = supplied_authorization.denial.map_or(
             (TcpOpenDenial::PolicyDenied, "transparent_tcp_policy_denied"),
             |denial| match denial {
@@ -1268,7 +1268,7 @@ async fn handle_transparent_tcp_connection(
     .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
 
     if let NetworkAction::Deny { reason } = &decision.action {
-        decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Tcp);
+        metrics::decision(Scope::Connection, Outcome::Deny, InspectionType::Tcp);
         emit_transparent_policy_denial(&decision, workload_addr, &host, port);
         emit_denial(
             &denial_tx,
@@ -1457,7 +1457,7 @@ async fn handle_transparent_tcp_connection(
         }
     ));
     emit_activity(&activity_tx, false, "transparent_tcp");
-    decision.record_admission(Scope::Connection, Outcome::Allow, InspectionType::Tcp);
+    metrics::decision(Scope::Connection, Outcome::Allow, InspectionType::Tcp);
     relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await
 }
 
@@ -2414,7 +2414,7 @@ async fn deny_connect_destination<C>(
 where
     C: TokioAsyncWrite + Unpin,
 {
-    decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
+    metrics::decision(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
     let detail = destination_denial_detail(denial.kind);
     egress_emit!(build_connect_destination_deny_ocsf_event(
         denial, peer_addr, host, port, binary, pid, ancestors, cmdline,
@@ -2477,7 +2477,7 @@ where
         correlation.record_rejection(403, HttpOutcome::Denied, None);
         correlation.emit(event);
     } else {
-        decision.record_admission(Scope::Request, Outcome::Deny, InspectionType::Http);
+        metrics::decision(Scope::Request, Outcome::Deny, InspectionType::Http);
         crate::telemetry::emit_decision([event], Some(connect_span));
     }
 
@@ -2933,7 +2933,7 @@ async fn handle_mediated_connection(
     // Allowed connections are logged after the L7 config check (below)
     // so we can distinguish CONNECT (L4-only) from CONNECT_L7 (L7 follows).
     if matches!(decision.action, NetworkAction::Deny { .. }) {
-        decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
+        metrics::decision(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -3113,7 +3113,7 @@ async fn handle_mediated_connection(
     if refuse_connect_when_tls_unavailable(&mut client, tls_state.is_some(), effective_tls_skip)
         .await?
     {
-        decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
+        metrics::decision(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
         if let Some(observer) = connect_endpoint_observer.as_ref() {
             observer.observe(EndpointResult::TlsFailed);
         }
@@ -3228,7 +3228,7 @@ async fn handle_mediated_connection(
     if effective_tls_skip {
         match middleware_uninspectable_gate(&opa_engine, &ctx)? {
             crate::l7::middleware::UninspectableTrafficGate::Deny => {
-                decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Tcp);
+                metrics::decision(Scope::Connection, Outcome::Deny, InspectionType::Tcp);
                 crate::l7::middleware::emit_middleware_uninspectable(&ctx, "tls-skip tunnel", true);
                 respond(
                     &mut client,
@@ -3328,7 +3328,7 @@ async fn handle_mediated_connection(
         else {
             return Ok(());
         };
-        decision.record_admission(Scope::Connection, raw_admission, InspectionType::Tcp);
+        metrics::decision(Scope::Connection, raw_admission, InspectionType::Tcp);
         relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await?;
         return Ok(());
     }
@@ -3487,7 +3487,7 @@ async fn handle_mediated_connection(
         if let Some(protocol_detail) =
             unsupported_l7_tunnel_protocol_detail(tunnel_protocol, requirement)
         {
-            decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
+            metrics::decision(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
             if requirement == InspectionRequirement::RequiredMiddleware {
                 crate::l7::middleware::emit_middleware_uninspectable(&ctx, protocol_detail, true);
             }
@@ -3553,7 +3553,7 @@ async fn handle_mediated_connection(
         } else {
             Outcome::Allow
         };
-        decision.record_admission(Scope::Connection, outcome, InspectionType::Tcp);
+        metrics::decision(Scope::Connection, outcome, InspectionType::Tcp);
         relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await?;
     }
 
@@ -4823,8 +4823,8 @@ async fn dial_transparent_upstream(
 }
 
 async fn dial_direct(addrs: &[SocketAddr]) -> std::io::Result<upstream_proxy::PrefixedStream> {
-    crate::metrics::connect(
-        crate::metrics::Route::Direct,
+    metrics::connect(
+        metrics::Route::Direct,
         connect_tcp_nodelay_best_effort(addrs),
     )
     .await
@@ -5860,7 +5860,7 @@ async fn handle_forward_proxy_inner(
     let matched_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
-            decision.record_admission(Scope::Request, Outcome::Deny, InspectionType::Http);
+            metrics::decision(Scope::Request, Outcome::Deny, InspectionType::Http);
             crate::telemetry::emit_decision(
                 [build_forward_policy_deny_ocsf_event(
                     workload_addr,
@@ -6158,7 +6158,7 @@ async fn handle_forward_proxy_inner(
             .await?;
             return Ok(());
         };
-        correlation.select_inspector(l7_config.config.protocol, &l7_ctx.policy_name);
+        correlation.select_inspector(l7_config.config.protocol);
         endpoint_observer = crate::l7::EndpointObserver::begin_captured(
             l7_ctx.endpoint_observation_tx.as_ref(),
             &l7_config.config,
@@ -6589,7 +6589,7 @@ async fn handle_forward_proxy_inner(
     } else {
         egress::resolve_span(&connect_span)
     };
-    correlation.inspection_timer(crate::metrics::Timer::pause);
+    correlation.inspection_timer(metrics::Timer::pause);
     let resolved = validate_destination(DestinationRequest {
         host: &raw_host,
         port,
@@ -6598,7 +6598,7 @@ async fn handle_forward_proxy_inner(
     })
     .instrument(resolve_span.clone())
     .await;
-    correlation.inspection_timer(crate::metrics::Timer::resume);
+    correlation.inspection_timer(metrics::Timer::resume);
     if inspected {
         if resolved.is_err() {
             egress::mark_error(&resolve_span);
@@ -7158,11 +7158,11 @@ async fn handle_forward_proxy_inner(
     } else {
         egress::dial_span(&connect_span)
     };
-    correlation.inspection_timer(crate::metrics::Timer::pause);
-    let dial_result = crate::metrics::connect(crate::metrics::Route::Direct, connector.connect())
+    correlation.inspection_timer(metrics::Timer::pause);
+    let dial_result = metrics::connect(metrics::Route::Direct, connector.connect())
         .instrument(dial_span.clone())
         .await;
-    correlation.inspection_timer(crate::metrics::Timer::resume);
+    correlation.inspection_timer(metrics::Timer::resume);
     let mut upstream = match dial_result {
         Ok(s) => {
             if inspected {
@@ -7271,7 +7271,7 @@ async fn handle_forward_proxy_inner(
         });
     let _connection = ActiveConnection::new(inspection);
     if !inspected {
-        decision.record_admission(Scope::Request, Outcome::Allow, InspectionType::Http);
+        metrics::decision(Scope::Request, Outcome::Allow, InspectionType::Http);
     }
     let outcome_result = relay_rewritten_forward_request(
         method,

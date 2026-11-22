@@ -257,7 +257,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    use crate::metrics::{self, ActiveConnection, InspectionType, Outcome, Policy, Scope};
+    use crate::metrics::{self, ActiveConnection, InspectionType, Outcome, Scope};
 
     let protocol = match &context.policy {
         PreparedHttpPolicy::Inspect { configs, .. } if configs.len() == 1 => {
@@ -268,12 +268,7 @@ where
     let inspection = protocol.map_or(InspectionType::Http, InspectionType::from_protocol);
     let _connection = ActiveConnection::new(inspection);
     if protocol != Some(crate::l7::L7Protocol::Sql) {
-        metrics::decision(
-            Scope::Connection,
-            Outcome::Allow,
-            inspection,
-            Policy::from(Some(context.request.policy_name.as_str())),
-        );
+        metrics::decision(Scope::Connection, Outcome::Allow, inspection);
     }
 
     match context.policy {

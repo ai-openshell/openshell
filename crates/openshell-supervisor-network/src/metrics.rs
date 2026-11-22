@@ -3,14 +3,13 @@
 
 //! Bounded, process-wide supervisor egress metrics.
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
-use opentelemetry::{Context, KeyValue};
 
 use crate::l7::L7Protocol;
 
@@ -18,9 +17,6 @@ const LATENCY_BUCKETS_SECONDS: [f64; 17] = [
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
     5.0, 10.0, 15.0,
 ];
-const MAX_POLICY_NAMES: usize = 16;
-const MAX_POLICY_NAME_BYTES: usize = 128;
-
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 
 /// Installs the process's egress instruments before starting any proxies.
@@ -80,7 +76,7 @@ impl InspectionType {
         }
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
             Self::Http => "http",
@@ -131,7 +127,7 @@ pub(crate) enum ResultLabel {
 }
 
 impl ResultLabel {
-    pub(crate) fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Success => "success",
             Self::Deny => "deny",
@@ -164,25 +160,11 @@ impl Route {
     }
 }
 
-pub(crate) enum Policy<'a> {
-    Named(&'a str),
-    NoMatch,
-    Unattributed,
-}
-
-impl<'a> From<Option<&'a str>> for Policy<'a> {
-    fn from(name: Option<&'a str>) -> Self {
-        name.filter(|name| !name.is_empty() && *name != "-")
-            .map_or(Self::Unattributed, Self::Named)
-    }
-}
-
 struct Metrics {
     decisions: Counter<u64>,
     policy_evaluation: Histogram<f64>,
     request_inspection: Histogram<f64>,
     upstream_connect: Histogram<f64>,
-    policy_names: Mutex<HashSet<Arc<str>>>,
     connections: Arc<[AtomicU64; InspectionType::ALL.len()]>,
     _active_connections: ObservableGauge<u64>,
 }
@@ -229,50 +211,13 @@ impl Metrics {
                 "openshell_supervisor_upstream_connect_duration_seconds",
                 "Time spent establishing an upstream connection.",
             ),
-            policy_names: Mutex::new(HashSet::new()),
             connections,
             _active_connections: active_connections,
         }
     }
-
-    fn policy_label(&self, policy: Policy<'_>) -> Arc<str> {
-        let name = match policy {
-            Policy::NoMatch => return Arc::from("no_match"),
-            Policy::Unattributed => return Arc::from("unattributed"),
-            Policy::Named(name) if name.len() > MAX_POLICY_NAME_BYTES => {
-                return Arc::from("overflow");
-            }
-            Policy::Named(name) => name,
-        };
-        let mut names = self
-            .policy_names
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let name = if matches!(name, "no_match" | "unattributed" | "overflow")
-            || name.starts_with("name:")
-        {
-            std::borrow::Cow::Owned(format!("name:{name}"))
-        } else {
-            std::borrow::Cow::Borrowed(name)
-        };
-        if let Some(existing) = names.get(name.as_ref()) {
-            return Arc::clone(existing);
-        }
-        if names.len() >= MAX_POLICY_NAMES {
-            return Arc::from("overflow");
-        }
-        let name = Arc::<str>::from(name.as_ref());
-        names.insert(Arc::clone(&name));
-        name
-    }
 }
 
-pub(crate) fn decision(
-    scope: Scope,
-    outcome: Outcome,
-    inspection: InspectionType,
-    policy: Policy<'_>,
-) {
+pub(crate) fn decision(scope: Scope, outcome: Outcome, inspection: InspectionType) {
     if let Some(metrics) = METRICS.get() {
         metrics.decisions.add(
             1,
@@ -280,7 +225,6 @@ pub(crate) fn decision(
                 KeyValue::new("scope", scope.label()),
                 KeyValue::new("outcome", outcome.label()),
                 KeyValue::new("inspection_type", inspection.label()),
-                KeyValue::new("policy", metrics.policy_label(policy)),
             ],
         );
     }
@@ -324,7 +268,6 @@ pub(crate) async fn connect<T>(
     let label = result
         .as_ref()
         .map_or_else(ResultLabel::from_io_error, |_| ResultLabel::Success);
-    tracing::Span::current().record("openshell.egress.result", label.label());
     timer.finish(label);
     result
 }
@@ -341,7 +284,6 @@ pub(crate) fn evaluate<T, E>(
         Ok(false) => ResultLabel::Deny,
         Err(_) => ResultLabel::Error,
     };
-    tracing::Span::current().record("openshell.egress.result", result.label());
     timer.finish(result);
     decision
 }
@@ -349,7 +291,7 @@ pub(crate) fn evaluate<T, E>(
 #[derive(Debug)]
 pub(crate) struct Timer {
     stage: Stage,
-    start: Option<(Instant, Context)>,
+    start: Option<Instant>,
     pause: Option<Instant>,
     excluded: Duration,
 }
@@ -358,7 +300,7 @@ impl Timer {
     pub(crate) fn new(stage: Stage) -> Self {
         Self {
             stage,
-            start: METRICS.get().map(|_| (Instant::now(), Context::current())),
+            start: METRICS.get().map(|_| Instant::now()),
             pause: None,
             excluded: Duration::ZERO,
         }
@@ -385,14 +327,13 @@ impl Timer {
     }
 
     fn record(&mut self, result: ResultLabel) {
-        let (Some(metrics), Some((started, context))) = (METRICS.get(), self.start.take()) else {
+        let (Some(metrics), Some(started)) = (METRICS.get(), self.start.take()) else {
             return;
         };
         let ended = self.pause.unwrap_or_else(Instant::now);
         let seconds = (ended - started)
             .saturating_sub(self.excluded)
             .as_secs_f64();
-        let _active_context = context.attach();
         let result = KeyValue::new("result", result.label());
         match self.stage {
             Stage::PolicyEvaluation(scope) => {
@@ -430,27 +371,6 @@ mod tests {
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 
-    #[test]
-    fn policy_labels_are_bounded_for_the_process_lifetime() {
-        let provider = SdkMeterProvider::builder().build();
-        let metrics = Metrics::new(&provider.meter("supervisor-metrics-test"));
-
-        assert_eq!(&*metrics.policy_label(Policy::NoMatch), "no_match");
-        assert_eq!(&*metrics.policy_label(Policy::Unattributed), "unattributed");
-        for policy in ["overflow", "no_match", "unattributed", "name:overflow"] {
-            assert_eq!(
-                &*metrics.policy_label(Policy::Named(policy)),
-                format!("name:{policy}"),
-            );
-        }
-        for index in 4..MAX_POLICY_NAMES {
-            let policy = index.to_string();
-            assert_eq!(&*metrics.policy_label(Policy::Named(&policy)), policy);
-        }
-        assert_eq!(&*metrics.policy_label(Policy::Named("16")), "overflow");
-        assert_eq!(&*metrics.policy_label(Policy::Named("4")), "4");
-    }
-
     #[tokio::test]
     async fn histograms_and_decisions_record_without_a_sampled_span() {
         let exporter = InMemoryMetricExporter::default();
@@ -472,12 +392,14 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.kind(), kind);
         }
-        decision(
-            Scope::Connection,
+        for outcome in [
+            Outcome::Allow,
             Outcome::Deny,
-            InspectionType::Unknown,
-            Policy::Unattributed,
-        );
+            Outcome::Audit,
+            Outcome::FailOpen,
+        ] {
+            decision(Scope::Connection, outcome, InspectionType::Unknown);
+        }
         provider.force_flush().unwrap();
 
         let records = exporter.get_finished_metrics().unwrap();
@@ -530,7 +452,18 @@ mod tests {
             panic!("Decision counter should export a sum");
         };
         assert!(decisions.is_monotonic());
-        assert!(decisions.data_points().any(|point| point.value() > 0));
+        for outcome in ["allow", "deny", "audit", "fail_open"] {
+            let labels = [
+                KeyValue::new("scope", "connection"),
+                KeyValue::new("outcome", outcome),
+                KeyValue::new("inspection_type", "unknown"),
+            ];
+            assert!(decisions.data_points().any(|point| {
+                point.value() > 0
+                    && point.attributes().count() == labels.len()
+                    && point.attributes().all(|label| labels.contains(label))
+            }));
+        }
 
         let active_connections =
             |records: &[opentelemetry_sdk::metrics::data::ResourceMetrics]| {

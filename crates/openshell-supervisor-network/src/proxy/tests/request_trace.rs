@@ -528,8 +528,7 @@ network_policies:
     }
     if connect_failed {
         let failure = &records[1];
-        assert_eq!(failure["unmapped"]["egress_result"], "error");
-        assert!(failure["unmapped"].get("egress_outcome").is_none());
+        assert_eq!(failure["status_id"], StatusId::Failure.as_u8());
     } else if !policy_denied && !credential_failure {
         let forwarded = &records[1];
         assert!(

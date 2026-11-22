@@ -31,6 +31,7 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -43,7 +44,6 @@ openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
-uuid = { workspace = true }
 
 [lints]
 workspace = true

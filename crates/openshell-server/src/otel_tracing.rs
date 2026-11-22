@@ -329,7 +329,8 @@ impl OtlpExport {
 }
 
 /// Collector headers for each supervisor export, delivered in the launch
-/// bundle because supervisors do not inherit the gateway's environment.
+/// bundle or assignment stream because supervisors do not inherit the
+/// gateway's environment.
 #[derive(Clone, Debug, Default)]
 pub struct SupervisorOtlpHeaders {
     pub traces: Option<SecretOtlpHeaders>,
@@ -350,8 +351,8 @@ impl SupervisorOtlpHeaders {
 /// The headers each enabled supervisor export sends.
 ///
 /// Traces and the agent relay send their collector's configured headers. OCSF
-/// export also sends the headers the gateway's own OCSF exporter reads from
-/// its environment, which override configured ones.
+/// and metrics also use the gateway's environment headers, which override
+/// configured ones.
 pub fn supervisor_otlp_headers(otlp: Option<&OtlpConfig>) -> SupervisorOtlpHeaders {
     supervisor_otlp_headers_from(otlp, |name| std::env::var(name).ok())
 }
@@ -409,7 +410,13 @@ fn supervisor_otlp_headers_from(
             .agent
             .as_ref()
             .and_then(|agent| configured(&agent.collector)),
-        metrics: otlp.supervisor_metrics.as_ref().and_then(configured),
+        metrics: otlp.metrics.as_ref().and_then(|metrics| {
+            secret_headers(with_env_headers(
+                metrics,
+                "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+                &var,
+            ))
+        }),
     }
 }
 
@@ -458,7 +465,7 @@ pub fn supervisor_otlp_tls(otlp: Option<&OtlpConfig>) -> SupervisorOtlpTls {
         otlp.traces.as_ref().map(|traces| &traces.collector),
         otlp.ocsf.as_ref().map(|ocsf| &ocsf.collector),
         otlp.agent.as_ref().map(|agent| &agent.collector),
-        otlp.supervisor_metrics.as_ref(),
+        otlp.metrics.as_ref(),
     ];
     let mut materials = Vec::new();
     let mut seen = Vec::new();
@@ -826,7 +833,6 @@ mod tests {
             }),
             ocsf: None,
             agent: None,
-            supervisor_metrics: None,
         }
     }
 
@@ -842,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisors_receive_configured_trace_headers_and_merged_ocsf_headers() {
+    fn supervisors_receive_configured_and_environment_headers_by_signal() {
         let env = |vars: &'static [(&'static str, &'static str)]| {
             move |name: &str| {
                 vars.iter()
@@ -863,6 +869,10 @@ mod tests {
             collector: OtlpCollectorConfig::new("http://mlflow:5000", OtlpProtocol::HttpProtobuf)
                 .with_headers([("x-mlflow-experiment-id", "0")].into()),
         });
+        otlp.metrics = Some(
+            OtlpCollectorConfig::new("https://metrics:4317", OtlpProtocol::Grpc)
+                .with_headers([("authorization", "toml"), ("x-tenant", "blue")].into()),
+        );
 
         let headers = supervisor_otlp_headers_from(
             Some(&otlp),
@@ -872,6 +882,10 @@ mod tests {
                     "authorization=traces%20env",
                 ),
                 ("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "x-extra=logs"),
+                (
+                    "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+                    "authorization=metrics",
+                ),
                 ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=all"),
             ]),
         );
@@ -890,12 +904,20 @@ mod tests {
             Some("x-mlflow-experiment-id=0"),
             "the agent lane never reads the environment"
         );
+        assert_eq!(
+            exposed(headers.metrics).as_deref(),
+            Some("authorization=metrics,x-tenant=blue"),
+        );
 
         let generic = supervisor_otlp_headers_from(
             Some(&otlp),
             env(&[("OTEL_EXPORTER_OTLP_HEADERS", "authorization=all")]),
         );
         assert_eq!(exposed(generic.ocsf).as_deref(), Some("authorization=all"));
+        assert_eq!(
+            exposed(generic.metrics).as_deref(),
+            Some("authorization=all,x-tenant=blue"),
+        );
 
         let unconfigured = supervisor_otlp_headers_from(
             Some(&config()),
@@ -903,6 +925,10 @@ mod tests {
                 ("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "authorization=traces"),
                 ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=all"),
                 ("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "authorization=logs"),
+                (
+                    "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+                    "authorization=metrics",
+                ),
             ]),
         );
         assert!(
@@ -911,6 +937,7 @@ mod tests {
         );
         assert!(unconfigured.ocsf.is_none(), "OCSF export is not enabled");
         assert!(unconfigured.agent.is_none());
+        assert!(unconfigured.metrics.is_none());
         assert!(
             supervisor_otlp_headers_from(None, env(&[("OTEL_EXPORTER_OTLP_HEADERS", "a=b")]))
                 .traces
@@ -990,7 +1017,7 @@ mod tests {
             OtlpCollectorConfig::new(endpoint, OtlpProtocol::Grpc).with_tls(mutual())
         };
         let otlp = OtlpConfig {
-            metrics: None,
+            metrics: Some(collector("https://metrics:4318")),
             service_name: None,
             traces: Some(OtlpTracesConfig {
                 collector: collector("https://shared:4317"),
@@ -1002,12 +1029,11 @@ mod tests {
             agent: Some(AgentOtlpConfig {
                 collector: collector("https://agents:4318"),
             }),
-            supervisor_metrics: None,
         };
 
         let tls = supervisor_otlp_tls(Some(&otlp));
         assert_eq!(tls.materials.len(), 1);
-        assert_eq!([tls.traces, tls.ocsf, tls.agent], [Some(0); 3]);
+        assert_eq!([tls.traces, tls.ocsf, tls.agent, tls.metrics], [Some(0); 4]);
     }
 
     #[tokio::test]

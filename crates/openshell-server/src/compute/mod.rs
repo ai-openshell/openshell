@@ -13972,14 +13972,17 @@ mod tests {
             traces: secret("authorization=traces"),
             ocsf: secret("authorization=Bearer%20secret"),
             agent: secret("x-mlflow-experiment-id=0"),
-            metrics: None,
+            metrics: secret("authorization=metrics"),
         });
         runtime.configure_supervisor_otlp_tls(crate::otel_tracing::SupervisorOtlpTls {
-            materials: vec![openshell_core::jwt::OtlpTlsMaterial {
-                ca_pem: Some("agent-ca".to_string()),
-                ..Default::default()
-            }],
+            materials: ["agent-ca", "metrics-ca"]
+                .map(|ca| openshell_core::jwt::OtlpTlsMaterial {
+                    ca_pem: Some(ca.to_string()),
+                    ..Default::default()
+                })
+                .into(),
             agent: Some(0),
+            metrics: Some(1),
             ..Default::default()
         });
         let sandbox = sandbox_record(
@@ -14013,11 +14016,13 @@ mod tests {
                 exposed(&bundle.traces_otlp_headers),
                 exposed(&bundle.ocsf_otlp_headers),
                 exposed(&bundle.agent_otlp_headers),
+                exposed(&bundle.metrics_otlp_headers),
             ],
             [
                 Some("authorization=traces".to_string()),
                 Some("authorization=Bearer%20secret".to_string()),
                 Some("x-mlflow-experiment-id=0".to_string()),
+                Some("authorization=metrics".to_string()),
             ]
         );
         assert!(bundle.traces_otlp_tls.is_none() && bundle.ocsf_otlp_tls.is_none());
@@ -14027,6 +14032,13 @@ mod tests {
                 .tls
                 .and_then(|tls| tls.ca_pem.as_deref()),
             Some("agent-ca")
+        );
+        assert_eq!(
+            bundle
+                .metrics_otlp()
+                .tls
+                .and_then(|tls| tls.ca_pem.as_deref()),
+            Some("metrics-ca")
         );
     }
 

@@ -97,7 +97,7 @@ message HostAccepted {
   // Optional JSON-encoded OTLP configuration for the host's own metrics.
   // Includes collector credentials and is sent only over this authenticated
   // supervisor stream.
-  bytes supervisor_metrics = 4;
+  bytes supervisor_metrics = 4 [(openshell.options.v1.secret) = true];
 }
 
 // Another gateway replica should serve the host, which dials it at once. The

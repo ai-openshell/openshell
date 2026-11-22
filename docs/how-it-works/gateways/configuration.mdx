@@ -818,11 +818,13 @@ Each enabled signal needs an endpoint, either in its own table or from `endpoint
 
 `protocol` selects the transport to a collector: `grpc`, the default, or `http/protobuf`. With `http/protobuf`, the endpoint is a base URL and each signal is posted to its path under it, `/v1/traces`, `/v1/logs`, or `/v1/metrics`, as with `OTEL_EXPORTER_OTLP_ENDPOINT`. HTTP/JSON is not supported. Point a `grpc` endpoint at a collector's gRPC receiver, conventionally port `4317`, and an `http/protobuf` endpoint at its HTTP receiver, conventionally port `4318`. A URI alone cannot distinguish the two, so a mismatched endpoint is accepted at startup and then fails on export. Sandbox supervisors and standalone compute drivers must come from the same release as the gateway to use `http/protobuf`: an older supervisor exports over gRPC, and an older driver rejects the protocol setting.
 
-`headers` sets request headers sent with every export to a collector, as gRPC metadata or HTTP headers, such as an authorization token or a backend's routing header. Each name must be a valid HTTP header name set once, ignoring case; names the exporters set themselves, such as `content-type`, `host`, and `grpc-*`, and binary gRPC names ending in `-bin` are rejected. Each value must be non-empty printable ASCII; spaces are allowed. The gateway's exporters also read their signal's `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, or `OTEL_EXPORTER_OTLP_METRICS_HEADERS`, or else `OTEL_EXPORTER_OTLP_HEADERS`, and a header set there replaces a configured header of the same name. In-process compute drivers and the VM driver send the gateway's trace headers, including those from the environment, with their own spans. A standalone compute driver sends only the headers in its own `OTEL_EXPORTER_OTLP_*HEADERS` variables. Supervisors send their trace collector's `headers` with their own spans, and the gateway's OCSF headers, including those from the environment, with their OCSF records. Trace headers from the gateway's environment do not reach supervisors, so set `headers` or `headers_file` on the trace collector when supervisor spans need them. The agent trace relay sends only its collector's `headers`, never ones from the environment, so its credentials can only be set with `headers` or `headers_file`. A changed header takes effect when the gateway restarts, and reaches a running sandbox only after that sandbox restarts.
+`headers` sets request headers sent with every export to a collector, as gRPC metadata or HTTP headers, such as an authorization token or a backend's routing header. Each name must be a valid HTTP header name set once, ignoring case; names the exporters set themselves, such as `content-type`, `host`, and `grpc-*`, and binary gRPC names ending in `-bin` are rejected. Each value must be non-empty printable ASCII; spaces are allowed. The gateway's exporters also read their signal's `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, or `OTEL_EXPORTER_OTLP_METRICS_HEADERS`, or else `OTEL_EXPORTER_OTLP_HEADERS`, and a header set there replaces a configured header of the same name. In-process compute drivers and the VM driver send the gateway's trace headers, including those from the environment, with their own spans. A standalone compute driver sends only the headers in its own `OTEL_EXPORTER_OTLP_*HEADERS` variables.
+
+Supervisors send the gateway's OCSF and metrics headers, including environment overrides, with their own OCSF records and metrics. For supervisor traces and the agent trace relay, set `headers` or `headers_file` on the corresponding collector. Header changes take effect when the gateway restarts and reach supervisors when they next start.
 
 Put credentials in `headers_file` rather than `headers`. It reads a collector's headers from a file instead, such as a mounted Kubernetes Secret, so credentials stay out of the configuration file. The file holds one `name=value` header per line. Blank lines are skipped, and whitespace around each name and value is trimmed. The headers are validated like `headers`, the file must be UTF-8 and at most 64 KiB, and setting both `headers` and `headers_file` in one table is a configuration error. A relative path uses the gateway's working directory. The gateway reads the file at startup and fails to start if it is missing or invalid, so a changed file takes effect as a changed header does.
 
-Supervisors receive the gateway's headers but export to the endpoints their compute driver gives them. An external compute driver takes those endpoints from its own flags, so give it the same endpoints as the gateway, or supervisors send the gateway's credentials to a different collector. Supervisors and external compute drivers from an earlier release than the gateway reject launch credentials that carry trace or agent relay headers, so when the trace or agent collector sets `headers` or `headers_file`, upgrade them with or before the gateway. A gateway rolled back to an earlier release cannot read the stored launch credentials of sandboxes created with those headers, so delete and recreate those sandboxes after a rollback.
+Dedicated supervisors receive the gateway's headers but export to the endpoints their compute driver gives them. An external compute driver takes those endpoints from its own flags, so give it the same endpoints as the gateway to send the gateway's credentials to the intended collector. Upgrade dedicated supervisors and external compute drivers with or before the gateway when enabling authenticated trace, metrics, or agent relay export. Earlier releases can reject launch credentials containing the new collector settings. If you roll back to such a release, delete and recreate the sandboxes created with those settings.
 
 Headers travel in cleartext unless the endpoint uses `https://`, so use TLS when they carry credentials over an untrusted network.
 
@@ -927,11 +929,10 @@ In-process compute drivers read their backend-specific settings from `[openshell
 
 ### OTLP Metrics
 
-Set `enabled = true` in `[openshell.gateway.otlp.metrics]` to push gateway
-metrics over OTLP. It defaults to `false` and uses the table's collector
-settings, or inherits the shared endpoint, protocol, headers, and TLS settings
-from `[openshell.gateway.otlp]` when its own `endpoint` is omitted. This works
-even when `[openshell.gateway.otlp.traces]` selects a different collector.
+Set `enabled = true` in `[openshell.gateway.otlp.metrics]` to push gateway and
+supervisor metrics over OTLP. It defaults to `false`. Both use the table's
+collector settings, or inherit the shared endpoint, protocol, headers, and TLS
+settings from `[openshell.gateway.otlp]` when the metrics table omits `endpoint`.
 
 ```toml
 [openshell.gateway.otlp.metrics]
@@ -939,15 +940,18 @@ enabled = true
 # endpoint = "https://metrics-collector:4317" # optional override
 ```
 
-Metric export works with or without the Prometheus listener. Metric names and
-labels are preserved: for example, `openshell_server_grpc_requests_total`
-keeps that name, and `openshell_server_grpc_request_duration_seconds` is one
-OTLP histogram with that name, not separate `_bucket`, `_sum`, or `_count`
-metric names. Prometheus summary quantiles are not exported. Metrics carry the
-gateway's trace resource attributes and a `service.instance.id` that distinguishes
-gateway processes. Set it through `OTEL_RESOURCE_ATTRIBUTES` to override the
-generated process identity. Supervisors and workloads do not export metrics
-through this setting.
+If you already enable gateway metrics over OTLP, this setting now also enables
+supervisor export. Make the collector reachable from the gateway and its
+supervisors. See [Supervisor Metrics](/observability/gateway-metrics#supervisor-metrics)
+for the egress metrics catalog.
+
+Metric export works with or without the Prometheus listener. Gateway metric
+names and labels are preserved. The OTLP export sends
+`openshell_server_grpc_request_duration_seconds` as a single histogram and
+omits Prometheus summary quantiles. Gateway metrics carry the gateway's trace
+resource attributes and a `service.instance.id` that distinguishes gateway
+processes. Set it through `OTEL_RESOURCE_ATTRIBUTES` to override the generated
+gateway process identity.
 
 For Helm, set `gatewayConfig."openshell.gateway.otlp.metrics".enabled: true`.
 
@@ -980,23 +984,6 @@ A failed batch is retried with backoff for up to four attempts, so delivery is a
 A collector can accept a batch while rejecting some of its records, an OTLP partial success. The gateway counts such a batch as exported, and the exporter logs the number of rejected records as a warning. Gap records and `openshell_ocsf_otlp_dropped_total` cover only records the gateway dropped, so check the collector's own metrics for records it rejected.
 
 Metrics include `openshell_ocsf_otlp_queued_total`, `openshell_ocsf_otlp_exported_total`, `openshell_ocsf_otlp_dropped_total` (with a `reason` label of `queue_capacity`, `queue_bytes`, `oversized`, `export_failed`, `serialization`, or `closed`), `openshell_ocsf_otlp_export_errors_total`, and `openshell_ocsf_otlp_retries_total`.
-
-### Supervisor Metrics Export
-
-Enable supervisor egress metrics in `gateway.toml`.
-
-```toml
-[openshell.gateway.otlp.supervisor_metrics]
-enabled = true
-endpoint = "https://otel-collector.observability.svc:4317"
-```
-
-Omit `endpoint` to inherit the full `[openshell.gateway.otlp]` collector
-configuration. With its own endpoint, this table accepts the same protocol,
-header, and TLS settings as the base collector table. The collector must be
-reachable from supervisor processes. In Helm, put the table under
-`gatewayConfig`. See [Supervisor Metrics](/observability/gateway-metrics#supervisor-metrics)
-for the catalog.
 
 ### Agent trace relay
 

@@ -102,19 +102,6 @@ fn enrich_request(event: &mut openshell_ocsf::BaseEventData) {
             .entry("http_event_kind")
             .or_insert_with(|| event_kind.into());
         fields.insert("request_sequence".into(), sequence.into());
-        let finished_inspection = scope
-            .trace
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(RequestTrace::finished_inspection);
-        if let Some((inspection, result, outcome)) = finished_inspection {
-            fields.insert("egress_inspection_type".into(), inspection.label().into());
-            fields.insert("egress_result".into(), result.label().into());
-            if let Some(outcome) = outcome {
-                fields.insert("egress_outcome".into(), outcome.label().into());
-            }
-        }
     }
 }
 
@@ -291,7 +278,7 @@ impl RequestCorrelation {
 
     fn build(method: &str, raw_header: &[u8], ctx: &L7EvalContext, request_id: String) -> Self {
         let mut trace = RequestTrace::new(&request_id, method, &ctx.host, ctx.port, raw_header);
-        trace.start_inspection(&ctx.policy_name);
+        trace.start_inspection();
         Self::install(RequestScope {
             request_id,
             inspected: true,
@@ -349,7 +336,7 @@ impl RequestCorrelation {
             .map_or_else(tracing::Span::none, |trace| trace.stage(stage))
     }
 
-    pub(crate) fn select_inspector(&self, protocol: crate::l7::L7Protocol, policy: &str) {
+    pub(crate) fn select_inspector(&self, protocol: crate::l7::L7Protocol) {
         if let Some(trace) = self
             .scope
             .trace
@@ -357,10 +344,7 @@ impl RequestCorrelation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_mut()
         {
-            trace.select_inspector(
-                crate::metrics::InspectionType::from_protocol(protocol),
-                policy,
-            );
+            trace.select_inspector(crate::metrics::InspectionType::from_protocol(protocol));
         }
     }
 

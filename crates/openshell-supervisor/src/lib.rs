@@ -906,8 +906,6 @@ pub fn trace_context_from_environment() -> Option<RegistrationTraceContext> {
 /// from its [`SandboxInstanceBindings`], so one process can host several
 /// instances.
 pub struct SandboxInstanceConfig {
-    /// Instance ID sent on this sandbox's supervisor control stream.
-    pub supervisor_instance_id: String,
     pub app_router: Option<app_listener::Router>,
     pub command: Vec<String>,
     pub workdir: Option<String>,
@@ -1091,7 +1089,6 @@ pub async fn run_sandbox_instance(
     controls: SandboxInstanceControls,
 ) -> Result<i32> {
     let SandboxInstanceConfig {
-        supervisor_instance_id,
         app_router,
         command,
         workdir,
@@ -1767,7 +1764,6 @@ pub async fn run_sandbox_instance(
         let agent = running.agent();
         let boundary_access = openshell_supervisor_process::delegated::start_boundary_access(
             sandbox_id.as_deref(),
-            supervisor_instance_id,
             gateway.as_ref(),
             ssh_socket_path.as_deref(),
             shared_ssh_socket,
@@ -4772,7 +4768,6 @@ mod tests {
             agent_otlp_tls: None,
         };
         let config = SandboxInstanceConfig {
-            supervisor_instance_id: uuid::Uuid::new_v4().to_string(),
             app_router: None,
             command: vec!["true".to_string()],
             workdir: None,

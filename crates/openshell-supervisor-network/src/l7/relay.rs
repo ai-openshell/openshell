@@ -1444,7 +1444,7 @@ where
         }
         L7Protocol::Graphql => relay_graphql(config, &engine, client, upstream, ctx).await,
         L7Protocol::Sql => {
-            use crate::metrics::{self, InspectionType, Outcome, Policy, Scope};
+            use crate::metrics::{self, InspectionType, Outcome, Scope};
 
             if close_if_stale(engine.generation_guard(), ctx) {
                 return Ok(());
@@ -1464,12 +1464,7 @@ where
                 }
                 UninspectableTrafficGate::Unrestricted => Outcome::Allow,
             };
-            metrics::decision(
-                Scope::Connection,
-                outcome,
-                InspectionType::Tcp,
-                Policy::from(Some(ctx.policy_name.as_str())),
-            );
+            metrics::decision(Scope::Connection, outcome, InspectionType::Tcp);
             if matches!(outcome, Outcome::Deny) {
                 return Ok(());
             }
@@ -1609,7 +1604,7 @@ where
                 .map_err(&capture_error)?;
             return Ok(());
         };
-        correlation.select_inspector(config.protocol, &ctx.policy_name);
+        correlation.select_inspector(config.protocol);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
             config,
@@ -2596,7 +2591,7 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
-        correlation.select_inspector(config.protocol, &ctx.policy_name);
+        correlation.select_inspector(config.protocol);
         let capture_error = |error| correlation.capture_error(error);
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation))
@@ -3157,7 +3152,7 @@ where
         let req = parsed.request;
         let jsonrpc_info = parsed.info;
         let correlation = RequestCorrelation::new(&req, ctx);
-        correlation.select_inspector(config.protocol, &ctx.policy_name);
+        correlation.select_inspector(config.protocol);
         let capture_error = |error| correlation.capture_error(error);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
@@ -3530,7 +3525,7 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
-        correlation.select_inspector(config.protocol, &ctx.policy_name);
+        correlation.select_inspector(config.protocol);
         let capture_error = |error| correlation.capture_error(error);
 
         if !request_authority_matches_endpoint(&req, ctx) {

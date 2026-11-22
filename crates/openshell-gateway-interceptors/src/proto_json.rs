@@ -399,6 +399,10 @@ mod tests {
         for (message_name, field_name) in [
             ("openshell.datamodel.v1.Provider", "credentials"),
             ("openshell.compute.v1.DriverSandboxSpec", "sandbox_token"),
+            (
+                "openshell.supervisor.host.v1.HostAccepted",
+                "supervisor_metrics",
+            ),
             ("openshell.v1.IssueSandboxTokenResponse", "token"),
             ("openshell.v1.RefreshSandboxTokenResponse", "token"),
             ("openshell.v1.ExtensionServiceCredential", "token"),

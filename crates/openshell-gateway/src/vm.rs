@@ -953,7 +953,6 @@ mod tests {
             traces: Some(OtlpTracesConfig { collector }),
             ocsf: None,
             agent: None,
-            supervisor_metrics: None,
         };
         let mut command = tokio::process::Command::new("openshell-driver-vm");
         append_otlp_args(&mut command, Some(&otlp), "production-us-west");
@@ -992,7 +991,6 @@ mod tests {
                 }),
                 ocsf: None,
                 agent: None,
-                supervisor_metrics: None,
             }),
             "production-us-west",
         );
@@ -1026,7 +1024,6 @@ mod tests {
                 }),
                 ocsf: None,
                 agent: None,
-                supervisor_metrics: None,
             }),
             "production-us-west",
         );
@@ -1063,7 +1060,6 @@ mod tests {
                     schema_version: Some("2.0".into()),
                 }),
                 agent: None,
-                supervisor_metrics: None,
             }),
             "production-us-west",
         );
@@ -1102,7 +1098,6 @@ mod tests {
                         OtlpProtocol::HttpProtobuf,
                     ),
                 }),
-                supervisor_metrics: None,
             }),
             "production-us-west",
         );

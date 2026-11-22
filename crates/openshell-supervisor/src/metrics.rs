@@ -3,6 +3,7 @@
 
 //! Process-owned supervisor metrics export.
 
+use openshell_core::config::DEFAULT_GATEWAY_NAME;
 use openshell_core::jwt::{OtlpExportCredentials, OtlpTlsMaterial, SecretOtlpHeaders};
 use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_otel::{
@@ -13,25 +14,53 @@ use opentelemetry::metrics::MeterProvider as _;
 
 const SERVICE_NAME: &str = "openshell-supervisor";
 
+/// The deployment identity of a supervisor, independent of its process.
+pub enum SupervisorIdentity<'a> {
+    Sandbox(&'a str),
+    PoolMember(&'a str),
+}
+
+fn resource_attributes(
+    gateway_name: Option<&str>,
+    identity: Option<SupervisorIdentity<'_>>,
+) -> Vec<KeyValue> {
+    let mut attributes = openshell_otel::gateway_resource_attributes(gateway_name, None);
+    if let Some(identity) = identity {
+        let (kind, key, id) = match identity {
+            SupervisorIdentity::Sandbox(id) => ("sandbox", "openshell.sandbox.id", id),
+            SupervisorIdentity::PoolMember(id) => {
+                ("pool", "openshell.supervisor.pool_member.id", id)
+            }
+        };
+        // Keep the components unambiguous when a configured gateway name contains a colon.
+        let gateway = gateway_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(DEFAULT_GATEWAY_NAME)
+            .replace('%', "%25")
+            .replace(':', "%3A");
+        attributes.extend([
+            KeyValue::new("service.instance.id", format!("{kind}:{gateway}:{id}")),
+            KeyValue::new(key, id.to_string()),
+        ]);
+    }
+    attributes
+}
+
 /// Create the process's metrics provider inside the runtime driving OTLP.
 pub fn start(
-    instance_id: &str,
     endpoint: &str,
     protocol: OtlpProtocol,
     credentials: OtlpExportCredentials<'_>,
     gateway_name: Option<&str>,
+    identity: Option<SupervisorIdentity<'_>>,
     sandbox_count: impl Fn() -> u64 + Send + Sync + 'static,
 ) -> Result<SdkMeterProvider, SetupError> {
-    let mut resource_attributes = openshell_otel::gateway_resource_attributes(gateway_name, None);
-    resource_attributes.push(KeyValue::new(
-        "service.instance.id",
-        instance_id.to_string(),
-    ));
     let config = OtlpExportConfig {
         endpoint,
         service_name: ServiceName::Fixed(SERVICE_NAME),
         service_version: Some(openshell_core::VERSION),
-        resource_attributes,
+        resource_attributes: resource_attributes(gateway_name, identity),
     };
     let transport = CollectorTransport {
         protocol: protocol.into(),
@@ -74,15 +103,26 @@ mod tests {
     use opentelemetry_proto::tonic::metrics::v1::metric::Data;
     use prost::Message as _;
 
+    #[test]
+    fn dedicated_metrics_identify_the_gateway_and_sandbox() {
+        let attributes = resource_attributes(
+            Some("test:gateway"),
+            Some(SupervisorIdentity::Sandbox("sandbox-id")),
+        );
+        assert!(attributes.contains(&KeyValue::new(
+            "service.instance.id",
+            "sandbox:test%3Agateway:sandbox-id",
+        )));
+        assert!(attributes.contains(&KeyValue::new("openshell.sandbox.id", "sandbox-id")));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn pushes_supervisor_gauges_and_resource_to_the_collector() {
         let mut collector = OtlpHttpTestServer::start().await;
         let path = format!("{}/receiver", collector.endpoint());
         let headers = SecretOtlpHeaders::new("x-collector-test=metrics".to_string());
         let count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
-        let instance_id = "registered-supervisor";
         let provider = start(
-            instance_id,
             &path,
             OtlpProtocol::HttpProtobuf,
             OtlpExportCredentials {
@@ -90,6 +130,7 @@ mod tests {
                 tls: None,
             },
             Some("test-gateway"),
+            Some(SupervisorIdentity::PoolMember("member-1")),
             {
                 let count = count.clone();
                 move || count.load(std::sync::atomic::Ordering::Relaxed)
@@ -109,7 +150,14 @@ mod tests {
             let response = ExportMetricsServiceRequest::decode(received.body).unwrap();
             let resource = &response.resource_metrics[0];
             let attributes = &resource.resource.as_ref().unwrap().attributes;
-            assert!(attributes.contains(&string_attribute("service.instance.id", instance_id)));
+            assert!(attributes.contains(&string_attribute(
+                "service.instance.id",
+                "pool:test-gateway:member-1",
+            )));
+            assert!(attributes.contains(&string_attribute(
+                "openshell.supervisor.pool_member.id",
+                "member-1",
+            )));
             assert!(
                 attributes.contains(&string_attribute("openshell.gateway.name", "test-gateway"))
             );

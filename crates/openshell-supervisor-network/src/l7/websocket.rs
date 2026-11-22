@@ -8,7 +8,7 @@
 
 use crate::l7::relay::{L7EvalContext, evaluate_l7_in_scope};
 use crate::l7::{EnforcementMode, L7RequestInfo};
-use crate::metrics::{self, InspectionType, Outcome, Policy, ResultLabel, Scope, Stage, Timer};
+use crate::metrics::{self, InspectionType, Outcome, ResultLabel, Scope, Stage, Timer};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use crate::telemetry::egress_emit;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
@@ -1254,7 +1254,7 @@ where
             | WebSocketTerminationCause::DownstreamDisconnect => (None, ResultLabel::Cancelled),
             _ => (None, ResultLabel::Error),
         };
-        metrics.finish(options.policy_name, outcome, label);
+        metrics.finish(outcome, label);
     }
     result
 }
@@ -1266,15 +1266,10 @@ struct MessageInspection {
 }
 
 impl MessageInspection {
-    fn finish(&mut self, policy: &str, outcome: Option<Outcome>, result: ResultLabel) {
+    fn finish(&mut self, outcome: Option<Outcome>, result: ResultLabel) {
         if let Some(timer) = self.timer.take() {
             if let Some(outcome) = outcome {
-                metrics::decision(
-                    Scope::Message,
-                    outcome,
-                    self.inspection,
-                    Policy::from(Some(policy)),
-                );
+                metrics::decision(Scope::Message, outcome, self.inspection);
             }
             timer.finish(result);
         }
@@ -1449,11 +1444,7 @@ where
             ))
         })?;
         apply_mask(&mut payload, mask_key);
-        metrics.finish(
-            options.policy_name,
-            Some(metrics.outcome),
-            ResultLabel::Success,
-        );
+        metrics.finish(Some(metrics.outcome), ResultLabel::Success);
         return write_text_frame_guarded(
             writer,
             &frame.raw_header,
@@ -1485,11 +1476,7 @@ where
                 error,
             ))
         })?;
-        metrics.finish(
-            options.policy_name,
-            Some(metrics.outcome),
-            ResultLabel::Success,
-        );
+        metrics.finish(Some(metrics.outcome), ResultLabel::Success);
         return write_masked_text_frame_guarded(
             writer,
             0x40,
@@ -1501,11 +1488,7 @@ where
         )
         .await;
     }
-    metrics.finish(
-        options.policy_name,
-        Some(metrics.outcome),
-        ResultLabel::Success,
-    );
+    metrics.finish(Some(metrics.outcome), ResultLabel::Success);
     write_masked_text_frame_guarded(
         writer,
         0,
