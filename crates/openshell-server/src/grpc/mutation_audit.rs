@@ -8,17 +8,29 @@ use std::future::Future;
 
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
-    AddWorkspaceMemberResponse, AttachSandboxProviderResponse, BeginRootfsTarStagingResponse,
-    CreateWorkspaceResponse, DeleteProviderProfileResponse, DeleteProviderRefreshResponse,
-    DeleteProviderResponse, DeleteSandboxResponse, DeleteSandboxTemplateResponse,
-    DeleteServiceResponse, DeleteWorkspaceResponse, DeletionOutcome, DetachSandboxProviderResponse,
-    ImportProviderProfilesResponse, ProviderProfile, RemoveWorkspaceMemberResponse, Sandbox,
-    SandboxResponse, SandboxTemplateResponse, ServiceEndpointResponse,
-    UpdateProviderProfilesResponse, WorkspaceSelector, workspace_selector::Selection,
+    AddWorkspaceMemberResponse, ApproveAllDraftChunksResponse, ApproveDraftChunkResponse,
+    AttachSandboxProviderResponse, BeginRootfsTarStagingResponse, ClearDraftChunksResponse,
+    ConfigureProviderRefreshResponse, CreateWorkspaceResponse, DeleteProviderProfileResponse,
+    DeleteProviderRefreshResponse, DeleteProviderResponse, DeleteSandboxResponse,
+    DeleteSandboxTemplateResponse, DeleteSecretResponse, DeleteServiceResponse,
+    DeleteWorkspaceResponse, DeletionOutcome, DetachSandboxProviderResponse,
+    EditDraftChunkResponse, ImportProviderProfilesResponse, InlineProviderRefreshSecretsResponse,
+    ProviderCredentialRefreshStatus, ProviderProfile, ProviderResponse, RejectDraftChunkResponse,
+    RemoveWorkspaceMemberResponse, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
+    SandboxTemplateResponse, SecretResponse, ServiceEndpointResponse, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesResponse, WorkspaceSelector,
+    setting_value, workspace_selector::Selection,
 };
+use openshell_core::proto::{
+    CreateSshSessionResponse, ExecSandboxRequest, RevokeSshSessionResponse, SshSession,
+    TcpForwardInit, relay_open,
+};
+use openshell_core::settings::{self, SettingValueKind};
+use openshell_core::{GatewayAuditConfig, ObjectName, ObjectWorkspace};
 use openshell_ocsf::ResourceDetails;
 use tonic::{Code, Response, Status};
 
+use super::policy::POLICY_SETTING_KEY;
 pub(super) use crate::auth::audit::requested;
 use crate::auth::audit::{self, Outcome};
 
@@ -63,12 +75,14 @@ macro_rules! deletion {
 
 deletion!(
     DeleteSandboxTemplateResponse,
+    DeleteSecretResponse,
     DeleteServiceResponse,
     DeleteProviderResponse,
     DeleteProviderProfileResponse,
     DeleteProviderRefreshResponse,
     DeleteWorkspaceResponse,
     RemoveWorkspaceMemberResponse,
+    RevokeSshSessionResponse,
 );
 
 impl Audited for DeleteSandboxResponse {
@@ -124,6 +138,27 @@ impl Audited for SandboxTemplateResponse {
             self.template
                 .as_ref()
                 .and_then(|template| template.metadata.as_ref()),
+        )
+    }
+}
+
+/// Records who read which secret. The named target comes from the request;
+/// the response carries the value and contributes nothing to the record.
+impl Audited for openshell_core::proto::RevealSecretResponse {}
+
+impl Audited for InlineProviderRefreshSecretsResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        refreshed_provider(self.status.as_ref())
+    }
+}
+
+impl Audited for SecretResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored(
+            "secret",
+            self.secret
+                .as_ref()
+                .and_then(|secret| secret.metadata.as_ref()),
         )
     }
 }
@@ -212,19 +247,189 @@ impl Audited for AddWorkspaceMemberResponse {
 
 impl Audited for BeginRootfsTarStagingResponse {}
 
+impl Audited for ProviderResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored(
+            "provider",
+            self.provider
+                .as_ref()
+                .and_then(|provider| provider.metadata.as_ref()),
+        )
+    }
+}
+
+fn refreshed_provider(status: Option<&ProviderCredentialRefreshStatus>) -> Vec<Produced<'_>> {
+    status
+        .map(|status| Produced {
+            type_label: "provider",
+            name: &status.provider,
+            uid: &status.provider_id,
+        })
+        .into_iter()
+        .collect()
+}
+
+impl Audited for ConfigureProviderRefreshResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        refreshed_provider(self.status.as_ref())
+    }
+}
+
+impl Audited for RotateProviderCredentialResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        refreshed_provider(self.status.as_ref())
+    }
+}
+
+/// The policy a call left in place, identified by its hash.
+fn stored_policy(hash: &str) -> Vec<Produced<'_>> {
+    (!hash.is_empty())
+        .then_some(Produced {
+            type_label: "policy",
+            name: "",
+            uid: hash,
+        })
+        .into_iter()
+        .collect()
+}
+
+impl Audited for UpdateConfigResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored_policy(&self.policy_hash)
+    }
+}
+
+impl Audited for ApproveDraftChunkResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored_policy(&self.policy_hash)
+    }
+}
+
+impl Audited for UndoDraftChunkResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored_policy(&self.policy_hash)
+    }
+}
+
+impl Audited for ApproveAllDraftChunksResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored_policy(&self.policy_hash)
+    }
+
+    fn outcome(&self) -> Option<Outcome> {
+        (self.chunks_approved == 0).then_some(Outcome::Detail("no_op:unchanged"))
+    }
+}
+
+impl Audited for ClearDraftChunksResponse {
+    fn outcome(&self) -> Option<Outcome> {
+        (self.chunks_cleared == 0).then_some(Outcome::Detail("no_op:already_absent"))
+    }
+}
+
+impl Audited for CreateSshSessionResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        vec![Produced {
+            type_label: "sandbox",
+            name: "",
+            uid: &self.sandbox_id,
+        }]
+    }
+}
+
+impl Audited for RejectDraftChunkResponse {}
+impl Audited for EditDraftChunkResponse {}
+
+/// The resources an `UpdateConfig` call changes, with the setting value it
+/// sets when `capture_values` is on.
+pub(super) fn update_config_targets(
+    request: &UpdateConfigRequest,
+    capture_values: bool,
+) -> Vec<ResourceDetails> {
+    let scope = if request.global {
+        "global"
+    } else {
+        request.sandbox.as_str()
+    };
+    let key = request.setting_key.trim();
+    let mut targets = Vec::new();
+    if !request.global {
+        targets.push(requested("sandbox", &request.sandbox));
+    }
+    if key == POLICY_SETTING_KEY {
+        targets.push(requested("policy", scope));
+    } else if !key.is_empty() {
+        let mut setting = requested("setting", key);
+        if capture_values
+            && !request.delete_setting
+            && let Some(value) = request
+                .setting_value
+                .as_ref()
+                .and_then(|value| value.value.as_ref())
+            && let Some(value) = captured_value(key, value)
+        {
+            setting = setting.with_data(serde_json::json!({ "value": value }));
+        }
+        targets.push(setting);
+    }
+    if request.policy.is_some() || !request.merge_operations.is_empty() {
+        targets.push(requested("policy", scope));
+    }
+    scoped(request.workspace_scope.as_ref(), targets)
+}
+
+/// The value of a registered setting when it has the registered kind and is
+/// allowed. Bytes and unregistered keys are never recorded.
+fn captured_value(key: &str, value: &setting_value::Value) -> Option<serde_json::Value> {
+    let setting = settings::setting_for_key(key)?;
+    match (setting.kind, value) {
+        (SettingValueKind::String, setting_value::Value::StringValue(value))
+            if setting.validate_string_value(value).is_ok() =>
+        {
+            Some(value.as_str().into())
+        }
+        (SettingValueKind::Bool, setting_value::Value::BoolValue(value)) => Some((*value).into()),
+        (SettingValueKind::Int, setting_value::Value::IntValue(value)) => Some((*value).into()),
+        _ => None,
+    }
+}
+
+/// Whether an `UpdateConfig` call only deletes a setting.
+pub(super) fn deletes_only_a_setting(request: &UpdateConfigRequest) -> bool {
+    request.delete_setting && request.annotations.is_empty()
+}
+
+/// Run an `UpdateConfig` call, recording a delete that removed no setting
+/// and changed nothing else as a no-op.
+pub(super) async fn record_absent_delete(
+    deleting_only: bool,
+    call: impl Future<Output = Result<Response<UpdateConfigResponse>, Status>>,
+) -> Result<Response<UpdateConfigResponse>, Status> {
+    let response = call.await;
+    if deleting_only
+        && response
+            .as_ref()
+            .is_ok_and(|response| !response.get_ref().deleted)
+    {
+        audit::record_outcome(Outcome::Detail("no_op:already_absent"));
+    }
+    response
+}
+
 /// Run `call`, recording the requested `targets` that have a name before it
 /// starts, then what it produced and how it ended. The call is boxed because
 /// handler futures are large.
+///
+/// Hooks record targets here when the unary request names them. Handlers
+/// record the rest: what exists only once admitted, such as a relay channel
+/// or a stored session, and the targets of client-streaming requests.
 pub(super) fn audited<T: Audited>(
-    mut targets: Vec<ResourceDetails>,
+    targets: Vec<ResourceDetails>,
     call: impl Future<Output = Result<Response<T>, Status>>,
 ) -> impl Future<Output = Result<Response<T>, Status>> {
     let call = Box::pin(call);
     async move {
-        targets.retain(|target| target.name.as_deref().is_some_and(|name| !name.is_empty()));
-        for target in targets {
-            audit::record_target(target);
-        }
+        record_requested(targets);
         let response = call.await;
         if let Ok(response) = &response {
             let response = response.get_ref();
@@ -236,6 +441,118 @@ pub(super) fn audited<T: Audited>(
         }
         response
     }
+}
+
+/// Record each requested target that has a non-empty name.
+fn record_requested(targets: impl IntoIterator<Item = ResourceDetails>) {
+    for target in targets {
+        if target.name.as_deref().is_some_and(|name| !name.is_empty()) {
+            audit::record_target(target);
+        }
+    }
+}
+
+/// Command arguments an exec record holds at most.
+const MAX_EXEC_ARGS: usize = 32;
+
+/// Record the workspace and sandbox an exec requested, before it starts.
+pub(super) fn record_exec_targets(request: &ExecSandboxRequest) {
+    record_requested(scoped(
+        request.workspace_scope.as_ref(),
+        [requested("sandbox", &request.sandbox)],
+    ));
+}
+
+/// Record the relay an exec opened, with its command when `config` captures it.
+pub(super) fn record_exec_relay(
+    config: &GatewayAuditConfig,
+    sandbox: &Sandbox,
+    channel_id: &str,
+    request: &ExecSandboxRequest,
+) {
+    let data = exec_command(config.capture_exec_command, request);
+    record_relay("exec", sandbox, channel_id, data);
+}
+
+/// Resource data holding an exec's first `MAX_EXEC_ARGS` command arguments
+/// and how many it left out, when `capture` is set.
+fn exec_command(capture: bool, request: &ExecSandboxRequest) -> Option<serde_json::Value> {
+    capture.then(|| {
+        let command: Vec<&String> = request.command.iter().take(MAX_EXEC_ARGS).collect();
+        let omitted = request.command.len() - command.len();
+        if omitted == 0 {
+            serde_json::json!({ "command": command })
+        } else {
+            serde_json::json!({ "command": command, "omitted": omitted })
+        }
+    })
+}
+
+/// Record the workspace and sandbox a forward requested, before it starts.
+/// `TcpForwardInit` names its workspace directly.
+pub(super) fn record_forward_targets(init: &TcpForwardInit) {
+    record_requested([
+        requested("workspace", &init.workspace),
+        requested("sandbox", &init.sandbox),
+    ]);
+}
+
+/// Record the relay a forward opened to `target`. A TCP forward's data holds
+/// its host and port.
+pub(super) fn record_forward_relay(
+    sandbox: &Sandbox,
+    channel_id: &str,
+    target: &relay_open::Target,
+) {
+    let data = match target {
+        relay_open::Target::Tcp(target) => {
+            Some(serde_json::json!({ "host": target.host, "port": target.port }))
+        }
+        relay_open::Target::Ssh(_) => None,
+    };
+    record_relay("forward", sandbox, channel_id, data);
+}
+
+/// Record the relay opened to `sandbox` as a `type_label` resource whose
+/// `uid` is its channel ID.
+fn record_relay(
+    type_label: &str,
+    sandbox: &Sandbox,
+    channel_id: &str,
+    data: Option<serde_json::Value>,
+) {
+    let produced = stored_sandbox(Some(sandbox));
+    audit::amend_targets(|targets| {
+        complete(targets, produced);
+        targets.push(ResourceDetails {
+            uid: Some(channel_id.to_string()),
+            name: None,
+            type_label: Some(type_label.to_string()),
+            data,
+        });
+    });
+}
+
+/// Record an SSH session by its name, never by its ID, which is its token.
+pub(super) fn record_ssh_session(name: &str) {
+    record_requested([requested("ssh_session", name)]);
+}
+
+/// Record the session a revoke found: its workspace, sandbox, and name.
+pub(super) fn record_revoked_ssh_session(session: &SshSession) {
+    record_requested([requested("workspace", session.object_workspace())]);
+    audit::record_target(ResourceDetails {
+        uid: Some(session.sandbox_id.clone()),
+        name: None,
+        type_label: Some("sandbox".to_string()),
+        data: None,
+    });
+    record_ssh_session(session.object_name());
+}
+
+/// Record a revoke of a session that was already revoked as a no-op.
+pub(super) fn record_repeated_revoke() {
+    audit::record_outcome(Outcome::Detail("no_op:already_absent"));
 }
 
 /// Fill in the first unfilled requested target of each produced
@@ -257,6 +574,7 @@ fn complete(targets: &mut Vec<ResourceDetails>, produced: Vec<Produced<'_>>) {
                 uid: None,
                 name: None,
                 type_label: Some(produced.type_label.to_string()),
+                data: None,
             });
             targets.last_mut().expect("target just added")
         };
@@ -282,877 +600,4 @@ pub(super) fn scoped(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::auth::audit::test_support::{audited_mutation, cancelled_mutation};
-    use crate::auth::principal::Principal;
-    use crate::grpc::OpenShellService;
-    use crate::grpc::test_support::{authed_request, test_server_state};
-    use openshell_core::proto::datamodel::v1::ObjectMeta;
-    use openshell_core::proto::open_shell_server::OpenShell;
-    use openshell_core::proto::sandbox_updates_server::SandboxUpdates;
-    use openshell_core::proto::{
-        AddWorkspaceMemberRequest, AttachSandboxProviderRequest, AttachSandboxProviderResponse,
-        BeginRootfsTarStagingRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
-        CreateWorkspaceRequest, DeleteProviderProfileRequest, DeleteProviderRefreshRequest,
-        DeleteProviderRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-        DeleteServiceRequest, DeleteWorkspaceRequest, DetachSandboxProviderRequest,
-        DetachSandboxProviderResponse, ExposeServiceRequest, ImportProviderProfilesRequest,
-        ImportProviderProfilesResponse, ProviderProfile, ProviderProfileCategory,
-        ProviderProfileImportItem, RemoveWorkspaceMemberRequest, ResumeSandboxRequest, Sandbox,
-        SandboxSpec, SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
-        StartSandboxRequest, StopSandboxRequest, SuspendSandboxRequest,
-        UpdateProviderProfilesRequest, UpdateSandboxRequest, WorkspaceRole, workspace_selector,
-    };
-    use serde_json::{Value, json};
-
-    fn principal() -> Principal {
-        authed_request(())
-            .extensions()
-            .get::<Principal>()
-            .cloned()
-            .unwrap()
-    }
-
-    fn path(method: &str) -> String {
-        format!("/openshell.v1.OpenShell/{method}")
-    }
-
-    fn only(events: &[Value]) -> &Value {
-        assert_eq!(events.len(), 1, "{events:?}");
-        &events[0]
-    }
-
-    #[tokio::test]
-    async fn deletes_of_absent_resources_name_the_target_and_record_a_no_op() {
-        let service = OpenShellService::new(test_server_state().await);
-        let principal = principal();
-        let scope = || Some(workspace_selector("default"));
-
-        let cases: Vec<(&str, Value, Vec<Value>)> = vec![
-            (
-                "DeleteSandbox",
-                only(
-                    &audited_mutation(&path("DeleteSandbox"), &principal, async {
-                        service
-                            .delete_sandbox(authed_request(DeleteSandboxRequest {
-                                workspace_scope: scope(),
-                                name: "absent-sandbox".into(),
-                                allow_missing: true,
-                                ..Default::default()
-                            }))
-                            .await
-                    })
-                    .await
-                    .1,
-                )
-                .clone(),
-                vec![
-                    json!({"type": "workspace", "name": "default"}),
-                    json!({"type": "sandbox", "name": "absent-sandbox"}),
-                ],
-            ),
-            (
-                "DeleteSandboxTemplate",
-                only(
-                    &audited_mutation(&path("DeleteSandboxTemplate"), &principal, async {
-                        service
-                            .delete_sandbox_template(authed_request(DeleteSandboxTemplateRequest {
-                                workspace_scope: scope(),
-                                name: "absent-template".into(),
-                                allow_missing: true,
-                                ..Default::default()
-                            }))
-                            .await
-                    })
-                    .await
-                    .1,
-                )
-                .clone(),
-                vec![
-                    json!({"type": "workspace", "name": "default"}),
-                    json!({"type": "sandbox_template", "name": "absent-template"}),
-                ],
-            ),
-            (
-                "DeleteProvider",
-                only(
-                    &audited_mutation(&path("DeleteProvider"), &principal, async {
-                        service
-                            .delete_provider(authed_request(DeleteProviderRequest {
-                                workspace_scope: scope(),
-                                name: "absent-provider".into(),
-                                allow_missing: true,
-                                ..Default::default()
-                            }))
-                            .await
-                    })
-                    .await
-                    .1,
-                )
-                .clone(),
-                vec![
-                    json!({"type": "workspace", "name": "default"}),
-                    json!({"type": "provider", "name": "absent-provider"}),
-                ],
-            ),
-            (
-                "DeleteProviderProfile",
-                only(
-                    &audited_mutation(&path("DeleteProviderProfile"), &principal, async {
-                        service
-                            .delete_provider_profile(authed_request(DeleteProviderProfileRequest {
-                                workspace_scope: scope(),
-                                id: "absent-profile".into(),
-                                allow_missing: true,
-                                ..Default::default()
-                            }))
-                            .await
-                    })
-                    .await
-                    .1,
-                )
-                .clone(),
-                vec![
-                    json!({"type": "workspace", "name": "default"}),
-                    json!({"type": "provider_profile", "name": "absent-profile"}),
-                ],
-            ),
-            (
-                "DeleteWorkspace",
-                only(
-                    &audited_mutation(&path("DeleteWorkspace"), &principal, async {
-                        service
-                            .delete_workspace(authed_request(DeleteWorkspaceRequest {
-                                name: "absent-workspace".into(),
-                                allow_missing: true,
-                                ..Default::default()
-                            }))
-                            .await
-                    })
-                    .await
-                    .1,
-                )
-                .clone(),
-                vec![json!({"type": "workspace", "name": "absent-workspace"})],
-            ),
-            (
-                "RemoveWorkspaceMember",
-                only(
-                    &audited_mutation(&path("RemoveWorkspaceMember"), &principal, async {
-                        service
-                            .remove_workspace_member(authed_request(RemoveWorkspaceMemberRequest {
-                                workspace_scope: scope(),
-                                principal_subject: "absent-member".into(),
-                                allow_missing: true,
-                                ..Default::default()
-                            }))
-                            .await
-                    })
-                    .await
-                    .1,
-                )
-                .clone(),
-                vec![
-                    json!({"type": "workspace", "name": "default"}),
-                    json!({"type": "workspace_member", "name": "absent-member"}),
-                ],
-            ),
-        ];
-
-        for (method, event, resources) in cases {
-            assert_eq!(event["api"]["operation"], method, "{event}");
-            assert_eq!(event["status_id"], 1, "{method}: {event}");
-            assert_eq!(
-                event["status_detail"], "no_op:already_absent",
-                "{method}: {event}"
-            );
-            assert_eq!(event["resources"], json!(resources), "{method}: {event}");
-        }
-    }
-
-    #[tokio::test]
-    async fn rejected_delete_names_the_requested_target() {
-        let service = OpenShellService::new(test_server_state().await);
-
-        let (result, events) = audited_mutation(&path("DeleteProvider"), &principal(), async {
-            service
-                .delete_provider(authed_request(DeleteProviderRequest {
-                    workspace_scope: Some(workspace_selector("default")),
-                    name: "missing-provider".into(),
-                    ..Default::default()
-                }))
-                .await
-        })
-        .await;
-
-        assert_eq!(result.unwrap_err().code(), Code::NotFound);
-        let event = only(&events);
-        assert_eq!(event["status_detail"], "rejected:not_found", "{event}");
-        assert_eq!(
-            event["resources"],
-            json!([{"type": "workspace", "name": "default"}, {"type": "provider", "name": "missing-provider"}])
-        );
-
-        let (result, events) =
-            audited_mutation(&path("DeleteProviderRefresh"), &principal(), async {
-                service
-                    .delete_provider_refresh(authed_request(DeleteProviderRefreshRequest {
-                        workspace_scope: Some(workspace_selector("default")),
-                        provider: "missing-provider".into(),
-                        credential_key: "API_TOKEN".into(),
-                        allow_missing: true,
-                        ..Default::default()
-                    }))
-                    .await
-            })
-            .await;
-
-        assert_eq!(result.unwrap_err().code(), Code::NotFound);
-        let event = only(&events);
-        assert_eq!(event["status_detail"], "rejected:not_found", "{event}");
-        assert_eq!(
-            event["resources"],
-            json!([
-                {"type": "workspace", "name": "default"},
-                {"type": "provider", "name": "missing-provider"},
-                {"type": "provider_credential", "name": "API_TOKEN"},
-            ])
-        );
-
-        let (result, events) = audited_mutation(&path("DeleteService"), &principal(), async {
-            service
-                .delete_service(authed_request(DeleteServiceRequest {
-                    workspace_scope: Some(workspace_selector("default")),
-                    sandbox: "missing-sandbox".into(),
-                    name: "web".into(),
-                    allow_missing: true,
-                    ..Default::default()
-                }))
-                .await
-        })
-        .await;
-
-        assert_eq!(result.unwrap_err().code(), Code::NotFound);
-        let event = only(&events);
-        assert_eq!(event["status_detail"], "rejected:not_found", "{event}");
-        assert_eq!(
-            event["resources"],
-            json!([
-                {"type": "workspace", "name": "default"},
-                {"type": "sandbox", "name": "missing-sandbox"},
-                {"type": "service", "name": "web"},
-            ])
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_delete_names_the_requested_target() {
-        let targets = scoped(
-            Some(&workspace_selector("default")),
-            [requested("provider", "github")],
-        );
-        let call = audited(
-            targets,
-            std::future::pending::<Result<Response<DeleteProviderResponse>, Status>>(),
-        );
-
-        let events = cancelled_mutation(&path("DeleteProvider"), &principal(), call).await;
-
-        let event = only(&events);
-        assert_eq!(event["status_detail"], "unknown:cancelled", "{event}");
-        assert_eq!(
-            event["resources"],
-            json!([
-                {"type": "workspace", "name": "default"},
-                {"type": "provider", "name": "github"},
-            ])
-        );
-    }
-
-    #[tokio::test]
-    async fn denied_delete_names_the_requested_target() {
-        let targets = scoped(
-            Some(&workspace_selector("default")),
-            [requested("provider", "github")],
-        );
-        let call = audited(targets, async {
-            Err::<Response<DeleteProviderResponse>, _>(audit::deny(
-                &principal(),
-                audit::AuthzDenial::InsufficientWorkspaceRole {
-                    workspace: "default",
-                },
-                "workspace role required",
-            ))
-        });
-
-        let (result, events) = audited_mutation(&path("DeleteProvider"), &principal(), call).await;
-
-        assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
-        let event = only(&events);
-        assert_eq!(
-            event["status_detail"], "insufficient_workspace_role",
-            "{event}"
-        );
-        assert_eq!(
-            event["resources"],
-            json!([
-                {"type": "workspace", "name": "default"},
-                {"type": "provider", "name": "github"},
-            ])
-        );
-    }
-
-    #[tokio::test]
-    async fn accepted_sandbox_delete_records_the_sandbox_id() {
-        let service = OpenShellService::new(test_server_state().await);
-        let created = service
-            .create_sandbox(authed_request(CreateSandboxRequest {
-                workspace_scope: Some(workspace_selector("default")),
-                name: "audit-delete-sbx".into(),
-                spec: Some(SandboxSpec::default()),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        let sandbox_id = created.sandbox.unwrap().metadata.unwrap().id;
-
-        let (result, events) = audited_mutation(&path("DeleteSandbox"), &principal(), async {
-            service
-                .delete_sandbox(authed_request(DeleteSandboxRequest {
-                    workspace_scope: Some(workspace_selector("default")),
-                    name: "audit-delete-sbx".into(),
-                    ..Default::default()
-                }))
-                .await
-        })
-        .await;
-
-        assert_eq!(
-            result.unwrap().get_ref().outcome(),
-            DeletionOutcome::Accepted
-        );
-        let event = only(&events);
-        assert_eq!(event["status_detail"], "accepted", "{event}");
-        assert_eq!(
-            event["resources"],
-            json!([{"type": "workspace", "name": "default"}, {"type": "sandbox", "name": "audit-delete-sbx", "uid": sandbox_id}])
-        );
-    }
-
-    #[tokio::test]
-    async fn completed_delete_records_plain_success() {
-        let service = OpenShellService::new(test_server_state().await);
-        service
-            .create_workspace(authed_request(CreateWorkspaceRequest {
-                name: "audit-delete-done".into(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-
-        let (result, events) = audited_mutation(&path("DeleteWorkspace"), &principal(), async {
-            service
-                .delete_workspace(authed_request(DeleteWorkspaceRequest {
-                    name: "audit-delete-done".into(),
-                    ..Default::default()
-                }))
-                .await
-        })
-        .await;
-
-        result.unwrap();
-        let event = only(&events);
-        assert_eq!(event["status_id"], 1, "{event}");
-        assert!(event.get("status_detail").is_none(), "{event}");
-        assert_eq!(
-            event["resources"],
-            json!([{"type": "workspace", "name": "audit-delete-done"}])
-        );
-    }
-
-    async fn record<T>(
-        method: &str,
-        call: impl Future<Output = Result<Response<T>, Status>>,
-    ) -> (Result<Response<T>, Status>, Value) {
-        record_at(&path(method), call).await
-    }
-
-    async fn record_at<T>(
-        path: &str,
-        call: impl Future<Output = Result<Response<T>, Status>>,
-    ) -> (Result<Response<T>, Status>, Value) {
-        let (result, events) = audited_mutation(path, &principal(), call).await;
-        (result, only(&events).clone())
-    }
-
-    fn default_workspace() -> Value {
-        json!({"type": "workspace", "name": "default"})
-    }
-
-    fn stored_json(type_label: &str, meta: &ObjectMeta) -> Value {
-        json!({"type": type_label, "name": meta.name, "uid": meta.id})
-    }
-
-    #[tokio::test]
-    async fn creates_name_the_resource_they_produced() {
-        let service = OpenShellService::new(test_server_state().await);
-
-        let (result, event) = record(
-            "CreateSandbox",
-            service.create_sandbox(authed_request(CreateSandboxRequest {
-                workspace_scope: Some(workspace_selector("default")),
-                spec: Some(SandboxSpec::default()),
-                ..Default::default()
-            })),
-        )
-        .await;
-        let sandbox = result.unwrap().into_inner().sandbox.unwrap();
-        assert!(event.get("status_detail").is_none(), "{event}");
-        assert_eq!(
-            event["resources"],
-            json!([
-                default_workspace(),
-                stored_json("sandbox", sandbox.metadata.as_ref().unwrap())
-            ])
-        );
-
-        let (result, event) = record(
-            "CreateWorkspace",
-            service.create_workspace(authed_request(CreateWorkspaceRequest {
-                name: "audit-create".into(),
-                ..Default::default()
-            })),
-        )
-        .await;
-        let workspace = result.unwrap().into_inner().workspace.unwrap();
-        assert_eq!(
-            event["resources"],
-            json!([stored_json(
-                "workspace",
-                workspace.metadata.as_ref().unwrap()
-            )])
-        );
-
-        let (result, event) = record(
-            "AddWorkspaceMember",
-            service.add_workspace_member(authed_request(AddWorkspaceMemberRequest {
-                workspace_scope: Some(workspace_selector("audit-create")),
-                principal_subject: "bob".into(),
-                role: WorkspaceRole::User.into(),
-                ..Default::default()
-            })),
-        )
-        .await;
-        let member = result.unwrap().into_inner().member.unwrap();
-        assert_eq!(
-            event["resources"],
-            json!([
-                {"type": "workspace", "name": "audit-create"},
-                {"type": "workspace_member", "name": "bob", "uid": member.metadata.unwrap().id},
-            ])
-        );
-
-        let (result, event) = record(
-            "CreateSandboxTemplate",
-            service.create_sandbox_template(authed_request(CreateSandboxTemplateRequest {
-                workspace_scope: Some(workspace_selector("default")),
-                template: Some(SandboxWorkloadTemplate {
-                    metadata: Some(ObjectMeta {
-                        name: "audit-template".into(),
-                        ..Default::default()
-                    }),
-                    spec: Some(SandboxWorkloadTemplateSpec {
-                        workload: Some(SandboxWorkloadConfig {
-                            image: "registry.example.com/agent:latest".into(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                }),
-                ..Default::default()
-            })),
-        )
-        .await;
-        let template = result.unwrap().into_inner().template.unwrap();
-        assert_eq!(
-            event["resources"],
-            json!([
-                default_workspace(),
-                stored_json("sandbox_template", template.metadata.as_ref().unwrap())
-            ])
-        );
-    }
-
-    #[tokio::test]
-    async fn rejected_creates_and_updates_name_the_requested_targets() {
-        let service = OpenShellService::new(test_server_state().await);
-        let scope = || Some(workspace_selector("default"));
-        let sandbox = json!({"type": "sandbox", "name": "missing-sbx"});
-        let cases = vec![
-            (
-                "rejected:not_found",
-                record(
-                    "StopSandbox",
-                    service.stop_sandbox(authed_request(StopSandboxRequest {
-                        workspace_scope: scope(),
-                        name: "missing-sbx".into(),
-                        ..Default::default()
-                    })),
-                )
-                .await
-                .1,
-                json!([default_workspace(), sandbox]),
-            ),
-            (
-                "rejected:not_found",
-                record(
-                    "StartSandbox",
-                    service.start_sandbox(authed_request(StartSandboxRequest {
-                        workspace_scope: scope(),
-                        name: "missing-sbx".into(),
-                        ..Default::default()
-                    })),
-                )
-                .await
-                .1,
-                json!([default_workspace(), sandbox]),
-            ),
-            (
-                "rejected:not_found",
-                record(
-                    "SuspendSandbox",
-                    service.suspend_sandbox(authed_request(SuspendSandboxRequest {
-                        workspace_scope: scope(),
-                        name: "missing-sbx".into(),
-                    })),
-                )
-                .await
-                .1,
-                json!([default_workspace(), sandbox]),
-            ),
-            (
-                "rejected:not_found",
-                record(
-                    "ResumeSandbox",
-                    service.resume_sandbox(authed_request(ResumeSandboxRequest {
-                        workspace_scope: scope(),
-                        name: "missing-sbx".into(),
-                        ..Default::default()
-                    })),
-                )
-                .await
-                .1,
-                json!([default_workspace(), sandbox]),
-            ),
-            (
-                "rejected:invalid_argument",
-                record_at(
-                    "/openshell.v1.SandboxUpdates/UpdateSandbox",
-                    SandboxUpdates::update_sandbox(
-                        &service,
-                        authed_request(UpdateSandboxRequest {
-                            workspace_scope: scope(),
-                            name: "missing-sbx".into(),
-                            image: Some("registry.example.com/agent:v2".into()),
-                            ..Default::default()
-                        }),
-                    ),
-                )
-                .await
-                .1,
-                json!([default_workspace(), sandbox]),
-            ),
-            (
-                "rejected:not_found",
-                record(
-                    "AttachSandboxProvider",
-                    service.attach_sandbox_provider(authed_request(AttachSandboxProviderRequest {
-                        workspace_scope: scope(),
-                        sandbox: "missing-sbx".into(),
-                        provider: "github".into(),
-                        ..Default::default()
-                    })),
-                )
-                .await
-                .1,
-                json!([default_workspace(), sandbox, {"type": "provider", "name": "github"}]),
-            ),
-            (
-                "rejected:not_found",
-                record(
-                    "DetachSandboxProvider",
-                    service.detach_sandbox_provider(authed_request(DetachSandboxProviderRequest {
-                        workspace_scope: scope(),
-                        sandbox: "missing-sbx".into(),
-                        provider: "github".into(),
-                        ..Default::default()
-                    })),
-                )
-                .await
-                .1,
-                json!([default_workspace(), sandbox, {"type": "provider", "name": "github"}]),
-            ),
-            (
-                "rejected:not_found",
-                record(
-                    "ExposeService",
-                    service.expose_service(authed_request(ExposeServiceRequest {
-                        workspace_scope: scope(),
-                        sandbox: "missing-sbx".into(),
-                        name: "web".into(),
-                        target_port: 8080,
-                        ..Default::default()
-                    })),
-                )
-                .await
-                .1,
-                json!([default_workspace(), sandbox, {"type": "service", "name": "web"}]),
-            ),
-            (
-                "rejected:invalid_argument",
-                record(
-                    "UpdateProviderProfiles",
-                    service.update_provider_profiles(authed_request(
-                        UpdateProviderProfilesRequest {
-                            workspace_scope: scope(),
-                            id: "missing-profile".into(),
-                            ..Default::default()
-                        },
-                    )),
-                )
-                .await
-                .1,
-                json!([default_workspace(), {"type": "provider_profile", "name": "missing-profile"}]),
-            ),
-            (
-                "rejected:invalid_argument",
-                record(
-                    "ImportProviderProfiles",
-                    service.import_provider_profiles(authed_request(
-                        ImportProviderProfilesRequest {
-                            workspace_scope: scope(),
-                            ..Default::default()
-                        },
-                    )),
-                )
-                .await
-                .1,
-                json!([default_workspace()]),
-            ),
-        ];
-
-        for (detail, event, resources) in &cases {
-            assert_eq!(event["status_id"], 2, "{event}");
-            assert_eq!(event["severity_id"], 2, "{event}");
-            assert_eq!(event["status_detail"], *detail, "{event}");
-            assert_eq!(&event["resources"], resources, "{event}");
-        }
-    }
-
-    #[tokio::test]
-    async fn empty_requested_names_are_dropped() {
-        let service = OpenShellService::new(test_server_state().await);
-
-        let (_, event) = record(
-            "UpdateProviderProfiles",
-            service.update_provider_profiles(authed_request(UpdateProviderProfilesRequest {
-                workspace_scope: Some(workspace_selector("default")),
-                ..Default::default()
-            })),
-        )
-        .await;
-
-        assert_eq!(event["resources"], json!([default_workspace()]), "{event}");
-    }
-
-    #[tokio::test]
-    async fn imports_name_every_profile_they_produce() {
-        let service = OpenShellService::new(test_server_state().await);
-        let item = |id: &str| ProviderProfileImportItem {
-            profile: Some(ProviderProfile {
-                id: id.into(),
-                display_name: id.into(),
-                category: ProviderProfileCategory::Other.into(),
-                ..Default::default()
-            }),
-            source: format!("{id}.yaml"),
-        };
-
-        let (result, event) = record(
-            "ImportProviderProfiles",
-            service.import_provider_profiles(authed_request(ImportProviderProfilesRequest {
-                workspace_scope: Some(workspace_selector("default")),
-                profiles: vec![item("audit-a"), item("audit-b")],
-                ..Default::default()
-            })),
-        )
-        .await;
-
-        assert!(result.unwrap().into_inner().imported);
-        assert_eq!(
-            event["resources"],
-            json!([
-                default_workspace(),
-                {"type": "provider_profile", "name": "audit-a"},
-                {"type": "provider_profile", "name": "audit-b"},
-            ])
-        );
-    }
-
-    #[tokio::test]
-    async fn replayed_rejection_stays_a_failure() {
-        let (_, event) = record(
-            "ImportProviderProfiles",
-            audited(Vec::new(), async {
-                let mut response = Response::new(ImportProviderProfilesResponse::default());
-                response.metadata_mut().insert(
-                    crate::grpc::mutation_replay::REPLAYED_HEADER,
-                    "true".parse().unwrap(),
-                );
-                Ok(response)
-            }),
-        )
-        .await;
-
-        assert_eq!(event["status_id"], 2, "{event}");
-        assert_eq!(
-            event["status_detail"], "rejected:invalid_argument",
-            "{event}"
-        );
-    }
-
-    #[tokio::test]
-    async fn produced_names_are_bounded() {
-        let long = "p".repeat(300);
-        let (_, event) = record(
-            "ImportProviderProfiles",
-            audited(Vec::new(), async {
-                Ok(Response::new(ImportProviderProfilesResponse {
-                    profiles: vec![ProviderProfile {
-                        id: long.clone(),
-                        ..Default::default()
-                    }],
-                    imported: true,
-                    ..Default::default()
-                }))
-            }),
-        )
-        .await;
-
-        let name = event["resources"][0]["name"].as_str().unwrap();
-        assert_eq!(name, format!("{}...", "p".repeat(128)));
-    }
-
-    #[tokio::test]
-    async fn large_imports_list_a_bounded_number_of_resources() {
-        let profiles = (0..40)
-            .map(|index| ProviderProfile {
-                id: format!("profile-{index}"),
-                ..Default::default()
-            })
-            .collect();
-        let (_, event) = record(
-            "ImportProviderProfiles",
-            audited(Vec::new(), async {
-                Ok(Response::new(ImportProviderProfilesResponse {
-                    profiles,
-                    imported: true,
-                    ..Default::default()
-                }))
-            }),
-        )
-        .await;
-
-        assert_eq!(event["resources"].as_array().unwrap().len(), 16, "{event}");
-        assert_eq!(event["resources"][15]["name"], "profile-15", "{event}");
-        assert_eq!(
-            event["message"], "mutation succeeded; 24 more resources not listed",
-            "{event}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rootfs_staging_names_the_requested_file() {
-        let service = OpenShellService::new(test_server_state().await);
-
-        let (_, event) = record(
-            "BeginRootfsTarStaging",
-            service.begin_rootfs_tar_staging(authed_request(BeginRootfsTarStagingRequest {
-                workspace_scope: Some(workspace_selector("default")),
-                file_name: "rootfs.tar".into(),
-                size_bytes: 1024,
-            })),
-        )
-        .await;
-
-        assert_eq!(
-            event["resources"],
-            json!([default_workspace(), {"type": "rootfs_staging", "name": "rootfs.tar"}])
-        );
-
-        let (_, event) = record(
-            "BeginRootfsTarStaging",
-            service.begin_rootfs_tar_staging(authed_request(BeginRootfsTarStagingRequest {
-                workspace_scope: Some(workspace_selector("default")),
-                file_name: "/home/alice/rootfs.tar".into(),
-                size_bytes: 1024,
-            })),
-        )
-        .await;
-
-        assert_eq!(
-            event["resources"],
-            json!([default_workspace(), {"type": "rootfs_staging", "name": "rootfs.tar"}])
-        );
-    }
-
-    #[tokio::test]
-    async fn unchanged_attachments_record_no_ops() {
-        let sandbox = Sandbox {
-            metadata: Some(ObjectMeta {
-                id: "sb-1".into(),
-                name: "agent-01".into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let targets = || {
-            vec![
-                requested("sandbox", "agent-01"),
-                requested("provider", "github"),
-            ]
-        };
-        let sandbox_with_uid = json!({"type": "sandbox", "name": "agent-01", "uid": "sb-1"});
-        let provider = json!({"type": "provider", "name": "github"});
-
-        let (_, event) = record(
-            "AttachSandboxProvider",
-            audited(targets(), async {
-                Ok(Response::new(AttachSandboxProviderResponse {
-                    sandbox: Some(sandbox.clone()),
-                    attached: false,
-                    ..Default::default()
-                }))
-            }),
-        )
-        .await;
-        assert_eq!(event["status_detail"], "no_op:unchanged", "{event}");
-        assert_eq!(event["resources"], json!([sandbox_with_uid, provider]));
-
-        let (_, event) = record(
-            "DetachSandboxProvider",
-            audited(targets(), async {
-                Ok(Response::new(DetachSandboxProviderResponse {
-                    sandbox: Some(sandbox.clone()),
-                    detached: false,
-                    ..Default::default()
-                }))
-            }),
-        )
-        .await;
-        assert_eq!(event["status_detail"], "no_op:already_absent", "{event}");
-        assert_eq!(event["resources"], json!([sandbox_with_uid, provider]));
-    }
-}
+mod tests;

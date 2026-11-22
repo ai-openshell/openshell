@@ -44,7 +44,7 @@ use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
-use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
+use crate::storage_proto::StoredProviderCredentialRefreshState;
 #[cfg(test)]
 use crate::storage_proto::StoredProviderProfile;
 use metrics::counter;
@@ -133,7 +133,7 @@ const GLOBAL_SETTINGS_NAME: &str = "global";
 pub const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
 const PROVIDER_COMPOSITION_VALIDATION_PAGE_SIZE: u32 = 1000;
 /// Reserved settings key used to store global policy payload.
-const POLICY_SETTING_KEY: &str = "policy";
+pub(super) const POLICY_SETTING_KEY: &str = "policy";
 /// Sentinel `sandbox_id` used to store global policy revisions.
 const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
 /// Stable labels used when stored policy state fails validation.

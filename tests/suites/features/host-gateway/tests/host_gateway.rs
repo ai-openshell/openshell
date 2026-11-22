@@ -9,10 +9,14 @@
 //! Python test image ([`testkit::python_image`]) that requests a page from that
 //! server through the name.
 
-use host_server_support::HttpRecorder;
+use host_server_support::{HttpRecorder, TEST_HOST};
 use testkit::policy;
 use testkit::sdk::raw::proto;
 use testkit::{Context, PYTHON_BINARIES, ResultExt as _};
+
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
 
 /// The image's Python, which needs nothing beyond its standard library. The
 /// policy allows [`PYTHON_BINARIES`], the real paths behind `python3` in
@@ -20,14 +24,14 @@ use testkit::{Context, PYTHON_BINARIES, ResultExt as _};
 /// behind a symlink.
 const PYTHON: &str = "python3";
 
-/// Requests `/` from `host.openshell.internal` on the port in `argv[1]` and
+/// Requests `/` from the host named in `argv[1]` on the port in `argv[2]` and
 /// prints the response. The server listens before the sandbox is created,
 /// and the network is up before the main process starts, so the client
 /// doesn't retry.
 const CLIENT: &str = r#"
 import socket, sys
 
-host, port = "host.openshell.internal", int(sys.argv[1])
+host, port = sys.argv[1], int(sys.argv[2])
 with socket.create_connection((host, port), timeout=10) as conn:
     conn.sendall(f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n".encode())
     response = b""
@@ -54,7 +58,7 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
         .cli_sandbox("hg")
         .image(image.clone())
         .policy_yaml(policy::to_yaml(&policy(server.port))?)
-        .command([PYTHON, "-c", CLIENT, &server.port.to_string()])
+        .command([PYTHON, "-c", CLIENT, TEST_HOST, &server.port.to_string()])
         .run()
         .await?
         .success()
@@ -71,17 +75,11 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
 }
 
 /// A sandbox policy that allows the image's Python ([`PYTHON`]) to
-/// connect to `host.openshell.internal` on `port`. The endpoint names only the
+/// connect to [`TEST_HOST`] on `port`. The endpoint names only the
 /// host and port, as the policy docs describe, so the driver's address for the
 /// name is what makes it reachable, not an `allowed_ips` range.
 fn policy(port: u16) -> proto::SandboxPolicy {
     let mut policy = policy::base();
-    policy::allow(
-        &mut policy,
-        "host_server",
-        "host.openshell.internal",
-        port,
-        PYTHON_BINARIES,
-    );
+    policy::allow(&mut policy, "host_server", TEST_HOST, port, PYTHON_BINARIES);
     policy
 }
