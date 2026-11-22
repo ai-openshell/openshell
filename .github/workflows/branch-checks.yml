@@ -332,6 +332,58 @@ jobs:
           cargo clippy --locked --manifest-path tests/suites/features/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/support/Cargo.toml --all-targets -- -D warnings
 
+      # Balance ARM crypto checks against the parallel workspace test job.
+      - name: Verify crypto backend independence
+        if: matrix.runner == 'openshell-ci-arm64-pd-lint'
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo tree --locked -p openshell-crypto --no-default-features --edges normal,build,dev --target all --prefix none > /tmp/openshell-crypto-dependencies.txt
+          if grep -Eq '^(ring|aws-lc-rs|aws-lc-sys|aws-lc-fips-sys) v' /tmp/openshell-crypto-dependencies.txt; then
+            echo "ERROR: backend-free crypto build includes Ring or AWS-LC" >&2
+            cat /tmp/openshell-crypto-dependencies.txt >&2
+            exit 1
+          fi
+          cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
+
+      - name: Verify OpenSSL backend
+        if: matrix.runner == 'openshell-ci-arm64-pd-lint'
+        shell: nix develop .#crypto -c bash -euo pipefail {0}
+        env:
+          OPENSSL_NO_VENDOR: "1"
+          OPENSSL_STATIC: "0"
+        run: |
+          cargo tree --locked -p openshell-crypto --no-default-features --features openssl --edges normal,build,dev --target all --prefix none > /tmp/openshell-openssl-dependencies.txt
+          if grep -Eq '^(ring|aws-lc-rs|aws-lc-sys|aws-lc-fips-sys|openssl-src) v' /tmp/openshell-openssl-dependencies.txt; then
+            echo "ERROR: OpenSSL-only crypto build includes another backend or vendored OpenSSL" >&2
+            cat /tmp/openshell-openssl-dependencies.txt >&2
+            exit 1
+          fi
+          cargo clippy --locked -p openshell-crypto --no-default-features --features openssl --all-targets -- -D warnings
+          cargo test --locked -p openshell-crypto --no-default-features --features openssl
+          for feature in tls-tonic tls-kube tls-sqlx; do
+            cargo check --locked -p openshell-crypto --no-default-features --features "openssl,$feature"
+          done
+          cargo clippy --locked -p openshell-crypto --features openssl --all-targets -- -D warnings
+          cargo test --locked -p openshell-crypto --features openssl
+
+      - name: Verify dynamic OpenSSL linkage on Linux
+        if: runner.os == 'Linux' && matrix.runner == 'openshell-ci-arm64-pd-lint'
+        shell: nix develop .#crypto -c bash -euo pipefail {0}
+        env:
+          OPENSSL_NO_VENDOR: "1"
+          OPENSSL_STATIC: "0"
+        run: |
+          cargo test --locked -p openshell-crypto --no-default-features --features openssl --test openssl_tls --no-run --message-format=json > "$RUNNER_TEMP/openssl-artifacts.jsonl"
+          executable=$(uv run --no-project python -c 'import json, sys; artifacts = [json.loads(line) for line in sys.stdin]; paths = [a["executable"] for a in artifacts if a.get("reason") == "compiler-artifact" and a.get("target", {}).get("name") == "openssl_tls" and a.get("executable")]; assert len(paths) == 1, paths; print(paths[0])' < "$RUNNER_TEMP/openssl-artifacts.jsonl")
+          ldd "$executable" > "$RUNNER_TEMP/openssl-linkage.txt"
+          cat "$RUNNER_TEMP/openssl-linkage.txt"
+          for library in libssl libcrypto; do
+            if ! grep -Eq "^[[:space:]]*$library\\.so[^[:space:]]* => /" "$RUNNER_TEMP/openssl-linkage.txt"; then
+              echo "ERROR: $library did not resolve to a dynamic library" >&2
+              exit 1
+            fi
+          done
+
       - name: Shared sccache statistics
         if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && (startsWith(runner.name, 'openshell-ci-amd64-') || startsWith(runner.name, 'openshell-ci-arm64-')) }}
         run: sccache --show-stats
@@ -364,6 +416,7 @@ jobs:
           save-cache: "true"
 
       - name: Verify crypto backend independence
+        if: matrix.runner != 'openshell-ci-arm64-pd-test'
         shell: nix develop -c bash -euo pipefail {0}
         run: |
           cargo tree --locked -p openshell-crypto --no-default-features --edges normal,build,dev --target all --prefix none > /tmp/openshell-crypto-dependencies.txt
@@ -375,6 +428,7 @@ jobs:
           cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
 
       - name: Verify OpenSSL backend
+        if: matrix.runner != 'openshell-ci-arm64-pd-test'
         shell: nix develop .#crypto -c bash -euo pipefail {0}
         env:
           OPENSSL_NO_VENDOR: "1"
@@ -395,7 +449,7 @@ jobs:
           cargo test --locked -p openshell-crypto --features openssl
 
       - name: Verify dynamic OpenSSL linkage on Linux
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.runner != 'openshell-ci-arm64-pd-test'
         shell: nix develop .#crypto -c bash -euo pipefail {0}
         env:
           OPENSSL_NO_VENDOR: "1"

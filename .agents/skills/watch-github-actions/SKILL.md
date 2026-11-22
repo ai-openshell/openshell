@@ -150,6 +150,9 @@ size before building and skips GitHub Cargo cache restore/save. Compare empty
 and warm runs on different runner pods; a PVC surviving pod replacement is the
 persistence check. `Pending` pods can be waiting for exclusive disk attachment;
 inspect PVC/PV events before treating this as a runner registration failure.
+On native ARM the crypto backend/OpenSSL verification steps run in the lint
+job, in parallel with workspace tests; inspect that job for crypto failures.
+Hosted/fork and x86 test jobs keep their existing crypto steps.
 See `CI.md` for trial scope and cache setup.
 
 ## View Job Logs

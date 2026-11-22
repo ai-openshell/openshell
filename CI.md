@@ -43,7 +43,10 @@ for lint/tests. Each ARM lane has one ready worker, reserves 12 CPUs for the
 runner plus one for Docker, and uses the same exclusive persistent-cache setup
 as x86. BuildKit is native ARM too. Compare an empty-disk run with a same-commit
 warm run on replacement pods; report queue/startup separately. Full ARM test
-coverage is retained, and hosted ARM labels remain the fork fallback.
+coverage is retained, and hosted ARM labels remain the fork fallback. On native
+ARM, crypto backend independence, OpenSSL backend, and dynamic-linkage checks run
+after lint while workspace tests run in parallel on the test lane. Other runner
+configurations retain those checks in the test job.
 
 `pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive.
 
