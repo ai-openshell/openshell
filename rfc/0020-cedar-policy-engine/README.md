@@ -21,8 +21,8 @@ connections a process may open, which requests it may make on an inspected
 connection, and which filesystem paths it may read or write. OpenShell
 accepts only Cedar policies it can enforce exactly as written and rejects the
 rest when they are submitted. Settings that configure inspection rather than
-grant access, such as middleware and MCP revisions, move into a separate
-`--middleware` file.
+grant access, such as middleware and MCP revisions, are separate fields of
+the policy message, outside the Cedar text.
 
 The reason is expressiveness that stays analyzable: authors can write
 conditions the YAML structure never anticipated, and every policy remains
@@ -121,23 +121,25 @@ This RFC does not restate Cedar; see:
 | | YAML today | Cedar |
 |---|---|---|
 | Policy file | `.yaml`, `.yml`, or any other extension | `.cedar` (any case) |
-| Create | `openshell sandbox create --policy p.yaml` | `openshell sandbox create --policy p.cedar [--middleware m.yaml]` |
+| Create | `openshell sandbox create --policy p.yaml` | `openshell sandbox create --policy p.cedar` |
 | Replace on a live sandbox | `openshell policy set` | `openshell policy set` with the whole policy |
 | Incremental edits | `openshell policy update`, policy advisor proposals | Not available; replace the whole policy |
-| Middleware | `network_middlewares:` in the policy | `network_middlewares:` in the `--middleware` file |
-| Inspection settings (`tls: skip`, MCP revisions, body limits, persisted queries) | Fields on the endpoint | `endpoint_settings:` in the `--middleware` file |
-| `process:` section | Set in the policy | `process:` in the `--middleware` file, same schema and validation |
+| Middleware | `network_middlewares:` in the policy | The `network_middlewares` field beside the Cedar text, set through the API; the CLI does not set it yet |
+| Inspection settings (`tls: skip`, MCP revisions, body limits, persisted queries) | Fields on the endpoint | The `endpoint_settings` field, set through the API |
+| `process:` section | Set in the policy | The `process` field, set through the API, same schema and validation |
 | `landlock:` section | Set in the policy | No Cedar form; defaults apply |
 | Attached providers | Grant access to their endpoints and supply credentials | Supply credentials only; your policy must allow the endpoints |
 | Gateway-wide configuration applied to every sandbox (`openshell policy set --global`), policy templates | Supported | YAML only |
 | Format of a sandbox | — | Fixed for its lifetime; recreate to switch |
-| Gateway and runtime versions | Any | Both must support Cedar; the CLI and SDKs refuse to send a Cedar policy to a gateway that does not advertise it, and the gateway withholds a Cedar policy from a runtime that cannot interpret it |
-| View the policy | `openshell policy get` | `openshell policy get` prints the Cedar text, then middleware and endpoint settings; `--full` adds provider credential rules |
+| Gateway and runtime versions | Any | Development builds of both; a gateway without Cedar support rejects a Cedar policy, the gateway withholds a Cedar policy from a runtime that does not advertise support, and a gateway released before Cedar may ignore it (see [Open questions](#open-questions)) |
+| View the policy | `openshell policy get` | `openshell policy get` prints the Cedar text |
 
 Validation happens twice with the same checks: at the gateway when the policy
 is submitted, and in the supervisor when it is loaded. The CLI and SDKs do not
 link the Cedar engine; they read the `.cedar` file, send its text as is, and
-print the load-time warnings the gateway returns. A policy OpenShell cannot
+show the gateway's error when it rejects the policy. Load-time warnings are
+computed by the policy crates but not returned to clients (see
+[Open questions](#open-questions)). A policy OpenShell cannot
 enforce exactly is rejected with the reason, never loaded with part of its
 meaning dropped. Rejected revisions on a live sandbox follow the gateway's
 `policy_validation_failure_mode`, as for YAML.
@@ -181,7 +183,7 @@ by field:
 | `enforcement: audit` (or no `enforcement`, which YAML defaults to audit) | `@enforcement("audit")` on each `HttpRequest` policy for the endpoint |
 | `protocol: rest`, `enforcement: enforce` | The defaults; naming the endpoint in any `HttpRequest` policy makes it inspected |
 | `include_workdir: true` | No form; list the workdir (for example `/sandbox`) explicitly |
-| `process:` | `process:` in the `--middleware` file |
+| `process:` | The `process` field beside the Cedar text, set through the API |
 | `version: 1`, `landlock:` | No form |
 
 Two rules of thumb carry most translations:
@@ -291,7 +293,7 @@ when {
 };
 ```
 
-`@id` is an optional label. Logs, deny reasons, and the parity harness name a
+`@id` is an optional label. Logs, deny reasons, and the parity suite name a
 policy by its `@id` when it has one, and by Cedar's positional id
 (`policy0`, `policy1`, ...) otherwise. The `rule/purpose` form used here,
 `github_api/connect`, is a convention that records which YAML rule a
@@ -488,7 +490,7 @@ when {
 ```
 
 ```yaml
-# middleware.yaml, passed with --middleware
+# endpoint_settings field of the policy message, set through the API
 endpoint_settings:
   - host: mcp.example.com
     port: 443
@@ -691,14 +693,13 @@ network_middlewares:
       include: ["api.github.com"]
 ```
 
-The section moves unchanged into the `--middleware` file:
+On a Cedar sandbox the section keeps its format but is the
+`network_middlewares` field of the policy message, beside the Cedar text,
+and is set through the gateway API or an SDK. The CLI sends Cedar text only,
+so it cannot yet set middleware, endpoint settings, or `process` for a Cedar
+sandbox; CLI configuration for them is planned separately.
 
-```shell
-openshell sandbox create --policy ./policy.cedar --middleware ./middleware.yaml -- claude
-openshell policy set <name> --policy ./policy.cedar --middleware ./middleware.yaml --wait
-```
-
-The same file carries `endpoint_settings`: `tls: skip`,
+The `endpoint_settings` field carries `tls: skip`,
 `allow_encoded_slash`, JSON-RPC and MCP body limits, `mcp.versions` and
 `mcp.strict_tool_names`, and the GraphQL persisted-query registry. Each entry
 selects endpoints with the YAML fields (`host`, `port` or `ports`, optional
@@ -727,6 +728,7 @@ time, never silently relaxed:
 - `**` touching other characters in a glob, which YAML reads as `*`; write
   `*`, or `**` as a whole segment.
 - `GET` implying `HEAD`; list `HEAD`.
+- `tls: skip` on an endpoint the policy inspects; Cedar rejects it.
 - Implicit MCP receive streams and response frames; permit them.
 - A generic `WEBSOCKET_TEXT` permit on a GraphQL-over-WebSocket path; YAML
   rejects the rule and Cedar rejects the permit.
@@ -738,31 +740,38 @@ time, never silently relaxed:
 
 ### Parity with YAML
 
-The parity harness in `openshell-supervisor-network` pairs each YAML test
-policy with a Cedar policy written to mean the same thing and runs both
-through their engines with the calls the proxy makes, comparing decisions,
-selected inspection, policy DNS eligibility and records, admitted token-grant
-owners, endpoint settings, address admission, and whole relay exchanges.
+The parity suite, `tests/policy-conformance`, pairs each YAML test policy
+with a Cedar policy written to mean the same thing and runs both through
+their engines with the calls the proxy makes, comparing decisions, selected
+inspection, policy DNS eligibility and records, admitted token-grant owners,
+endpoint settings, address admission, and whole relay exchanges. It is a
+test-only workspace member: workspace test runs include it, and no product
+crate depends on it.
 
-Of the unit tests in that crate, 260 test a YAML policy decision. 258
-have a Cedar equivalent in the harness. The remaining two need a Cedar
-language change (a binary glob matched against ancestors) or test data the
-YAML loader rejects. On Linux the harness runs 2,911 cases, counting the
-rows generated per example and per glob pattern: 2,906 agree, and 5 are
-recorded differences that the harness fails on if the engines start to
-agree (the harness prints this tally, so the numbers are reproducible). An
-evaluation error on either side fails a case unless the case allows it, and
-where Cedar now rejects a policy shape at load the harness asserts the
-rejection. Porting found two places Cedar was more permissive than YAML and
-one where it was stricter; all three are fixed and covered.
+The suite ports the YAML policy-decision unit tests from supervisor
+networking under their original names. Of 260 such tests, 258 have a Cedar
+equivalent; the remaining two need a Cedar language change (a binary glob
+matched against ancestors) or test data the YAML loader rejects.
+`src/conformance/expected.json` records 1,276 expected outcomes across 225
+scenarios: one outcome where both formats must agree, or a YAML and a Cedar
+outcome for a recorded difference. Each engine is checked against its own
+expectation, so both engines returning the same wrong answer still fails,
+and expectations change only with the behavior they describe; the suite
+never regenerates them. An evaluation error on either side fails a case
+unless the case allows it, and where Cedar rejects a policy shape at load the
+suite asserts the rejection. Porting found two places Cedar was more
+permissive than YAML and one where it was stricter; all three are fixed and
+covered.
 
-The five recorded differences are deliberate, and Cedar is the stricter side
-in each: `HEAD` under a `GET` rule (list `HEAD`); MCP revisions carried in the
-settings file rather than the policy; more than 4,096 query value
-combinations; and two private-address cases that YAML admits through
+The seven recorded differences are deliberate, and Cedar is the stricter
+side in each: `HEAD` under a `GET` rule (list `HEAD`); MCP revisions carried
+in endpoint settings rather than the policy; more than 4,096 query value
+combinations; two private-address cases that YAML admits through
 first-matching-endpoint order or through provider rules granting access,
-which the design rejects. Everything a literal translation used to allow
-beyond YAML is now either expressed exactly (`context.binary_globs`,
+which the design rejects; and two cases of `tls: skip` on an inspected
+endpoint, where the Cedar policy inspects instead. Everything a literal
+translation used to allow beyond YAML is now either expressed exactly
+(`context.binary_globs`,
 wildcard-host inspection, audit semantics, GraphQL path authority) or
 rejected at load (`**` touching other characters, a generic message permit on
 a GraphQL-over-WebSocket path).
@@ -776,9 +785,9 @@ ancestors, and, after DNS, the resolved address are known. `HttpRequest` is
 decided per message inside a connection the proxy has allowed and chosen to
 inspect, once a method, path, or body exists. One action for both would
 either decide the connection on request fields that cannot be filled yet or
-re-decide the connection on every request. (In the Rust crate, `NetworkRequest`
-and `L7Request` are the inputs to these two actions; the first is not a
-broader form of the second.)
+re-decide the connection on every request. (In the Rust crate,
+`NetworkConnectRequest` and `HttpRequestInput` are the inputs to these two
+actions.)
 
 `HttpRequest` is one action rather than one per protocol because everything
 the relay inspects arrives over HTTP: REST calls, JSON-RPC and MCP calls in
@@ -799,23 +808,30 @@ them.
 **Cedar is the enforced policy, not a model of one.** There is no
 translation from YAML and no second engine checking Cedar's answers, so the
 policy the analysis tools read is the policy that runs.
-`SandboxPolicy.cedar_policy_source` carries the text, and a non-empty value
-is what makes a sandbox a Cedar sandbox.
+`SandboxPolicy.cedar_policy`, a `CedarPolicy` message, carries the text. The
+message being present, even with empty text, is what makes a sandbox a Cedar
+sandbox, so an empty Cedar policy cannot be read as an empty YAML one.
 
-**One engine per sandbox, chosen once.** In the supervisor, every network
+**One engine per sandbox, chosen once.** Supervisor networking depends only
+on the contracts in `openshell-policy-runtime-interface`. Every network
 decision point (CONNECT, forward proxy, transparent connections, policy DNS,
 the credential guard, relay setup, middleware selection) receives a
-`PolicyEngine` that is either `Opa` or `Cedar`. A Cedar sandbox never
-constructs an OPA engine and evaluates no Rego. This keeps the decision path
-singular, makes "which engine decided" a fact the OCSF events can record, and
-means a Rego change cannot affect a Cedar sandbox or the reverse. The data
-both engines hand to the proxy (endpoint configs, policy DNS records,
-middleware configs) is typed Rust; the Rego engine converts its output into
-those types at one boundary, and nothing from the Rego library appears on the
-Cedar path. A format switch on a live sandbox is rejected because the engine
-is fixed at startup. Limits that belong to the sandbox rather than to an
-engine, such as the WebSocket message-assembly budget, are shared by every
-tunnel of either engine and survive reloads.
+`PolicyEngine` handle and the authorizers it issues, without knowing which
+engine implements them. The supervisor's composition module is the one place
+that constructs a backend: OPA for YAML, or `openshell-policy-cedar-runtime`
+for Cedar, which it builds only with the `experimental` feature. A Cedar
+sandbox never constructs an OPA engine and evaluates no Rego. This keeps the
+decision path singular, makes "which engine decided" a fact the OCSF events
+can record, and means a Rego change cannot affect a Cedar sandbox or the
+reverse. The data both engines hand to the proxy (endpoint configs, policy
+DNS records, middleware configs) is typed Rust defined in the interface
+crate; the Rego engine converts its output into those types at one boundary,
+and nothing from the Rego library appears on the Cedar path. A format switch
+on a live sandbox is rejected because the engine is fixed at startup.
+Networking enforces baseline destination restrictions before it consults
+either engine, so neither engine can widen them. Limits that belong to the
+sandbox rather than to an engine, such as the WebSocket message-assembly
+budget, are shared by every tunnel of either engine and survive reloads.
 
 **Accept only what can be enforced exactly.** Cedar decides `NetworkConnect`
 and `HttpRequest` at request time, but Landlock grants, which endpoints the
@@ -832,12 +848,13 @@ length, literal hosts are compared directly, and host-glob overlap is checked
 in space linear in the pattern length, so the largest policy the gateway
 accepts cannot exhaust its memory at validation.
 
-**Policy and configuration are separate files.** Middleware and endpoint
+**Policy and configuration are separate fields.** Middleware and endpoint
 settings do not grant or deny anything; they configure how allowed traffic is
-handled. Keeping them out of the `.cedar` file keeps the Cedar text pure
-access control, which is what the analysis tools reason about, and lets the
-same `network_middlewares` format serve both policy languages. The cost is a
-second file for sandboxes that need them. `endpoint_settings` reuses the YAML
+handled. Keeping them out of the Cedar text keeps it pure access control,
+which is what the analysis tools reason about, and lets the same
+`network_middlewares` format serve both policy languages. The cost is that
+they travel beside the Cedar text rather than in it, and until the CLI can
+set them, only API and SDK clients can. `endpoint_settings` reuses the YAML
 `NetworkEndpoint` message, and its validation classifies every field of that
 message explicitly, so a field added to `NetworkEndpoint` later fails the build
 until it is classified rather than being accepted as a setting.
@@ -868,22 +885,26 @@ symbolic-compiler, and Lean specification support, in `ai-openshell/cedar`,
   own Cedar by design, so this is not a schedule dependency on upstream.
 
 **Additive storage.** The three new `SandboxPolicy` fields
-(`cedar_policy_source`, `provider_credential_rules`, `endpoint_settings`) are
+(`cedar_policy`, `provider_credential_rules`, `endpoint_settings`) are
 additive, so gateway storage, revision history, and policy hashing are
 unchanged and stored YAML policies decode exactly as before.
 
-**Cedar support is negotiated, never assumed.** Additive fields cut both
-ways: a gateway without Cedar support would decode a Cedar policy as an empty
-YAML policy, accept it, and let attached providers open their endpoints,
-whatever the Cedar text forbids. Two flags close that gap, following the
-`supports_stable_placeholder` precedent. `HealthResponse.supports_cedar_policy`
-tells a client whether the gateway interprets Cedar; the CLI and the Rust,
-Python, Go, and TypeScript SDKs check it and refuse to send a Cedar policy to
-a gateway that does not advertise it, before any sandbox is created or policy
-changed. `GetSandboxConfigRequest.supports_cedar_policy` tells the gateway
-whether the sandbox runtime fetching a configuration interprets Cedar; a
-Cedar policy requested without it is answered with `Unimplemented` rather
-than an empty policy, so an older runtime cannot start a Cedar sandbox open.
+**The gateway decides Cedar support; the runtime negotiates it.** Additive
+fields cut both ways: a gateway that does not know the `cedar_policy` field
+would decode a Cedar policy as an empty YAML policy, accept it, and let
+attached providers open their endpoints, whatever the Cedar text forbids.
+Every gateway built with the field knows a Cedar policy when it sees one: a
+gateway built without Cedar support rejects it on sandbox create and policy
+update. Clients do not check support first; the CLI and SDKs send the policy
+and show the gateway's rejection, so there is one source of truth for what a
+gateway accepts. Toward the runtime,
+`GetSandboxConfigRequest.supported_capabilities` lists versioned policy
+capabilities, and only a supervisor built with Cedar includes
+`openshell.policy.cedar.v1`. A Cedar configuration requested without it is
+answered with `Unimplemented` rather than an empty policy, so an older
+runtime cannot start a Cedar sandbox open. Gateways released before the
+`cedar_policy` field remain an open case (see
+[Open questions](#open-questions)).
 
 **Decisions before and after DNS.** A connection is authorized before the
 destination resolves, so address conditions are evaluated twice: once with
@@ -901,19 +922,24 @@ middleware alone keeps Cedar's generation so it does not close tunnels.
 
 ## Implementation plan
 
-The proposal is implemented on `vishwa/cedar-openshell`, under review as
-[pull request #4565](https://github.com/NVIDIA/OpenShell/pull/4565). It
-contains the schema and engine crates (`openshell-policy-cedar-schema`,
-`openshell-policy-cedar`), the proto fields and capability flags, CLI,
-gateway, and supervisor integration, the `PolicyEngine` enum, the middleware
-file with `endpoint_settings`, credentials-only providers with token-grant
-admission, the opt-in `cedar` feature on `openshell-policy` that only the
-gateway and supervisor enable, Cedar fields and
-capability checks in the Rust, Python, Go, and TypeScript SDKs, the parity
-harness, the `e2e/cedar` suite and its CI matrix entry, Cedar versions of
-every example and e2e policy, the Cedar policies documentation page, the
-crate README, and the public `openshell-cli` and `generate-sandbox-policy`
-skills.
+The proposal is implemented as a stack of pull requests.
+[#5005](https://github.com/NVIDIA/OpenShell/pull/5005) adds the
+`experimental` feature bundle for development builds.
+[#5006](https://github.com/NVIDIA/OpenShell/pull/5006) adds Cedar on top of
+it, refactoring the original implementation branch (`vishwa/cedar-openshell`,
+[#4565](https://github.com/NVIDIA/OpenShell/pull/4565)) along the boundary
+described under [Rollout](#rollout).
+[#4991](https://github.com/NVIDIA/OpenShell/pull/4991) carries the Cedar
+versions of the examples. Together they contain the schema and engine crates
+(`openshell-policy-cedar-schema`, `openshell-policy-cedar`), the message
+adapter shared by the gateway and runtime (`openshell-policy-cedar-adapter`),
+the engine-neutral runtime contracts (`openshell-policy-runtime-interface`)
+and the Cedar runtime that implements them
+(`openshell-policy-cedar-runtime`), the proto fields and the supervisor's
+policy capability, gateway and supervisor integration, `endpoint_settings`,
+credentials-only providers with token-grant admission, the
+`tests/policy-conformance` parity suite, the `e2e/cedar` suite, the Cedar
+policies documentation page, and the crate READMEs.
 
 A panel review of the pull request found six defects and one documentation
 gap, each since fixed with a regression test: host-glob overlap analysis
@@ -924,21 +950,16 @@ let a REST permit decide GraphQL requests; a per-tunnel rather than
 sandbox-wide WebSocket budget; staged policies that could change an enforced
 decision through the query budget or an evaluation error; Cedar MCP endpoints
 missing from endpoint status; and public skills that round-tripped every
-policy through YAML. The review also recommended splitting the change into
-four pull requests (shared runtime refactor, standalone engine, feature
-integration, remaining examples); that is a maintainers' decision and is
-listed below.
+policy through YAML. The review also recommended splitting the change; the
+stack above does that, separating build configuration, the Cedar
+integration, and the examples.
 
 Remaining steps:
 
-- Decide whether to land the pull request whole or split it as the review
-  recommends.
 - Keep `ai-openshell/cedar` moving with the Cedar team: track delimited
   `like` upstream (cedar-policy/rfcs#115) and bump the pin as features land.
-- Rename the Rust input types of `openshell-policy-cedar` after the schema
-  actions (`NetworkRequest` to a `NetworkConnect` request type, `L7Request`
-  to an `HttpRequest` one), so the code stops inviting the question answered
-  above.
+- Let the CLI set middleware, endpoint settings, and `process` for Cedar
+  sandboxes.
 - Extend `e2e/cedar` to endpoint settings, `@path`, WebSocket, query
   parameters, native TCP, `destination_ip`, and `binary_aliases`, which
   today are covered by unit and parity tests.
@@ -949,50 +970,48 @@ Remaining steps:
   through Cedar's symbolic compiler, so a Cedar policy gets at least the
   checks a YAML policy gets today. `openshell-prover check` reads YAML only.
 
-Verification so far: unit tests and `clippy -D warnings` pass on macOS and
-Linux with `openshell-policy` built with and without `cedar`; pre-commit,
-`cargo deny`, the docs build, and the Go, TypeScript, and Python SDK checks
-pass; `mise run e2e:cedar` passes its 39 checks against a Docker gateway,
-including a provider attached through the gateway (attachment alone grants
-no access, an explicit permit injects the credential, a denied request never
-reaches the upstream, and a rotated credential reaches it); the parity
-harness passes (2,911 cases on Linux, 2,906 agreeing, 5 recorded
-differences; the 13 symlink cases are ignored on macOS); the
-example parity module passes (166 tests); and the quickstart, content guard,
-and MCP conformance examples run end to end in both formats. Mixed versions
-are covered by unit tests: a Cedar policy sent to a gateway without support
-is refused by the CLI and each SDK, and a Cedar configuration fetched by a
-runtime without support is refused by the gateway. On the pull request, CI
-ran the `cedar` and `mcp-cedar` end-to-end suites, the Docker, Podman,
+Verification of #5006: the conformance suite passes on macOS (151 tests,
+with the 3 symlink tests that need Linux ignored), and the Cedar runtime's 76
+tests pass. Default builds of the gateway, supervisor, CLI, sandbox, and TUI
+contain no `cedar-policy`, and `experimental` builds of the gateway and
+supervisor resolve `ai-openshell/cedar`. The pull request also reports strict
+Clippy across the affected crates, the TypeScript SDK checks, protobuf
+compatibility checks, and the 37 checks of `e2e/cedar` passing against a
+Docker gateway, including a provider attached through the gateway
+(attachment alone grants no access, an explicit permit injects the
+credential, a denied request never reaches the upstream, and a rotated
+credential reaches it). A Cedar configuration fetched by a runtime without
+support is refused by the gateway, which unit tests cover. On #4565, CI ran
+the `cedar` and `mcp-cedar` end-to-end suites, the Docker, Podman,
 Kubernetes, and VM matrices, and the Windows MSVC lane, all passing. Not yet
 verified against a live gateway: native TCP, WebSocket, address ranges, and
-symlinked binaries beyond what the parity harness covers.
+symlinked binaries beyond what the conformance suite covers.
 
 ### Rollout
 
-Cedar ships as an opt-in, development-only feature. A later review of the
-pull request asked for this, and the branch implements it:
+Cedar ships as an opt-in, development-only feature. A review of #4565 asked
+for this, and #5005 and #5006 implement it:
 
-- `openshell-policy` has no default features; its `cedar` feature pulls in
-  `openshell-policy-cedar`. Only `openshell-gateway` and
-  `openshell-supervisor` expose a `cedar` feature that forwards to it. The
-  CLI, SDKs, compute drivers, providers, and sandbox runtime never link the
-  engine, in any build.
-- Release Dev builds the gateway and supervisor with `cedar` and verifies
-  the Cedar crates appear in the binaries' embedded dependency lists.
-  Pre-release and stable builds pass no feature and verify the Cedar crates
-  are absent. Branch checks lint and test both configurations, and
-  `mise run rust:verify:cedar-boundary` asserts every stable binary graph
-  excludes `cedar-policy` while the two opt-in features include it.
-- `HealthResponse.supports_cedar_policy` and the supervisor's
-  `GetSandboxConfigRequest.supports_cedar_policy` derive from the feature,
-  so a stable gateway or supervisor never claims support it lacks. A stable
-  gateway rejects Cedar on sandbox create and policy update; over state that
-  already holds Cedar sandboxes it refuses to start them, deliver their
-  configuration, or change their policy until they are deleted or the
-  gateway returns to a development build.
-- The Cedar documentation page is marked development-only and publishes in
-  the `dev` docs version only.
+- One `experimental` feature bundle gates Cedar; there is no Cedar-specific
+  feature. `openshell-gateway`, `openshell-server`, `openshell-supervisor`,
+  `openshell-supervisor-network`, and `openshell-policy` declare the bundle
+  and forward it. The CLI, TUI, SDKs, compute drivers, providers, and sandbox
+  runtime never link the engine, in any build.
+- Release Dev and branch end-to-end builds set the binary build's
+  `dev-build` input, which enables `experimental` for the gateway and
+  supervisor. Pre-release and stable builds do not. Branch checks lint and
+  test with the bundle enabled. Stable binary graphs exclude `cedar-policy`
+  today; whether CI should assert that is an
+  [open question](#open-questions).
+- Only a supervisor built with the bundle advertises
+  `openshell.policy.cedar.v1`, so a stable supervisor never claims support
+  it lacks. A gateway without the bundle rejects Cedar on sandbox create and
+  policy update; over state that already holds Cedar sandboxes it refuses to
+  start them, deliver their configuration, change their policy or providers,
+  or show their policy until they are deleted or the gateway returns to a
+  development build.
+- The Cedar documentation page states that Cedar policies are available only
+  in development builds.
 
 Promotion into pre-release and stable builds follows acceptance of this RFC
 and the schema-affecting open questions below being decided, because schema
@@ -1020,13 +1039,16 @@ maintainers to confirm.
   bytes; query evaluation is capped at 4,096 combinations. Each fails closed
   and is reported.
 - **Mixed versions.** Cedar needs a development build of both the gateway
-  and the sandbox runtime. Stable builds do not link the engine, so the only
-  mixed case is a development gateway with a stable or older runtime, or an
-  operator switching a gateway from a development build to a stable one over
-  existing Cedar sandboxes. The CLI and SDKs refuse a gateway that does not
-  advertise Cedar support, and the gateway refuses a runtime that does not,
-  so the failure is a refused command or a sandbox that does not start, never
-  a sandbox running with less than its policy.
+  and the sandbox runtime. A gateway built without Cedar support rejects
+  Cedar policies, and a gateway with support refuses a runtime that does not
+  advertise it, so a development gateway with a stable or older runtime, or
+  a gateway switched from a development build to a stable one over existing
+  Cedar sandboxes, fails as a refused command or a sandbox that does not
+  start. The remaining case is a gateway released before the `cedar_policy`
+  field: it ignores the field and would accept the request as an empty YAML
+  policy, under which attached providers open their endpoints. Clients no
+  longer check gateway support before sending, so they do not refuse that
+  case (see [Open questions](#open-questions)).
 - **Providers do not open access.** Authors used to attaching a provider and
   getting its endpoints must now write the permits. Forgetting the
   `HttpRequest` policy for a credentialed endpoint refuses the connection.
@@ -1039,7 +1061,10 @@ maintainers to confirm.
 - **Build effects.** `cedar-policy` enables `serde_json`'s `preserve_order`
   in every binary that links it, so code assuming sorted JSON keys must sort
   explicitly; the boundary digest already does. Linking Cedar also grew
-  `SandboxPolicy` enough that some gateway futures needed boxing.
+  `SandboxPolicy` enough that some gateway futures needed boxing. The
+  `ai-openshell/cedar` git source is in `Cargo.lock` for every build,
+  including builds that do not compile Cedar, so offline packaging such as
+  the RPM build must map that source to vendored crates.
 
 ## Alternatives
 
@@ -1103,6 +1128,17 @@ maintainers to confirm.
 - Which temporal policies do sandboxes need first (approval-gated calls,
   rate limits, session windows), and how would Dogwood's event history be fed
   from supervisor decisions and OCSF events?
+- Clients no longer check whether a gateway supports Cedar before sending a
+  policy, and the gateway health response no longer reports it. A gateway
+  released before the `cedar_policy` field ignores it and accepts an empty
+  YAML policy, under which attached providers grant access. Should a gateway
+  capability that clients check close that case again, or is documenting it
+  enough while Cedar is development-only?
+- Load-time analysis warnings, such as an audit-only path beside enforced
+  rules on the same endpoint, are computed but no longer returned to
+  clients. Should an additive response field return them?
+- Should CI assert that stable binaries exclude `cedar-policy`, for example
+  with a `cargo tree -i cedar-policy` check that must fail?
 - What would make Cedar the default rather than an opt-in?
 
 ## References
