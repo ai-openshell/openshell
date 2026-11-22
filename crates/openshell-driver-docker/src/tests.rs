@@ -1894,6 +1894,45 @@ fn docker_identity_resolution_uses_numeric_default_for_userless_image() {
 }
 
 #[test]
+fn docker_identity_resolution_needs_no_account_files_for_numeric_ids() {
+    let mut image = DockerImageMetadata {
+        id: "sha256:image".to_string(),
+        user: String::new(),
+        working_dir: "/".to_string(),
+        volumes: Vec::new(),
+    };
+    let resolved =
+        resolve_docker_identity_from_accounts(&test_sandbox(), &image, b"", b"").unwrap();
+    assert_eq!(resolved.source, "default");
+
+    image.user = "10001:10002".to_string();
+    let resolved =
+        resolve_docker_identity_from_accounts(&test_sandbox(), &image, b"", b"").unwrap();
+    assert_eq!((resolved.uid, resolved.gid), (10001, 10002));
+    assert_eq!(resolved.source, "image");
+}
+
+#[test]
+fn docker_identity_resolution_names_the_file_for_unresolved_names() {
+    let mut image = DockerImageMetadata {
+        id: "sha256:image".to_string(),
+        user: "app".to_string(),
+        working_dir: "/".to_string(),
+        volumes: Vec::new(),
+    };
+    let error =
+        resolve_docker_identity_from_accounts(&test_sandbox(), &image, b"", b"").unwrap_err();
+    assert!(error.message().contains("'app'"));
+    assert!(error.message().contains("/etc/passwd"));
+
+    image.user = "10001:workers".to_string();
+    let error =
+        resolve_docker_identity_from_accounts(&test_sandbox(), &image, b"", b"").unwrap_err();
+    assert!(error.message().contains("'workers'"));
+    assert!(error.message().contains("/etc/group"));
+}
+
+#[test]
 fn docker_identity_resolution_honors_policy_selectors_and_rejects_root() {
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().workload_identity = Some(WorkloadIdentityRequest {

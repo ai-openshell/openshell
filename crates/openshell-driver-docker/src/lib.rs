@@ -668,7 +668,7 @@ fn resolve_numeric_or_named_user<'a>(
         .find(|entry| entry.name == selector)
         .ok_or_else(|| {
             Status::failed_precondition(format!(
-                "workload user '{selector}' does not exist in the pinned image"
+                "workload user '{selector}' not found in the pinned image's /etc/passwd (file missing or no matching entry)"
             ))
         })?;
     Ok((entry.uid, Some(entry)))
@@ -687,7 +687,7 @@ fn resolve_numeric_or_named_group(
         .map(|entry| entry.gid)
         .ok_or_else(|| {
             Status::failed_precondition(format!(
-                "workload group '{selector}' does not exist in the pinned image"
+                "workload group '{selector}' not found in the pinned image's /etc/group (file missing or no matching entry)"
             ))
         })
 }
@@ -1458,6 +1458,10 @@ impl DockerComputeDriver {
                 ),
                 ContainerCreateBody {
                     image: Some(image.id.clone()),
+                    // Never started. Docker rejects create for an image with no
+                    // CMD or ENTRYPOINT unless one is set.
+                    entrypoint: Some(vec![SANDBOX_BINARY_PATH.to_string()]),
+                    cmd: Some(Vec::new()),
                     labels: Some(docker_auxiliary_container_labels(
                         sandbox,
                         &self.config,
@@ -1475,21 +1479,9 @@ impl DockerComputeDriver {
 
         let result = async {
             let passwd =
-                download_path_from_container(&self.docker, &container_name, "/etc/passwd", true)
-                    .await
-                    .map_err(|error| {
-                        Status::failed_precondition(format!(
-                            "read immutable image /etc/passwd for workload identity: {error}"
-                        ))
-                    })?;
+                read_optional_image_file(&self.docker, &container_name, "/etc/passwd").await?;
             let group =
-                download_path_from_container(&self.docker, &container_name, "/etc/group", true)
-                    .await
-                    .map_err(|error| {
-                        Status::failed_precondition(format!(
-                            "read immutable image /etc/group for workload identity: {error}"
-                        ))
-                    })?;
+                read_optional_image_file(&self.docker, &container_name, "/etc/group").await?;
             resolve_docker_identity_from_accounts(sandbox, image, &passwd, &group)
         }
         .await;
@@ -7200,12 +7192,11 @@ async fn extract_runtime_path_archive(
     result
 }
 
-async fn download_path_from_container(
+async fn download_tar_from_container(
     docker: &Docker,
     container_name: &str,
     path: &str,
-    extract_single_file: bool,
-) -> CoreResult<Vec<u8>> {
+) -> Result<Vec<u8>, bollard::errors::Error> {
     let options = DownloadFromContainerOptionsBuilder::default()
         .path(path)
         .build();
@@ -7213,13 +7204,25 @@ async fn download_path_from_container(
 
     let mut tar_bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk: Bytes = chunk.map_err(|err| {
+        let chunk: Bytes = chunk?;
+        tar_bytes.extend_from_slice(&chunk);
+    }
+    Ok(tar_bytes)
+}
+
+async fn download_path_from_container(
+    docker: &Docker,
+    container_name: &str,
+    path: &str,
+    extract_single_file: bool,
+) -> CoreResult<Vec<u8>> {
+    let tar_bytes = download_tar_from_container(docker, container_name, path)
+        .await
+        .map_err(|err| {
             Error::config(format!(
                 "failed to read supervisor binary stream from '{container_name}': {err}",
             ))
         })?;
-        tar_bytes.extend_from_slice(&chunk);
-    }
 
     if extract_single_file {
         extract_first_tar_entry(&tar_bytes).map_err(|err| {
@@ -7229,6 +7232,27 @@ async fn download_path_from_container(
         })
     } else {
         Ok(tar_bytes)
+    }
+}
+
+/// Reads a file from an image, treating an absent file as empty.
+async fn read_optional_image_file(
+    docker: &Docker,
+    container_name: &str,
+    path: &str,
+) -> Result<Vec<u8>, Status> {
+    match download_tar_from_container(docker, container_name, path).await {
+        Ok(tar_bytes) => extract_first_tar_entry(&tar_bytes).map_err(|error| {
+            Status::failed_precondition(format!(
+                "read immutable image {path} for workload identity: {error}"
+            ))
+        }),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(Vec::new()),
+        Err(error) => Err(Status::failed_precondition(format!(
+            "read immutable image {path} for workload identity: {error}"
+        ))),
     }
 }
 
