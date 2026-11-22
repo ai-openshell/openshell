@@ -4,6 +4,10 @@
 self-hosted-runner:
   labels:
     - openshell-ci-amd64
+    - openshell-ci-amd64-pd-lint
+    - openshell-ci-amd64-pd-test
+    - openshell-ci-arm64-pd-lint
+    - openshell-ci-arm64-pd-test
     - ubuntu-26.04
     - windows-arm64
 

@@ -8,8 +8,9 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 `Branch Checks` uses the `openshell-ci-amd64` GKE ARC scale set for Linux amd64
 jobs from branches in `ai-openshell/openshell`, manual runs, and merge groups.
-Fork PRs use GitHub-hosted runners; ARM and macOS jobs keep their existing
-runner labels. This is a branch trial and does not change main until merged.
+Fork PRs use GitHub-hosted runners. ARM Linux lint/tests use the dedicated
+`openshell-ci-arm64-pd-lint` and `openshell-ci-arm64-pd-test` trial scale sets;
+other ARM jobs and macOS keep their hosted labels. This is a branch trial and does not change main until merged.
 `Branch Checks` and `Helm Lint` trigger on `pull_request` and `merge_group`.
 Workflow runs from outside contributors wait for a maintainer to approve them
 in the Actions tab.
@@ -33,8 +34,16 @@ ephemeral; only Cargo build outputs persist. Cargo still validates artifacts,
 and fresh checkout timestamps can trigger workspace rebuilds. These two lanes
 serialize concurrent jobs during the trial; the ordinary scale set stays 5–20.
 Inspect the job's
-runner name to confirm whether it ran on GKE. ARM, macOS, and fork jobs do not
-use the cluster-local cache endpoint.
+runner name to confirm whether it ran on GKE. Hosted ARM, macOS, and fork jobs
+do not use the cluster-local cache endpoint.
+
+The ARM trial uses native `t2a-standard-16` Ubuntu nodes (minimum two, maximum
+four), an ARM64 runner image with baked Nix shells, and separate 200 GiB SSDs
+for lint/tests. Each ARM lane has one ready worker, reserves 12 CPUs for the
+runner plus one for Docker, and uses the same exclusive persistent-cache setup
+as x86. BuildKit is native ARM too. Compare an empty-disk run with a same-commit
+warm run on replacement pods; report queue/startup separately. Full ARM test
+coverage is retained, and hosted ARM labels remain the fork fallback.
 
 `pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive.
 

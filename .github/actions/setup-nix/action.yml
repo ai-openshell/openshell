@@ -33,7 +33,7 @@ runs:
           http2 = false
 
     - name: Verify GKE image cache configuration
-      if: ${{ startsWith(runner.name, 'openshell-ci-amd64-') }}
+      if: ${{ (startsWith(runner.name, 'openshell-ci-amd64-') || startsWith(runner.name, 'openshell-ci-arm64-')) }}
       shell: bash
       run: |
         nix config show --json | jq -e '.substituters.value | index("https://openshell.cachix.org") != null' > /dev/null
@@ -42,7 +42,7 @@ runs:
       with:
         name: openshell
         # The image configures the substituter globally before dropping to runner.
-        skipAddingSubstituter: ${{ startsWith(runner.name, 'openshell-ci-amd64-') }}
+        skipAddingSubstituter: ${{ (startsWith(runner.name, 'openshell-ci-amd64-') || startsWith(runner.name, 'openshell-ci-arm64-')) }}
         authToken: ${{ inputs.cachix-auth-token }}
         skipPush: ${{ inputs.cachix-auth-token == '' }}
 

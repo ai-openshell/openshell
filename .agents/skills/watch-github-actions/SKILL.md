@@ -134,8 +134,9 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 ## GKE runner trial
 
 Branch Checks Linux amd64 jobs from ai-openshell/openshell branches run on the
-`openshell-ci-amd64` ARC scale set during the GKE trial. Fork, ARM, and macOS jobs
-keep their hosted runners. Confirm the runner name in the job details before
+`openshell-ci-amd64` ARC scale set during the GKE trial. ARM Linux lint/tests
+use `openshell-ci-arm64-pd-*` on native ARM Ubuntu nodes with ARM64 images.
+Fork PRs, other ARM jobs, and macOS retain hosted runners. Confirm the runner name in the job details before
 attributing a result to GKE. For a job-container or PostgreSQL startup failure,
 check the runner pod's Docker sidecar first. A missing `gh` executable or
 Cachix's `$USER must be set` error indicates incomplete runner bootstrap.
@@ -143,8 +144,8 @@ For a preloaded image, `setup-nix` verifies its global Cachix substituter and
 skips adding it again. A cache-configuration permission failure indicates the
 image/setup contract is out of sync. Rust jobs report shared memcached
 sccache statistics; distinguish backend connectivity errors from compiler/test
-failures. The x86 GKE lint/test jobs use single-worker `openshell-ci-amd64-pd-*`
-scale sets with separate exclusive persistent disks. Setup reports the target
+failures. The x86 and ARM GKE lint/test jobs use single-worker
+`openshell-ci-amd64-pd-*` and `openshell-ci-arm64-pd-*` scale sets with separate exclusive persistent disks. Setup reports the target
 size before building and skips GitHub Cargo cache restore/save. Compare empty
 and warm runs on different runner pods; a PVC surviving pod replacement is the
 persistence check. `Pending` pods can be waiting for exclusive disk attachment;

@@ -26,7 +26,7 @@ runs:
   using: composite
   steps:
     - name: Configure shared sccache on GKE runners
-      if: ${{ runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+      if: ${{ runner.environment == 'self-hosted' && (startsWith(runner.name, 'openshell-ci-amd64-') || startsWith(runner.name, 'openshell-ci-arm64-')) }}
       shell: nix develop -c bash -euo pipefail {0}
       run: |
         mise install --locked github:mozilla/sccache
