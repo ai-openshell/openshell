@@ -82,6 +82,7 @@ impl Drop for BoundaryAccess {
 #[allow(clippy::too_many_arguments)]
 pub async fn start_boundary_access(
     sandbox_id: Option<&str>,
+    instance_id: String,
     gateway: Option<&openshell_core::grpc_client::GatewayEndpoint>,
     ssh_socket_path: Option<&str>,
     shared_ssh_socket: bool,
@@ -96,7 +97,6 @@ pub async fn start_boundary_access(
     gateway_home: Option<tokio::sync::watch::Receiver<Option<String>>>,
     app_installations: Option<openshell_core::app_listener::InstallationSource>,
 ) -> Result<BoundaryAccess> {
-    let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
     let attachment = agent
         .attach()
@@ -367,6 +367,7 @@ mod tests {
         );
         let access = start_boundary_access(
             Some("sandbox"),
+            "registered-supervisor".into(),
             Some(&gateway),
             None,
             false,
@@ -383,6 +384,7 @@ mod tests {
         )
         .await
         .expect("access without SSH is portable");
+        assert_eq!(access.instance_id(), "registered-supervisor");
         assert!(access.ssh_task.is_none());
         assert!(access.session_task.is_some());
         assert!(
@@ -410,6 +412,7 @@ mod tests {
         let boundary = Arc::new(AccessBoundary);
         let result = start_boundary_access(
             None,
+            "registered-supervisor".into(),
             None,
             Some("health.sock"),
             false,

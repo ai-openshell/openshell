@@ -21,6 +21,12 @@ and configure your collector to forward the metrics to your backend.
 `openshell.gateway.name` and `service.instance.id` are OTLP resource attributes
 for grouping by gateway and supervisor process.
 
+A dedicated supervisor uses its sandbox control-stream registration ID as
+`service.instance.id` across metrics, traces, and OTLP OCSF records. A shared
+supervisor uses its host registration ID. Search gateway logs for the instance
+ID in `supervisor session: accepted` to find the dedicated supervisor's sandbox,
+or in `supervisor host attached` to find the shared supervisor's pool member.
+
 | Metric | Type | Labels | Measures |
 | --- | --- | --- | --- |
 | `openshell_supervisor_egress_decisions_total` | Counter | `scope`, `outcome`, `inspection_type`, `policy` | Final egress admission decisions. |

@@ -383,7 +383,7 @@ impl SharedHost {
         }
     }
 
-    fn start_metrics(self: &Arc<Self>, configuration: &[u8]) {
+    fn start_metrics(self: &Arc<Self>, instance_id: &str, configuration: &[u8]) {
         if configuration.is_empty() || self.metrics_provider.get().is_some() {
             return;
         }
@@ -395,6 +395,7 @@ impl SharedHost {
         };
         let host = Arc::downgrade(self);
         let result = crate::metrics::start(
+            instance_id,
             &config.collector.endpoint,
             config.collector.protocol,
             openshell_core::jwt::OtlpExportCredentials {
@@ -837,6 +838,7 @@ impl SharedHost {
         crate::sandbox_instance_host::prepare_private_dir(&trust_dir).map_err(failure)?;
         let ssh_socket = dir.join("ssh.sock");
         let config = crate::SandboxInstanceConfig {
+            supervisor_instance_id: uuid::Uuid::new_v4().to_string(),
             app_router: self
                 .app_listener
                 .as_ref()
@@ -1493,6 +1495,7 @@ async fn run_stream(
                 .is_ok_and(|sent| sent.is_ok())
         }
     };
+    let instance_id = hello.instance_id.clone();
     if !send(
         HostMessage {
             payload: Some(host_message::Payload::Hello(hello)),
@@ -1546,11 +1549,11 @@ async fn run_stream(
                 last_heard = tokio::time::Instant::now();
                 match payload {
                     Some(host_gateway_message::Payload::Accepted(accepted_message)) => {
-                        host.start_metrics(&accepted_message.supervisor_metrics);
+                        host.start_metrics(&instance_id, &accepted_message.supervisor_metrics);
                         accepted = true;
                         host.gateway_connected.send_replace(true);
                         host.gateway_home.send_replace(Some(accepted_message.peer_endpoint.clone()));
-                        tracing::info!(session = %accepted_message.session_id, "gateway accepted the supervisor host");
+                        tracing::info!(instance_id = %instance_id, session = %accepted_message.session_id, "gateway accepted the supervisor host");
                         // A pool gateway detects failed members by silence,
                         // so it asks for more frequent heartbeats.
                         if let Some(interval) = accepted_message

@@ -835,6 +835,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .store(true, Ordering::SeqCst);
     let startup = |await_main_process_attachment| {
         let config = crate::SandboxInstanceConfig {
+            supervisor_instance_id: uuid::Uuid::new_v4().to_string(),
             app_router: None,
             command: vec!["test-agent".into(), "test-argument".into()],
             workdir: Some("/test-workspace".into()),
@@ -1053,6 +1054,7 @@ async fn suspend_signal_exits_without_terminating_boundary() {
     let setup = TestSetup::new();
     let startup = || {
         let config = crate::SandboxInstanceConfig {
+            supervisor_instance_id: uuid::Uuid::new_v4().to_string(),
             app_router: None,
             command: vec!["test-agent".into(), "test-argument".into()],
             workdir: Some("/test-workspace".into()),

@@ -515,11 +515,13 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .into_diagnostic()?;
+    let instance_id = uuid::Uuid::new_v4().to_string();
     let export_config = |endpoint| openshell_otel::OtlpExportConfig {
         endpoint,
         service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
         service_version: Some(openshell_core::VERSION),
         resource_attributes: supervisor_resource_attributes(
+            &instance_id,
             args.sandbox_id.as_deref(),
             args.gateway_name.as_deref(),
         ),
@@ -550,6 +552,7 @@ fn main() -> Result<()> {
             .map(|endpoint| {
                 let assigned = sandbox_assigned.clone();
                 openshell_supervisor::metrics::start(
+                    &instance_id,
                     endpoint,
                     args.otlp_metrics_protocol,
                     auth.map(SupervisorAuthBundle::metrics_otlp)
@@ -657,7 +660,7 @@ fn main() -> Result<()> {
         };
         match args.role {
             SupervisorRole::IsolationBackend => {
-                info!(command = ?command, "Starting sandbox supervision");
+                info!(instance_id = %instance_id, command = ?command, "Starting sandbox supervision");
                 let Some((
                     backend_setup,
                     backend_descriptor,
@@ -675,6 +678,7 @@ fn main() -> Result<()> {
                     .transpose()?
                     .map(openshell_supervisor::app_listener::BoundListener::start);
                 let config = openshell_supervisor::SandboxInstanceConfig {
+                    supervisor_instance_id: instance_id,
                     app_router: app_host
                         .as_ref()
                         .map(openshell_supervisor::app_listener::HostHandle::router),
@@ -883,20 +887,24 @@ fn target(
     Ok(openshell_otel::OtlpTarget::new(config)?.with_transport(&transport))
 }
 
-/// Resource attributes identifying this supervisor's sandbox and the gateway
-/// that launched it.
+/// Resource attributes identifying this supervisor, its sandbox, and gateway.
 fn supervisor_resource_attributes(
+    instance_id: &str,
     sandbox_id: Option<&str>,
     gateway_name: Option<&str>,
 ) -> Vec<opentelemetry::KeyValue> {
-    sandbox_id
-        .map(|id| opentelemetry::KeyValue::new("openshell.sandbox.id", id.to_string()))
-        .into_iter()
-        .chain(openshell_otel::gateway_resource_attributes(
-            gateway_name,
-            None,
-        ))
-        .collect()
+    let mut attributes = vec![opentelemetry::KeyValue::new(
+        "service.instance.id",
+        instance_id.to_string(),
+    )];
+    attributes.extend(
+        sandbox_id.map(|id| opentelemetry::KeyValue::new("openshell.sandbox.id", id.to_string())),
+    );
+    attributes.extend(openshell_otel::gateway_resource_attributes(
+        gateway_name,
+        None,
+    ));
+    attributes
 }
 
 /// Choose the supervisor's exit status for a sandbox run.
@@ -1077,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_names_the_sandbox_and_its_gateway() {
+    fn telemetry_identifies_the_supervisor_sandbox_and_gateway() {
         let args = Args::try_parse_from([
             "openshell-supervisor",
             "--sandbox-id",
@@ -1087,17 +1095,25 @@ mod tests {
         ])
         .expect("parse telemetry identity");
         let attributes = supervisor_resource_attributes(
+            "registered-supervisor",
             args.sandbox_id.as_deref(),
             args.gateway_name.as_deref(),
         );
         assert_eq!(
             attributes,
             vec![
+                opentelemetry::KeyValue::new("service.instance.id", "registered-supervisor"),
                 opentelemetry::KeyValue::new("openshell.sandbox.id", "sb-1"),
                 opentelemetry::KeyValue::new("openshell.gateway.name", "prod-west"),
             ]
         );
-        assert!(supervisor_resource_attributes(None, None).is_empty());
+        assert_eq!(
+            supervisor_resource_attributes("registered-supervisor", None, None),
+            vec![opentelemetry::KeyValue::new(
+                "service.instance.id",
+                "registered-supervisor",
+            )]
+        );
     }
 
     #[test]

@@ -287,6 +287,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         probe: probe.clone(),
     };
     let config = SandboxInstanceConfig {
+        supervisor_instance_id: uuid::Uuid::new_v4().to_string(),
         app_router: None,
         command: vec!["true".into()],
         workdir: None,

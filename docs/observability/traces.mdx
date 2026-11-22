@@ -55,6 +55,7 @@ Resource attributes identify which process produced a span:
 |---|---|---|
 | `service.name` | `openshell-gateway`, `openshell-driver-<driver>`, such as `openshell-driver-docker`, or `openshell-supervisor` | Every span |
 | `service.version` | The OpenShell version | Every span |
+| `service.instance.id` | The supervisor's sandbox control-stream registration ID | Dedicated supervisor spans |
 | `openshell.gateway.name` | The gateway name | Every span |
 | `openshell.gateway.compute_driver` | The configured compute driver, such as `kubernetes` | Gateway and compute-driver spans |
 | `openshell.sandbox.id` | The sandbox ID | Supervisor spans |

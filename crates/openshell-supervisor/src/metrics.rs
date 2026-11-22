@@ -15,6 +15,7 @@ const SERVICE_NAME: &str = "openshell-supervisor";
 
 /// Create the process's metrics provider inside the runtime driving OTLP.
 pub fn start(
+    instance_id: &str,
     endpoint: &str,
     protocol: OtlpProtocol,
     credentials: OtlpExportCredentials<'_>,
@@ -24,7 +25,7 @@ pub fn start(
     let mut resource_attributes = openshell_otel::gateway_resource_attributes(gateway_name, None);
     resource_attributes.push(KeyValue::new(
         "service.instance.id",
-        uuid::Uuid::new_v4().to_string(),
+        instance_id.to_string(),
     ));
     let config = OtlpExportConfig {
         endpoint,
@@ -68,7 +69,7 @@ pub fn shutdown(provider: &SdkMeterProvider) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_otel_test_support::OtlpHttpTestServer;
+    use openshell_otel_test_support::{OtlpHttpTestServer, relay::string_attribute};
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::metrics::v1::metric::Data;
     use prost::Message as _;
@@ -79,7 +80,9 @@ mod tests {
         let path = format!("{}/receiver", collector.endpoint());
         let headers = SecretOtlpHeaders::new("x-collector-test=metrics".to_string());
         let count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+        let instance_id = "registered-supervisor";
         let provider = start(
+            instance_id,
             &path,
             OtlpProtocol::HttpProtobuf,
             OtlpExportCredentials {
@@ -106,11 +109,9 @@ mod tests {
             let response = ExportMetricsServiceRequest::decode(received.body).unwrap();
             let resource = &response.resource_metrics[0];
             let attributes = &resource.resource.as_ref().unwrap().attributes;
-            assert!(attributes.iter().any(|kv| kv.key == "service.instance.id"));
+            assert!(attributes.contains(&string_attribute("service.instance.id", instance_id)));
             assert!(
-                attributes
-                    .iter()
-                    .any(|kv| kv.key == "openshell.gateway.name")
+                attributes.contains(&string_attribute("openshell.gateway.name", "test-gateway"))
             );
             let instruments = resource
                 .scope_metrics
