@@ -21,6 +21,10 @@ use testkit::{
 };
 use url::Url;
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 const ADMIN_ROLE_REQUIRED: &str = "role 'openshell-admin' required";
 const ONLY_PLATFORM_ADMINS: &str = "only platform admins can assign the workspace admin role";
 /// The provider credential the test profile defines.
