@@ -126,7 +126,9 @@ impl SshTarget {
             let id = Uuid::new_v4();
             let listener = ipc::Listener::bind(id).into_diagnostic()?;
             let handle = format!("{}-{id}", std::process::id());
-            let command = build_proxy_command(&handle, &self.name, &self.workspace)?;
+            let exe = std::env::current_exe().into_diagnostic()?;
+            let command =
+                build_proxy_command(&exe.to_string_lossy(), &handle, &self.name, &self.workspace);
             Ok((listener, command))
         };
         let (listener, command) = match setup() {

@@ -124,18 +124,13 @@ async fn proxy_exits_with_stdin_open(relay_status: Status) {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"probe")
-        .await
-        .unwrap();
-    // Keep child.stdin alive throughout wait: closing it would conceal the bug.
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"probe").await.unwrap();
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
         .await
         .expect("SSH proxy must exit even while the parent holds stdin open")
         .unwrap();
+    drop(stdin);
     let mut stderr = String::new();
     tokio::io::AsyncReadExt::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr)
         .await
