@@ -85,7 +85,8 @@ struct RunArgs {
     /// the guest's architecture (a `*-unknown-linux-musl` build).
     #[arg(long, value_name = "PATH", conflicts_with = "packages")]
     program: Option<PathBuf>,
-    /// Maximum number of tests nextest runs at once [default: 1].
+    /// Maximum number of concurrent tests [default: 1].
+    /// With `--program`, the program must support `run --test-threads`.
     #[arg(long, value_name = "N")]
     test_threads: Option<NonZeroUsize>,
     /// The gateway name the installer registers with the CLI. The packaged

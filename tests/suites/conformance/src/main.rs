@@ -13,6 +13,13 @@ use std::process::ExitCode;
 // missing.
 use conformance as _;
 
+#[cfg(all(unix, conformance_bundle))]
+mod bundled;
+
 fn main() -> ExitCode {
-    testkit::program::main_for(env!("CARGO_PKG_NAME"), env!("CARGO_BIN_NAME"))
+    #[cfg(all(unix, conformance_bundle))]
+    if let Some(status) = bundled::dispatch() {
+        return status;
+    }
+    testkit::main()
 }

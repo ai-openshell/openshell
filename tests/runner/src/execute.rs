@@ -42,6 +42,7 @@ const READY_SLACK: Duration = Duration::from_mins(1);
 const NEXTEST_TEST_FAILED: i32 = 100;
 /// nextest's exit code when `--no-tests fail` found no tests to run.
 const NEXTEST_NO_TESTS_RUN: i32 = 4;
+const PROGRAM_TEST_FAILED: i32 = 1;
 /// How much of the end of the nextest log to print after a failure. nextest
 /// ends its output with a summary that names the failed tests.
 const LOG_TAIL_LINES: usize = 40;
@@ -99,6 +100,17 @@ impl Status {
             )),
         }
     }
+
+    fn of_program(status: ExitStatus, log: &Path) -> Self {
+        match status.code() {
+            Some(0) => Self::Passed,
+            Some(PROGRAM_TEST_FAILED) => Self::Failed,
+            _ => Self::Error(format!(
+                "the test program exited with {status}; see {}",
+                log.display()
+            )),
+        }
+    }
 }
 
 impl fmt::Display for Status {
@@ -123,7 +135,7 @@ pub struct Run<'a> {
     /// Narrowing the tests in the bundle: nextest filtersets (`-E`) for a
     /// nextest bundle, parts of test names for a program bundle.
     pub filters: &'a [String],
-    /// Concurrency override for nextest.
+    /// Concurrency override for the test runner.
     pub test_threads: Option<std::num::NonZeroUsize>,
     /// Where `junit.xml`, `nextest.log` and, after a failure, the guest's
     /// `diagnostics/` go.
@@ -390,28 +402,23 @@ async fn run_selected(
     let archive = format!("{guest}/tests.tar.zst");
     let extract = format!("{guest}/extract");
     let config = format!("{guest}/nextest.toml");
-    let test_threads = run
-        .test_threads
-        .map_or(1, std::num::NonZeroUsize::get)
-        .to_string();
-    let metadata = format!("{guest}/metadata");
-    let cargo_metadata = format!("{metadata}/cargo-metadata.json");
-    let binaries_metadata = format!("{metadata}/binaries-metadata.json");
+    let test_threads = run.test_threads.map(|count| count.to_string());
+    let junit = format!("{guest}/junit.xml");
     let export = test_env::export_script(test_env::ENV_DIR);
     let mut args: Vec<&str> = vec!["--config-file", &config, "--profile", PROFILE];
     let env_args = std::iter::once("env").chain(env.iter().map(String::as_str));
     let mut tests: Vec<_> = env_args.clone().collect();
-    tests.extend([
-        "cargo-nextest",
-        "nextest",
-        "run",
-        "--test-threads",
-        &test_threads,
-        "--no-tests",
-        "fail",
-    ]);
     match kind {
         Kind::Nextest => {
+            tests.extend([
+                "cargo-nextest",
+                "nextest",
+                "run",
+                "--test-threads",
+                test_threads.as_deref().unwrap_or("1"),
+                "--no-tests",
+                "fail",
+            ]);
             args.extend([
                 "--archive-file",
                 &archive,
@@ -427,34 +434,18 @@ async fn run_selected(
             if run.test_threads.is_none_or(|count| count.get() == 1) {
                 tests.push("--no-capture");
             }
+            tests.extend(&args);
         }
         Kind::Program => {
-            checked(
-                "write nextest metadata",
-                session
-                    .exec(&[&program, "nextest-metadata", &metadata])
-                    .await?,
-            )?;
-            args.extend([
-                "--cargo-metadata",
-                &cargo_metadata,
-                "--binaries-metadata",
-                &binaries_metadata,
-            ]);
-            tests.extend([
-                "--no-fail-fast",
-                "--success-output",
-                "immediate",
-                "--failure-output",
-                "immediate",
-            ]);
+            tests.extend([program.as_str(), "run", "--junit", &junit]);
+            if let Some(count) = &test_threads {
+                tests.extend(["--test-threads", count]);
+            }
+            if !filters.is_empty() {
+                tests.push("--");
+                tests.extend(filters.iter().map(String::as_str));
+            }
         }
-    }
-    tests.extend(&args);
-    // Prebuilt programs keep substring filters, unlike archive filtersets.
-    if kind == Kind::Program && !filters.is_empty() {
-        tests.push("--");
-        tests.extend(filters.iter().map(String::as_str));
     }
     // nextest writes its output to a file in the guest, so a run that times
     // out or loses SSH still leaves a log for `collect_results`. The guest
@@ -491,7 +482,10 @@ async fn run_selected(
         }
     }
     let log = run.results.join(NEXTEST_LOG);
-    Ok(Status::of_nextest(output.status, &log))
+    Ok(match kind {
+        Kind::Nextest => Status::of_nextest(output.status, &log),
+        Kind::Program => Status::of_program(output.status, &log),
+    })
 }
 
 /// Copy the nextest log and the JUnit report out of the guest, whether or not
@@ -649,6 +643,14 @@ mod tests {
             Status::Error("no test ran; see log".to_string())
         );
         assert!(matches!(status(1), Status::Error(_)));
+    }
+
+    #[test]
+    fn status_follows_the_program_exit_code() {
+        let status = |code| Status::of_program(ExitStatus::from_raw(code << 8), Path::new("log"));
+        assert_eq!(status(0), Status::Passed);
+        assert_eq!(status(1), Status::Failed);
+        assert!(matches!(status(2), Status::Error(_)));
     }
 
     #[test]

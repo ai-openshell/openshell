@@ -68,6 +68,24 @@ Feature and driver suites are not part of it. The
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
 
+Branch E2E builds a single executable with nextest bundled inside. Use
+`openshell-conformance run --test-threads 4 --junit conformance.xml` to run
+that build in parallel. The default is one worker. No separately installed
+nextest is required. Plain Cargo builds run serially.
+
+To build the bundled executable, use the repository development shell:
+
+```shell
+bash tests/suites/conformance/package.sh <rust-target> <output-directory>
+```
+
+The bundled scheduler runs from a private temporary directory. Tests use
+that workspace as their working directory; use absolute paths for custom
+CLI and gateway configuration paths.
+An interrupted or timed-out test cannot clean up its gateway resources.
+Nextest may leave a descendant running if it ignores termination and the
+test process exits first.
+
 See [Unsupported tests](../../testkit/README.md#unsupported-tests) to skip a
 test in specific CI environments.
 
