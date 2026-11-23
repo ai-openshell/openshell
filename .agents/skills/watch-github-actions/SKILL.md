@@ -131,63 +131,36 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 `Release Dev` finishes its active run and replaces pending runs when new commits arrive. Other callers retain E2E cancellation. Inspect job annotations for cancellation reasons.
 
-## GKE runner trial
+## GKE runners
 
-Branch Checks Linux amd64 jobs from ai-openshell/openshell branches run on the
-`openshell-ci-amd64` ARC scale set during the GKE trial. ARM Linux lint/tests
-use `openshell-ci-arm64-pd-*` on native ARM Ubuntu nodes with ARM64 images.
-Fork PRs, other ARM jobs, and macOS retain hosted runners. Confirm the runner name in the job details before
-attributing a result to GKE. For a job-container or PostgreSQL startup failure,
-check the runner pod's Docker sidecar first. A missing `gh` executable or
-Cachix's `$USER must be set` error indicates incomplete runner bootstrap.
-For a preloaded image, `setup-nix` verifies its global Cachix substituter and
-skips adding it again. A cache-configuration permission failure indicates the
-image/setup contract is out of sync. Rust jobs report shared memcached
-sccache statistics; distinguish backend connectivity errors from compiler/test
-failures. The x86 and ARM GKE lint/test jobs use single-worker
-`openshell-ci-amd64-pd-*` and `openshell-ci-arm64-pd-*` scale sets with separate exclusive persistent disks. Setup reports the target
-size before building and skips GitHub Cargo cache restore/save. Compare empty
-and warm runs on different runner pods; a PVC surviving pod replacement is the
-persistence check. `Pending` pods can be waiting for exclusive disk attachment;
-inspect PVC/PV events before treating this as a runner registration failure.
-On native ARM the crypto backend/OpenSSL verification steps run in the lint
-job, in parallel with workspace tests; inspect that job for crypto failures.
-Hosted/fork and x86 test jobs keep their existing crypto steps.
-Gateway core features use parallel `base-kubernetes` and `docker-podman` matrix
-jobs on `openshell-ci-amd64-pd-gateway-a/b`, with separate exclusive caches and
-eight reserved runner CPUs. Inspect both jobs and all four named feature steps;
-measure the later completion rather than summing durations. Fork jobs retain
-hosted Ubuntu. A failed lane must fail the Branch Checks workflow gate.
-The AMD64 speed trial selects C4 nodes for persistent-cache lanes and disables
-test debug information only on the trusted AMD64 test job. General x86
-workers/system nodes use N4. ARM workers now use C4A; all cache lanes use
-Hyperdisk Balanced. The generation-four migrations recreate caches, so
-record initial target size before comparing timings. Verify its
-`test-debug0` target path, initial size, and C4 node placement. Compare a first
-population pass and a warm rerun. The earlier N2/C3 trial introduced no-debug
-tests; N4/C4 retains that setting and changes CPU/storage generation. Avoid
-attributing all gains to one factor. Debug assertions stay enabled.
-The manual `local_image_builds` input additionally stages release binaries,
-builds all three native AMD64 images, and runs local `--help` smoke checks.
-It builds auditable binaries with the production Nix GNU/musl toolchains,
-checks the glibc 2.28 floor/static sandbox, and skips unrelated mise installs.
-The local Zig staging helper conflicts with Nix GNU linking for vendored Z3.
-It uses explicit Docker local output and no publication or image artifact
-upload. Diagnose binary staging separately from image assembly. Keep optional
-image-build timing separate from ordinary branch-check latency.
-Trusted ARM build-mode checks use `openshell-ci-arm64-pd-build-modes` on C4A,
-with a separate exclusive cache and one prewarmed worker. ARM lint/tests also
-use C4A, preserving all three lanes in parallel. Verify telemetry on/off marker
-checks inspect `${CARGO_TARGET_DIR:-target}/debug/...`, plus both dependency
-boundaries. Fork build-mode checks and ARM Python stay hosted. Measure the
-first empty-cache pass and a same-commit warm pass separately.
-See `CI.md` for trial scope and cache setup.
+Trusted Branch Checks Linux jobs use only `openshell-ci-amd64` and
+`openshell-ci-arm64`. Fork PRs, ARM Python, and macOS use hosted runners.
+AMD64 runs on C4 Ubuntu; ARM64 runs natively on C4A Ubuntu. Each public label
+is shared by internal singleton cache slots, with five warm/twenty maximum
+AMD64 workers and three warm/four maximum ARM64 workers. Slot names in job
+logs are internal identities, not labels to hardcode in workflows.
 
-## View Job Logs
+Every slot owns an exclusive 200 GiB Hyperdisk mounted at `/mnt/ci-cache`.
+Setup separates targets by repository, Nix shell, job, and matrix variant,
+reports initial size/slot name, and skips GitHub Cargo archive caches. Claims
+survive pod replacement and node scaling. Different runs may use different
+slots, so compare actual cache size and shared memcached sccache statistics
+before attributing changes to hardware. There is no automatic target pruning;
+monitor disk usage. Pending replacement pods can be waiting for exclusive disk
+release; inspect PVC/PV events before diagnosing registration failure.
 
-For Branch Checks `Reviewer Roster` failures, the log lists non-collaborators in
-`REVIEWERS.md`. Remove those entries or arrange repository access before rerunning.
-Lookup errors fail the check rather than treating missing results as eligibility.
+Check Docker sidecar logs for job-container or PostgreSQL startup failures.
+A missing `gh` or `$USER must be set` indicates runner-image/bootstrap drift.
+Preloaded Nix runners verify the global Cachix substituter and skip re-adding it.
+Separate sccache backend failures from compiler/test failures. AMD64 tests
+set `CARGO_PROFILE_TEST_DEBUG=0`; debug assertions remain enabled. ARM crypto
+checks run in lint while workspace tests run separately. Gateway core features
+retain both parallel matrix jobs and all four independent feature checks.
+
+Manual `local_image_builds` runs build AMD64 gateway/sandbox/supervisor images
+and smoke-test `--help` with pushing disabled. They use production auditable
+Nix GNU/musl release commands, verify glibc/static linkage, and load images only
+into ephemeral Docker. They do not qualify ARM images or publish artifacts.
 
 For Kubernetes app-listener E2E failures during kind setup, inspect the uploaded
 `results/app-listener/cni-setup/` evidence. It includes node and Calico pod

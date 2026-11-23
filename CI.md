@@ -6,94 +6,70 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 ## Overview
 
-`Branch Checks` uses the `openshell-ci-amd64` GKE ARC scale set for Linux amd64
-jobs from branches in `ai-openshell/openshell`, manual runs, and merge groups.
-Fork PRs use GitHub-hosted runners. ARM Linux lint/tests use the dedicated
-`openshell-ci-arm64-pd-lint` and `openshell-ci-arm64-pd-test` trial scale sets;
-other ARM jobs and macOS keep their hosted labels. This is a branch trial and does not change main until merged.
-`Branch Checks` and `Helm Lint` trigger on `pull_request` and `merge_group`.
-Workflow runs from outside contributors wait for a maintainer to approve them
+`Branch Checks` targets two GKE ARC labels for trusted Linux jobs:
+`openshell-ci-amd64` and `openshell-ci-arm64`. Same-repository branches, manual
+runs, and merge groups use these labels. Fork PRs use GitHub-hosted runners;
+ARM Python and macOS also remain hosted. This configuration is on the CI branch
+and takes effect on main when merged. `Branch Checks` and `Helm Lint` trigger on
+`pull_request` and `merge_group`. Outside contributors may need maintainer approval
 in the Actions tab.
 
-The GKE scale set maintains five idle runners and permits twenty total. Each
-runner has an isolated Docker daemon for job containers and Docker-backed tests.
-Runner bootstrap provides GitHub CLI, compression utilities, and the `USER`
-environment variable expected by the existing checks and Cachix. The custom
-image preloads Nix shells and configures the signed Cachix substituter globally;
-setup verifies that cache and skips duplicate user-level cache configuration.
-Rust jobs use the shared memcached sccache backend and report cache statistics;
-the standard runner jobs retain the existing GitHub Rust target/registry cache.
-The x86 lint/test jobs instead use `openshell-ci-amd64-pd-lint` and
-`openshell-ci-amd64-pd-test`. Each trial scale set has one worker and an exclusive
-200 GiB persistent cache disk, mounted at `/mnt/ci-cache`. Setup verifies the mount
-and selects a repository/Nix-shell-specific target directory shared by that
-job's Cargo commands. It skips GitHub Cargo cache restore/save entirely.
-Check the initial target size and runner pod name to distinguish an empty-disk
-run from a warm run on a replacement pod. Checkout and credentials remain
-ephemeral; only Cargo build outputs persist. Cargo still validates artifacts,
-and fresh checkout timestamps can trigger workspace rebuilds. These two lanes
-serialize concurrent jobs during the trial; the ordinary scale set stays 5–20.
-Inspect the job's
-runner name to confirm whether it ran on GKE. Hosted ARM, macOS, and fork jobs
-do not use the cluster-local cache endpoint.
+AMD64 has five warm workers and a twenty-worker limit on `c4-standard-24` Ubuntu
+nodes; ARM64 has three warm workers and a four-worker limit on `c4a-standard-16`.
+Each architecture label is shared by internal singleton cache slots. GitHub
+can dispatch any matching job to a free slot; workflows never select slot names.
+Each slot owns an exclusive 200 GiB Hyperdisk Balanced claim, provisioned on
+first use, with 6,000 IOPS and 250 MiB/s. At full use this is 4.8 TiB across
+24 slots. Claims survive runner replacement and node scaling; deleting a claim
+deletes its disk. `ReadWriteOncePod` prevents concurrent mounts, including on
+the same node. Replacement runners may briefly wait for disk release.
 
-The AMD64 speed trial moves the persistent lint/test and gateway core lanes to
-`c4-standard-24` Ubuntu nodes in the same zone. The general workers use
-`n4-standard-16`, and the system pool uses `n4-standard-8`. Images and
-per-runner CPU/memory settings are unchanged. Fourth-generation nodes require
-Hyperdisk boot/cache storage. The four AMD64 caches were recreated as empty
-200 GiB Hyperdisk Balanced claims (6,000 IOPS, 250 MiB/s), and their old SSD
-Persistent Disks were deleted. ARM workers also use C4A and fresh Hyperdisk claims, as described below.
-Only the trusted AMD64 test job sets `CARGO_PROFILE_TEST_DEBUG=0`; it retains
-all crypto/workspace checks and debug assertions, with less backtrace detail.
-Setup places these artifacts under a separate `test-debug0` target directory.
-Measure the first population pass and a warm rerun separately. The earlier
-N2/C3 trial introduced the no-debug setting; the N4/C4 migration keeps it and
-changes CPU/storage generation. These trials do not isolate every factor.
-ARM64, macOS, hosted forks, and lint debug settings keep their existing profiles.
+Every AMD64 runner reserves/limits eight CPUs, with 16 GiB requested and 32 GiB
+maximum memory. ARM64 reserves/limits twelve CPUs, with 32 GiB requested and
+48 GiB maximum memory. Each has an isolated Docker sidecar reserving one CPU
+and 4 GiB memory, limited to two CPUs and 8 GiB. Runner images contain GitHub
+CLI, system dependencies, and preloaded Nix shells with signed Cachix configured.
+The system pool uses N4, and the general N4 pool continues to host AMD64 BuildKit
+and memcached.
+
+Rust jobs use shared memcached sccache plus the slot's persistent target directory.
+Targets are separated by repository, Nix shell, job, and matrix variant; branch
+and run IDs are excluded so subsequent runs can reuse outputs. GitHub Cargo
+archive caches are skipped on these workers. Checkout, credentials, and Docker
+storage remain ephemeral. A job can land on a different slot with a colder
+target cache; shared sccache can still serve compiler outputs. This removes the
+old job-specific serialization but does not guarantee a warm target every run.
+Check initial target size, runner name, and queue/setup time when comparing runs.
+There is no automatic disk pruning; monitor usage and pause workers before
+resetting or removing cache directories.
+
+AMD64 tests set `CARGO_PROFILE_TEST_DEBUG=0` and use a separate `test-debug0`
+target directory. All assertions and crypto/workspace checks remain enabled;
+backtraces contain less debug information. Other platforms retain their profiles.
 
 Manual Branch Checks runs can enable `local_image_builds` for an additional
 native AMD64 gateway/sandbox/supervisor build and `--help` smoke check. It uses
 the production Nix auditable release-binary build commands and remote BuildKit, explicitly sets
 `DOCKER_PUSH=0` and `DOCKER_OUTPUT=type=docker`, and loads results only into the
 runner's ephemeral Docker daemon. No registry login, image upload, or registry
-cache export is performed. The trial uses the production Nix GNU/musl toolchain
+cache export is performed. The job uses the production Nix GNU/musl toolchain
 rather than the local Zig staging helper, verifies the glibc 2.28 floor and
 static sandbox linkage, and skips unrelated mise tool installation. This optional release/image build is measured
 separately from the normal branch-check latency and does not qualify ARM64
 images or release attestations.
 
-The ARM trial uses native `c4a-standard-16` Ubuntu nodes (minimum three, maximum
-four) for lint/crypto, workspace tests, and build-mode checks. The three
-`openshell-ci-arm64-pd-lint`, `openshell-ci-arm64-pd-test`, and
-`openshell-ci-arm64-pd-build-modes` scale sets each keep one ready worker and
-an exclusive 200 GiB Hyperdisk Balanced cache. Each runner reserves/limits
-12 CPUs, plus one reserved CPU for Docker, and reuses the digest-pinned ARM64
-image with baked Nix shells. The T2A pool and two old SSD cache disks are
-replaced; AMD64 workers and caches are unchanged by this ARM migration.
+Native ARM lint/crypto, workspace tests, and build-mode checks all use
+`openshell-ci-arm64`. Build-mode checks retain telemetry-on/off builds,
+telemetry-marker verification, system CA roots, and prover dependency checks.
+Verification reads `${CARGO_TARGET_DIR:-target}/debug/...`. ARM crypto checks
+run in the lint job in parallel with workspace tests; AMD64 and hosted test jobs
+retain their crypto checks.
 
-Trusted ARM build-mode checks use the new lane; forks retain hosted ARM.
-They retain telemetry-on/off builds, telemetry-marker verification, system CA
-root checks, and standalone-prover dependency checks. Verification reads
-`${CARGO_TARGET_DIR:-target}/debug/...` so it inspects the binaries Cargo just
-built on either a persistent-cache or ordinary worker. Debug profiles and all
-feature/dependency assertions are preserved. Compare first population and warm
-runs on the same commit, including queue/setup. No ARM image publication is
-required. ARM Python checks still use GitHub-hosted runners.
-
-Crypto verification runs after ARM lint while workspace tests run in parallel
-on the test lane. Other runner configurations keep their previous placement.
-
-Gateway core-feature checks run in two parallel matrix lanes: no-driver plus
-Kubernetes in `base-kubernetes`, and Docker plus Podman in `docker-podman`.
-Trusted jobs use `openshell-ci-amd64-pd-gateway-a` and
-`openshell-ci-amd64-pd-gateway-b`, each with an exclusive 200 GiB Hyperdisk, eight
-reserved runner CPUs, and shared memcached sccache. Fork jobs use hosted Ubuntu.
-All four commands keep `--all-targets --no-default-features`; each driver is
-checked independently. The matrix keeps running both lanes after a failure,
-and the existing Branch Checks workflow gate requires both to succeed.
-Compare the later lane completion, including queue time, against the old
-sequential job; adding lane durations measures CPU cost rather than latency.
+Gateway core features run two matrix jobs on `openshell-ci-amd64`:
+`base-kubernetes` checks no-driver and Kubernetes-only configurations, while
+`docker-podman` checks Docker-only and Podman-only configurations. Each variant
+has its own persistent target namespace. All four commands retain
+`--all-targets --no-default-features`, and both matrix jobs must succeed.
 
 `pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive.
 

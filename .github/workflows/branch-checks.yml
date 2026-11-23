@@ -299,9 +299,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64-pd-lint' || 'ubuntu-24.04' }}
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
             system: x86_64-linux
-          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-arm64-pd-lint' || 'ubuntu-24.04-arm' }}
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-arm64' || 'ubuntu-24.04-arm' }}
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -339,7 +339,7 @@ jobs:
 
       # Balance ARM crypto checks against the parallel workspace test job.
       - name: Verify crypto backend independence
-        if: matrix.runner == 'openshell-ci-arm64-pd-lint'
+        if: matrix.runner == 'openshell-ci-arm64'
         shell: nix develop -c bash -euo pipefail {0}
         run: |
           cargo tree --locked -p openshell-crypto --no-default-features --edges normal,build,dev --target all --prefix none > /tmp/openshell-crypto-dependencies.txt
@@ -351,7 +351,7 @@ jobs:
           cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
 
       - name: Verify OpenSSL backend
-        if: matrix.runner == 'openshell-ci-arm64-pd-lint'
+        if: matrix.runner == 'openshell-ci-arm64'
         shell: nix develop .#crypto -c bash -euo pipefail {0}
         env:
           OPENSSL_NO_VENDOR: "1"
@@ -372,7 +372,7 @@ jobs:
           cargo test --locked -p openshell-crypto --features openssl
 
       - name: Verify dynamic OpenSSL linkage on Linux
-        if: runner.os == 'Linux' && matrix.runner == 'openshell-ci-arm64-pd-lint'
+        if: runner.os == 'Linux' && matrix.runner == 'openshell-ci-arm64'
         shell: nix develop .#crypto -c bash -euo pipefail {0}
         env:
           OPENSSL_NO_VENDOR: "1"
@@ -399,17 +399,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64-pd-test' || 'ubuntu-24.04' }}
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
             system: x86_64-linux
-          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-arm64-pd-test' || 'ubuntu-24.04-arm' }}
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-arm64' || 'ubuntu-24.04-arm' }}
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - name: Disable test debug information on the AMD64 trial
-        if: matrix.runner == 'openshell-ci-amd64-pd-test'
+      - name: Disable test debug information on AMD64
+        if: matrix.runner == 'openshell-ci-amd64'
         run: echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -425,7 +425,7 @@ jobs:
           save-cache: "true"
 
       - name: Verify crypto backend independence
-        if: matrix.runner != 'openshell-ci-arm64-pd-test'
+        if: matrix.runner != 'openshell-ci-arm64'
         shell: nix develop -c bash -euo pipefail {0}
         run: |
           cargo tree --locked -p openshell-crypto --no-default-features --edges normal,build,dev --target all --prefix none > /tmp/openshell-crypto-dependencies.txt
@@ -437,7 +437,7 @@ jobs:
           cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
 
       - name: Verify OpenSSL backend
-        if: matrix.runner != 'openshell-ci-arm64-pd-test'
+        if: matrix.runner != 'openshell-ci-arm64'
         shell: nix develop .#crypto -c bash -euo pipefail {0}
         env:
           OPENSSL_NO_VENDOR: "1"
@@ -458,7 +458,7 @@ jobs:
           cargo test --locked -p openshell-crypto --features openssl
 
       - name: Verify dynamic OpenSSL linkage on Linux
-        if: runner.os == 'Linux' && matrix.runner != 'openshell-ci-arm64-pd-test'
+        if: runner.os == 'Linux' && matrix.runner != 'openshell-ci-arm64'
         shell: nix develop .#crypto -c bash -euo pipefail {0}
         env:
           OPENSSL_NO_VENDOR: "1"
@@ -492,8 +492,8 @@ jobs:
         if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && (startsWith(runner.name, 'openshell-ci-amd64-') || startsWith(runner.name, 'openshell-ci-arm64-')) }}
         run: sccache --show-stats
 
-  local-image-build-trial:
-    name: Local image build trial (amd64, no push)
+  local-image-builds:
+    name: Local image builds (amd64, no push)
     if: github.event_name == 'workflow_dispatch' && inputs.local_image_builds && github.repository == 'ai-openshell/openshell'
     runs-on: openshell-ci-amd64
     timeout-minutes: 90
@@ -502,7 +502,7 @@ jobs:
       DOCKER_PLATFORM: linux/amd64
       DOCKER_PUSH: "0"
       DOCKER_OUTPUT: type=docker
-      DOCKER_BUILDER: openshell-local-trial
+      DOCKER_BUILDER: openshell-local-images
       IMAGE_REGISTRY: localhost/openshell-ci
       IMAGE_TAG: ${{ github.sha }}
       PREBUILT_ARCH: amd64
@@ -516,7 +516,7 @@ jobs:
           prepare-shell: "true"
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: local-image-build-trial
+          cache-key: local-image-builds
           save-cache: "false"
       - name: Stage real release binaries
         shell: nix develop -c bash -euo pipefail {0}
@@ -594,7 +594,7 @@ jobs:
         include:
           - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
             system: x86_64-linux
-          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-arm64-pd-build-modes' || 'ubuntu-24.04-arm' }}
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-arm64' || 'ubuntu-24.04-arm' }}
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -683,10 +683,8 @@ jobs:
       matrix:
         include:
           - lane: base-kubernetes
-            runner: openshell-ci-amd64-pd-gateway-a
           - lane: docker-podman
-            runner: openshell-ci-amd64-pd-gateway-b
-    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.runner || 'ubuntu-24.04' }}
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -699,6 +697,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: rust-checks-v2
+          cache-variant: ${{ matrix.lane }}
           save-cache: "false"
 
       - name: Test gateway without optional drivers

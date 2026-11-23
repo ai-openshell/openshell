@@ -8,6 +8,10 @@ inputs:
   cache-key:
     description: Rust target cache namespace
     required: true
+  cache-variant:
+    description: Separate persistent targets for matrix variants within one job
+    required: false
+    default: ""
   save-cache:
     description: Whether this job writes the Rust target cache
     required: false
@@ -50,6 +54,7 @@ runs:
       shell: bash
       env:
         NIX_SHELL_HASH: ${{ steps.dev-shell.outputs.hash }}
+        CACHE_VARIANT: ${{ inputs.cache-variant }}
       run: |
         set -euo pipefail
         # Pod environment is visible to the shell, not the workflow env context.
@@ -60,14 +65,20 @@ runs:
         test "$GITHUB_REPOSITORY" = ai-openshell/openshell
         test "$OPENSHELL_PERSISTENT_CACHE" = /mnt/ci-cache
         mountpoint -q "$OPENSHELL_PERSISTENT_CACHE"
-        cache_root="$OPENSHELL_PERSISTENT_CACHE/ai-openshell-openshell/$NIX_SHELL_HASH"
-        # Keep the no-debug experiment separate from the existing test artifacts.
+        # A slot can run any job. Keep incompatible job/matrix targets separate,
+        # independent of branch/run IDs so later runs can reuse their artifacts.
+        cache_namespace="$GITHUB_JOB${CACHE_VARIANT:+-$CACHE_VARIANT}"
+        [[ "$cache_namespace" =~ ^[a-zA-Z0-9_-]+$ ]]
+        [[ "$NIX_SHELL_HASH" =~ ^[a-f0-9]{64}$ ]]
+        cache_root="$OPENSHELL_PERSISTENT_CACHE/ai-openshell-openshell/$NIX_SHELL_HASH/$cache_namespace"
+        # Keep no-debug artifacts separate from targets with debug information.
         if [[ "${CARGO_PROFILE_TEST_DEBUG:-}" == "0" ]]; then
           cache_root="$cache_root/test-debug0"
         fi
         mkdir -p "$cache_root/target"
         echo "CARGO_TARGET_DIR=$cache_root/target" >> "$GITHUB_ENV"
-        echo "Persistent cache lane: $OPENSHELL_CACHE_LANE"
+        echo "Persistent cache slot: $OPENSHELL_CACHE_SLOT"
+        echo "Cache namespace: $cache_namespace"
         echo "Runner pod: $RUNNER_NAME"
         echo "Target directory: $cache_root/target"
         du -sh "$cache_root/target"
