@@ -742,6 +742,15 @@ mod tests {
         (server, handle, rx)
     }
 
+    async fn assert_nothing_buffered(rx: &mut BatchReceiver, message: &str) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "{message}"
+        );
+    }
+
     fn body() -> Vec<u8> {
         encoded_request("test-span", &[("service.name", "unit-agent")])
     }
@@ -900,12 +909,7 @@ mod tests {
         let (code, _message) = json_status(&head);
         assert_eq!(code, i64::from(tonic::Code::InvalidArgument as i32));
         assert_eq!(server.counters.invalid_requests(), 1);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), rx.recv())
-                .await
-                .is_err(),
-            "nothing is buffered"
-        );
+        assert_nothing_buffered(&mut rx, "nothing is buffered").await;
     }
 
     #[tokio::test]
@@ -945,12 +949,7 @@ mod tests {
             message.contains("JSON body") && message.contains("100000 values"),
             "{message}"
         );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), rx.recv())
-                .await
-                .is_err(),
-            "nothing more is buffered"
-        );
+        assert_nothing_buffered(&mut rx, "nothing more is buffered").await;
         assert_eq!(server.counters.invalid_requests(), 1);
     }
 
@@ -967,12 +966,7 @@ mod tests {
         assert_eq!(head.status, 413);
         let (_code, message) = json_status(&head);
         assert!(message.contains("nests more than 32 levels"), "{message}");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), rx.recv())
-                .await
-                .is_err(),
-            "nothing is buffered"
-        );
+        assert_nothing_buffered(&mut rx, "nothing is buffered").await;
     }
 
     #[tokio::test]
@@ -986,12 +980,7 @@ mod tests {
             assert_eq!(head.body, b"{}");
         }
         assert_eq!(server.counters.discarded_signals(), 2);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), rx.recv())
-                .await
-                .is_err(),
-            "metrics and logs are not buffered"
-        );
+        assert_nothing_buffered(&mut rx, "metrics and logs are not buffered").await;
     }
 
     #[tokio::test]
