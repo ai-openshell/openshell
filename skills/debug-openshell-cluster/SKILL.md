@@ -307,7 +307,7 @@ for the marker format and delivery limits.
 docker info
 docker ps --filter name=openshell
 docker logs <container> --tail=200
-docker run --rm --entrypoint /openshell-sandbox "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-ghcr.io/nvidia/openshell/sandbox:latest}" --version
+docker run --rm --entrypoint /openshell-sandbox "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-quay.io/ai-openshell/sandbox:latest}" --version
 openshell status
 ```
 
@@ -454,6 +454,10 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Supervisor cannot connect: check its gateway endpoint and gateway logs.
+- A private-channel handshake failure can indicate mismatched runtime versions.
+  Check the configured `sandbox_runtime_image` and `supervisor_image` against
+  the images reported in gateway provisioning logs; both must belong to the
+  intended build. The workload image is a separate setting.
 - Inspect both Podman containers for the sandbox: the `sandbox` isolation role
   must have network mode `none`; the `supervisor` role owns the gateway session
   and egress. Both run non-root with all capabilities dropped. Check the private
@@ -508,6 +512,12 @@ When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
   to a workload that runs as the sandbox user.
 
 ### Step 6: Check Kubernetes Helm Gateways
+
+If a gateway, supervisor, or sandbox pod shows `ImagePullBackOff`, verify that
+the nodes can reach `quay.io/ai-openshell`, or the mirror set in
+`global.image.registry`, and that the requested image tag exists there. Images
+are public, so a pull failure after a successful chart download usually means
+the cluster has no route to the registry while the Helm client does.
 
 ```bash
 helm -n openshell status openshell
@@ -1069,7 +1079,7 @@ driver config includes `provider_spiffe_workload_api_socket_path`:
 helm -n openshell get values openshell | grep provider_spiffe_workload_api_socket_path
 kubectl get pods -A | grep -E 'spire|spiffe'
 kubectl -n openshell get configmap openshell-config -o yaml | grep provider_spiffe_workload_api_socket_path
-kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
+kubectl -n openshell get pod -l app.kubernetes.io/name=openshell -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
 ```
 
 Sandbox pods using provider token grants should have an

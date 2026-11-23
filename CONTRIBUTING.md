@@ -63,7 +63,7 @@ Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTA
 
 Pull requests that touch the enforcement machinery or reviewer routing — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `REVIEWERS.md`, `.github/CODEOWNERS`, or the enforcement and reviewer-routing scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
 
-Once your pull request represents [accepted work](#accepted-work), it needs exactly one `area:` label and any relevant `topic:` labels; see [Labeling and Notifications](#labeling-and-notifications) for guidance. The [reviewer routing workflow](.github/workflows/review-readiness.yml) adds reviewers from [REVIEWERS.md](REVIEWERS.md) based on these labels.
+Once your pull request represents [accepted work](#accepted-work), it needs exactly one `area:` label and any relevant `topic:` labels; see [Labeling and Notifications](#labeling-and-notifications) for guidance. The [reviewer routing workflow](.github/workflows/review-readiness.yml) adds reviewers from [REVIEWERS.md](REVIEWERS.md) based on these labels. The same workflow fails a ready PR from a personal fork that does not allow edits by maintainers; `gh pr create` enables that setting by default.
 
 Branch Checks requires accounts in `REVIEWERS.md` to appear in the repository collaborator list or have confirmed write or admin permission. Public read access alone does not qualify; read and triage accounts must appear in the collaborator list.
 
@@ -560,7 +560,7 @@ chore(deps): bump tokio to 1.40
 
 ### DCO
 
-All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. Dependabot-authored dependency update PRs are allowlisted because the bot cannot sign commits.
+All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. The DCO check fails a PR if any of its commits lacks the trailer; add it with `git rebase --signoff` and force-push.
 
 The project uses version 1.1 of the [Developer Certificate of Origin](https://developercertificate.org/):
 
@@ -607,7 +607,7 @@ git commit --signoff --message "feat(sandbox): add new capability"
 
 DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
 
-- **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
+- **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor and every commit.
 - **Cryptographic commit signing** applies to org members and collaborators only; see [CI.md](CI.md#commit-signing) for setup.
 
 ### PR testing checklist
