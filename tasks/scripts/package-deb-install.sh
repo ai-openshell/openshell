@@ -7,7 +7,7 @@
 # or on the gateway-as-a-service flow.
 #
 # Steps:
-#   1. cargo build --release the four binaries that go into the deb.
+#   1. cargo build --release the five binaries that go into the deb.
 #   2. Run tasks/scripts/package-deb.sh against those binaries.
 #   3. sudo dpkg -i the resulting artifact.
 #   4. Start the packaged user gateway service and register it locally.
@@ -58,13 +58,15 @@ cargo build --release \
 	-p openshell-cli \
 	-p openshell-gateway \
 	-p openshell-prover-cli \
-	-p openshell-driver-vm
+	-p openshell-driver-vm \
+	-p openshell-driver-podman
 
 echo "==> Building Debian package"
 OPENSHELL_CLI_BINARY="${repo_root}/target/release/openshell" \
 	OPENSHELL_GATEWAY_BINARY="${repo_root}/target/release/openshell-gateway" \
 	OPENSHELL_PROVER_BINARY="${repo_root}/target/release/openshell-prover" \
 	OPENSHELL_DRIVER_VM_BINARY="${repo_root}/target/release/openshell-driver-vm" \
+	OPENSHELL_DRIVER_PODMAN_BINARY="${repo_root}/target/release/openshell-driver-podman" \
 	OPENSHELL_DEB_VERSION="$VERSION" \
 	OPENSHELL_DEB_ARCH="$ARCH" \
 	OPENSHELL_OUTPUT_DIR="$OUTPUT_DIR" \

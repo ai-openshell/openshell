@@ -263,6 +263,7 @@ Package existing ARM64 Linux binaries with the repository's `package:deb:arm64` 
 OPENSHELL_CLI_BINARY="$PWD/target/aarch64-unknown-linux-musl/release/openshell" \
 OPENSHELL_GATEWAY_BINARY="$PWD/target/aarch64-unknown-linux-gnu/release/openshell-gateway" \
 OPENSHELL_DRIVER_VM_BINARY="$PWD/target/aarch64-unknown-linux-gnu/release/openshell-driver-vm" \
+OPENSHELL_DRIVER_PODMAN_BINARY="$PWD/target/aarch64-unknown-linux-gnu/release/openshell-driver-podman" \
 OPENSHELL_DEB_VERSION=0.0.0-local \
 OPENSHELL_OUTPUT_DIR="$PWD/artifacts" \
 nix develop --command mise run package:deb:arm64
