@@ -212,20 +212,18 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
           TRIPLE: ${{ matrix.triple }}
         run: |
-          bash tests/suites/conformance/package.sh "$TRIPLE" "artifacts/conformance/$TRIPLE"
-          binary="artifacts/conformance/$TRIPLE/openshell-conformance"
+          cargo build --release --locked --target "$TRIPLE" \
+            --manifest-path tests/suites/conformance/Cargo.toml \
+            --bin openshell-conformance
+          binary="target/$TRIPLE/release/openshell-conformance"
           # The program must run on any lane host.
           tasks/scripts/verify-static-binary.sh "$binary"
           # Fails if the program has no tests linked.
           "$binary" list
-          # Verify bundled nextest starts without a toolchain or gateway.
-          status=0
-          PATH=/usr/bin:/bin "$binary" run -- --no-tests fail __conformance_smoke_no_match__ || status=$?
-          test "$status" = 4
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: openshell-conformance-${{ matrix.triple }}
-          path: artifacts/conformance/${{ matrix.triple }}/openshell-conformance
+          path: target/${{ matrix.triple }}/release/openshell-conformance
           compression-level: 0
           retention-days: 5
           if-no-files-found: error

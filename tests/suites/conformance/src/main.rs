@@ -13,12 +13,6 @@ use std::process::ExitCode;
 // missing.
 use conformance as _;
 
-#[cfg(all(unix, conformance_bundle))]
-mod bundled;
-
 fn main() -> ExitCode {
-    #[cfg(all(unix, conformance_bundle))]
-    return testkit::program::main_with_runner(bundled::run);
-    #[cfg(not(all(unix, conformance_bundle)))]
-    testkit::main()
+    testkit::program::main_for(env!("CARGO_PKG_NAME"), env!("CARGO_BIN_NAME"))
 }

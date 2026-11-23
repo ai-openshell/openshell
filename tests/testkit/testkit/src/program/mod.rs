@@ -12,12 +12,14 @@
 //! }
 //! ```
 //!
-//! It has three subcommands:
+//! Its subcommands:
 //!
 //! - `list [FILTER]...` prints each test's name and description.
 //! - `ready [--timeout SECS]` waits for the gateway, as `testkit-ready` does.
 //! - `run [FILTER]...` runs tests one at a time, each in its own process with
 //!   a timeout, and can write a `JUnit` report. Unix only.
+//! - `nextest-metadata DIR` describes the executable to nextest, so it can
+//!   run the prebuilt program without Cargo.
 //!
 //! Any other arguments are libtest's, so the program also works as a
 //! `harness = false` test target under `cargo test` and nextest: it answers
@@ -33,6 +35,7 @@
 mod capture;
 #[cfg(unix)]
 mod junit;
+mod nextest;
 #[cfg(unix)]
 mod process;
 #[cfg(unix)]
@@ -62,9 +65,10 @@ pub fn main() -> ExitCode {
     main_with(&TESTS)
 }
 
-/// Run a program whose `run` subcommand delegates to a bundled scheduler.
-pub fn main_with_runner(runner: fn(RunOptions) -> ExitCode) -> ExitCode {
-    dispatch(&TESTS, Some(runner))
+/// Run a suite program with the package and binary names it has under Cargo.
+/// These names are used by `nextest-metadata`, even if the executable is renamed.
+pub fn main_for(package: &str, binary: &str) -> ExitCode {
+    dispatch(&TESTS, Some((package, binary)))
 }
 
 /// [`main`] over `tests` instead of every registered test.
@@ -73,7 +77,7 @@ pub fn main_with(tests: &'static [Test]) -> ExitCode {
     dispatch(tests, None)
 }
 
-fn dispatch(tests: &'static [Test], runner: Option<fn(RunOptions) -> ExitCode>) -> ExitCode {
+fn dispatch(tests: &'static [Test], identity: Option<(&str, &str)>) -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     let program = program_name(&args);
     // A suite crate that the program never names is not linked, and its
@@ -105,7 +109,7 @@ fn dispatch(tests: &'static [Test], runner: Option<fn(RunOptions) -> ExitCode>) 
                 return ExitCode::from(if error.use_stderr() { ERROR_EXIT } else { 0 });
             }
         };
-        command(&program, tests, unsupported, cli.command, runner)
+        command(&program, tests, unsupported, cli.command, identity)
     } else {
         libtest(tests, unsupported, args)
     }
@@ -127,6 +131,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Write metadata to run the prebuilt executable with cargo-nextest.
+    NextestMetadata {
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+    },
     /// Print each test's name and description, including ignored tests.
     List {
         /// Show tests whose name contains any of these (all if none).
@@ -139,31 +148,25 @@ enum Command {
         #[arg(long, default_value = "60", value_name = "SECS", value_parser = seconds)]
         timeout: Duration,
     },
-    /// Run tests, each in its own process.
-    Run(RunOptions),
-}
-
-/// Arguments shared by the standalone runner and the bundled scheduler.
-#[derive(clap::Args)]
-pub struct RunOptions {
-    /// Run tests whose name contains any of these (all if none).
-    pub filters: Vec<String>,
-    /// Run ignored tests too.
-    #[arg(long)]
-    pub include_ignored: bool,
-    /// Stop a test that runs longer than this, in seconds. Longer than
-    /// testkit's own step timeouts, so those report first.
-    #[arg(long, default_value = "900", value_name = "SECS", value_parser = seconds)]
-    pub timeout: Duration,
-    /// How long a stopped test has between SIGTERM and SIGKILL, in seconds.
-    #[arg(long, default_value = "10", value_name = "SECS", value_parser = seconds)]
-    pub grace: Duration,
-    /// Write a JUnit report here.
-    #[arg(long, value_name = "PATH")]
-    pub junit: Option<PathBuf>,
-    /// Arguments passed to nextest (bundled builds only).
-    #[arg(last = true, value_name = "NEXTEST_ARGS", allow_hyphen_values = true)]
-    pub nextest_args: Vec<OsString>,
+    /// Run tests one at a time, each in its own process. Exits 1 if a test
+    /// failed and 2 if tests could not run.
+    Run {
+        /// Run tests whose name contains any of these (all if none).
+        filters: Vec<String>,
+        /// Run ignored tests too.
+        #[arg(long)]
+        include_ignored: bool,
+        /// Stop a test that runs longer than this, in seconds. Longer than
+        /// testkit's own step timeouts, so those report first.
+        #[arg(long, default_value = "900", value_name = "SECS", value_parser = seconds)]
+        timeout: Duration,
+        /// How long a stopped test has between SIGTERM and SIGKILL, in seconds.
+        #[arg(long, default_value = "10", value_name = "SECS", value_parser = seconds)]
+        grace: Duration,
+        /// Write a JUnit report here.
+        #[arg(long, value_name = "PATH")]
+        junit: Option<PathBuf>,
+    },
 }
 
 /// A positive, finite number of seconds.
@@ -182,50 +185,46 @@ fn command(
     tests: &'static [Test],
     unsupported: Unsupported,
     command: Command,
-    runner: Option<fn(RunOptions) -> ExitCode>,
+    identity: Option<(&str, &str)>,
 ) -> ExitCode {
     match command {
+        Command::NextestMetadata { dir } => {
+            let package = tests[0].package();
+            let (package, binary) = identity.unwrap_or((package, program));
+            match nextest::write(&dir, package, binary) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!(
+                        "{program}: write nextest metadata to {}: {error}",
+                        dir.display()
+                    );
+                    ExitCode::from(ERROR_EXIT)
+                }
+            }
+        }
         Command::List { filters } => {
             list(tests, &unsupported, filters);
             ExitCode::SUCCESS
         }
         Command::Ready { timeout } => ready(program, timeout),
-        Command::Run(options) => {
-            if let Some(runner) = runner {
-                return runner(options);
-            }
-            let RunOptions {
-                mut filters,
+        Command::Run {
+            filters,
+            include_ignored,
+            timeout,
+            grace,
+            junit,
+        } => run(
+            program,
+            tests,
+            Selection {
+                filters,
                 include_ignored,
-                timeout,
-                grace,
-                junit,
-                nextest_args,
-            } = options;
-            for arg in nextest_args {
-                let Ok(filter) = arg.into_string() else {
-                    eprintln!("{program}: test filters must be UTF-8");
-                    return ExitCode::from(ERROR_EXIT);
-                };
-                if filter.starts_with('-') {
-                    eprintln!("{program}: nextest options require a bundled build");
-                    return ExitCode::from(ERROR_EXIT);
-                }
-                filters.push(filter);
-            }
-            run(
-                program,
-                tests,
-                Selection {
-                    filters,
-                    include_ignored,
-                    unsupported,
-                },
-                timeout,
-                grace,
-                junit,
-            )
-        }
+                unsupported,
+            },
+            timeout,
+            grace,
+            junit,
+        ),
     }
 }
 
@@ -398,7 +397,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, Command, RunOptions};
+    use super::{Cli, Command};
 
     #[test]
     fn cli_is_consistent() {
@@ -417,21 +416,15 @@ mod tests {
             "1.5",
             "--junit",
             "out/junit.xml",
-            "--",
-            "-j",
-            "4",
-            "-E",
-            "test(smoke)",
         ])
         .unwrap();
-        let Command::Run(RunOptions {
+        let Command::Run {
             filters,
             include_ignored,
             timeout,
             grace,
             junit,
-            nextest_args,
-        }) = cli.command
+        } = cli.command
         else {
             panic!("not run");
         };
@@ -440,7 +433,6 @@ mod tests {
         assert_eq!(timeout, Duration::from_millis(1500));
         assert_eq!(grace, Duration::from_secs(10));
         assert_eq!(junit.unwrap().to_str(), Some("out/junit.xml"));
-        assert_eq!(nextest_args, ["-j", "4", "-E", "test(smoke)"]);
 
         let Command::Ready { timeout } = Cli::try_parse_from(["p", "ready"]).unwrap().command
         else {

@@ -81,11 +81,11 @@ struct RunArgs {
     #[arg(long, value_name = "DIR", conflicts_with = "program")]
     bundle: Option<PathBuf>,
     /// Run this prebuilt testkit program, such as `openshell-conformance`,
-    /// instead of building the family's tests. It must bundle nextest and
-    /// be a static binary for the guest's architecture.
+    /// instead of building the family's tests. It must be a static binary for
+    /// the guest's architecture (a `*-unknown-linux-musl` build).
     #[arg(long, value_name = "PATH", conflicts_with = "packages")]
     program: Option<PathBuf>,
-    /// Maximum number of concurrent tests [default: 1].
+    /// Maximum number of tests nextest runs at once [default: 1].
     #[arg(long, value_name = "N")]
     test_threads: Option<NonZeroUsize>,
     /// The gateway name the installer registers with the CLI. The packaged

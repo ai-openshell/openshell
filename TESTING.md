@@ -256,14 +256,13 @@ prebuilt testkit program, such as a static `openshell-conformance` for the
 guest's architecture, instead of building the family's tests; it can't be
 combined with `--package`. With it, `--filter` (repeatable) takes parts of test
 names, as the program does, such as `--filter policy_advisor::`, rather than a
-nextest filterset. The runner invokes the program's `ready` and `run`
-commands in the guest. It writes `junit.xml`
+nextest filterset. The runner runs the program's `ready` command in the
+guest, then uses nextest to run the prebuilt binary. It writes `junit.xml`
 and `nextest.log` to the results directory. Branch E2E builds
 `openshell-conformance` once and passes it to every conformance row this way.
 `--test-threads N` runs up to N tests concurrently in the guest, whether
 the runner builds the suite or uses `--bundle` or `--program`. The default
-is one. With `--program`, use a binary that bundles nextest.
-CI rows can opt in with `test_threads`.
+is one. CI rows can opt in with `test_threads`.
 
 `openshell-test-runner build --family <family> --out <dir>` builds a family's
 test bundle for the guest without booting a VM, and `run --bundle <dir>` runs
@@ -523,12 +522,9 @@ feature variable (`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURE
 `e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
 it skips them. Unset or empty values select the driver's default Rust
 features. The selector is handled by the runner; it is not a Cargo feature.
-Branch E2E packages `openshell-conformance` with nextest, so `run` can
-schedule tests without an installed nextest. With a bundled binary, pass
-nextest options after `--`, for example `run -- --test-threads 4`. The
-driver wrappers accept whitespace-separated options in
-`OPENSHELL_TESTKIT_NEXTEST_ARGS` when using a prebuilt binary. Plain
-Cargo builds run serially.
+The wrappers use nextest. Set `NEXTEST_TEST_THREADS` to change the
+worker count from the default of one. For a standalone run without nextest,
+invoke `openshell-conformance run` directly.
 
 ```shell
 OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes
