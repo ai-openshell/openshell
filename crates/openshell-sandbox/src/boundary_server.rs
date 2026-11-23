@@ -1155,7 +1155,7 @@ mod linux {
         stream: tokio::net::TcpStream,
         /// The supervisor named itself, as only a pool member does.
         named: bool,
-        /// A member's route directory led here.
+        /// A member's redirect led here.
         redirected: bool,
     }
 

@@ -40,6 +40,7 @@ message HostMessage {
     HostHello hello = 1;
     HostStatus status = 2;
     HostHeartbeat heartbeat = 3;
+    RouteLookup route_lookup = 4;
   }
 }
 
@@ -51,6 +52,7 @@ message HostGatewayMessage {
     AssignmentSnapshot assignments = 3;
     HostGatewayHeartbeat heartbeat = 4;
     HostRedirect redirect = 5;
+    RouteOwner route_owner = 6;
   }
 }
 
@@ -111,6 +113,9 @@ message HostRejected {
 // previous one; an instance absent from a snapshot must stop, except on a
 // pool host, which releases it without stopping its workload.
 message AssignmentSnapshot {
+  reserved 5;
+  reserved "route_directory";
+
   // Monotonic within the session, starting at 1.
   uint64 revision = 1;
   repeated SandboxInstanceAssignment instances = 2;
@@ -120,9 +125,6 @@ message AssignmentSnapshot {
   // Pool hosts only: routes whose sandbox is stopping or deleted; the host
   // stops their workloads if it still hosts them.
   repeated string stop_routes = 4;
-  // Pool hosts only: where each instance placed in the pool is supervised,
-  // so a sandbox runtime that reaches this host is redirected to its owner.
-  repeated RouteOwner route_directory = 5;
   // Pool hosts only: routes this host's process owns whose launch material
   // this gateway replica has not loaded yet. The host keeps supervising them
   // unchanged; it neither releases nor stops them, and starts nothing for
@@ -135,10 +137,18 @@ message AssignmentSnapshot {
   google.protobuf.Duration recovery_timeout = 7;
 }
 
+// A pool host asks where a route it does not own is supervised, so a sandbox
+// runtime that reached it can be redirected. The gateway answers each lookup
+// with a RouteOwner for the same route.
+message RouteLookup {
+  string route = 1;
+}
+
 // The pool member that supervises one route.
 message RouteOwner {
   string route = 1;
-  // Runtime listener address (IP:port) of the owning member.
+  // Runtime listener address (IP:port) of the owning member; empty when no
+  // live member owns the route.
   string runtime_address = 2;
 }
 
