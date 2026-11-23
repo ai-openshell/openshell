@@ -39,6 +39,7 @@ ALIGNED_WORKSPACES = (
     "tests/testkit",
     "tests/suites/conformance",
     "tests/suites/continuity",
+    "tests/suites/drivers/kubernetes",
     "tests/suites/drivers/podman",
     "tests/suites/features",
 )
