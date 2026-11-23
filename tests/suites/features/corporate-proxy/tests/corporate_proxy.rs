@@ -26,6 +26,10 @@ use testkit::policy::{self, Endpoint as _};
 use testkit::sdk::raw::proto;
 use testkit::{Context, PYTHON_BINARIES, Poll, ResultExt as _, Sandbox};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 /// Requests `https://<argv[2]>:<port>/` for each `<name>:<port>:<attempts>`
 /// after `argv[2]` and prints one JSON object of results by name. With
 /// `argv[1]` `verify`, the client verifies the server against the image's
