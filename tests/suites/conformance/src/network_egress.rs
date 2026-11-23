@@ -182,6 +182,14 @@ async fn fail_closed_middleware_blocks_uninspectable_traffic(cx: &mut Context) -
             && crate::network_l7::error_code(&reply).as_deref() == Some("unsupported_l7_protocol"),
         "expected the middleware to block the payload: {reply:?}"
     );
+    // Give any bytes the proxy forwarded time to arrive before checking.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let received = server.received();
+    testkit::ensure!(
+        received.is_empty(),
+        "the payload reached upstream before the denial: {:?}",
+        String::from_utf8_lossy(&received)
+    );
     sandbox
         .logs_until("the middleware denial", |logs| {
             logs.contains("openshell.middleware.traffic_uninspectable")
