@@ -1952,9 +1952,12 @@ impl ComputeRuntime {
             }
 
             let previous = current.clone();
+            // Timeout cleanup can leave a stopped driver entry that needs
+            // fresh launch credentials even though the gateway reports Error.
             let next_identity = if authority.is_some()
                 && (matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
-                    || is_failed_main_process_result(&current))
+                    || is_failed_main_process_result(&current)
+                    || provisioning_timeout)
             {
                 Some(next_runtime_identity(&current)?)
             } else {
