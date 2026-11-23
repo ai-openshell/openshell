@@ -14,8 +14,12 @@ and takes effect on main when merged. `Branch Checks` and `Helm Lint` trigger on
 `pull_request` and `merge_group`. Outside contributors may need maintainer approval
 in the Actions tab.
 
-AMD64 has five warm workers and a twenty-worker limit on `c4-standard-24` Ubuntu
-nodes; ARM64 has three warm workers and a four-worker limit on `c4a-standard-16`.
+AMD64 has five warm workers and a twenty-worker limit on `n4-standard-32` Ubuntu
+nodes; ARM64 has three warm workers and a four-worker limit on `n4a-standard-16`.
+The `runners-amd64` pool keeps two nodes and allows seven. It hosts AMD64
+BuildKit plus up to three workers per node, or two on the BuildKit node;
+1 TB boot disks accommodate their combined ephemeral-storage requests.
+`runners-arm64` keeps three nodes and allows four, with one worker per node. Per-runner CPU reservations remain eight and twelve.
 Each architecture label is shared by internal singleton cache slots. GitHub
 can dispatch any matching job to a free slot; workflows never select slot names.
 Each slot owns an exclusive 200 GiB Hyperdisk Balanced claim, provisioned on
@@ -29,8 +33,9 @@ maximum memory. ARM64 reserves/limits twelve CPUs, with 32 GiB requested and
 48 GiB maximum memory. Each has an isolated Docker sidecar reserving one CPU
 and 4 GiB memory, limited to two CPUs and 8 GiB. Runner images contain GitHub
 CLI, system dependencies, and preloaded Nix shells with signed Cachix configured.
-The system pool uses N4, and the general N4 pool continues to host AMD64 BuildKit
-and memcached.
+The `system-amd64` pool uses `n4-standard-8` for ARC, listeners, and memcached.
+Each architecture's BuildKit shares its runner pool. Node-role labels match
+the pool names. The N-series migration preserves images and existing Hyperdisk caches; it does not change job routing.
 
 Rust jobs use shared memcached sccache plus the slot's persistent target directory.
 Targets are separated by repository, Nix shell, job, and matrix variant; branch

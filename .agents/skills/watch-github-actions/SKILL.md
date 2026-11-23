@@ -135,7 +135,8 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 Trusted Branch Checks Linux jobs use only `openshell-ci-amd64` and
 `openshell-ci-arm64`. Fork PRs, ARM Python, and macOS use hosted runners.
-AMD64 runs on C4 Ubuntu; ARM64 runs natively on C4A Ubuntu. Each public label
+AMD64 runs on N4 Ubuntu (`runners-amd64`); ARM64 runs natively on N4A Ubuntu
+(`runners-arm64`). Node-role labels match pool names. Each public label
 is shared by internal singleton cache slots, with five warm/twenty maximum
 AMD64 workers and three warm/four maximum ARM64 workers. Slot names in job
 logs are internal identities, not labels to hardcode in workflows.
