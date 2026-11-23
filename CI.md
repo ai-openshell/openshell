@@ -6,7 +6,22 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 ## Overview
 
-PR CI runs on standard GitHub-hosted runners. `Branch Checks` and `Helm Lint` trigger on `pull_request` and `merge_group`. Workflow runs from outside contributors wait for a maintainer to approve them in the Actions tab.
+PR CI runs on GitHub-hosted runners. This branch trials 16-CPU / 64-GB / 600-GB
+Ubuntu 24.04 runners for Rust lint, workspace tests, build-mode checks, PostgreSQL
+tests, feature-alias verification, and gateway feature checks. Their labels are
+`openshell-hosted-amd64-16` and `openshell-hosted-arm64-16`. Lightweight checks,
+ARM Python, and macOS keep their existing runner targets. The trial changes
+runner targets only: commands, features, cache settings, debug profiles, and job
+structure are unchanged from main.
+
+The runner definitions belong to `ai-openshell`, in the `openshell-default` group
+restricted to `ai-openshell/openshell`. Concurrency is capped at eight AMD64 jobs
+and four ARM64 jobs. Larger hosted runners are billable for public repositories;
+GitHub provisions a fresh VM per job and manages its teardown. External
+contributor approval requirements remain in effect. This is a separate trial
+from the GKE runner PR.
+
+`Branch Checks` and `Helm Lint` trigger on `pull_request` and `merge_group`. Workflow runs from outside contributors wait for a maintainer to approve them in the Actions tab.
 
 `pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive.
 
