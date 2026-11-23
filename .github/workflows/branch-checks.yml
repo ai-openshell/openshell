@@ -605,8 +605,16 @@ jobs:
         run: sccache --show-stats
 
   rust-gateway-core-features:
-    name: Rust gateway core features
-    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
+    name: Rust gateway core features (${{ matrix.lane }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: base-kubernetes
+            runner: openshell-ci-amd64-pd-gateway-a
+          - lane: docker-podman
+            runner: openshell-ci-amd64-pd-gateway-b
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.runner || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -621,13 +629,25 @@ jobs:
           cache-key: rust-checks-v2
           save-cache: "false"
 
-      - name: Verify core gateway compute-driver feature sets
+      - name: Test gateway without optional drivers
+        if: matrix.lane == 'base-kubernetes'
         shell: nix develop -c bash -euo pipefail {0}
-        run: |
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
+        run: cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features
+
+      - name: Test Kubernetes-only gateway
+        if: matrix.lane == 'base-kubernetes'
+        shell: nix develop -c bash -euo pipefail {0}
+        run: cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
+
+      - name: Test Docker-only gateway
+        if: matrix.lane == 'docker-podman'
+        shell: nix develop -c bash -euo pipefail {0}
+        run: cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker
+
+      - name: Test Podman-only gateway
+        if: matrix.lane == 'docker-podman'
+        shell: nix develop -c bash -euo pipefail {0}
+        run: cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
 
       - name: Shared sccache statistics
         if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && (startsWith(runner.name, 'openshell-ci-amd64-') || startsWith(runner.name, 'openshell-ci-arm64-')) }}

@@ -48,6 +48,17 @@ ARM, crypto backend independence, OpenSSL backend, and dynamic-linkage checks ru
 after lint while workspace tests run in parallel on the test lane. Other runner
 configurations retain those checks in the test job.
 
+Gateway core-feature checks run in two parallel matrix lanes: no-driver plus
+Kubernetes in `base-kubernetes`, and Docker plus Podman in `docker-podman`.
+Trusted jobs use `openshell-ci-amd64-pd-gateway-a` and
+`openshell-ci-amd64-pd-gateway-b`, each with an exclusive 200 GiB SSD, eight
+reserved runner CPUs, and shared memcached sccache. Fork jobs use hosted Ubuntu.
+All four commands keep `--all-targets --no-default-features`; each driver is
+checked independently. The matrix keeps running both lanes after a failure,
+and the existing Branch Checks workflow gate requires both to succeed.
+Compare the later lane completion, including queue time, against the old
+sequential job; adding lane durations measures CPU cost rather than latency.
+
 `pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.

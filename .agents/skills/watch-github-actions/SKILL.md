@@ -153,6 +153,11 @@ inspect PVC/PV events before treating this as a runner registration failure.
 On native ARM the crypto backend/OpenSSL verification steps run in the lint
 job, in parallel with workspace tests; inspect that job for crypto failures.
 Hosted/fork and x86 test jobs keep their existing crypto steps.
+Gateway core features use parallel `base-kubernetes` and `docker-podman` matrix
+jobs on `openshell-ci-amd64-pd-gateway-a/b`, with separate exclusive caches and
+eight reserved runner CPUs. Inspect both jobs and all four named feature steps;
+measure the later completion rather than summing durations. Fork jobs retain
+hosted Ubuntu. A failed lane must fail the Branch Checks workflow gate.
 See `CI.md` for trial scope and cache setup.
 
 ## View Job Logs
