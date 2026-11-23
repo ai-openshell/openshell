@@ -21,6 +21,14 @@ impl Fixture {
         let tools = root.path().join("tools");
         fs::create_dir(&tools).expect("tools directory");
         let config = root.path().join("gateway.toml");
+        // The driver validates its own configuration. These tests are about
+        // the host tools, so a stand-in driver accepts any document.
+        let drivers = root.path().join("drivers");
+        fs::create_dir(&drivers).expect("drivers directory");
+        let driver = drivers.join("openshell-driver-vm");
+        fs::write(&driver, "#!/bin/sh\necho '{\"ok\":true}'\n").expect("driver fixture");
+        fs::set_permissions(&driver, fs::Permissions::from_mode(0o755)).expect("driver mode");
+        fs::set_permissions(&drivers, fs::Permissions::from_mode(0o755)).expect("drivers mode");
         let fixture = Self {
             root,
             tools,
@@ -41,8 +49,10 @@ impl Fixture {
         // TOML serialization preserves quotes and escapes in the fixture path.
         let state_dir = toml::Value::try_from(self.root.path().join("vm-state"))
             .expect("serialize VM state directory");
+        let driver_dir = toml::Value::try_from(self.root.path().join("drivers"))
+            .expect("serialize driver directory");
         fs::write(&self.config, format!(
-            "[openshell]\nversion = 2\n[openshell.gateway]\ndisable_tls = true\n{selector}[openshell.drivers.vm]\nbootstrap_image = 'unreachable.invalid/vm:must-not-pull'\nstate_dir = {state_dir}\n"
+            "[openshell]\nversion = 2\n[openshell.gateway]\ndisable_tls = true\n{selector}[openshell.drivers.vm]\nbootstrap_image = 'unreachable.invalid/vm:must-not-pull'\nstate_dir = {state_dir}\ndriver_dir = {driver_dir}\n"
         )).expect("gateway configuration");
     }
 
@@ -217,7 +227,9 @@ async fn signals_stop_probe_wrapper_and_descendants_before_cli_exit() {
             .expect("preflight process");
         let pid =
             Pid::from_raw(i32::try_from(child.id().expect("gateway PID")).expect("valid PID"));
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Startup of a debug gateway under parallel tests is slow; only the
+        // cleanup after the signal is time-sensitive.
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !ready.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

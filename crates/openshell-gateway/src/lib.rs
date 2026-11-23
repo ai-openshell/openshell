@@ -16,6 +16,12 @@ compile_error!(
      build a telemetry-free gateway with `--no-default-features --features defaults-without-telemetry`"
 );
 
+#[cfg(all(
+    not(target_os = "windows"),
+    any(feature = "compute-driver-vm", feature = "compute-driver-podman")
+))]
+mod launcher;
+
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 mod vm;
 
@@ -544,6 +550,19 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
         true
     }
 
+    // The driver validates its own configuration through `preflight`.
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        vm::preflight(
+            context.gateway_log_level(),
+            context.gateway_name(),
+            context.gateway_port(),
+            vm_driver_table(context)?,
+        )
+    }
+
     async fn preflight_host_tools(
         &self,
         cancellation: tokio::sync::watch::Receiver<bool>,
@@ -557,46 +576,24 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
         true
     }
 
-    fn validate_config(
-        &self,
-        context: openshell_server::ComputeDriverConfigContext<'_>,
-    ) -> openshell_core::Result<()> {
-        let mut config = vm_config(context)?;
-        if config.grpc_endpoint.trim().is_empty() {
-            let scheme = if context.gateway_tls_enabled() {
-                "https"
-            } else {
-                "http"
-            };
-            config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port());
-        }
-        config.validate_configuration()
-    }
-
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config = vm_config(context.config_context())?;
+        let driver_config = vm_driver_table(context.config_context())?;
+        let settings = vm::VmLaunchSettings::from_table(&driver_config)?;
         require_guest_tls_for_local_driver(&context, "vm")?;
-        if config.grpc_endpoint.trim().is_empty()
-            && (!context.gateway_tls_enabled() || context.guest_tls_ca().is_some())
-        {
-            let scheme = if context.gateway_tls_enabled() {
-                "https"
-            } else {
-                "http"
-            };
-            config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port());
-        }
-        apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
-        let endpoint = vm::spawn(
-            context.gateway_log_level(),
-            context.gateway_name(),
-            &config,
-            context.otlp_config(),
-            context.network_trust_bundle(),
-        )
+        let endpoint = vm::spawn(vm::VmLaunch {
+            gateway_log_level: context.gateway_log_level(),
+            gateway_name: context.gateway_name(),
+            gateway_port: context.gateway_port(),
+            tls_ca: context.guest_tls_ca(),
+            otlp_config: context.otlp_config(),
+            network_trust: context.network_trust_bundle(),
+            shutdown: context.shutdown_receiver(),
+            settings: &settings,
+            driver_config,
+        })
         .await?;
         Ok(openshell_server::ComputeDriverInstance::ManagedRemote(
             endpoint,
@@ -605,14 +602,10 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
-fn vm_config(
+fn vm_driver_table(
     context: openshell_server::ComputeDriverConfigContext<'_>,
-) -> openshell_core::Result<vm::VmComputeConfig> {
-    let mut config: vm::VmComputeConfig = context.driver_config()?;
-    if config.state_dir.as_os_str().is_empty() {
-        config.state_dir = vm::VmComputeConfig::default_state_dir();
-    }
-    Ok(config)
+) -> openshell_core::Result<toml::Table> {
+    context.driver_config()
 }
 
 #[cfg(all(
