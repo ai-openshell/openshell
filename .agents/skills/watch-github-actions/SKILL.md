@@ -158,6 +158,11 @@ jobs on `openshell-ci-amd64-pd-gateway-a/b`, with separate exclusive caches and
 eight reserved runner CPUs. Inspect both jobs and all four named feature steps;
 measure the later completion rather than summing durations. Fork jobs retain
 hosted Ubuntu. A failed lane must fail the Branch Checks workflow gate.
+The opt-in `compare_linux_combined` manual input adds Linux combined lint,
+crypto, and test jobs beside the regular controls. Compare each architecture's
+later control completion against its combined job, and runner minutes against
+the control sum. Confirm cold versus warm target sizes; no Clippy architecture
+coverage is dropped in this experiment. Ordinary PR runs skip the comparison.
 See `CI.md` for trial scope and cache setup.
 
 ## View Job Logs

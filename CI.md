@@ -59,6 +59,18 @@ and the existing Branch Checks workflow gate requires both to succeed.
 Compare the later lane completion, including queue time, against the old
 sequential job; adding lane durations measures CPU cost rather than latency.
 
+Manual Branch Checks runs can enable `compare_linux_combined` to add one
+combined lint/crypto/test job on each Linux architecture alongside the normal
+parallel controls. No macOS combined job is added. All Clippy, crypto, workspace,
+and independent-workspace commands are retained. Combined jobs use their own
+exclusive SSDs and the same image, CPU limits, and memory settings as their
+architecture's controls. During this infra trial AMD64 lint/test/combined
+workers each reserve eight runner CPUs; ARM64 workers each reserve twelve.
+Compare warmed runs on the same commit: parallel completion is the later
+lint/test completion; combined completion is one job. Report total runner
+minutes separately. The input defaults to false so ordinary PR checks do not
+run duplicate suites.
+
 `pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
