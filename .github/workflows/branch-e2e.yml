@@ -219,12 +219,19 @@ jobs:
           # Fails if the program has no tests linked.
           "$binary" list
           # Exercise the packaged scheduler, not just the discovery interface.
-          PATH=/usr/bin:/bin "$binary" run --help | grep -- --test-threads
           status=0
-          PATH=/usr/bin:/bin "$binary" run -- __conformance_smoke_no_match__ >"$RUNNER_TEMP/conformance-smoke.log" 2>&1 || status=$?
-          cat "$RUNNER_TEMP/conformance-smoke.log"
+          PATH=/usr/bin:/bin "$binary" run -- --no-tests fail __conformance_smoke_no_match__ || status=$?
+          test "$status" = 4
+          # A successful nextest invocation that did not run tests has no report.
+          status=0
+          PATH=/usr/bin:/bin "$binary" run --junit "$RUNNER_TEMP/conformance.xml" -- --no-run || status=$?
           test "$status" = 2
-          grep -F 'no tests to run' "$RUNNER_TEMP/conformance-smoke.log"
+          test ! -e "$RUNNER_TEMP/conformance.xml"
+          status=0
+          PATH=/usr/bin:/bin OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:1 \
+            "$binary" run --junit "$RUNNER_TEMP/conformance.xml" -- -j 2 -E 'test(=smoke::create_exec_delete)' || status=$?
+          test "$status" = 100
+          test -s "$RUNNER_TEMP/conformance.xml"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: openshell-conformance-${{ matrix.triple }}

@@ -9,10 +9,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{ExitCode, Stdio};
-use std::time::Duration;
+use std::process::{ExitCode, ExitStatus, Stdio};
 
-use clap::Parser;
+use testkit::program::RunOptions;
 use tokio::process::Command;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -20,40 +19,6 @@ macro_rules! payload {
     ($name:literal) => {
         concat!(env!("OPENSHELL_CONFORMANCE_BUNDLE"), "/", $name)
     };
-}
-
-#[derive(Parser)]
-#[command(
-    name = "openshell-conformance run",
-    about = "Run tests with bundled nextest"
-)]
-struct Run {
-    /// Run tests whose name contains any of these.
-    filters: Vec<String>,
-    /// Run ignored tests too.
-    #[arg(long)]
-    include_ignored: bool,
-    /// Maximum concurrent tests. Use more than one only on a suitable gateway.
-    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..))]
-    test_threads: u32,
-    /// Stop each test after this many seconds.
-    #[arg(long, default_value = "900", value_parser = seconds)]
-    timeout: Duration,
-    /// Grace period before forcibly killing a stopped test, in seconds.
-    #[arg(long, default_value = "10", value_parser = seconds)]
-    grace: Duration,
-    /// Write a JUnit report here.
-    #[arg(long, value_name = "PATH")]
-    junit: Option<PathBuf>,
-}
-
-fn seconds(value: &str) -> Result<Duration, &'static str> {
-    value
-        .parse::<f64>()
-        .ok()
-        .and_then(|value| Duration::try_from_secs_f64(value).ok())
-        .filter(|value| !value.is_zero())
-        .ok_or("expected positive, finite seconds")
 }
 
 // Keep the payload out of the async state machine, which otherwise embeds
@@ -79,32 +44,26 @@ fn materialize(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn dispatch() -> Option<ExitCode> {
-    let mut args = env::args_os().skip(1);
-    if args.next()?.as_os_str() != "run" {
-        return None;
-    }
-    let options = match Run::try_parse_from(std::iter::once("run".into()).chain(args)) {
-        Ok(options) => options,
-        Err(error) => {
-            let _ = error.print();
-            return Some(ExitCode::from(if error.use_stderr() { 2 } else { 0 }));
-        }
-    };
+pub(crate) fn run(options: RunOptions) -> ExitCode {
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .and_then(|runtime| runtime.block_on(run(options)));
-    Some(match result {
-        Ok(code) => ExitCode::from(code),
+        .and_then(|runtime| runtime.block_on(run_nextest(options)));
+    match result {
+        Ok(status) => ExitCode::from(
+            status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .unwrap_or(2),
+        ),
         Err(error) => {
             eprintln!("openshell-conformance: bundled nextest: {error}");
             ExitCode::from(2)
         }
-    })
+    }
 }
 
-async fn run(options: Run) -> io::Result<u8> {
+async fn run_nextest(options: RunOptions) -> io::Result<ExitStatus> {
     let mut int = signal(SignalKind::interrupt())?;
     let mut term = signal(SignalKind::terminate())?;
     let mut hup = signal(SignalKind::hangup())?;
@@ -124,6 +83,10 @@ async fn run(options: Run) -> io::Result<u8> {
     let report = root.join("target/nextest/default/junit.xml");
     let mut profile = format!(
         "[profile.default]\n\
+         test-threads = 1\n\
+         fail-fast = false\n\
+         success-output = \"immediate\"\n\
+         failure-output = \"immediate\"\n\
          slow-timeout = {{ period = \"{}ns\", terminate-after = 1, grace-period = \"{}ns\" }}\n",
         options.timeout.as_nanos(),
         options.grace.as_nanos()
@@ -154,33 +117,16 @@ async fn run(options: Run) -> io::Result<u8> {
             "--no-pager",
             "--profile",
             "default",
-            "--no-fail-fast",
-            "--retries",
-            "0",
-            "--no-tests",
-            "fail",
-            "--success-output",
-            "immediate",
-            "--failure-output",
-            "immediate",
-            "--test-threads",
         ])
-        .arg(options.test_threads.to_string())
-        .args([
-            "--run-ignored",
-            if options.include_ignored {
-                "all"
-            } else {
-                "default"
-            },
-        ])
-        .arg("--")
-        .args(options.filters)
         .current_dir(&root)
         .stdin(Stdio::null())
         // The terminal sends Ctrl-C to us, not to nextest too. Nextest owns
         // the test process groups, so forward to the runner and let it reap.
         .process_group(0);
+    if options.include_ignored {
+        command.args(["--run-ignored", "all"]);
+    }
+    command.args(options.nextest_args).args(options.filters);
     let mut child = command.spawn().map_err(|error| {
         io::Error::other(format!("start runner under {}: {error}", root.display()))
     })?;
@@ -214,10 +160,5 @@ async fn run(options: Run) -> io::Result<u8> {
         }
     }
 
-    // Keep the testkit `run` exit contract rather than exposing nextest codes.
-    Ok(match (interrupted, status.code()) {
-        (false, Some(0)) => 0,
-        (false, Some(100)) => 1,
-        _ => 2,
-    })
+    Ok(status)
 }

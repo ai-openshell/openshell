@@ -69,9 +69,11 @@ and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
 
 Branch E2E builds a single executable with nextest bundled inside. Use
-`openshell-conformance run --test-threads 4 --junit conformance.xml` to run
+`openshell-conformance run --junit conformance.xml -- --test-threads 4` to run
 that build in parallel. The default is one worker. No separately installed
 nextest is required. Plain Cargo builds run serially.
+On bundled builds, arguments after `--` go to nextest (see `run -- --help`),
+and `run` returns nextest's exit status.
 
 To build the bundled executable, use the repository development shell:
 

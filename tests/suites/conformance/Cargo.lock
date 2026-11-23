@@ -539,7 +539,6 @@ dependencies = [
 name = "conformance"
 version = "0.0.0"
 dependencies = [
- "clap",
  "host-server-support",
  "libc",
  "openshell-crypto",

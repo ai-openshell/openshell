@@ -18,8 +18,7 @@ mod bundled;
 
 fn main() -> ExitCode {
     #[cfg(all(unix, conformance_bundle))]
-    if let Some(status) = bundled::dispatch() {
-        return status;
-    }
+    return testkit::program::main_with_runner(bundled::run);
+    #[cfg(not(all(unix, conformance_bundle)))]
     testkit::main()
 }

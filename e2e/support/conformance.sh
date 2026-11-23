@@ -64,6 +64,7 @@ e2e_openshell_conformance_bin() {
 # to OPENSHELL_CONFORMANCE_JUNIT, else results/conformance-<gateway>.xml.
 e2e_run_openshell_conformance() {
   local gateway_label=${1:-OpenShell}
+  if (($#)); then shift; fi
   local root program junit
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -85,12 +86,19 @@ e2e_run_openshell_conformance() {
   echo "==> Running conformance suites against the ${gateway_label} gateway"
   "${program}" ready || return
   local args=(--junit "${junit}")
-  if [[ -n "${OPENSHELL_TESTKIT_THREADS:-}" ]]; then
-    args+=(--test-threads "${OPENSHELL_TESTKIT_THREADS}")
+  if [[ -n "${OPENSHELL_CONFORMANCE_BIN:-}" && -n "${OPENSHELL_CONFORMANCE_NEXTEST_ARGS:-}" ]]; then
+    local -a nextest_args
+    # Simple whitespace-separated CI flags. Callers with quoted values can
+    # pass them as arguments to this function instead.
+    read -r -a nextest_args <<< "${OPENSHELL_CONFORMANCE_NEXTEST_ARGS}"
+    set -- "${nextest_args[@]}" "$@"
+  fi
+  if (($#)); then
+    args+=(-- "$@")
   fi
   "${program}" run "${args[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  e2e_run_openshell_conformance
+  e2e_run_openshell_conformance OpenShell "$@"
 fi

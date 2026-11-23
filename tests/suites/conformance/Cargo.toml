@@ -32,7 +32,6 @@ tempfile = "3"
 tokio = { version = "1", features = ["process", "time"] }
 
 [target.'cfg(unix)'.dependencies]
-clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 tokio = { version = "1", features = ["signal"] }
 

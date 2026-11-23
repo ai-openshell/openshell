@@ -239,6 +239,9 @@ A filter selects tests whose name contains it. `run` also takes:
   SIGKILL after `--grace SECS` (default 10).
 - `--junit PATH`: writes a JUnit report with one test suite per family.
 
+Programs with a bundled nextest scheduler, such as the packaged conformance
+binary, pass arguments after `--` through to nextest and return its exit code.
+
 Each test runs in its own process group. When the test's process exits, `run`
 kills anything left in the group, such as CLI processes the test started.
 Interrupting `run` stops the current test the same way and runs no more

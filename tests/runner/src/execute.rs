@@ -42,7 +42,6 @@ const READY_SLACK: Duration = Duration::from_mins(1);
 const NEXTEST_TEST_FAILED: i32 = 100;
 /// nextest's exit code when `--no-tests fail` found no tests to run.
 const NEXTEST_NO_TESTS_RUN: i32 = 4;
-const PROGRAM_TEST_FAILED: i32 = 1;
 /// How much of the end of the nextest log to print after a failure. nextest
 /// ends its output with a summary that names the failed tests.
 const LOG_TAIL_LINES: usize = 40;
@@ -96,17 +95,6 @@ impl Status {
             }
             _ => Self::Error(format!(
                 "nextest exited with {status}; see {}",
-                log.display()
-            )),
-        }
-    }
-
-    fn of_program(status: ExitStatus, log: &Path) -> Self {
-        match status.code() {
-            Some(0) => Self::Passed,
-            Some(PROGRAM_TEST_FAILED) => Self::Failed,
-            _ => Self::Error(format!(
-                "the test program exited with {status}; see {}",
                 log.display()
             )),
         }
@@ -438,12 +426,9 @@ async fn run_selected(
         }
         Kind::Program => {
             tests.extend([program.as_str(), "run", "--junit", &junit]);
+            tests.extend(filters.iter().map(String::as_str));
             if let Some(count) = &test_threads {
-                tests.extend(["--test-threads", count]);
-            }
-            if !filters.is_empty() {
-                tests.push("--");
-                tests.extend(filters.iter().map(String::as_str));
+                tests.extend(["--", "--test-threads", count]);
             }
         }
     }
@@ -482,10 +467,7 @@ async fn run_selected(
         }
     }
     let log = run.results.join(NEXTEST_LOG);
-    Ok(match kind {
-        Kind::Nextest => Status::of_nextest(output.status, &log),
-        Kind::Program => Status::of_program(output.status, &log),
-    })
+    Ok(Status::of_nextest(output.status, &log))
 }
 
 /// Copy the nextest log and the JUnit report out of the guest, whether or not
@@ -643,14 +625,6 @@ mod tests {
             Status::Error("no test ran; see log".to_string())
         );
         assert!(matches!(status(1), Status::Error(_)));
-    }
-
-    #[test]
-    fn status_follows_the_program_exit_code() {
-        let status = |code| Status::of_program(ExitStatus::from_raw(code << 8), Path::new("log"));
-        assert_eq!(status(0), Status::Passed);
-        assert_eq!(status(1), Status::Failed);
-        assert!(matches!(status(2), Status::Error(_)));
     }
 
     #[test]

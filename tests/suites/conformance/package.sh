@@ -13,6 +13,8 @@ target=$1
 mkdir -p "$2"
 out=$(cd "$2" && pwd)
 manifest="$(cd "$(dirname "$0")" && pwd)/Cargo.toml"
+# Keep this release and its checksums in sync with the cargo-nextest pin in
+# mise.toml and the version provided by the Nix dev shell (flake.nix).
 version=0.9.143
 case "$target" in
   aarch64-apple-darwin|x86_64-apple-darwin)
@@ -28,7 +30,7 @@ case "$target" in
     sha=6d891c18105ec2d33f6e441a4f92b7ccab47ba263e22055c8bb66884243f3389
     ;;
   *)
-    echo "Unsupported prototype target: $target" >&2
+    echo "Unsupported conformance bundle target: $target (arm64 or x86-64, macOS or Linux musl)" >&2
     exit 2
     ;;
 esac
@@ -59,8 +61,9 @@ fi
 
 build=(--locked --release --manifest-path "$manifest" --target "$target")
 cargo nextest archive "${build[@]}" --bin openshell-conformance --archive-file "$work/suite.tar.zst"
-# Keep the archive off the runtime path: it contains the test executable,
-# build outputs, and sometimes a Rust sysroot. Carry only the generated JSON.
+# Discard the archive's unbundled test executable. The metadata still names
+# its target-relative path; at runtime a symlink there points to the final
+# bundled executable, which exposes the same test harness.
 for name in cargo-metadata.json binaries-metadata.json; do
   zstd -dc "$work/suite.tar.zst" | tar -xOf - "target/nextest/$name" > "$work/$name"
 done
