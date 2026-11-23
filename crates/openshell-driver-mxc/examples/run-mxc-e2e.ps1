@@ -485,6 +485,18 @@ function Assert-ExecPrintsMarker([string]$sandboxName, [string]$workload, [strin
 }
 
 function Test-ExecRestart([string]$sandboxName, [string]$workload, [string]$launchLog, [string]$exitFile) {
+    # Exercise exec and restart through the CLI on a real MXC ProcessContainer.
+    # The sandbox's main program waits for $exitFile so it stays Ready between execs.
+    #
+    # 1. Check that commands launch, report spawn errors and exit codes, and
+    #    return complete output even when they print many lines.
+    # 2. Time out a command with a subprocess. Check that both stop and the
+    #    same sandbox still accepts exec with its original main process.
+    # 3. Check the working directory, environment, literal arguments, and
+    #    streaming stdin, stdout, and stderr.
+    # 4. Restart from Completed and Stopped. Check for a fresh main process,
+    #    working exec, and the launch log retained across all three starts.
+
     $initial = Wait-RuntimePhase $sandboxName 'Ready'
     Assert-ExecPrintsMarker $sandboxName $workload 'spaces & %PATH% | literal'
 
@@ -518,13 +530,20 @@ function Test-ExecRestart([string]$sandboxName, [string]$workload, [string]$laun
         throw "Large exec output differed: expected $($expectedOutput.Length) stdout characters, received $($result.Stdout.Length) (exit $($result.ExitCode)), stderr '$($result.Stderr)'"
     }
 
-    # The child prints a unique marker before looping. It must start and then time out.
+    # Run the waiting fixture through cmd.exe so exec has a real subprocess.
+    # The fixture writes its startup marker, then waits on a file we never create.
     $timeoutNonce = "mxcto$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $workspace = Split-Path -Parent $workload
+    $subprocessStarted = Join-Path $workspace "$timeoutNonce.started"
+    $subprocessExit = Join-Path $workspace "$timeoutNonce.exit"
+    $command = '"{0}" --exit-on-file "{1}" "{2}"' -f $workload, $subprocessStarted, $subprocessExit
     $started = Get-Date
-    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--timeout', '5', '--', $cmdExe, '/d', '/c', "echo $timeoutNonce&for /l %i in (1,1,2000000000) do @rem $timeoutNonce") 60
-    $markerMatches = [string]::Equals($result.Stdout, "$timeoutNonce`r`n", [StringComparison]::Ordinal)
-    if ($result.ExitCode -ne 124 -or -not $markerMatches) {
-        throw "Exec did not print '$timeoutNonce' and time out with exit 124 (exit $($result.ExitCode)): $($result.Output)"
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--timeout', '5', '--', $cmdExe, '/d', '/c', $command) 60
+    if ($result.ExitCode -ne 124) {
+        throw "Exec did not time out with exit 124 (exit $($result.ExitCode)): $($result.Output)"
+    }
+    if (-not (Test-Path -LiteralPath $subprocessStarted) -or (Get-Content -LiteralPath $subprocessStarted) -cne 'launched') {
+        throw "Exec timed out before the subprocess wrote its startup marker: $($result.Output)"
     }
     if (((Get-Date) - $started).TotalSeconds -gt 40) { throw "Exec did not stop near --timeout (took $([int]((Get-Date) - $started).TotalSeconds) s)" }
     $leakDeadline = (Get-Date).AddSeconds(20)

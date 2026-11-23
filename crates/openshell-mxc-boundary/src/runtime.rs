@@ -19,6 +19,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::audit::MxcSandboxAuditEvidence;
+use crate::exec_job::ExecJob;
 use openshell_core::jwt::{
     SandboxId, SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SystemJwtClock,
 };
@@ -1296,6 +1297,7 @@ struct ManagedProcess {
     id: String,
     kind: ProcessKindWire,
     child: Arc<tokio::sync::Mutex<Child>>,
+    exec_job: Option<ExecJob>,
     stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
     output: Arc<OutputLog>,
     exit: tokio::sync::watch::Receiver<Option<ExitStatusWire>>,
@@ -1419,9 +1421,13 @@ impl ManagedProcess {
         if let Some(workdir) = workdir.filter(|path| !path.trim().is_empty()) {
             command.current_dir(workdir);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("spawn MXC workload executable {program:?}: {error}"))?;
+        let (mut child, exec_job) = match kind {
+            ProcessKindWire::Exec => {
+                ExecJob::spawn(&mut command).map(|(child, job)| (child, Some(job)))
+            }
+            ProcessKindWire::Main => command.spawn().map(|child| (child, None)),
+        }
+        .map_err(|error| format!("spawn MXC workload executable {program:?}: {error}"))?;
         if matches!(kind, ProcessKindWire::Main) {
             openshell_ocsf::ocsf_emit!(
                 openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -1462,6 +1468,7 @@ impl ManagedProcess {
             id,
             kind,
             child: Arc::new(tokio::sync::Mutex::new(child)),
+            exec_job,
             stdin: tokio::sync::Mutex::new(stdin),
             output,
             exit,
@@ -1540,6 +1547,12 @@ impl ManagedProcess {
     }
 
     async fn terminate(&self) -> Result<(), String> {
+        // The launcher can exit while its descendants are still running.
+        if let Some(job) = &self.exec_job {
+            return job
+                .terminate()
+                .map_err(|error| format!("terminate MXC exec process tree: {error}"));
+        }
         if self.exit_status().is_some() {
             return Ok(());
         }
