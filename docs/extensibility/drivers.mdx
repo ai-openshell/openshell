@@ -19,6 +19,10 @@ external compute driver communicates with the gateway over a Unix domain
 socket and negotiates its protocol version and capabilities before serving
 requests.
 
+The gateway launches the VM and Podman drivers as separate processes. Refer to
+[Launched Compute Drivers](/how-it-works/gateways/configuration#launched-compute-drivers)
+for how it finds, starts, and validates them.
+
 For built-in driver configuration and behavior, refer to
 [Runtimes](/how-it-works/sandboxes/runtimes). For implementation details, refer
 to each driver crate:

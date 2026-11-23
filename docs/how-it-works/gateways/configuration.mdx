@@ -961,7 +961,7 @@ Each enabled signal needs an endpoint, either in its own table or from `endpoint
 
 `protocol` selects the transport to a collector: `grpc`, the default, or `http/protobuf`. With `http/protobuf`, the endpoint is a base URL and each signal is posted to its path under it, `/v1/traces`, `/v1/logs`, or `/v1/metrics`, as with `OTEL_EXPORTER_OTLP_ENDPOINT`. HTTP/JSON is not supported. Point a `grpc` endpoint at a collector's gRPC receiver, conventionally port `4317`, and an `http/protobuf` endpoint at its HTTP receiver, conventionally port `4318`. A URI alone cannot distinguish the two, so a mismatched endpoint is accepted at startup and then fails on export. Sandbox supervisors and standalone compute drivers must come from the same release as the gateway to use `http/protobuf`: an older supervisor exports over gRPC, and an older driver rejects the protocol setting.
 
-`headers` sets request headers sent with every export to a collector, as gRPC metadata or HTTP headers, such as an authorization token or a backend's routing header. Each name must be a valid HTTP header name set once, ignoring case; names the exporters set themselves, such as `content-type`, `host`, and `grpc-*`, and binary gRPC names ending in `-bin` are rejected. Each value must be non-empty printable ASCII; spaces are allowed. The gateway's exporters also read their signal's `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, or `OTEL_EXPORTER_OTLP_METRICS_HEADERS`, or else `OTEL_EXPORTER_OTLP_HEADERS`, and a header set there replaces a configured header of the same name. In-process compute drivers and the VM driver send the gateway's trace headers, including those from the environment, with their own spans. A standalone compute driver sends only the headers in its own `OTEL_EXPORTER_OTLP_*HEADERS` variables. Supervisors send their trace collector's `headers` with their own spans, and the gateway's OCSF headers, including those from the environment, with their OCSF records. Trace headers from the gateway's environment do not reach supervisors, so set `headers` or `headers_file` on the trace collector when supervisor spans need them. The agent trace relay sends only its collector's `headers`, never ones from the environment, so its credentials can only be set with `headers` or `headers_file`. A changed header takes effect when the gateway restarts, and reaches a running sandbox only after that sandbox restarts.
+`headers` sets request headers sent with every export to a collector, as gRPC metadata or HTTP headers, such as an authorization token or a backend's routing header. Each name must be a valid HTTP header name set once, ignoring case; names the exporters set themselves, such as `content-type`, `host`, and `grpc-*`, and binary gRPC names ending in `-bin` are rejected. Each value must be non-empty printable ASCII; spaces are allowed. The gateway's exporters also read their signal's `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, or `OTEL_EXPORTER_OTLP_METRICS_HEADERS`, or else `OTEL_EXPORTER_OTLP_HEADERS`, and a header set there replaces a configured header of the same name. In-process compute drivers and launched compute drivers (VM and Podman) send the gateway's trace headers, including those from the environment, with their own spans. A standalone compute driver sends only the headers in its own `OTEL_EXPORTER_OTLP_*HEADERS` variables. Supervisors send their trace collector's `headers` with their own spans, and the gateway's OCSF headers, including those from the environment, with their OCSF records. Trace headers from the gateway's environment do not reach supervisors, so set `headers` or `headers_file` on the trace collector when supervisor spans need them. The agent trace relay sends only its collector's `headers`, never ones from the environment, so its credentials can only be set with `headers` or `headers_file`. A changed header takes effect when the gateway restarts, and reaches a running sandbox only after that sandbox restarts.
 
 Put credentials in `headers_file` rather than `headers`. It reads a collector's headers from a file instead, such as a mounted Kubernetes Secret, so credentials stay out of the configuration file. The file holds one `name=value` header per line. Blank lines are skipped, and whitespace around each name and value is trimmed. The headers are validated like `headers`, the file must be UTF-8 and at most 64 KiB, and setting both `headers` and `headers_file` in one table is a configuration error. A relative path uses the gateway's working directory. The gateway reads the file at startup and fails to start if it is missing or invalid, so a changed file takes effect as a changed header does.
 
@@ -1066,7 +1066,7 @@ gateway under the worktree-specific k3d cluster name; select it with
 tasks export spans and OCSF log records to the forwarded receiver
 automatically.
 
-In-process compute drivers read their backend-specific settings from `[openshell.drivers.<name>]`. An external driver's gateway table supplies only its `socket_path`; configure the external driver process itself through that binary's flags or environment variables. A driver that advertises `supports_sandbox_authentication` may authenticate an opaque bootstrap credential through the compute-driver protocol. It must return the same non-empty runtime identity from sandbox creation and credential authentication. Start requests include the previously recorded opaque identity so the driver can preserve the stable resource while rotating generation-specific compute. For `IssueSandboxToken`, the gateway verifies the sandbox exists and the driver/runtime identity matches the durable provisioning record before returning a generation-bound session JWT. The in-process Kubernetes driver reads `service_account_name`, `workspace_mode`, and namespace discovery from `[openshell.drivers.kubernetes]`; an external Kubernetes driver receives the equivalent values through its own CLI or environment contract.
+Built-in compute drivers read their backend-specific settings from `[openshell.drivers.<name>]`. The gateway passes the table of a launched driver (VM or Podman) through unchanged, and the driver validates it. An external driver's gateway table supplies only its `socket_path`; configure the external driver process itself through that binary's flags or environment variables. A driver that advertises `supports_sandbox_authentication` may authenticate an opaque bootstrap credential through the compute-driver protocol. It must return the same non-empty runtime identity from sandbox creation and credential authentication. Start requests include the previously recorded opaque identity so the driver can preserve the stable resource while rotating generation-specific compute. For `IssueSandboxToken`, the gateway verifies the sandbox exists and the driver/runtime identity matches the durable provisioning record before returning a generation-bound session JWT. The in-process Kubernetes driver reads `service_account_name`, `workspace_mode`, and namespace discovery from `[openshell.drivers.kubernetes]`; an external Kubernetes driver receives the equivalent values through its own CLI or environment contract.
 
 ### OTLP Metrics
 
@@ -1404,6 +1404,24 @@ Multi-replica gateways relay session-bound traffic to the replica that owns a sa
 The gateway refuses to start when a peer endpoint is configured on a multi-replica backend and peer authentication is unavailable, because the replica could not serve relays from its peers. That happens when the pod identity variables are missing, when the in-cluster Kubernetes client cannot be built, or when the gateway is not running in a cluster. A plaintext `http://` peer endpoint is also rejected when the gateway serves TLS; use it only when the gateway itself serves plaintext.
 
 ## Driver References
+
+### Launched Compute Drivers
+
+The VM and Podman drivers run as separate binaries that the gateway launches: `openshell-driver-vm` and `openshell-driver-podman`. Docker and Kubernetes still run inside the gateway process.
+
+When `driver_dir` is set in `[openshell.drivers.vm]`, the gateway searches only that directory for the VM driver, then the directory that holds the gateway binary. Otherwise it searches these locations in order:
+
+1. `libexec` and `libexec/openshell` under the gateway's install prefix.
+2. `~/.local/libexec/openshell`, `/usr/libexec/openshell`, `/usr/local/libexec/openshell`, and `/usr/local/libexec`.
+3. The directory that holds the gateway binary.
+
+The Podman driver has no `driver_dir` setting.
+
+The gateway refuses a driver binary, or the directory that holds it, that is not owned by the gateway's user or root, or that is writable by its group or by other users. It fails with an error naming the driver when no binary is found.
+
+For the VM and Podman drivers, the gateway starts the driver as `openshell-driver-<name> serve` in a private `run/` directory under the driver's state directory, passing only its socket path, the gateway's process ID, and the log level. It then sends the rest in a `Configure` call on the driver's socket: the gateway's resolved values, telemetry settings including OTLP headers, the staged network trust artifact, and the driver's `[openshell.drivers.<name>]` table, which the gateway does not interpret. The gateway removes only the VM driver's `driver_dir` key, which the gateway itself uses. The driver validates the table and sets up its backend while it handles the call. When it fails, the gateway reports the driver's error and stops. If a driver exits after it was ready, the gateway logs an error naming the driver and exits with a nonzero status so a service manager can restart it. A driver that ends during a gateway shutdown is not reported.
+
+Podman auto-detection runs `openshell-driver-podman probe` with a five-second limit. A missing, untrusted, failing, slow, or malformed probe counts as Podman not being available. `openshell-gateway config preflight` runs the driver's `preflight` command for the selected driver, and for each auto-detectable driver that has a table in the configuration, so the binary must be installed on the host where you run it. Each driver gets ten seconds. Preflight does not see the gateway's TLS CA or the network trust bundle, because the gateway has not created them yet.
 
 ### External Resource Admission
 
@@ -2112,7 +2130,7 @@ gateway_id       = "openshell"
 
 [openshell.drivers.vm]
 state_dir        = "/var/lib/openshell/vm"
-# Where the gateway looks for the openshell-driver-vm subprocess binary.
+# Where the gateway looks for the openshell-driver-vm binary it launches.
 driver_dir       = "/usr/local/libexec/openshell"
 default_image    = "nvcr.io/nvidia/base/ubuntu:24.04"
 # Optional override. When omitted, the gateway derives
@@ -2190,6 +2208,8 @@ openshell-gateway generate-certs --output-dir "$OPENSHELL_LOCAL_TLS_DIR"
 ```
 
 The command also installs local CLI mTLS credentials. For explicit signing configuration, set the example's signing paths to `jwt/signing.pem`, `jwt/public.pem`, and `jwt/kid` under that directory. The gateway loads those paths in preference to local discovery.
+
+Configure the guest TLS CA only under `[openshell.gateway]`. The VM driver rejects a `guest_tls_ca` key in `[openshell.drivers.vm]`.
 
 Rootfs tar staging requires the gateway and the VM driver to share a filesystem
 and run as the same user. That holds for the managed VM driver, which the
