@@ -72,7 +72,9 @@ service OpenShell {
     };
   }
 
-  // Fetch a sandbox by name.
+  // Fetch a sandbox by name. Response metadata x-openshell-direct-ssh: 1
+  // advertises support for TcpForwardInit.direct_ssh_sandbox_id for this
+  // caller. ForwardTcp authorizes each connection independently.
   rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
@@ -2220,9 +2222,14 @@ message TcpForwardInit {
   oneof target {
     SshRelayTarget ssh = 5;
     TcpRelayTarget tcp = 6;
+    // Open SSH using the authenticated gateway caller. Set this to the
+    // immutable ID returned by GetSandbox and leave authorization_token empty.
+    // Use only when GetSandbox advertises x-openshell-direct-ssh: 1. A denied
+    // direct connection must not be retried with a session token.
+    string direct_ssh_sandbox_id = 8;
   }
-  // Optional target-specific authorization token. SSH targets use this as the
-  // short-lived SSH session token issued by CreateSshSession.
+  // The ssh target requires the session token issued by CreateSshSession.
+  // The tcp target accepts tokens from older clients.
   string authorization_token = 7 [(openshell.options.v1.secret) = true];
 }
 

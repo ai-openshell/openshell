@@ -4330,13 +4330,14 @@ async fn run_async() -> Result<()> {
                 tls.oidc_token.as_deref(),
                 tls.edge_token.as_deref(),
             )?;
-            openshell_tui::run(
+            openshell_tui::run_with_gateway_insecure(
                 channel,
                 interceptor,
                 &ctx.name,
                 &ctx.endpoint,
                 &cli.workspace,
                 theme,
+                tls.gateway_insecure,
             )
             .await?;
         }

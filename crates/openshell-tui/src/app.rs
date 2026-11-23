@@ -604,6 +604,7 @@ pub struct App {
     // Active gateway connection
     pub gateway_name: String,
     pub endpoint: String,
+    pub gateway_insecure: bool,
     pub client: OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>,
     pub status_text: String,
 
@@ -996,6 +997,7 @@ impl App {
             splash_start: Some(Instant::now()),
             gateway_name,
             endpoint,
+            gateway_insecure: false,
             client,
             status_text: String::from("connecting..."),
             gateways: Vec::new(),
