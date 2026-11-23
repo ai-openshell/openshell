@@ -1,0 +1,108 @@
+name: Snap Install Diagnostic
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/snap-install-diagnostic.yml
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: OpenShell amd64 snap revision to test in every job
+        required: true
+        type: string
+        default: "2730"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  install:
+    name: ${{ matrix.runner }} / extra user manager=${{ matrix.extra-user }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04]
+        extra-user: [false, true]
+    env:
+      SNAP_REVISION: ${{ inputs.revision || '2730' }}
+      EXTRA_USER: ${{ matrix.extra-user }}
+      OPENSHELL_TELEMETRY_ENABLED: "false"
+    steps:
+      - name: Prepare snapd and system Docker
+        run: |
+          set -euo pipefail
+          [[ "$SNAP_REVISION" =~ ^[0-9]+$ ]]
+          sudo apt-get update
+          sudo apt-get install -y snapd
+          sudo systemctl enable --now snapd.socket
+          sudo systemctl start snapd
+          sudo snap wait system seed.loaded
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get install -y docker.io
+          fi
+          sudo systemctl start docker
+          docker info
+          if snap list openshell >/dev/null 2>&1; then
+            echo '::error::A fresh runner without OpenShell is required'
+            exit 1
+          fi
+          systemctl --user set-environment OPENSHELL_TELEMETRY_ENABLED=false
+
+      - name: Start extra user manager
+        if: matrix.extra-user
+        run: |
+          set -euo pipefail
+          other_user=openshell-canary-other
+          sudo useradd --create-home "$other_user"
+          other_uid=$(id -u "$other_user")
+          sudo loginctl enable-linger "$other_user"
+          sudo systemctl start "user@${other_uid}.service"
+          sudo -u "$other_user" env \
+            HOME="/home/${other_user}" \
+            XDG_RUNTIME_DIR="/run/user/${other_uid}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${other_uid}/bus" \
+            systemctl --user set-environment OPENSHELL_TELEMETRY_ENABLED=false
+
+      - name: Record environment
+        run: |
+          cat /etc/os-release
+          snap version
+          systemctl --version
+          id
+          loginctl list-users
+          systemctl --user status --no-pager || true
+          sudo systemctl list-units 'user@*.service' --no-pager
+
+      - name: Install pinned snap
+        id: install
+        run: sudo snap install openshell --revision="$SNAP_REVISION"
+
+      - name: Collect installation diagnostics
+        if: always()
+        env:
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+        run: |
+          {
+            echo "Runner: ${RUNNER_ENVIRONMENT}; OS: $(. /etc/os-release; echo "$PRETTY_NAME")"
+            echo "Snap revision: ${SNAP_REVISION}"
+            echo "Extra user manager: ${EXTRA_USER}"
+            echo "Install outcome: ${INSTALL_OUTCOME}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          sudo snap list
+          sudo snap changes
+          for change in $(sudo snap changes | awk 'NR > 1 && $1 ~ /^[0-9]+$/ {print $1}'); do
+            sudo snap tasks "$change"
+          done
+          loginctl list-users
+          sudo systemctl list-units 'user@*.service' --all --no-pager
+          systemctl --user status snap.openshell.user-gateway.service --no-pager
+          journalctl --user -u snap.openshell.user-gateway.service --no-pager -n 100
+          sudo journalctl -b -u snapd.service -u systemd-logind.service --no-pager -n 500
+          exit 0
