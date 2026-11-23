@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "vm"
+description = "Drivers suite: VM driver behavior"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/ai-openshell/openshell"
+publish = false
+
+[[test]]
+name = "vm-smoke"
+path = "tests/smoke.rs"
+harness = false
+
+[dependencies]
+openshell-testkit = { path = "../../../testkit/testkit" }
+
+[workspace]

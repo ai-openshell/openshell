@@ -309,7 +309,23 @@ impl Context {
     /// tests whose setup depends on it. Fails unless gateway info reports
     /// exactly one driver, under the same configured and driver name.
     pub async fn compute_driver(&self) -> Result<String> {
-        let info = self
+        single_compute_driver(&self.gateway_info().await?)
+    }
+
+    /// Like [`Context::expect_compute_driver`], for a driver whose advertised
+    /// name differs from its gateway configuration name.
+    pub async fn expect_compute_driver_identity(&self, name: &str, advertised: &str) -> Result {
+        let info = self.gateway_info().await?;
+        let drivers = compute_driver_identities(&info);
+        crate::ensure!(
+            drivers == [(name, advertised)],
+            "the gateway reports compute drivers (name, driver name) {drivers:?}; expected only ({name}, {advertised})"
+        );
+        Ok(())
+    }
+
+    async fn gateway_info(&self) -> Result<proto::GetGatewayInfoResponse> {
+        Ok(self
             .handles
             .grpc
             .client()
@@ -317,8 +333,7 @@ impl Context {
             .get_gateway_info(proto::GetGatewayInfoRequest {})
             .await
             .context("get gateway info")?
-            .into_inner();
-        single_compute_driver(&info)
+            .into_inner())
     }
 
     /// Run the cleanup hooks, including deleting the sandboxes the test
@@ -332,17 +347,7 @@ impl Context {
 /// The one compute driver `info` reports, when its configured name and the
 /// name the driver reports agree.
 fn single_compute_driver(info: &proto::GetGatewayInfoResponse) -> Result<String> {
-    let drivers: Vec<(&str, &str)> = info
-        .compute_drivers
-        .iter()
-        .map(|driver| {
-            let reported = driver
-                .capabilities
-                .as_ref()
-                .map_or("", |capabilities| capabilities.driver_name.as_str());
-            (driver.name.as_str(), reported)
-        })
-        .collect();
+    let drivers = compute_driver_identities(info);
     match drivers.as_slice() {
         [(configured, reported)] if configured == reported && !configured.is_empty() => {
             Ok((*configured).to_string())
@@ -351,6 +356,19 @@ fn single_compute_driver(info: &proto::GetGatewayInfoResponse) -> Result<String>
             "the gateway reports compute drivers (name, driver name) {drivers:?}; expected exactly one"
         ))),
     }
+}
+
+fn compute_driver_identities(info: &proto::GetGatewayInfoResponse) -> Vec<(&str, &str)> {
+    info.compute_drivers
+        .iter()
+        .map(|driver| {
+            let reported = driver
+                .capabilities
+                .as_ref()
+                .map_or("", |capabilities| capabilities.driver_name.as_str());
+            (driver.name.as_str(), reported)
+        })
+        .collect()
 }
 
 /// Register the cleanup hook that deletes sandbox `name`, unless it is

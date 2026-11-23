@@ -268,6 +268,7 @@ jobs:
           cargo fmt --manifest-path tests/suites/continuity/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/suites/drivers/podman/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/suites/drivers/kubernetes/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/suites/drivers/vm/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/suites/features/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/support/Cargo.toml --all -- --check
 
@@ -331,6 +332,7 @@ jobs:
           cargo clippy --locked --manifest-path tests/suites/continuity/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/suites/drivers/podman/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/suites/drivers/kubernetes/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/suites/drivers/vm/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/suites/features/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/support/Cargo.toml --all-targets -- -D warnings
 
