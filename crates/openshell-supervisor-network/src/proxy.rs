@@ -753,6 +753,7 @@ async fn preauthorize_transparent_open(
                 &binary_identity,
                 "sandbox-local policy API requires port 80 and an active context",
                 "transparent_tcp_policy_local_invalid_destination",
+                None,
             );
             let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
@@ -777,6 +778,7 @@ async fn preauthorize_transparent_open(
                 &binary_identity,
                 "sandbox-local policy API requires a verified workload identity",
                 "transparent_tcp_policy_local_identity_unavailable",
+                None,
             );
             let _ = completion.send(TcpOpenDecision::Denied(denial));
             return None;
@@ -806,6 +808,7 @@ async fn preauthorize_transparent_open(
                     &binary_identity,
                     &error.to_string(),
                     "transparent_tcp_mapping_denied",
+                    None,
                 );
                 let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
                 return None;
@@ -823,6 +826,7 @@ async fn preauthorize_transparent_open(
         )
     });
     let mut decision = supplied_authorization.decision;
+    let policy_generation = decision.policy_generation;
     if let NetworkAction::Deny { reason } = &decision.action {
         let (denial, status_detail) = supplied_authorization.denial.map_or(
             (TcpOpenDenial::PolicyDenied, "transparent_tcp_policy_denied"),
@@ -844,6 +848,7 @@ async fn preauthorize_transparent_open(
             &binary_identity,
             reason,
             status_detail,
+            Some(policy_generation),
         );
         if supplied_authorization.denial.is_none()
             && !is_always_blocked_ip(destination.ip())
@@ -872,6 +877,7 @@ async fn preauthorize_transparent_open(
             &binary_identity,
             &denial.reason,
             "transparent_tcp_destination_denied",
+            Some(decision.policy_generation),
         );
         let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
         return None;
@@ -910,6 +916,7 @@ async fn preauthorize_transparent_open(
                     &binary_identity,
                     &reason,
                     status_detail,
+                    Some(policy_generation),
                 );
                 let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
                 return None;
@@ -942,6 +949,7 @@ async fn preauthorize_transparent_open(
                 &binary_identity,
                 &denial.reason,
                 "transparent_tcp_destination_denied",
+                Some(policy_generation),
             );
             let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
@@ -962,12 +970,15 @@ async fn preauthorize_transparent_open(
     ))
 }
 
+/// `policy_generation` is the generation of the egress decision that denied
+/// the open, or `None` when the open failed before policy evaluation.
 fn emit_staged_transparent_denial(
     destination: SocketAddr,
     mapped_host: Option<&str>,
     identity: &Result<ContractBinaryIdentity, ResolveError>,
     reason: &str,
     status_detail: &'static str,
+    policy_generation: Option<u64>,
 ) {
     egress_emit!(build_staged_transparent_denial_event(
         destination,
@@ -975,6 +986,7 @@ fn emit_staged_transparent_denial(
         identity,
         reason,
         status_detail,
+        policy_generation,
     ));
 }
 
@@ -984,6 +996,7 @@ fn build_staged_transparent_denial_event(
     identity: &Result<ContractBinaryIdentity, ResolveError>,
     reason: &str,
     status_detail: &'static str,
+    policy_generation: Option<u64>,
 ) -> openshell_ocsf::OcsfEvent {
     let (binary, ancestors, cmdline, process) = identity.as_ref().map_or_else(
         |_| ("-".to_string(), "-".to_string(), "-".to_string(), None),
@@ -1007,7 +1020,7 @@ fn build_staged_transparent_denial_event(
         },
     );
     let pid = process.map_or_else(|| "-".to_string(), |process| process.pid.to_string());
-    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let mut builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -1016,7 +1029,11 @@ fn build_staged_transparent_denial_event(
         .dst_endpoint(transparent_destination_endpoint(destination, mapped_host))
         .actor_process(egress::actor_process(
             &binary, &pid, &ancestors, &cmdline, process,
-        ))
+        ));
+    if let Some(generation) = policy_generation {
+        builder = builder.firewall_rule_at_generation("-", "opa", generation);
+    }
+    builder
         .message(format!("Transparent TCP denied before relay: {reason}"))
         .status_detail(status_detail)
         .build()
@@ -1249,7 +1266,7 @@ async fn handle_transparent_tcp_connection(
                     MappingLookupError::Expired
                 }
             };
-            emit_transparent_mapping_denial(workload_addr, original, None, cause);
+            emit_transparent_mapping_denial(workload_addr, original, None, cause, None);
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -1293,6 +1310,7 @@ async fn handle_transparent_tcp_connection(
             original,
             Some(&host),
             MappingLookupError::EndpointMismatch,
+            Some(decision.policy_generation),
         );
         emit_activity(&activity_tx, true, "transparent_tcp_mapping");
         return Ok(());
@@ -1311,6 +1329,7 @@ async fn handle_transparent_tcp_connection(
             original,
             Some(&host),
             MappingLookupError::StalePolicy,
+            Some(decision.policy_generation),
         );
         emit_activity(&activity_tx, true, "transparent_tcp_mapping");
         return Ok(());
@@ -1323,7 +1342,13 @@ async fn handle_transparent_tcp_connection(
     ) {
         Ok(mapping) => mapping,
         Err(error) => {
-            emit_transparent_mapping_denial(workload_addr, original, Some(&host), error);
+            emit_transparent_mapping_denial(
+                workload_addr,
+                original,
+                Some(&host),
+                error,
+                Some(decision.policy_generation),
+            );
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -1513,7 +1538,11 @@ fn build_transparent_tcp_allow_ocsf_event(
         ))
         .src_endpoint_addr(audit.workload.ip(), audit.workload.port())
         .actor_process(Process::from_bypass(audit.binary, audit.pid, ""))
-        .firewall_rule(audit.policy_name, "opa")
+        .firewall_rule_at_generation(
+            audit.policy_name,
+            "opa",
+            audit.authorization_policy_generation,
+        )
         .unmapped("matched_policy", audit.policy_name)
         .unmapped("normalized_domain", audit.normalized_domain)
         .unmapped("logical_destination", logical_destination)
@@ -1573,7 +1602,28 @@ fn emit_transparent_mapping_denial(
     original: SocketAddr,
     mapped_host: Option<&str>,
     error: MappingLookupError,
+    policy_generation: Option<u64>,
 ) {
+    egress_emit!(build_transparent_mapping_denial_event(
+        workload,
+        original,
+        mapped_host,
+        error,
+        policy_generation,
+    ));
+}
+
+/// `policy_generation` is the generation of the egress decision made before
+/// the mapping check, or `None` when the open failed before policy
+/// evaluation.
+#[cfg(target_os = "linux")]
+fn build_transparent_mapping_denial_event(
+    workload: SocketAddr,
+    original: SocketAddr,
+    mapped_host: Option<&str>,
+    error: MappingLookupError,
+    policy_generation: Option<u64>,
+) -> openshell_ocsf::OcsfEvent {
     let detail = match error {
         MappingLookupError::Missing => "transparent_tcp_mapping_missing",
         MappingLookupError::Expired => "transparent_tcp_mapping_expired",
@@ -1583,19 +1633,21 @@ fn emit_transparent_mapping_denial(
         | MappingLookupError::InvalidMapping
         | MappingLookupError::LockPoisoned => "transparent_tcp_destination_denied",
     };
-    egress_emit!(
-        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::Medium)
-            .status(StatusId::Failure)
-            .dst_endpoint(transparent_destination_endpoint(original, mapped_host))
-            .src_endpoint_addr(workload.ip(), workload.port())
-            .message(format!("Transparent TCP denied: {error}"))
-            .status_detail(detail)
-            .build()
-    );
+    let mut builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(transparent_destination_endpoint(original, mapped_host))
+        .src_endpoint_addr(workload.ip(), workload.port());
+    if let Some(generation) = policy_generation {
+        builder = builder.firewall_rule_at_generation("-", "opa", generation);
+    }
+    builder
+        .message(format!("Transparent TCP denied: {error}"))
+        .status_detail(detail)
+        .build()
 }
 
 #[cfg(target_os = "linux")]
@@ -1627,7 +1679,7 @@ fn emit_transparent_policy_denial(
             .dst_endpoint(Endpoint::from_domain(host, port))
             .src_endpoint_addr(workload.ip(), workload.port())
             .actor_process(Process::from_bypass(&binary, &pid, "-"))
-            .firewall_rule("-", "opa")
+            .firewall_rule_at_generation("-", "opa", decision.policy_generation)
             .message(format!("Transparent TCP denied {host}:{port}"))
             .status_detail(status_detail)
             .build()
@@ -2040,6 +2092,7 @@ fn build_connect_allow_ocsf_event(
     port: u16,
     actor: &Process,
     policy: &str,
+    policy_generation: u64,
     l7_inspection: bool,
 ) -> openshell_ocsf::OcsfEvent {
     let connect_msg = if l7_inspection {
@@ -2056,7 +2109,7 @@ fn build_connect_allow_ocsf_event(
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
         .actor_process(actor.clone())
-        .firewall_rule(policy, "opa")
+        .firewall_rule_at_generation(policy, "opa", policy_generation)
         .message(format!("{connect_msg} allowed {host}:{port}"))
         .build()
 }
@@ -2070,6 +2123,7 @@ fn build_forward_allow_ocsf_event(
     path: &str,
     actor: &Process,
     policy: &str,
+    policy_generation: u64,
 ) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::for_http_method(method))
@@ -2084,7 +2138,7 @@ fn build_forward_allow_ocsf_event(
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
         .actor_process(actor.clone())
-        .firewall_rule(policy, "opa")
+        .firewall_rule_at_generation(policy, "opa", policy_generation)
         .message(format!("FORWARD allowed {method} {host}:{port}{path}"))
         .build()
 }
@@ -2247,6 +2301,7 @@ fn build_forward_policy_deny_ocsf_event(
     path: &str,
     actor: &Process,
     reason: &str,
+    policy_generation: u64,
 ) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
@@ -2261,7 +2316,7 @@ fn build_forward_policy_deny_ocsf_event(
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
         .actor_process(actor.clone())
-        .firewall_rule("-", "opa")
+        .firewall_rule_at_generation("-", "opa", policy_generation)
         .message(format!("FORWARD denied {method} {host}:{port}{path}"))
         .status_detail(reason)
         .build()
@@ -2893,7 +2948,7 @@ async fn handle_mediated_connection(
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
             .actor_process(actor.clone())
-            .firewall_rule("-", "opa")
+            .firewall_rule_at_generation("-", "opa", decision.policy_generation)
             .message(format!("CONNECT denied {host_lc}:{port}"))
             .status_detail(&deny_reason)
             .build();
@@ -2931,6 +2986,7 @@ async fn handle_mediated_connection(
                     &host_lc,
                     port,
                     activity_tx.as_ref(),
+                    decision.policy_generation,
                     error,
                 )
                 .await?;
@@ -3139,8 +3195,15 @@ async fn handle_mediated_connection(
     if let Err(error) =
         relay::validate_route_generation(l7_route, connect_generation_guard.captured_generation())
     {
-        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
-            .await?;
+        reject_stale_connect_policy(
+            &mut client,
+            &host_lc,
+            port,
+            activity_tx.as_ref(),
+            decision.policy_generation,
+            error,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -3199,6 +3262,7 @@ async fn handle_mediated_connection(
             &host_lc,
             port,
             activity_tx.as_ref(),
+            decision.policy_generation,
             miette::miette!(
                 "policy changed while CONNECT was dialing upstream \
                  [captured_generation:{} current_generation:{}]",
@@ -3220,8 +3284,15 @@ async fn handle_mediated_connection(
         }
     };
     if let Err(error) = connect_generation_guard.ensure_current() {
-        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
-            .await?;
+        reject_stale_connect_policy(
+            &mut client,
+            &host_lc,
+            port,
+            activity_tx.as_ref(),
+            decision.policy_generation,
+            error,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -3240,6 +3311,7 @@ async fn handle_mediated_connection(
         port,
         &actor,
         policy_str,
+        decision.policy_generation,
         should_inspect_l7,
     ));
     emit_connect_activity_if_l4_only(&activity_tx, l7_route);
@@ -4031,19 +4103,40 @@ fn authorize_egress_intent_inner(
     }
 }
 
-fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette::Report) {
-    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+/// `pinned_generation` is the generation the connection was authorized under,
+/// matching the L7 relay's stale-tunnel close event.
+fn emit_l7_tunnel_close_after_policy_change(
+    host: &str,
+    port: u16,
+    pinned_generation: u64,
+    error: miette::Report,
+) {
+    egress_emit!(build_l7_tunnel_close_after_policy_change_event(
+        host,
+        port,
+        pinned_generation,
+        &error,
+    ));
+}
+
+fn build_l7_tunnel_close_after_policy_change_event(
+    host: &str,
+    port: u16,
+    pinned_generation: u64,
+    error: &miette::Report,
+) -> openshell_ocsf::OcsfEvent {
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::Medium)
         .status(StatusId::Failure)
         .dst_endpoint(Endpoint::from_domain(host, port))
+        .firewall_rule_at_generation("-", "opa", pinned_generation)
         .message(format!(
             "L7 tunnel closed before inspection because policy changed: {error}"
         ))
-        .build();
-    egress_emit!(event);
+        .build()
 }
 
 async fn reject_stale_connect_policy<C>(
@@ -4051,6 +4144,7 @@ async fn reject_stale_connect_policy<C>(
     host: &str,
     port: u16,
     activity_tx: Option<&ActivitySender>,
+    pinned_generation: u64,
     error: miette::Report,
 ) -> Result<()>
 where
@@ -4062,7 +4156,7 @@ where
         error = %error,
         "CONNECT rejected because policy changed after L4 authorization"
     );
-    emit_l7_tunnel_close_after_policy_change(host, port, error);
+    emit_l7_tunnel_close_after_policy_change(host, port, pinned_generation, error);
     emit_activity_simple(activity_tx, true, "policy_stale");
     respond(
         client,
@@ -5765,6 +5859,7 @@ async fn handle_forward_proxy_inner(
                     &telemetry_path,
                     &actor,
                     reason,
+                    decision.policy_generation,
                 )],
                 Some(&connect_span),
             );
@@ -5818,7 +5913,7 @@ async fn handle_forward_proxy_inner(
                 error = %e,
                 "Forward proxy rejected request because policy generation changed after L4 decision"
             );
-            emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+            emit_l7_tunnel_close_after_policy_change(&host_lc, port, decision.policy_generation, e);
             emit_activity_simple(activity_tx, true, "policy_stale");
             respond(
                 client,
@@ -5961,6 +6056,7 @@ async fn handle_forward_proxy_inner(
             emit_l7_tunnel_close_after_policy_change(
                 &host_lc,
                 port,
+                decision.policy_generation,
                 miette::miette!(
                     "policy changed before forward L7 evaluation [expected_generation:{} current_generation:{}]",
                     forward_generation_guard.captured_generation(),
@@ -5993,7 +6089,12 @@ async fn handle_forward_proxy_inner(
                     error = %e,
                     "Forward proxy rejected request because L7 tunnel engine could not be cloned"
                 );
-                emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                emit_l7_tunnel_close_after_policy_change(
+                    &host_lc,
+                    port,
+                    decision.policy_generation,
+                    e,
+                );
                 emit_activity_simple(activity_tx, true, "policy_stale");
                 correlation.record_rejection(403, HttpOutcome::Denied, None);
                 respond(
@@ -6386,7 +6487,11 @@ async fn handle_forward_proxy_inner(
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                 .actor_process(actor.clone())
-                .firewall_rule(policy_str, engine_type)
+                .firewall_rule_at_generation(
+                    policy_str,
+                    engine_type,
+                    tunnel_engine.captured_generation(),
+                )
                 .message(log_message)
                 .build();
             emit_forward_l7_decision(event, evaluation_error, &connect_span, request_correlation);
@@ -6523,7 +6628,7 @@ async fn handle_forward_proxy_inner(
             error = %e,
             "Forward proxy rejected request because policy changed before upstream connect"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_policy_change(&host_lc, port, decision.policy_generation, e);
         emit_activity_simple(activity_tx, true, "policy_stale");
         correlation.record_rejection(403, HttpOutcome::Denied, None);
         respond(
@@ -6546,6 +6651,7 @@ async fn handle_forward_proxy_inner(
         emit_l7_tunnel_close_after_policy_change(
             &host_lc,
             port,
+            decision.policy_generation,
             miette::miette!(
                 "policy changed before forward middleware evaluation [expected_generation:{} current_generation:{}]",
                 forward_generation_guard.captured_generation(),
@@ -7006,7 +7112,7 @@ async fn handle_forward_proxy_inner(
             error = %e,
             "Forward proxy rejected request because policy changed before relay"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_policy_change(&host_lc, port, decision.policy_generation, e);
         if let Some(session) = middleware_session.take() {
             session
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
@@ -7102,7 +7208,7 @@ async fn handle_forward_proxy_inner(
             error = %e,
             "Forward proxy rejected request because policy changed during upstream connect"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_policy_change(&host_lc, port, decision.policy_generation, e);
         if let Some(session) = middleware_session.take() {
             session
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
@@ -7250,6 +7356,7 @@ async fn handle_forward_proxy_inner(
         &telemetry_path,
         &actor,
         policy_str,
+        decision.policy_generation,
     ));
     emit_forward_success_activity(activity_tx, l7_activity_pending);
 
@@ -7801,6 +7908,7 @@ process:
             443,
             &decision.actor_process(),
             "api",
+            decision.policy_generation,
             false,
         );
 
@@ -9019,6 +9127,62 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
     }
 
     #[test]
+    fn policy_change_close_records_the_pinned_generation() {
+        let event = build_l7_tunnel_close_after_policy_change_event(
+            "api.github.com",
+            443,
+            1,
+            &miette::miette!(
+                "policy generation is stale [captured_generation:1 current_generation:2]"
+            ),
+        );
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["action"], "Denied");
+        assert_eq!(
+            json["firewall_rule"],
+            serde_json::json!({"name": "-", "type": "opa", "version": "1"})
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_denial_after_evaluation_records_the_decision_generation() {
+        let workload: SocketAddr = "10.0.0.5:40000".parse().unwrap();
+        let original: SocketAddr = "198.18.0.2:443".parse().unwrap();
+
+        let stale = build_transparent_mapping_denial_event(
+            workload,
+            original,
+            Some("api.example.test"),
+            MappingLookupError::StalePolicy,
+            Some(5),
+        );
+        let stale = serde_json::to_value(stale).unwrap();
+        assert_eq!(
+            stale["status_detail"],
+            "transparent_tcp_mapping_stale_policy"
+        );
+        assert_eq!(
+            stale["firewall_rule"],
+            serde_json::json!({"name": "-", "type": "opa", "version": "5"})
+        );
+
+        let before_evaluation = build_transparent_mapping_denial_event(
+            workload,
+            original,
+            None,
+            MappingLookupError::Missing,
+            None,
+        );
+        let before_evaluation = serde_json::to_value(before_evaluation).unwrap();
+        assert_eq!(
+            before_evaluation["status_detail"],
+            "transparent_tcp_mapping_missing"
+        );
+        assert!(before_evaluation.get("firewall_rule").is_none());
+    }
+
+    #[test]
     fn staged_denial_names_the_mapped_host_and_keeps_the_synthetic_address() {
         let (open, _) = staged_curl_open("198.18.0.2:80".parse().unwrap(), 1);
         let mapped = build_staged_transparent_denial_event(
@@ -9027,18 +9191,21 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             &open.binary_identity,
             "endpoint blocked.invalid:80 is not allowed by any policy",
             "transparent_tcp_policy_denied",
+            Some(4),
         );
         assert_eq!(
             mapped.format_shorthand(),
             format!(
-                "NET:OPEN [MED] DENIED {}(0) -> blocked.invalid:80 [reason:transparent_tcp_policy_denied]",
+                "NET:OPEN [MED] DENIED {}(0) -> blocked.invalid:80 [policy:- engine:opa] [reason:transparent_tcp_policy_denied]",
                 executable_path("/usr/bin/curl").display()
             )
         );
+        let mapped = serde_json::to_value(mapped).unwrap();
         assert_eq!(
-            serde_json::to_value(mapped).unwrap()["dst_endpoint"],
+            mapped["dst_endpoint"],
             serde_json::json!({"domain": "blocked.invalid", "ip": "198.18.0.2", "port": 80})
         );
+        assert_eq!(mapped["firewall_rule"]["version"], "4");
 
         let unmapped = build_staged_transparent_denial_event(
             "203.0.113.7:443".parse().unwrap(),
@@ -9046,11 +9213,14 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             &open.binary_identity,
             "endpoint 203.0.113.7:443 is not allowed by any policy",
             "transparent_tcp_policy_denied",
+            None,
         );
+        let unmapped = serde_json::to_value(unmapped).unwrap();
         assert_eq!(
-            serde_json::to_value(unmapped).unwrap()["dst_endpoint"],
+            unmapped["dst_endpoint"],
             serde_json::json!({"ip": "203.0.113.7", "port": 443})
         );
+        assert!(unmapped.get("firewall_rule").is_none());
     }
 
     #[tokio::test]
@@ -11436,10 +11606,12 @@ network_policies:
             &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash")
                 .with_cmd_line("curl http://api.example.com/v1/models"),
             reason,
+            9,
         );
         let json = event.to_json().unwrap();
 
         assert_eq!(json["status_detail"], reason);
+        assert_eq!(json["firewall_rule"]["version"], "9");
         assert_eq!(json["action"], "Denied");
         assert_eq!(json["disposition"], "Blocked");
     }
@@ -11510,6 +11682,7 @@ network_policies:
         assert!(json["actor"]["process"].get("parent_process").is_none());
         assert_eq!(json["dst_endpoint"]["domain"], "redis.openshell.demo");
         assert_eq!(json["firewall_rule"]["name"], "redis");
+        assert_eq!(json["firewall_rule"]["version"], "7");
         assert_eq!(json["unmapped"]["synthetic_destination"], "198.18.0.7:6379");
         assert_eq!(
             json["unmapped"]["connected_real_destination"],
@@ -11626,6 +11799,7 @@ network_policies:
             &path,
             &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash").with_cmd_line("curl"),
             "allow_api",
+            3,
         )
         .to_json()
         .unwrap();
@@ -11637,10 +11811,12 @@ network_policies:
             &path,
             &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash").with_cmd_line("curl"),
             "policy denied",
+            3,
         )
         .to_json()
         .unwrap();
         for event in [&allowed, &denied] {
+            assert_eq!(event["firewall_rule"]["version"], "3");
             assert_eq!(event["http_request"]["url"]["path"], "/v1/[CREDENTIAL]");
             let serialized = event.to_string();
             assert!(!serialized.contains("API_TOKEN"), "{serialized}");
@@ -11660,6 +11836,7 @@ network_policies:
             &forward_telemetry_path(target),
             &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash").with_cmd_line("curl"),
             "allow_api",
+            3,
         )
         .to_json()
         .unwrap();
