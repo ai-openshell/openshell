@@ -26,3 +26,14 @@
   issue: https://github.com/ai-openshell/openshell/issues/5752
   environments:
     - ubuntu-k3s/k3s-ha
+
+# Rootless Podman can't relabel the root-owned proxy CA that the driver
+# bind-mounts, so sandbox creation fails (#5795).
+- test: corporate_proxy::approved_egress_uses_authenticated_proxy
+  issue: https://github.com/ai-openshell/openshell/issues/5795
+  environments:
+    - fedora-podman-rootless-corporate-proxy/rpm
+- test: corporate_proxy::intercepting_proxy_ca_is_trusted_by_supervisor_and_workload
+  issue: https://github.com/ai-openshell/openshell/issues/5795
+  environments:
+    - fedora-podman-rootless-corporate-proxy/rpm
