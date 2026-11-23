@@ -18,16 +18,17 @@ Monitor GitHub Actions workflow runs using the `gh` CLI.
 
 `TypeScript SDK Freeze` rejects additions and modifications under `sdk/typescript/` in pull requests, except the re-export stub's files. Move those changes to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript). Core proto changes need no regenerated TypeScript bindings. Deletions are allowed for removal. The job skips merge groups, matching `Python SDK Freeze`.
 
-## Larger hosted runner trial
+## Larger hosted runners
 
-On the larger-hosted trial branch, CPU-heavy Linux Rust checks use
-`openshell-hosted-amd64-8` and `openshell-hosted-arm64-8`: GitHub-managed Ubuntu
-24.04 VMs with 8 CPUs, 32 GB RAM, and 300 GB SSD. These labels select hosted
-runners; they do not use the GKE fleet. The definitions cap concurrency at eight
-AMD64 and four ARM64 jobs and restrict repository access to ai-openshell/openshell.
-Other runner targets, Cargo commands, cache settings, and debug profiles remain
-unchanged. Confirm actual runner assignment before comparing timings. Include
-queue/setup time and record cache hits; billing applies to larger hosted runners.
+CPU-heavy Linux Rust Branch Checks use `openshell-hosted-amd64-16` and
+`openshell-hosted-arm64-16`: GitHub-managed Ubuntu 24.04 VMs with 16 CPUs,
+64 GB RAM, and 600 GB SSD. The organization-level definitions cap concurrency at
+16 AMD64 and eight ARM64 jobs and restrict repository access to ai-openshell/openshell.
+Lightweight checks, ARM Python, macOS, and E2E use their existing runner targets.
+Confirm actual runner assignment before comparing timings. Include queue/setup
+time and record cache hits; billing applies to larger hosted runners. Inspect
+runner definition status and capacity with
+`gh api orgs/ai-openshell/actions/hosted-runners` when diagnosing queue delays.
 
 ## Quick Status Check
 
