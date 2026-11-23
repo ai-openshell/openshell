@@ -205,8 +205,9 @@ re-locks a workspace from the root lockfile. Add new testkit workspaces to
 
 Conformance tests must work concurrently on a shared gateway. Use
 `Context::name` (or testkit's sandbox builder) for gateway resource names,
-use test-unique selector values, and scope assertions and cleanup to
-resources the test owns. Do not change gateway-wide settings or routes.
+use test-unique selector values and host fixtures, and scope assertions and
+cleanup to resources the test owns. Do not change gateway-wide settings or
+routes.
 
 Conformance tests run on every compute driver, so they check the public
 contract and nothing a driver is free to change.
