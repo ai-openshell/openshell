@@ -49,10 +49,12 @@ combined effect. ARM64, macOS, hosted forks, and lint debug settings are unchang
 
 Manual Branch Checks runs can enable `local_image_builds` for an additional
 native AMD64 gateway/sandbox/supervisor build and `--help` smoke check. It uses
-the normal release-binary staging tasks and remote BuildKit, explicitly sets
+the production Nix auditable release-binary build commands and remote BuildKit, explicitly sets
 `DOCKER_PUSH=0` and `DOCKER_OUTPUT=type=docker`, and loads results only into the
 runner's ephemeral Docker daemon. No registry login, image upload, or registry
-cache export is performed. This optional release/image build is measured
+cache export is performed. The trial uses the production Nix GNU/musl toolchain
+rather than the local Zig staging helper, verifies the glibc 2.28 floor and
+static sandbox linkage, and skips unrelated mise tool installation. This optional release/image build is measured
 separately from the normal branch-check latency and does not qualify ARM64
 images or release attestations.
 

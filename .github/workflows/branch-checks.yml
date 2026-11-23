@@ -520,14 +520,32 @@ jobs:
           save-cache: "false"
       - name: Stage real release binaries
         shell: nix develop -c bash -euo pipefail {0}
-        run: mise run build:docker:prebuilt
+        run: |
+          # Match build-rust-binary's Nix release toolchain. The local Zig
+          # staging task mixes libc++ objects with Nix's GNU final linker.
+          for component in gateway sandbox supervisor; do
+            target=x86_64-unknown-linux-gnu
+            if [[ "$component" == sandbox ]]; then
+              target=x86_64-unknown-linux-musl
+            fi
+            binary="openshell-$component"
+            env -u RUSTC_WRAPPER cargo auditable build --locked --release \
+              --target "$target" --package "$binary" --bin "$binary"
+            artifact="target/$target/release/$binary"
+            if [[ "$component" == sandbox ]]; then
+              tasks/scripts/verify-static-binary.sh "$artifact"
+            else
+              tasks/scripts/verify-glibc-symbols.sh 2.28 "$artifact"
+            fi
+            install -Dm0755 "$artifact" "deploy/docker/.build/prebuilt-binaries/amd64/$binary"
+          done
       - name: Build and verify local images
         shell: nix develop -c bash -euo pipefail {0}
         run: |
           docker buildx create --name "$DOCKER_BUILDER" --driver remote "$BUILDKIT_HOST"
           trap 'docker buildx rm "$DOCKER_BUILDER"' EXIT
           for component in gateway sandbox supervisor; do
-            mise run "docker:build:$component"
+            mise run --skip-tools "docker:build:$component"
             image="$IMAGE_REGISTRY/$component:$IMAGE_TAG"
             test "$(docker image inspect --format '{{.Architecture}}' "$image")" = amd64
             docker run --rm --network none "$image" --help

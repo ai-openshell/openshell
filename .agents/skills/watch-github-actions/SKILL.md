@@ -165,6 +165,9 @@ population pass and a warm rerun; both hardware and debug information change,
 so avoid attributing gains to either alone. Debug assertions stay enabled.
 The manual `local_image_builds` input additionally stages release binaries,
 builds all three native AMD64 images, and runs local `--help` smoke checks.
+It builds auditable binaries with the production Nix GNU/musl toolchains,
+checks the glibc 2.28 floor/static sandbox, and skips unrelated mise installs.
+The local Zig staging helper conflicts with Nix GNU linking for vendored Z3.
 It uses explicit Docker local output and no publication or image artifact
 upload. Diagnose binary staging separately from image assembly. Keep optional
 image-build timing separate from ordinary branch-check latency.
