@@ -10,6 +10,7 @@ self-hosted-runner:
     - openshell-ci-amd64-pd-gateway-b
     - openshell-ci-arm64-pd-lint
     - openshell-ci-arm64-pd-test
+    - openshell-ci-arm64-pd-build-modes
     - ubuntu-26.04
     - windows-arm64
 

@@ -594,7 +594,7 @@ jobs:
         include:
           - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
             system: x86_64-linux
-          - runner: ubuntu-24.04-arm
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-arm64-pd-build-modes' || 'ubuntu-24.04-arm' }}
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -616,12 +616,13 @@ jobs:
       - name: Verify build modes
         shell: nix develop -c bash -euo pipefail {0}
         run: |
+          target_dir="${CARGO_TARGET_DIR:-target}"
           cargo build --locked -p openshell-gateway --bin openshell-gateway
-          tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
+          tasks/scripts/verify-telemetry-compiled-out.sh present "$target_dir/debug/openshell-gateway"
           cargo build --locked -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
-          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
+          tasks/scripts/verify-telemetry-compiled-out.sh absent "$target_dir/debug/openshell-gateway"
           cargo build --locked -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry
-          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor
+          tasks/scripts/verify-telemetry-compiled-out.sh absent "$target_dir/debug/openshell-supervisor"
           cargo check --locked -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots
 
       - name: Verify system CA roots dependency boundary

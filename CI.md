@@ -43,14 +43,14 @@ The AMD64 speed trial moves the persistent lint/test and gateway core lanes to
 per-runner CPU/memory settings are unchanged. Fourth-generation nodes require
 Hyperdisk boot/cache storage. The four AMD64 caches were recreated as empty
 200 GiB Hyperdisk Balanced claims (6,000 IOPS, 250 MiB/s), and their old SSD
-Persistent Disks were deleted. ARM keeps its T2A nodes and existing SSD claims.
+Persistent Disks were deleted. ARM workers also use C4A and fresh Hyperdisk claims, as described below.
 Only the trusted AMD64 test job sets `CARGO_PROFILE_TEST_DEBUG=0`; it retains
 all crypto/workspace checks and debug assertions, with less backtrace detail.
 Setup places these artifacts under a separate `test-debug0` target directory.
 Measure the first population pass and a warm rerun separately. The earlier
 N2/C3 trial introduced the no-debug setting; the N4/C4 migration keeps it and
 changes CPU/storage generation. These trials do not isolate every factor.
-ARM64, macOS, hosted forks, and lint debug settings are unchanged.
+ARM64, macOS, hosted forks, and lint debug settings keep their existing profiles.
 
 Manual Branch Checks runs can enable `local_image_builds` for an additional
 native AMD64 gateway/sandbox/supervisor build and `--help` smoke check. It uses
@@ -63,16 +63,26 @@ static sandbox linkage, and skips unrelated mise tool installation. This optiona
 separately from the normal branch-check latency and does not qualify ARM64
 images or release attestations.
 
-The ARM trial uses native `t2a-standard-16` Ubuntu nodes (minimum two, maximum
-four), an ARM64 runner image with baked Nix shells, and separate 200 GiB SSDs
-for lint/tests. Each ARM lane has one ready worker, reserves 12 CPUs for the
-runner plus one for Docker, and uses the same exclusive persistent-cache setup
-as x86. BuildKit is native ARM too. Compare an empty-disk run with a same-commit
-warm run on replacement pods; report queue/startup separately. Full ARM test
-coverage is retained, and hosted ARM labels remain the fork fallback. On native
-ARM, crypto backend independence, OpenSSL backend, and dynamic-linkage checks run
-after lint while workspace tests run in parallel on the test lane. Other runner
-configurations retain those checks in the test job.
+The ARM trial uses native `c4a-standard-16` Ubuntu nodes (minimum three, maximum
+four) for lint/crypto, workspace tests, and build-mode checks. The three
+`openshell-ci-arm64-pd-lint`, `openshell-ci-arm64-pd-test`, and
+`openshell-ci-arm64-pd-build-modes` scale sets each keep one ready worker and
+an exclusive 200 GiB Hyperdisk Balanced cache. Each runner reserves/limits
+12 CPUs, plus one reserved CPU for Docker, and reuses the digest-pinned ARM64
+image with baked Nix shells. The T2A pool and two old SSD cache disks are
+replaced; AMD64 workers and caches are unchanged by this ARM migration.
+
+Trusted ARM build-mode checks use the new lane; forks retain hosted ARM.
+They retain telemetry-on/off builds, telemetry-marker verification, system CA
+root checks, and standalone-prover dependency checks. Verification reads
+`${CARGO_TARGET_DIR:-target}/debug/...` so it inspects the binaries Cargo just
+built on either a persistent-cache or ordinary worker. Debug profiles and all
+feature/dependency assertions are preserved. Compare first population and warm
+runs on the same commit, including queue/setup. No ARM image publication is
+required. ARM Python checks still use GitHub-hosted runners.
+
+Crypto verification runs after ARM lint while workspace tests run in parallel
+on the test lane. Other runner configurations keep their previous placement.
 
 Gateway core-feature checks run in two parallel matrix lanes: no-driver plus
 Kubernetes in `base-kubernetes`, and Docker plus Podman in `docker-podman`.

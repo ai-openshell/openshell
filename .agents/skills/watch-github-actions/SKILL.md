@@ -160,8 +160,8 @@ measure the later completion rather than summing durations. Fork jobs retain
 hosted Ubuntu. A failed lane must fail the Branch Checks workflow gate.
 The AMD64 speed trial selects C4 nodes for persistent-cache lanes and disables
 test debug information only on the trusted AMD64 test job. General x86
-workers/system nodes use N4. AMD64 caches are Hyperdisk Balanced; ARM still uses
-SSD Persistent Disk. The generation-four migration recreates AMD64 caches, so
+workers/system nodes use N4. ARM workers now use C4A; all cache lanes use
+Hyperdisk Balanced. The generation-four migrations recreate caches, so
 record initial target size before comparing timings. Verify its
 `test-debug0` target path, initial size, and C4 node placement. Compare a first
 population pass and a warm rerun. The earlier N2/C3 trial introduced no-debug
@@ -175,6 +175,12 @@ The local Zig staging helper conflicts with Nix GNU linking for vendored Z3.
 It uses explicit Docker local output and no publication or image artifact
 upload. Diagnose binary staging separately from image assembly. Keep optional
 image-build timing separate from ordinary branch-check latency.
+Trusted ARM build-mode checks use `openshell-ci-arm64-pd-build-modes` on C4A,
+with a separate exclusive cache and one prewarmed worker. ARM lint/tests also
+use C4A, preserving all three lanes in parallel. Verify telemetry on/off marker
+checks inspect `${CARGO_TARGET_DIR:-target}/debug/...`, plus both dependency
+boundaries. Fork build-mode checks and ARM Python stay hosted. Measure the
+first empty-cache pass and a same-commit warm pass separately.
 See `CI.md` for trial scope and cache setup.
 
 ## View Job Logs
