@@ -441,13 +441,6 @@ async fn run_selected(
                 "--binaries-metadata",
                 &binaries_metadata,
             ]);
-            tests.extend([
-                "--no-fail-fast",
-                "--success-output",
-                "immediate",
-                "--failure-output",
-                "immediate",
-            ]);
         }
     }
     tests.extend(&args);

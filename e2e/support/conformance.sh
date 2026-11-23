@@ -88,20 +88,12 @@ e2e_run_openshell_conformance() (
   work="$(mktemp -d)" || return
   trap 'rm -rf "${work}"' EXIT
   "${program}" nextest-metadata "${work}" || return
-  cat > "${work}/nextest.toml" <<'EOF'
-[profile.openshell]
-slow-timeout = { period = "900s", terminate-after = 1, grace-period = "10s" }
-
-[profile.openshell.junit]
-path = "junit.xml"
-store-success-output = true
-EOF
+  # The profile the runner also uses for prebuilt programs.
   cargo-nextest nextest run \
     --cargo-metadata "${work}/cargo-metadata.json" \
     --binaries-metadata "${work}/binaries-metadata.json" \
-    --config-file "${work}/nextest.toml" --profile openshell \
-    --no-tests fail --no-fail-fast --success-output immediate \
-    --failure-output immediate || status=$?
+    --config-file "${root}/tests/runner/src/program-nextest.toml" \
+    --profile openshell --no-tests fail || status=$?
   if [[ -f "${work}/target/nextest/openshell/junit.xml" ]]; then
     mv "${work}/target/nextest/openshell/junit.xml" "${junit}" || return
   fi

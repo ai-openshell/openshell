@@ -105,21 +105,13 @@ pub fn program(program: &Path) -> Result<Bundle> {
     let dir = tempfile::tempdir().context("create bundle directory")?;
     std::fs::copy(program, dir.path().join(PROGRAM_BINARY))
         .with_context(|| format!("copy {}", program.display()))?;
-    std::fs::write(dir.path().join(CONFIG), program_config())?;
+    std::fs::write(dir.path().join(CONFIG), PROGRAM_CONFIG)?;
     Ok(Bundle(dir, Kind::Program))
 }
 
-fn program_config() -> String {
-    format!(
-        r#"[profile.{PROFILE}]
-slow-timeout = {{ period = "900s", terminate-after = 1, grace-period = "{GRACE_PERIOD_SECS}s" }}
-
-[profile.{PROFILE}.junit]
-path = "junit.xml"
-store-success-output = true
-"#
-    )
-}
+/// The nextest configuration written into a program bundle, shared with the
+/// host-lane wrapper (`e2e/support/conformance.sh`).
+const PROGRAM_CONFIG: &str = include_str!("program-nextest.toml");
 
 /// The Rust target for guests. tmachine only boots guests of the host's
 /// architecture, and static musl binaries don't depend on the guest's libc.
@@ -388,6 +380,12 @@ mod tests {
         names.sort();
         assert_eq!(names, [CONFIG, PROGRAM_BINARY]);
         assert!(program(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn program_config_defines_the_runner_profile() {
+        assert!(PROGRAM_CONFIG.contains(&format!("[profile.{PROFILE}]\n")));
+        assert!(PROGRAM_CONFIG.contains(&format!("[profile.{PROFILE}.junit]\n")));
     }
 
     fn write_bundle(dir: &Path, family: &str, packages: &[&str]) {
