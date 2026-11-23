@@ -164,3 +164,27 @@ When `[openshell.gateway.otlp.agent]` is enabled, the driver sets
 `OPENSHELL_OTLP_AGENT_PROTOCOL` for a non-gRPC collector, which starts the
 agent trace relay. On Podman Machine it rewrites a loopback agent endpoint to
 the desktop host, as it does for the supervisor's trace endpoint.
+
+## Launch by the gateway
+
+The gateway runs this driver as a separate process and does not link it. It
+starts `openshell-driver-podman serve --bind-socket <path> --expected-peer-pid
+<pid> --log-level <level>`. The driver logs to stderr and serves the
+`DriverLaunch` service at once; `ComputeDriver` RPCs return `UNAVAILABLE`
+until the gateway calls `Configure`. That request carries the gateway's
+resolved values (name, port, TLS CA, telemetry, the staged network trust
+artifact, image overrides) and the operator's `[openshell.drivers.podman]`
+table, which the driver deserializes and validates before it builds the
+driver. A failed `Configure` can be retried. The driver accepts any
+connection from its own user, on a socket in a private directory.
+
+Two subcommands take part in gateway decisions and start nothing:
+
+- `openshell-driver-podman probe` prints `{"available": bool, "reason": "..."}`.
+  Gateway auto-detection runs it.
+- `openshell-driver-podman preflight` reads the encoded `Configure` request on
+  stdin, validates it, and prints `{"ok": bool, "error": "..."}`.
+  `openshell-gateway config preflight` runs it.
+
+The binary must be installed beside the gateway or in a libexec directory. See
+[Launched Compute Drivers](../../docs/how-it-works/gateways/configuration.mdx#launched-compute-drivers).

@@ -489,12 +489,27 @@ fn telemetry(otlp: &OtlpConfig) -> openshell_driver_launch::proto::Telemetry {
     }
 }
 
-/// Run `<binary> <args>`, writing `input` to its stdin when given, and return
-/// its standard output.
+/// How long auto-detection waits for a driver's `probe` before it counts the
+/// driver as not available.
+#[cfg(unix)]
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `<binary> <args>` with no input and return its standard output.
 ///
 /// The command gets `timeout` to exit successfully and may print at most
 /// `max_output` bytes. A command that fails, runs out of time, or prints more
 /// than that returns an error message.
+#[cfg(unix)]
+fn run_bounded(
+    binary: &Path,
+    args: &[&std::ffi::OsStr],
+    timeout: Duration,
+    max_output: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    run_bounded_with_input(binary, args, None, timeout, max_output)
+}
+
+/// [`run_bounded`], writing `input` to the command's stdin when given.
 #[cfg(unix)]
 fn run_bounded_with_input(
     binary: &Path,
@@ -610,6 +625,36 @@ fn trusted_driver_bin(driver: &DriverProcess<'_>) -> Result<PathBuf> {
     let binary = resolve_driver_bin(driver)?;
     check_driver_binary_trust(&binary, current_euid())?;
     Ok(binary)
+}
+
+/// Run `<binary> probe` and report whether the driver is usable here.
+///
+/// A missing or untrusted binary, a failed or timed-out probe, and oversized or
+/// malformed output all count as not available, and the reason names the
+/// driver, so detection never hangs on or trusts one broken driver.
+#[cfg(unix)]
+pub fn probe(
+    driver: &DriverProcess<'_>,
+    timeout: Duration,
+) -> openshell_driver_sdk::probe::ProbeResult {
+    use openshell_driver_sdk::probe::{MAX_PROBE_OUTPUT_BYTES, ProbeResult};
+
+    let name = driver.name;
+    let unavailable = |reason: String| ProbeResult::unavailable(format!("{name} driver: {reason}"));
+    let binary = match trusted_driver_bin(driver) {
+        Ok(binary) => binary,
+        Err(error) => return unavailable(error.to_string()),
+    };
+    let output = match run_bounded(
+        &binary,
+        &["probe".as_ref()],
+        timeout,
+        MAX_PROBE_OUTPUT_BYTES,
+    ) {
+        Ok(output) => output,
+        Err(error) => return unavailable(format!("probe {error}")),
+    };
+    ProbeResult::parse(&output).unwrap_or_else(unavailable)
 }
 
 /// How long `preflight` may take before the driver counts as failed.
@@ -1259,9 +1304,7 @@ mod tests {
     fn output_beyond_the_limit_is_not_mistaken_for_a_timeout() {
         let dir = tempdir().unwrap();
         let binary = probe_script(dir.path(), "head -c 300000 /dev/zero | tr '\\0' x");
-        let output =
-            super::run_bounded_with_input(&binary, &[], None, Duration::from_secs(5), 4096)
-                .unwrap();
+        let output = super::run_bounded(&binary, &[], Duration::from_secs(5), 4096).unwrap();
         assert_eq!(output.len(), 4097);
     }
 
@@ -1269,6 +1312,60 @@ mod tests {
         let binary = driver_binary(dir, 0o755, 0o755);
         std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
         binary
+    }
+
+    fn run_probe(body: &str, timeout: Duration) -> openshell_driver_sdk::probe::ProbeResult {
+        let dir = tempdir().unwrap();
+        probe_script(dir.path(), body);
+        let state = dir.path().join("state");
+        let driver = DriverProcess {
+            name: "test",
+            binary_name: "openshell-driver-test",
+            driver_dir: Some(dir.path()),
+            driver_dir_key: None,
+            state_dir: &state,
+        };
+        super::probe(&driver, timeout)
+    }
+
+    #[test]
+    fn a_probe_reports_availability() {
+        let result = run_probe("echo '{\"available\":true}'", Duration::from_secs(5));
+        assert!(result.available, "{result:?}");
+        let result = run_probe(
+            "echo '{\"available\":false,\"reason\":\"no socket\"}'",
+            Duration::from_secs(5),
+        );
+        assert!(!result.available);
+        assert_eq!(result.reason.as_deref(), Some("no socket"));
+    }
+
+    #[test]
+    fn a_broken_probe_counts_as_unavailable_and_names_the_driver() {
+        for body in [
+            "exit 1",
+            "echo not-json",
+            "head -c 100000 /dev/zero | tr '\\0' ' '",
+            "sleep 30",
+        ] {
+            let result = run_probe(body, Duration::from_millis(300));
+            assert!(!result.available, "{body}");
+            assert!(result.reason.unwrap().starts_with("test driver:"), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_missing_driver_is_unavailable() {
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let driver = DriverProcess {
+            name: "test",
+            binary_name: "openshell-driver-absent",
+            driver_dir: Some(dir.path()),
+            driver_dir_key: None,
+            state_dir: &state,
+        };
+        assert!(!super::probe(&driver, Duration::from_secs(1)).available);
     }
 
     fn run_preflight(body: &str, timeout: Duration) -> openshell_core::Result<()> {
