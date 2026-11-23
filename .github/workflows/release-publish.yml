@@ -521,7 +521,9 @@ jobs:
   publish-snap:
     name: Publish Snap
     needs: release
-    if: ${{ !inputs.is-prerelease && inputs.make-latest }}
+    # TODO: Move stable snap publishing to the upcoming packages repository under
+    # ai-openshell. Keep disabled here until that migration.
+    if: ${{ !inputs.is-prerelease && inputs.make-latest && false }}
     permissions:
       actions: read
       contents: read
@@ -569,14 +571,9 @@ jobs:
       - name: Require every expected publisher to succeed
         env:
           NEEDS: ${{ toJSON(needs) }}
-          IS_PRERELEASE: ${{ inputs.is-prerelease }}
-          MAKE_LATEST: ${{ inputs.make-latest }}
         run: |
           set -euo pipefail
           expected=(assemble tag-ghcr-release release-helm release)
-          if [[ "${IS_PRERELEASE}" != "true" && "${MAKE_LATEST}" == "true" ]]; then
-            expected+=(publish-snap)
-          fi
           failed=0
           for job in "${expected[@]}"; do
             result=$(jq -r --arg job "${job}" '.[$job].result' <<<"${NEEDS}")
