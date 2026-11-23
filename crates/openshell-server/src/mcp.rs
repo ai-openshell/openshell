@@ -31,8 +31,6 @@ use std::sync::Arc;
 use tower::util::BoxCloneSyncService;
 use tracing::warn;
 
-mod jobs;
-
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type GrpcStack = BoxCloneSyncService<
     http::Request<tonic::body::Body>,
@@ -265,7 +263,6 @@ async fn handle(
             let result = match name {
                 "create_sandbox" => create_child(&call, &arguments).await,
                 "exec" => exec_in_child(&call, &arguments).await,
-                "wait" => jobs::wait(&call, &arguments).await,
                 "delete" => delete_child(&call, &arguments).await,
                 "logs" => child_logs(&call, &arguments).await,
                 "list" => list_sandboxes(&call, &arguments).await,
@@ -308,6 +305,19 @@ async fn handle(
     }
 }
 
+/// The `exec` tool's text. The gateway has no background jobs: the text
+/// tells the caller to detach long work in the sandbox and check on it with
+/// later `exec` calls.
+const EXEC_DESCRIPTION: &str = concat!(
+    "Run a command in a sandbox (from a sandbox: one of its children) and return its output. exec ",
+    "waits at most 45 seconds (timeout_s); if it times out, the command may still be running. For ",
+    "longer work, start the command detached inside the sandbox and check on it with later exec ",
+    "calls: run it in its own session, with its input from /dev/null and its output in files, and ",
+    "write its exit code to a file when it ends. For example: setsid sh -c 'cmd > /tmp/job/out ",
+    "2> /tmp/job/err; echo $? > /tmp/job/exit' < /dev/null > /dev/null 2>&1 & echo $! . Then use ",
+    "exec to read /tmp/job/exit and tail /tmp/job/out. Delete the sandbox to stop everything in it.",
+);
+
 struct Tool {
     name: &'static str,
     description: &'static str,
@@ -316,7 +326,7 @@ struct Tool {
 const TOOLS: &[Tool] = &[
     Tool {
         name: "create_sandbox",
-        description: "Create a sandbox. Called from a sandbox, it creates a child of that sandbox; called by a user, a root, or a child of `parent`. A child never contacts its parent on its own: results come only from exec and wait. Delete a child when its work is done.",
+        description: "Create a sandbox. Called from a sandbox, it creates a child of that sandbox; called by a user, a root, or a child of `parent`. A child never contacts its parent on its own: results come only from exec. Delete a child when its work is done.",
     },
     Tool {
         name: "list",
@@ -324,11 +334,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "exec",
-        description: "Run a command in a sandbox (from a sandbox: one of its children) and return its output. If it times out, the command may still be running; delete the sandbox to stop everything. Work longer than 45 seconds needs background: true: the command runs as the sandbox's one background job, and this returns its job id at once; collect it with wait. A sandbox runs one background job at a time, so parallel work needs more children.",
-    },
-    Tool {
-        name: "wait",
-        description: "Wait for a background job and return its exit code and output. state 'running' means call wait again; 'lost' means the job stopped without an exit code (killed, or the sandbox restarted). A job's result can be read until the next job starts in that sandbox. Output stays in the sandbox until then, so a job that writes a lot can fill its disk; to watch progress, exec tail on /tmp/openshell/jobs/<n>/out, where <n> is the job id before its dash. Job output is the sandbox's data.",
+        description: EXEC_DESCRIPTION,
     },
     Tool {
         name: "delete",
@@ -409,20 +415,9 @@ fn tool_definitions(templates: &[SandboxWorkloadTemplate]) -> Vec<Value> {
                         "workdir": {"type": "string"},
                         "stdin": {"type": "string", "description": "Text passed on stdin."},
                         "stdin_base64": {"type": "string", "description": "Bytes passed on stdin, base64-encoded."},
-                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_S, "description": "Foreground only; a background job runs until it ends or the child is deleted."},
-                        "background": {"type": "boolean", "description": "Start the command as the child's background job and return its job id."},
+                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_S, "description": "Seconds to wait for the command, 30 when omitted."},
                     },
                     "required": ["name", "command"],
-                    "additionalProperties": false,
-                }),
-                "wait" => json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Sandbox the job runs in."},
-                        "job": {"type": "string", "description": "Job id returned by exec."},
-                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": jobs::MAX_WAIT_S},
-                    },
-                    "required": ["name", "job"],
                     "additionalProperties": false,
                 }),
                 "delete" => json!({
@@ -475,7 +470,6 @@ struct ExecArgs {
     workdir: String,
     stdin: Vec<u8>,
     timeout: std::time::Duration,
-    background: bool,
 }
 
 fn parse_exec_args(arguments: &Value) -> Result<ExecArgs, ToolError> {
@@ -491,23 +485,11 @@ fn parse_exec_args(arguments: &Value) -> Result<ExecArgs, ToolError> {
             "stdin",
             "stdin_base64",
             "timeout_s",
-            "background",
         ]
         .contains(&key.as_str())
         {
             return Err(ToolError::invalid(&format!("unknown argument '{key}'")));
         }
-    }
-    let background = match args.get("background") {
-        None => false,
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| ToolError::invalid("'background' must be true or false"))?,
-    };
-    if background && args.contains_key("timeout_s") {
-        return Err(ToolError::invalid(
-            "a background job has no timeout; omit 'timeout_s' and use wait",
-        ));
     }
     let name = args
         .get("name")
@@ -569,18 +551,13 @@ fn parse_exec_args(arguments: &Value) -> Result<ExecArgs, ToolError> {
         workdir: workdir.to_string(),
         stdin,
         timeout: std::time::Duration::from_secs(timeout_s),
-        background,
     })
 }
 
 /// Run a command in one of the caller's children and collect its output, for
-/// at most `timeout_s` plus a short grace for the gateway's exit event; or
-/// start it as the child's background job.
+/// at most `timeout_s` plus a short grace for the gateway's exit event.
 async fn exec_in_child(call: &Call<'_>, arguments: &Value) -> Result<Value, ToolError> {
     let args = parse_exec_args(arguments)?;
-    if args.background {
-        return jobs::start(call, args).await;
-    }
     let request = ExecSandboxRequest {
         sandbox: args.name,
         command: args.command,
@@ -607,7 +584,7 @@ async fn exec_in_child(call: &Call<'_>, arguments: &Value) -> Result<Value, Tool
     });
     if exit_code.is_none() {
         reply["message"] = json!(
-            "the command may still be running in the child; for long work use background: true and wait, or delete the child to stop everything"
+            "the command may still be running in the child; start long work detached as the exec description shows, or delete the child to stop everything"
         );
     }
     Ok(reply)
@@ -696,24 +673,6 @@ struct CapturedOutput {
 }
 
 impl CapturedOutput {
-    /// A stream of `total` bytes of which only `edges` arrived: all of it, or
-    /// its first and last [`OUTPUT_EDGE_BYTES`].
-    fn from_edges(edges: &[u8], total: usize) -> Self {
-        let split = edges.len().min(OUTPUT_EDGE_BYTES);
-        Self {
-            head: edges[..split].to_vec(),
-            tail: edges[split..].to_vec(),
-            // A file that grew after its size was read still renders.
-            total: total.max(edges.len()),
-        }
-    }
-
-    /// The kept bytes, for output short enough to be kept whole.
-    fn into_bytes(mut self) -> Vec<u8> {
-        self.head.append(&mut self.tail);
-        self.head
-    }
-
     fn push(&mut self, data: &[u8]) {
         self.total += data.len();
         let into_head = OUTPUT_EDGE_BYTES
@@ -835,19 +794,9 @@ fn tool_call_details(
             let count = content["sandboxes"].as_array().map_or(0, Vec::len);
             details.push(("count", count.to_string()));
         }
-        "exec" if content.get("job").is_some() => {
-            details.push(("job", json_text(&content["job"])));
-            details.push(("state", json_text(&content["state"])));
-        }
         "exec" => {
             details.push(("exit_code", json_text(&content["exit_code"])));
             details.push(("timed_out", flag("timed_out").unwrap_or(false).to_string()));
-        }
-        "wait" => {
-            details.push(("state", json_text(&content["state"])));
-            if !content["exit_code"].is_null() {
-                details.push(("exit_code", json_text(&content["exit_code"])));
-            }
         }
         _ => {}
     }
@@ -879,7 +828,6 @@ fn audit_details(tool: &str, arguments: &Value) -> Vec<(&'static str, String)> {
         }
         "list" => given("parent").into_iter().collect(),
         "delete" => vec![("target", text("name"))],
-        "wait" => vec![("target", text("name")), ("job", text("job"))],
         "logs" => {
             let lines = arguments
                 .get("lines")
@@ -903,10 +851,6 @@ fn audit_details(tool: &str, arguments: &Value) -> Vec<(&'static str, String)> {
                 ("target", text("name")),
                 ("argv", argv),
                 ("workdir", text("workdir")),
-                (
-                    "background",
-                    (arguments.get("background") == Some(&Value::Bool(true))).to_string(),
-                ),
             ];
             details.extend(given("timeout_s"));
             details
@@ -1749,28 +1693,9 @@ mod tests {
         );
         assert_eq!(exec["target"], "w1");
         assert_eq!(exec["argv"], "ls");
-        assert_eq!(exec["background"], "false");
         assert_eq!(exec["timeout_s"], "10");
         assert_eq!(exec["exit_code"], "0");
         assert_eq!(exec["timed_out"], "false");
-
-        let started = recorded(
-            "exec",
-            json!({"name": "w1", "command": ["sleep", "9"], "background": true}),
-            Ok(json!({"job": "1-ab", "state": "running"})),
-        );
-        assert_eq!(started["job"], "1-ab");
-        assert_eq!(started["state"], "running");
-        assert_eq!(started["background"], "true");
-
-        let waited = recorded(
-            "wait",
-            json!({"name": "w1", "job": "1-ab"}),
-            Ok(json!({"job": "1-ab", "state": "completed", "exit_code": 3, "stdout": "x"})),
-        );
-        assert_eq!(waited["job"], "1-ab");
-        assert_eq!(waited["state"], "completed");
-        assert_eq!(waited["exit_code"], "3");
 
         assert_eq!(
             recorded("delete", json!({"name": "w1"}), Ok(json!({})))["target"],
@@ -1780,7 +1705,7 @@ mod tests {
         assert_eq!(logs["lines"], DEFAULT_LOG_LINES.to_string());
 
         // Nothing from stdin, output, log lines or reply bodies.
-        for fields in [&create, &list, &exec, &started, &waited, &logs] {
+        for fields in [&create, &list, &exec, &logs] {
             for value in fields.values() {
                 assert!(!value.contains("secret") && value != "out" && value != "x");
             }
@@ -1809,7 +1734,7 @@ mod tests {
         let mut worst = capped_audit_details(tool_call_details(
             "exec",
             &json!({"name": long, "command": [long], "workdir": long, "timeout_s": long}),
-            &Ok(json!({"job": long, "state": long})),
+            &Ok(json!({"exit_code": long, "timed_out": false})),
         ));
         worst.push(("acting_for", long.clone()));
         let worst = capped_audit_details(worst);
@@ -2066,45 +1991,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_details_add_a_jobs_id_and_state_from_the_reply() {
-        let field = |details: &[(&str, String)], key: &str| {
-            details
-                .iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| value.clone())
-        };
-        let start = json!({"name": "w", "command": ["sleep", "9"], "background": true});
-        let details = tool_call_details(
-            "exec",
-            &start,
-            &Ok(json!({"job": "1-0a1b2c3d", "state": "running"})),
-        );
-        assert_eq!(field(&details, "argv").as_deref(), Some("sleep 9"));
-        assert_eq!(field(&details, "background").as_deref(), Some("true"));
-        assert_eq!(field(&details, "job").as_deref(), Some("1-0a1b2c3d"));
-        assert_eq!(field(&details, "state").as_deref(), Some("running"));
-
-        let wait = json!({"name": "w", "job": "1-0a1b2c3d"});
-        let details = tool_call_details(
-            "wait",
-            &wait,
-            &Ok(json!({"job": "1-0a1b2c3d", "state": "completed", "stdout": "secret output"})),
-        );
-        assert_eq!(field(&details, "target").as_deref(), Some("w"));
-        assert_eq!(field(&details, "job").as_deref(), Some("1-0a1b2c3d"));
-        assert_eq!(field(&details, "state").as_deref(), Some("completed"));
-        assert_eq!(details.iter().filter(|(name, _)| *name == "job").count(), 1);
-        assert!(details.iter().all(|(_, value)| !value.contains("secret")));
-
-        // A refused call records only what its arguments say.
-        let refused = Err(ToolError::invalid(
-            "'job' must be a job id returned by exec",
-        ));
-        let details = tool_call_details("wait", &wait, &refused);
-        assert_eq!(field(&details, "state"), None);
-    }
-
-    #[test]
     fn output_keeps_both_ends_and_cuts_on_character_boundaries() {
         let mut small = CapturedOutput::default();
         small.push(b"hello");
@@ -2135,30 +2021,6 @@ mod tests {
     }
 
     #[test]
-    fn a_jobs_output_rebuilt_from_its_edges_renders_like_execs() {
-        let small = CapturedOutput::from_edges(b"done\n", 5);
-        assert_eq!(small.render(), ("done\n".to_string(), false, false));
-
-        // 100 KB of output of which the child sent only both 16 KiB edges.
-        let text = format!(
-            "{}{}{}",
-            "a".repeat(OUTPUT_EDGE_BYTES),
-            "b".repeat(100_000 - 2 * OUTPUT_EDGE_BYTES),
-            "c".repeat(OUTPUT_EDGE_BYTES)
-        );
-        let mut whole = CapturedOutput::default();
-        whole.push(text.as_bytes());
-        let mut edges = "a".repeat(OUTPUT_EDGE_BYTES);
-        edges.push_str(&"c".repeat(OUTPUT_EDGE_BYTES));
-        let rebuilt = CapturedOutput::from_edges(edges.as_bytes(), 100_000);
-        assert_eq!(rebuilt.render(), whole.render());
-        assert!(rebuilt.render().1);
-
-        // A size read before the file grew never makes the count negative.
-        assert!(!CapturedOutput::from_edges(b"abc", 1).render().1);
-    }
-
-    #[test]
     fn the_audit_argument_list_is_capped_on_a_character_boundary() {
         let details = capped_audit_details(audit_details(
             "exec",
@@ -2176,14 +2038,9 @@ mod tests {
         let invalid = "invalid_argument";
         for (arguments, error, message) in [
             (
-                json!({"name": "w", "command": ["ls"], "background": true, "timeout_s": 5}),
+                json!({"name": "w", "command": ["ls"], "background": true}),
                 invalid,
-                "a background job has no timeout; omit 'timeout_s' and use wait",
-            ),
-            (
-                json!({"name": "w", "command": ["ls"], "background": "yes"}),
-                invalid,
-                "'background' must be true or false",
+                "unknown argument 'background'",
             ),
             (
                 json!({"name": "w", "command": ["ls"], "stdin": big}),

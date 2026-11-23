@@ -80,8 +80,7 @@ The gateway serves MCP tools at `/mcp` that create and manage sandboxes. Each to
 |---|---|
 | `create_sandbox` | Create a sandbox and wait until it is ready, up to 45 seconds. If it is not ready by then, the tool returns its current state with `timed_out: true`, not an error; call it again with the same name to keep waiting. Calling it again returns the existing sandbox with `already_existed: true`. |
 | `list` | List sandboxes and their state. |
-| `exec` | Run a command and return its exit code and output, or start a background job. |
-| `wait` | Wait for a background job, up to 40 seconds, and return its result. |
+| `exec` | Run a command and return its exit code and output. |
 | `delete` | Delete a sandbox. |
 | `logs` | Read a sandbox's own log lines, such as startup errors and policy denials. |
 
@@ -91,7 +90,7 @@ An agent in a root sandbox calls `http://openshell.local/mcp`. The sandbox's sup
 
 - `create_sandbox` takes a `name`, and optionally a `template` and `providers`. Without a template, the child copies the root's image, CPU and memory, but not a GPU or other device. A template must carry the label `openshell.ai/agent-usable: "true"` and have no driver configuration. The root's MCP tool list names the templates it may use, with their images, so the agent does not need to be told them. Either way, the child gets the root's runtime class and user namespace setting. Without `providers`, the child gets all of the root's.
 - A root created with driver configuration cannot create children through MCP.
-- `list`, `exec`, `wait`, `delete` and `logs` act only on the root's children. Any other name reads as not found.
+- `list`, `exec`, `delete` and `logs` act only on the root's children. Any other name reads as not found.
 - A sandbox can have 8 requests to `openshell.local/mcp` open at once. Another one gets `503` with `too many gateway requests at once; try again`.
 - The root can create children only while the user who created it is a member of the workspace with at least the user role. A platform admin who is not a member must be added with `openshell workspace member add`. A gateway with no admin role configured treats every authenticated user as an admin and skips this check. A child the root creates records the root as its creator, as `sandbox:<id>`; a child you create with `--parent` records you.
 
@@ -107,20 +106,22 @@ The tools act in the CLI's workspace. To use another workspace, add `"--workspac
 
 ### Run Long Work
 
-Write agents with these behaviors in mind:
+The gateway has no background jobs. An agent starts long work detached inside the sandbox and collects it with later `exec` calls. The `exec` tool's description gives the agent a short example. Weaker models may need the full steps below in their instructions.
 
 - `exec` waits up to 30 seconds by default and 45 at most. A command that reaches its timeout is reported as timed out but can keep running in the sandbox. Deleting the sandbox stops it.
-- For longer work, such as running a harness, call `exec` with `background: true`. It returns a job id at once. Call `wait` with that id until `state` is `completed` or `lost`. `running` means call `wait` again.
-- A sandbox runs one background job at a time. Starting another while one runs is refused, and the error names the running job. Use more children for parallel work.
-- A job's result can be read until the next job starts in that sandbox. `wait` reports no output while the job runs; to watch progress, run `tail` on `/tmp/openshell/jobs/<n>/out` with `exec`, where `<n>` is the job id before its dash. This path may change while child sandboxes are experimental.
-- Jobs need a writable `/tmp`. A child uses its parent's filesystem policy, so the parent's policy must let `/tmp` be written. The default policy does.
-- Each output stream keeps its first and last 16 KiB.
+- For longer work, such as running a harness, start the command in its own session with its output in files, and write its exit code to a file when it ends.
+- To wait, run a short loop with `exec` that checks for the exit code file, at most 25 seconds per call, and repeat it until the file exists.
+- Read the output with `tail` or `grep`. Each `exec` reply keeps the first and last 16 KiB of each output stream.
+- The files need a writable `/tmp`. A child uses its parent's filesystem policy, so the parent's policy must let `/tmp` be written. The default policy does.
+- Nothing stops a second long command in the same sandbox. Use one child for each piece of parallel work.
 
 ```text
-exec {name: "reviewer", command: ["claude", "-p", "Review the diff"], background: true}
-→ job: 1-9f2c41ab · running
-wait {name: "reviewer", job: "1-9f2c41ab"}
-→ completed · exit 0 · stdout: the review
+exec {name: "reviewer", command: ["sh", "-c", "mkdir -p /tmp/jobs/review || exit 1; setsid sh -c 'claude -p \"Review the diff\" > /tmp/jobs/review/out 2> /tmp/jobs/review/err; echo $? > /tmp/jobs/review/exit.tmp; mv /tmp/jobs/review/exit.tmp /tmp/jobs/review/exit' < /dev/null > /dev/null 2>&1 &"]}
+→ exit 0
+exec {name: "reviewer", command: ["sh", "-c", "for i in $(seq 25); do [ -f /tmp/jobs/review/exit ] && break; sleep 1; done; cat /tmp/jobs/review/exit 2>/dev/null || echo running"]}
+→ running, then 0
+exec {name: "reviewer", command: ["tail", "/tmp/jobs/review/out"]}
+→ the review
 delete {name: "reviewer"}
 ```
 

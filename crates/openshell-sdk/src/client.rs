@@ -38,8 +38,8 @@ use tonic::transport::Channel;
 const MCP_PATH: &str = "/mcp";
 /// The workspace a user acts in over MCP, read by the gateway's `/mcp`.
 const MCP_WORKSPACE_HEADER: &str = "x-openshell-workspace";
-/// A `/mcp` call's own limit, longer than the SDK's RPCs: `wait` can take
-/// 45 s and a foreground `exec` about 50 s.
+/// A `/mcp` call's own limit, longer than the SDK's RPCs: an `exec` can take
+/// about 50 s.
 const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(90);
 /// Largest `/mcp` reply read.
 const MAX_MCP_REPLY_BYTES: usize = 8 * 1024 * 1024;

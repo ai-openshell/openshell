@@ -48,15 +48,8 @@ async fn cli(args: &[&str]) -> (String, bool) {
 }
 
 /// A policy that lets any binary reach the host test server on `allow_port`,
-/// or nothing when `None`. `/tmp` is writable unless `writable_tmp` is false;
-/// then it is listed read-only, since the supervisor adds a writable `/tmp`
-/// to any policy that does not name it.
-fn policy(allow_port: Option<u16>, writable_tmp: bool) -> NamedTempFile {
-    let (tmp, read_only_tmp) = if writable_tmp {
-        ("\n    - /tmp", "")
-    } else {
-        ("", "\n    - /tmp")
-    };
+/// or nothing when `None`. `/tmp` is writable.
+fn policy(allow_port: Option<u16>) -> NamedTempFile {
     let network = allow_port.map_or_else(String::new, |port| {
         format!(
             r#"network_policies:
@@ -83,9 +76,10 @@ filesystem_policy:
     - /dev/urandom
     - /app
     - /etc
-    - /var/log{read_only_tmp}
+    - /var/log
   read_write:
-    - /sandbox{tmp}
+    - /sandbox
+    - /tmp
     - /dev/null
 
 landlock:
@@ -298,8 +292,8 @@ async fn children_are_created_listed_and_deleted_from_the_cli() {
 #[tokio::test]
 async fn a_child_follows_its_parents_policy_on_the_network() {
     let port = start_host_server().await;
-    let closed = policy(None, true);
-    let open = policy(Some(port), true);
+    let closed = policy(None);
+    let open = policy(Some(port));
     let root = SandboxGuard::create(&["--policy", &path(&closed)])
         .await
         .expect("create root");
@@ -419,31 +413,35 @@ async fn an_agent_in_a_root_manages_its_children_through_mcp() {
     assert_eq!(content(&ran)["exit_code"], 3, "{ran}");
     assert_eq!(content(&ran)["stdout"], "hello\n", "{ran}");
 
+    // Long work is started detached, as the exec tool's text describes, and
+    // outlives the exec that started it.
+    let start = "mkdir -p /tmp/jobs/t1 || exit 1; setsid sh -c 'sleep 5; echo done > /tmp/jobs/t1/out \
+                 2> /tmp/jobs/t1/err; echo $? > /tmp/jobs/t1/exit.tmp; mv /tmp/jobs/t1/exit.tmp \
+                 /tmp/jobs/t1/exit' < /dev/null > /dev/null 2>&1 &";
     let started = mcp(
         &root,
         "exec",
-        json!({"name": worker, "command": ["sh", "-c", "sleep 20; echo done"], "background": true}),
+        json!({"name": worker, "command": ["sh", "-c", start]}),
     )
     .await;
-    let job = content(&started)["job"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no job id: {started}"))
-        .to_string();
-    let mut waited = Value::Null;
-    for _ in 0..4 {
-        waited = mcp(
-            &root,
-            "wait",
-            json!({"name": worker, "job": job, "timeout_s": 30}),
-        )
-        .await;
-        if content(&waited)["state"] != "running" {
-            break;
-        }
-    }
-    assert_eq!(content(&waited)["state"], "completed", "{waited}");
-    assert_eq!(content(&waited)["exit_code"], 0, "{waited}");
-    assert_eq!(content(&waited)["stdout"], "done\n", "{waited}");
+    assert_eq!(content(&started)["exit_code"], 0, "{started}");
+    let check = "[ -d /tmp/jobs/t1 ] || { echo no such job; exit 0; }; for i in $(seq 25); do \
+                 [ -f /tmp/jobs/t1/exit ] && break; sleep 1; done; cat /tmp/jobs/t1/exit 2>/dev/null \
+                 || echo running";
+    let waited = mcp(
+        &root,
+        "exec",
+        json!({"name": worker, "command": ["sh", "-c", check]}),
+    )
+    .await;
+    assert_eq!(content(&waited)["stdout"], "0\n", "{waited}");
+    let output = mcp(
+        &root,
+        "exec",
+        json!({"name": worker, "command": ["cat", "/tmp/jobs/t1/out"]}),
+    )
+    .await;
+    assert_eq!(content(&output)["stdout"], "done\n", "{output}");
 
     // Another root, and the caller itself, read as missing.
     for name in [other_root.name.as_str(), root.name.as_str()] {
@@ -451,17 +449,16 @@ async fn an_agent_in_a_root_manages_its_children_through_mcp() {
         assert_eq!(content(&refused)["error"], "not_found", "{refused}");
     }
 
-    assert_job_audit_events(&job);
+    assert_exec_audit_event(&worker);
 
     let deleted = mcp(&root, "delete", json!({"name": worker})).await;
     assert_eq!(content(&deleted)["deleting"], true, "{deleted}");
 }
 
-/// The gateway's OCSF events for the job's start and wait carry its id and
-/// state. The e2e wrapper always writes the gateway's JSONL, so under it a
-/// missing directory fails the test; against a gateway started by hand the
-/// check is skipped.
-fn assert_job_audit_events(job: &str) {
+/// The gateway writes an OCSF event for an exec in the child. The e2e wrapper
+/// always writes the gateway's JSONL, so under it a missing directory fails
+/// the test; against a gateway started by hand the check is skipped.
+fn assert_exec_audit_event(worker: &str) {
     let Ok(dir) = std::env::var("OPENSHELL_E2E_GATEWAY_OCSF_DIR") else {
         assert_ne!(
             std::env::var("OPENSHELL_E2E_CHILD_SANDBOXES").as_deref(),
@@ -480,21 +477,13 @@ fn assert_job_audit_events(job: &str) {
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
         );
     }
-    let tool_event = |tool: &str| {
-        events
-            .iter()
-            .find(|event| event["api"]["operation"] == tool && event["unmapped"]["job"] == job)
-    };
-    let start = tool_event("exec").unwrap_or_else(|| panic!("no exec event for job {job}"));
-    assert_eq!(start["unmapped"]["state"], "running", "{start}");
-    assert_eq!(start["unmapped"]["background"], "true", "{start}");
     assert!(
         events
             .iter()
-            .any(|event| event["api"]["operation"] == "wait"
-                && event["unmapped"]["job"] == job
-                && event["unmapped"]["state"] == "completed"),
-        "no wait event with state completed for job {job}"
+            .any(|event| event["api"]["operation"] == "exec"
+                && event["unmapped"]["target"] == worker
+                && event["unmapped"]["exit_code"] == "3"),
+        "no exec event with exit code 3 for {worker}"
     );
 }
 
@@ -588,39 +577,6 @@ async fn an_agent_creates_children_only_from_templates_marked_for_agents() {
             "{refused}"
         );
     }
-}
-
-#[tokio::test]
-async fn a_background_job_needs_a_writable_tmp() {
-    ensure_workspace_member().await;
-    let no_tmp = policy(None, false);
-    let root = SandboxGuard::create(&["--policy", &path(&no_tmp)])
-        .await
-        .expect("create root");
-    let worker = format!("{}-w", root.name);
-    let created = mcp(&root, "create_sandbox", json!({"name": worker})).await;
-    let _worker_guard = SandboxGuard::manage_existing(worker.clone());
-    assert_eq!(created["isError"], false, "{created}");
-
-    let refused = mcp(
-        &root,
-        "exec",
-        json!({"name": worker, "command": ["true"], "background": true}),
-    )
-    .await;
-    assert_eq!(
-        content(&refused)["error"],
-        "failed_precondition",
-        "{refused}"
-    );
-    // Only the /tmp cause: /proc and stat are present, so the job is refused
-    // for the reason the test names.
-    let message = content(&refused)["message"].as_str().unwrap_or_default();
-    assert!(message.contains("need a writable /tmp"), "{message}");
-    assert!(
-        !message.contains("/proc") && !message.contains("stat"),
-        "{message}"
-    );
 }
 
 /// Talk to `openshell mcp serve` over stdio, as a host MCP client does.

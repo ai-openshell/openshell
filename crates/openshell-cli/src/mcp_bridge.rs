@@ -22,7 +22,7 @@ pub struct Sent {
 
 /// Read MCP messages from `input` and answer each on `output`, one per line.
 ///
-/// Each message is sent on its own task, so a long `wait` never holds up a
+/// Each message is sent on its own task, so a long `exec` never holds up a
 /// `ping`; a whole reply line is written under one lock. Returns when `input`
 /// closes and every call in flight has answered.
 pub async fn serve<R, W, S, F>(input: R, output: W, send: S) -> std::io::Result<()>
