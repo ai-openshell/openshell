@@ -7,6 +7,7 @@ use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
+use openshell_driver_vm::startup_config::VmComputeConfig;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
@@ -17,6 +18,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::info;
@@ -275,8 +277,216 @@ struct Args {
     vm_mount: Vec<String>,
 }
 
+/// `preflight` reads the `Configure` request the gateway would send from
+/// stdin, validates it, and reports on stdout. It starts nothing and creates
+/// no state.
+fn run_preflight(arguments: &[std::ffi::OsString]) -> ! {
+    use openshell_driver_sdk::preflight::PreflightResult;
+    use std::io::Read as _;
+
+    let result = if arguments.is_empty() {
+        let mut input = Vec::new();
+        io::stdin()
+            .take(openshell_driver_launch::MAX_CONFIGURE_REQUEST_BYTES as u64 + 1)
+            .read_to_end(&mut input)
+            .map_err(|error| format!("failed to read the configure request: {error}"))
+            .and_then(|_| openshell_driver_launch::decode_configure_request(&input))
+            .and_then(|request| configured_args(&request, "info".to_string()))
+            .and_then(|args| vm_driver_config(&args))
+            .map_or_else(PreflightResult::rejected, |_| PreflightResult::ok())
+    } else {
+        PreflightResult::rejected("usage: preflight < configure-request")
+    };
+    println!("{}", result.to_json());
+    std::process::exit(0);
+}
+
+/// Bootstrap flags of `serve`, the mode a gateway launches the driver in.
+/// Everything else, telemetry included, arrives in the `Configure` RPC.
+#[derive(Parser)]
+#[command(name = "openshell-driver-vm serve")]
+struct ServeArgs {
+    /// Unix socket the gateway connects to.
+    #[arg(long)]
+    bind_socket: PathBuf,
+
+    /// The launching gateway's PID; only it may connect.
+    #[arg(long)]
+    expected_peer_pid: u32,
+
+    #[arg(long, default_value = "info")]
+    log_level: String,
+}
+
+/// Serve `DriverLaunch` at once and build the VM driver when the gateway calls
+/// `Configure`.
+async fn run_serve(arguments: &[std::ffi::OsString]) -> Result<()> {
+    let args = ServeArgs::parse_from(
+        std::iter::once(std::ffi::OsString::from("openshell-driver-vm serve"))
+            .chain(arguments.iter().cloned()),
+    );
+    let ansi = openshell_core::color::stdout_ansi();
+    let driver_tracing = Arc::new(openshell_otel::install_deferred_driver_tracing(
+        openshell_driver_vm::otel_tracing::TRACING,
+        &args.log_level,
+        ansi,
+    ));
+    // If the gateway is killed, this driver and its VM launchers must die too.
+    if let Err(err) = procguard::die_with_parent() {
+        tracing::warn!(
+            error = %err,
+            "procguard arm failed; gateway crashes may orphan this driver"
+        );
+    }
+
+    let configured = Arc::new(OnceLock::<VmDriver>::new());
+    let slot = configured.clone();
+    let log_level = args.log_level.clone();
+    let (launch, compute) = openshell_driver_launch::services("vm", VERSION, move |request| {
+        openshell_driver_sdk::launch::enable_export(
+            &driver_tracing,
+            &request,
+            &log_level,
+            ansi,
+            VERSION,
+        );
+        let config =
+            configured_args(&request, log_level.clone()).and_then(|args| vm_driver_config(&args));
+        let slot = slot.clone();
+        async move {
+            let config = config.map_err(tonic::Status::invalid_argument)?;
+            let driver = VmDriver::new(config)
+                .await
+                .map_err(tonic::Status::unavailable)?;
+            let _ = slot.set(driver.clone());
+            info!("vm compute driver configured");
+            Ok(ComputeDriverServer::new(driver))
+        }
+    });
+
+    let socket_path = args.bind_socket;
+    prepare_compute_driver_socket(&socket_path).map_err(|err| miette::miette!("{err}"))?;
+    info!(socket = %socket_path.display(), "Starting vm compute driver; waiting for Configure");
+    let listener = UnixListener::bind(&socket_path).into_diagnostic()?;
+    restrict_socket_permissions(&socket_path).map_err(|err| miette::miette!("{err}"))?;
+    let result = tonic::transport::Server::builder()
+        .layer(openshell_otel::compute_driver_rpc_layer())
+        .add_service(launch)
+        .add_service(compute)
+        .serve_with_incoming_shutdown(
+            AuthenticatedUnixIncoming::new(listener, Some(args.expected_peer_pid)),
+            shutdown_signal(),
+        )
+        .await
+        .into_diagnostic();
+    let _ = std::fs::remove_file(&socket_path);
+    if let Some(driver) = configured.get() {
+        driver.remove_socket_root();
+    }
+    result
+}
+
+/// The driver's settings for a `Configure` request: the environment and
+/// defaults, overlaid with the gateway's settings.
+fn configured_args(
+    request: &openshell_driver_launch::proto::ConfigureRequest,
+    log_level: String,
+) -> std::result::Result<Args, String> {
+    let mut args =
+        Args::try_parse_from(["openshell-driver-vm"]).map_err(|error| error.to_string())?;
+    args.log_level = log_level;
+    apply_configure(&mut args, request)?;
+    Ok(args)
+}
+
+/// Overlay a `Configure` request onto the default flags. The request is
+/// authoritative for everything it carries; a driver setting the operator
+/// table leaves out keeps its default.
+fn apply_configure(
+    args: &mut Args,
+    request: &openshell_driver_launch::proto::ConfigureRequest,
+) -> std::result::Result<(), String> {
+    let gateway = request.gateway.clone().unwrap_or_default();
+    args.gateway_name = (!gateway.gateway_name.is_empty()).then(|| gateway.gateway_name.clone());
+    args.guest_tls_ca =
+        (!gateway.tls_ca_path.is_empty()).then(|| PathBuf::from(&gateway.tls_ca_path));
+    openshell_driver_sdk::launch::apply_telemetry(request.telemetry.as_ref(), &mut args.otlp)?;
+    if let Some(trust) = &request.network_trust {
+        args.additional_ca_bundle = Some(PathBuf::from(&trust.artifact_path));
+        args.additional_ca_digest = Some(trust.digest.clone());
+        args.additional_ca_certificate_count = Some(
+            usize::try_from(trust.certificate_count)
+                .map_err(|_| "network trust certificate count is too large".to_string())?,
+        );
+    }
+    let config: VmComputeConfig = toml::from_str(&request.driver_config_toml)
+        .map_err(|error| format!("invalid driver_config: {error}"))?;
+    let gateway_port = u16::try_from(gateway.gateway_port)
+        .map_err(|_| format!("gateway port {} is out of range", gateway.gateway_port))?;
+    let has_tls_ca = args.guest_tls_ca.is_some();
+    apply_vm_config(args, config, gateway_port, has_tls_ca)
+}
+
+/// The driver configuration the flags, environment, and any gateway settings
+/// applied to `args` describe.
+fn vm_driver_config(args: &Args) -> std::result::Result<VmDriverConfig, String> {
+    Ok(VmDriverConfig {
+        allow_driver_config: args.admission_config_json.allow_driver_config,
+        resource_admission: args.admission_config_json.resource_admission.clone(),
+        grpc_endpoint: args
+            .grpc_endpoint
+            .clone()
+            .ok_or_else(|| "OPENSHELL_GRPC_ENDPOINT is required".to_string())?,
+        supervisor_otlp: args.otlp.supervisor_otlp(),
+        supervisor_gateway_name: args.gateway_name.clone(),
+        state_dir: args.state_dir.clone(),
+        launcher_bin: None,
+        default_image: args.default_image.clone(),
+        bootstrap_image: args.bootstrap_image.clone(),
+        log_level: args.log_level.clone(),
+        krun_log_level: args.krun_log_level,
+        vcpus: args.vcpus,
+        mem_mib: args.mem_mib,
+        overlay_disk_mib: args.overlay_disk_mib,
+        guest_tls_ca: args.guest_tls_ca.clone(),
+        guest_tls_cert: args.guest_tls_cert.clone(),
+        guest_tls_key: args.guest_tls_key.clone(),
+        additional_ca_bundle: args.additional_ca_bundle.clone(),
+        additional_ca_digest: args.additional_ca_digest.clone(),
+        additional_ca_certificate_count: args.additional_ca_certificate_count,
+        additional_ca_snapshot: None,
+        upstream_proxy: openshell_core::UpstreamProxyConfig {
+            https_proxy: args.upstream_proxy.clone(),
+            no_proxy: args.upstream_no_proxy.clone(),
+            proxy_auth_file: args.upstream_proxy_auth_file.clone(),
+            proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure.then_some(true),
+            proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname.then_some(true),
+        },
+        proxy_ca_bundle: args.upstream_proxy_ca_bundle.clone(),
+        provider_spiffe_workload_api_tcp_endpoint: args
+            .provider_spiffe_workload_api_tcp_endpoint
+            .clone(),
+        provider_spiffe_allow_guest_tcp: args.provider_spiffe_allow_guest_tcp,
+        gpu_enabled: args.gpu,
+        gpu_mem_mib: args.gpu_mem_mib,
+        gpu_vcpus: args.gpu_vcpus,
+        sandbox_uid: args.sandbox_uid,
+        sandbox_gid: args.sandbox_gid,
+        rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
+        rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
+        enable_bind_mounts: args.enable_bind_mounts,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.first().is_some_and(|arg| arg == "serve") {
+        return run_serve(&arguments[1..]).await;
+    }
+    if arguments.first().is_some_and(|arg| arg == "preflight") {
+        run_preflight(&arguments[1..]);
+    }
     let args = Args::parse();
     if let Some(request) = args.internal_prepare_image {
         openshell_driver_vm::driver::run_image_preparation_worker(&request)
@@ -323,54 +533,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    let supervisor_otlp = args.otlp.supervisor_otlp();
-    let driver = VmDriver::new(VmDriverConfig {
-        allow_driver_config: args.admission_config_json.allow_driver_config,
-        resource_admission: args.admission_config_json.resource_admission.clone(),
-        grpc_endpoint: args
-            .grpc_endpoint
-            .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
-        supervisor_otlp,
-        supervisor_gateway_name: args.gateway_name.clone(),
-        state_dir: args.state_dir.clone(),
-        launcher_bin: None,
-        default_image: args.default_image.clone(),
-        bootstrap_image: args.bootstrap_image.clone(),
-        log_level: args.log_level.clone(),
-        krun_log_level: args.krun_log_level,
-        vcpus: args.vcpus,
-        mem_mib: args.mem_mib,
-        overlay_disk_mib: args.overlay_disk_mib,
-        guest_tls_ca: args.guest_tls_ca.clone(),
-        guest_tls_cert: args.guest_tls_cert.clone(),
-        guest_tls_key: args.guest_tls_key.clone(),
-        additional_ca_bundle: args.additional_ca_bundle.clone(),
-        additional_ca_digest: args.additional_ca_digest.clone(),
-        additional_ca_certificate_count: args.additional_ca_certificate_count,
-        additional_ca_snapshot: None,
-        upstream_proxy: openshell_core::UpstreamProxyConfig {
-            https_proxy: args.upstream_proxy.clone(),
-            no_proxy: args.upstream_no_proxy.clone(),
-            proxy_auth_file: args.upstream_proxy_auth_file.clone(),
-            proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure.then_some(true),
-            proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname.then_some(true),
-        },
-        proxy_ca_bundle: args.upstream_proxy_ca_bundle.clone(),
-        provider_spiffe_workload_api_tcp_endpoint: args
-            .provider_spiffe_workload_api_tcp_endpoint
-            .clone(),
-        provider_spiffe_allow_guest_tcp: args.provider_spiffe_allow_guest_tcp,
-        gpu_enabled: args.gpu,
-        gpu_mem_mib: args.gpu_mem_mib,
-        gpu_vcpus: args.gpu_vcpus,
-        sandbox_uid: args.sandbox_uid,
-        sandbox_gid: args.sandbox_gid,
-        rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
-        rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
-        enable_bind_mounts: args.enable_bind_mounts,
-    })
-    .await
-    .map_err(|err| miette::miette!("{err}"))?;
+    let driver = VmDriver::new(vm_driver_config(&args).map_err(|err| miette::miette!("{err}"))?)
+        .await
+        .map_err(|err| miette::miette!("{err}"))?;
 
     let socket_cleanup = driver.clone();
     let result = match listen_mode {
@@ -407,6 +572,65 @@ async fn main() -> Result<()> {
     };
     socket_cleanup.remove_socket_root();
     result
+}
+
+/// Apply the driver's own table on top of the gateway context already set on
+/// `args`, defaulting the sandbox endpoint to the gateway's own listener.
+fn apply_vm_config(
+    args: &mut Args,
+    mut config: VmComputeConfig,
+    gateway_port: u16,
+    has_tls_ca: bool,
+) -> std::result::Result<(), String> {
+    if config.state_dir.as_os_str().is_empty() {
+        config.state_dir = VmComputeConfig::default_state_dir();
+    }
+    // The gateway's own listener is the default endpoint for sandboxes. It has
+    // a gateway CA exactly when it serves TLS.
+    if config.grpc_endpoint.trim().is_empty() {
+        let scheme = if has_tls_ca { "https" } else { "http" };
+        config.grpc_endpoint = format!("{scheme}://127.0.0.1:{gateway_port}");
+    }
+    config
+        .validate_configuration()
+        .map_err(|error| error.to_string())?;
+    // The CA authenticates the gateway for an https endpoint only.
+    if !config.grpc_endpoint.starts_with("https://") {
+        args.guest_tls_ca = None;
+    }
+
+    args.admission_config_json = openshell_core::resource_admission::DriverAdmissionConfig {
+        allow_driver_config: config.allow_driver_config,
+        resource_admission: config.resource_admission.clone(),
+    };
+    args.grpc_endpoint = Some(config.grpc_endpoint);
+    let proxy = config.upstream_proxy;
+    args.upstream_proxy = proxy.https_proxy;
+    args.upstream_no_proxy = proxy.no_proxy;
+    args.upstream_proxy_auth_file = proxy.proxy_auth_file;
+    args.upstream_proxy_auth_allow_insecure = proxy.proxy_auth_allow_insecure == Some(true);
+    args.upstream_proxy_connect_by_hostname = proxy.proxy_connect_by_hostname == Some(true);
+    args.upstream_proxy_ca_bundle = config.proxy_ca_bundle;
+    args.state_dir = config.state_dir;
+    if !config.default_image.trim().is_empty() {
+        args.default_image = config.default_image;
+    }
+    if !config.bootstrap_image.trim().is_empty() {
+        args.bootstrap_image = config.bootstrap_image;
+    }
+    args.krun_log_level = config.krun_log_level;
+    args.vcpus = config.vcpus;
+    args.mem_mib = config.mem_mib;
+    args.overlay_disk_mib = config.overlay_disk_mib;
+    args.sandbox_uid = config.sandbox_uid;
+    args.sandbox_gid = config.sandbox_gid;
+    args.rootfs_tar_staging_dir = config.rootfs_tar_staging_dir;
+    args.rootfs_tar_max_bytes = config.rootfs_tar_max_bytes;
+    args.enable_bind_mounts = config.enable_bind_mounts;
+    args.provider_spiffe_workload_api_tcp_endpoint =
+        config.provider_spiffe_workload_api_tcp_endpoint;
+    args.provider_spiffe_allow_guest_tcp = config.provider_spiffe_allow_guest_tcp;
+    Ok(())
 }
 
 async fn shutdown_signal() {
@@ -785,10 +1009,126 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 mod tests {
     use super::{
         Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
-        compute_driver_listen_mode, parse_vm_mount_arg,
+        compute_driver_listen_mode, configured_args, parse_vm_mount_arg, vm_driver_config,
     };
     use clap::Parser;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    const VM_DRIVER_CONFIG_FIXTURE: &str = include_str!("../tests/fixtures/driver-config-vm.toml");
+
+    /// `Configure` supplies the settings the gateway used to pass as flags.
+    #[test]
+    fn configure_supplies_the_settings_the_gateway_used_to_pass_as_flags() {
+        use openshell_driver_launch::proto::{
+            CollectorTls, ConfigureRequest, GatewayContext, NetworkTrust, OtlpExport, Telemetry,
+        };
+
+        let export = |endpoint: &str, protocol: &str| {
+            Some(OtlpExport {
+                endpoint: endpoint.to_string(),
+                protocol: protocol.to_string(),
+            })
+        };
+        let request = ConfigureRequest {
+            protocol_version: openshell_driver_launch::PROTOCOL_VERSION,
+            gateway: Some(GatewayContext {
+                gateway_port: 8080,
+                tls_ca_path: "/etc/openshell/tls/ca.pem".to_string(),
+                gateway_name: "gateway-a".to_string(),
+            }),
+            network_trust: Some(NetworkTrust {
+                artifact_path: "/var/lib/openshell/trust/bundle.pem".to_string(),
+                digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                certificate_count: 3,
+            }),
+            driver_config_toml: VM_DRIVER_CONFIG_FIXTURE.to_string(),
+            telemetry: Some(Telemetry {
+                traces: export("https://collector.example:4317", "grpc"),
+                ocsf: export("https://collector.example:4318", "http/protobuf"),
+                agent: export("https://collector.example:4319", "grpc"),
+                collector: Some(CollectorTls {
+                    ca_file: "/etc/openshell/otlp/ca.pem".to_string(),
+                    cert_file: "/etc/openshell/otlp/cert.pem".to_string(),
+                    key_file: "/etc/openshell/otlp/key.pem".to_string(),
+                }),
+                trace_headers: String::new(),
+            }),
+            ..ConfigureRequest::default()
+        };
+        let args = configured_args(&request, "debug".to_string()).unwrap();
+        assert!(args.bind_socket.is_none());
+        assert!(args.expected_peer_pid.is_none());
+        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.gateway_name.as_deref(), Some("gateway-a"));
+        assert_eq!(
+            args.grpc_endpoint.as_deref(),
+            Some("https://127.0.0.1:8080")
+        );
+        assert_eq!(
+            args.guest_tls_ca.as_deref(),
+            Some(Path::new("/etc/openshell/tls/ca.pem"))
+        );
+        assert!(args.admission_config_json.allow_driver_config);
+        assert_eq!(
+            args.otlp.endpoint.as_deref(),
+            Some("https://collector.example:4317")
+        );
+        assert_eq!(
+            args.otlp.ocsf_protocol,
+            openshell_core::sandbox_env::OtlpProtocol::HttpProtobuf
+        );
+        assert_eq!(
+            args.otlp.agent_endpoint.as_deref(),
+            Some("https://collector.example:4319")
+        );
+        assert_eq!(
+            args.otlp.key_file.as_deref(),
+            Some(Path::new("/etc/openshell/otlp/key.pem"))
+        );
+        assert_eq!(
+            args.upstream_proxy.as_deref(),
+            Some("http://proxy.example:3128")
+        );
+        assert!(args.upstream_proxy_auth_allow_insecure);
+        assert!(args.upstream_proxy_connect_by_hostname);
+        assert_eq!(
+            args.upstream_proxy_ca_bundle.as_deref(),
+            Some(Path::new("/etc/openshell/proxy-ca.pem"))
+        );
+        assert_eq!(args.additional_ca_certificate_count, Some(3));
+        assert_eq!(args.state_dir, Path::new("/var/lib/openshell/vm"));
+        assert_eq!(args.vcpus, 4);
+        assert_eq!(args.mem_mib, 4096);
+        assert_eq!(args.overlay_disk_mib, 8192);
+        assert_eq!(args.sandbox_uid, Some(2000));
+        assert_eq!(args.rootfs_tar_max_bytes, Some(1_073_741_824));
+        assert!(args.enable_bind_mounts);
+        assert!(args.provider_spiffe_allow_guest_tcp);
+        vm_driver_config(&args).unwrap();
+    }
+
+    #[test]
+    fn configure_defaults_the_endpoint_to_the_gateway_listener() {
+        let request = openshell_driver_launch::proto::ConfigureRequest {
+            protocol_version: openshell_driver_launch::PROTOCOL_VERSION,
+            gateway: Some(openshell_driver_launch::proto::GatewayContext {
+                gateway_port: 9090,
+                tls_ca_path: String::new(),
+                gateway_name: "g".to_string(),
+            }),
+            ..Default::default()
+        };
+        let args = configured_args(&request, "info".to_string()).unwrap();
+        assert_eq!(args.grpc_endpoint.as_deref(), Some("http://127.0.0.1:9090"));
+
+        let unknown = openshell_driver_launch::proto::ConfigureRequest {
+            driver_config_toml: "surprise = 1".to_string(),
+            ..request
+        };
+        let error = configured_args(&unknown, "info".to_string()).unwrap_err();
+        assert!(error.contains("surprise"), "{error}");
+    }
 
     #[test]
     fn corporate_proxy_flags_parse_into_driver_settings() {

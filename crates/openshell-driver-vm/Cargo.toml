@@ -54,7 +54,9 @@ openshell-crypto = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-openshell-driver-sdk = { path = "../openshell-driver-sdk" }
+toml = { workspace = true }
+openshell-driver-sdk = { path = "../openshell-driver-sdk", features = ["clap"] }
+openshell-driver-launch = { path = "../openshell-driver-launch" }
 oci-client = { version = "0.16", optional = true }
 libc = "0.2"
 rustix = { workspace = true, features = ["fs"] }
@@ -117,6 +119,8 @@ telemetry = ["openshell-core/telemetry"]
 defaults-without-telemetry = ["compute-driver"]
 
 [dev-dependencies]
+hyper-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 temp-env = "0.3"
 tempfile = "3"

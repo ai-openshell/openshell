@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The operator's [openshell.drivers.vm] table as `Configure` carries it, with
+# every VM setting populated.
+
+allow_driver_config = true
+grpc_endpoint = "https://127.0.0.1:8080"
+https_proxy = "http://proxy.example:3128"
+no_proxy = "localhost,127.0.0.1"
+proxy_auth_file = "/etc/openshell/proxy-auth"
+proxy_auth_allow_insecure = true
+proxy_connect_by_hostname = true
+proxy_ca_bundle = "/etc/openshell/proxy-ca.pem"
+state_dir = "/var/lib/openshell/vm"
+default_image = "openshell/sandbox:default"
+bootstrap_image = "openshell/sandbox-bootstrap:latest"
+krun_log_level = 2
+vcpus = 4
+mem_mib = 4096
+overlay_disk_mib = 8192
+sandbox_uid = 2000
+sandbox_gid = 3000
+rootfs_tar_staging_dir = "/var/lib/openshell/rootfs-staging"
+rootfs_tar_max_bytes = 1073741824
+enable_bind_mounts = true
+provider_spiffe_workload_api_tcp_endpoint = "tcp:10.0.0.5:8081"
+provider_spiffe_allow_guest_tcp = true
+
+[resource_admission]
+enabled = true
+
+[resource_admission.required_labels]
+"openshell.ai/sandbox-attachable" = "true"
