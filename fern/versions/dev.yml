@@ -132,5 +132,7 @@ navigation:
   contents:
   - page: 0.1.0
     path: ../pages-dev/upgrade/0-1-0.mdx
+  - page: Registry Move
+    path: ../pages-dev/upgrade/registry-move.mdx
 - folder: ../pages-dev/resources
   title: Resources
