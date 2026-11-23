@@ -216,11 +216,14 @@ jobs:
       - name: Publish stable image archives
         if: ${{ !inputs.is-prerelease }}
         env:
+          # GitHub-hosted runners also ship podman, which the engine helper
+          # prefers; verify-image-sbom.sh needs Docker's buildx imagetools.
+          CONTAINER_ENGINE: docker
           VERSION: ${{ inputs.semver }}
         run: |
           set -euo pipefail
           for component in gateway sandbox supervisor; do
-            image="ghcr.io/nvidia/openshell/${component}:${VERSION}"
+            image="ghcr.io/ai-openshell/openshell/${component}:${VERSION}"
             # Never replace a published stable image; a rerun keeps the original.
             # Only a missing manifest means unpublished; any other lookup error
             # fails rather than risk overwriting.
@@ -264,7 +267,7 @@ jobs:
           VERSION: ${{ inputs.semver }}
         run: |
           set -euo pipefail
-          REGISTRY="ghcr.io/nvidia/openshell"
+          REGISTRY="ghcr.io/ai-openshell/openshell"
           for component in gateway sandbox supervisor; do
             if [[ "${IS_PRERELEASE}" == "true" ]]; then
               echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
@@ -309,6 +312,8 @@ jobs:
           chart-version: ${{ inputs.semver }}
           app-version: ${{ inputs.semver }}
           release-kind: public
+          registry-namespace: ghcr.io/ai-openshell/openshell
+          image-registry: ghcr.io/ai-openshell
 
   release:
     name: Publish Release Assets

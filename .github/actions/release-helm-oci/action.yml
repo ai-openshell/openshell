@@ -23,7 +23,7 @@ inputs:
   registry-namespace:
     description: "GHCR namespace without the oci:// prefix."
     required: false
-    default: ghcr.io/nvidia/openshell
+    default: ghcr.io/ai-openshell/openshell
   image-registry:
     description: "Override global.image.registry in the packaged gateway chart."
     required: false
