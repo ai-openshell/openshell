@@ -38,3 +38,13 @@ populated in it. Machine-checked breaking-change detection is not in place yet.
 - `gateway_port` lets a driver derive the endpoint sandboxes use to reach the
   gateway.
 - Proxy credentials are referenced by file path, not included.
+
+## Subcommands
+
+`probe` and `preflight` print one bounded JSON object on stdout; the result
+types are in `probe` and `preflight`. `probe` reports whether the driver is
+usable on this host, takes no startup document, and the gateway gives it five
+seconds and 4 KiB. `preflight --config <path>` validates a startup document
+without starting the driver and gets ten seconds and 16 KiB. The gateway treats
+a failure, a timeout, or oversized output as "not available" or a failed
+preflight.
