@@ -1,19 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(feature = "e2e-docker")]
-
-//! HTTP hooks end to end.
-//!
-//! Runs the `supervisor-middleware-content-guard` example from this checkout
-//! as an operator-registered middleware service for the current gateway and
-//! Docker sandbox supervisor. `mise run e2e:middleware-http-hooks` builds the
-//! example and exports `OPENSHELL_E2E_CONTENT_GUARD_BIN`; without it the test
-//! skips, unless `OPENSHELL_E2E_REQUIRE_MIDDLEWARE=1` makes the binary
-//! mandatory.
-//!
-//! The test registers the service in the managed gateway config, restarts
-//! the gateway (which describes it), and checks with sandboxes that:
+//! HTTP hooks against an environment with the content-guard service registered:
 //! - `WHOLE_BODY` redacts and denies request and response bodies;
 //! - a response stage inspects the body of a server that compresses, because
 //!   OpenShell asks for an identity-coded response when the workload asks for
@@ -25,28 +13,17 @@
 //!   the guard selects a `tls: skip` endpoint, is rejected at `policy set`.
 
 use std::io::Write as _;
-use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::{run_cli, wait_for_healthy};
-use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::port::{find_free_port, wait_for_port};
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use host_server_support::TEST_HOST as SANDBOX_HOST;
 use serde_json::Value;
-use serial_test::serial;
-use tempfile::NamedTempFile;
+use testkit::{Context, ResultExt as _, YamlFile};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-const BIN_ENV: &str = "OPENSHELL_E2E_CONTENT_GUARD_BIN";
-const REQUIRE_ENV: &str = "OPENSHELL_E2E_REQUIRE_MIDDLEWARE";
-/// Operator registration name used by the policies.
-const REGISTRATION: &str = "content-guard-example";
-const SANDBOX_HOST: &str = "host.openshell.internal";
 const SENSITIVE_BODY: &str = "contains prototype-secret and internal-only";
 const CLEAN_BODY: &str = "ordinary public text";
 const PRIVATE_ALLOWED_IPS: &str = r#"        allowed_ips:
@@ -55,132 +32,8 @@ const PRIVATE_ALLOWED_IPS: &str = r#"        allowed_ips:
           - "192.168.0.0/16"
           - "fc00::/7""#;
 
-/// The content guard, run as a host process.
-struct ContentGuard {
-    child: tokio::process::Child,
-    port: u16,
-}
-
-impl ContentGuard {
-    async fn start(binary: &str) -> Self {
-        let port = find_free_port();
-        let child = tokio::process::Command::new(binary)
-            .arg("--bind")
-            .arg(format!("0.0.0.0:{port}"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap_or_else(|error| panic!("start content guard '{binary}': {error}"));
-        wait_for_port("127.0.0.1", port, Duration::from_secs(30))
-            .await
-            .expect("content guard listens");
-        Self { child, port }
-    }
-}
-
-impl Drop for ContentGuard {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-    }
-}
-
-/// Appends the content-guard registration to the managed gateway config,
-/// restarts the gateway, and restores both on drop.
-struct GatewayRegistration {
-    config_path: PathBuf,
-    original: Vec<u8>,
-}
-
-impl GatewayRegistration {
-    fn config_path() -> PathBuf {
-        let args_file = std::env::var("OPENSHELL_E2E_GATEWAY_ARGS_FILE")
-            .expect("OPENSHELL_E2E_GATEWAY_ARGS_FILE is set for a managed gateway");
-        let raw = std::fs::read(&args_file).expect("read gateway args");
-        let args: Vec<String> = raw
-            .split(|byte| *byte == 0)
-            .filter(|arg| !arg.is_empty())
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect();
-        args.iter()
-            .position(|arg| arg == "--config")
-            .and_then(|index| args.get(index + 1))
-            .map(PathBuf::from)
-            .expect("gateway args include --config")
-    }
-
-    /// Host that both the gateway process and the host-networked Docker
-    /// supervisor use to reach this machine: the host of the driver's
-    /// gateway endpoint. Without one, the driver discovers the gateway on
-    /// loopback, which the host-networked supervisor shares.
-    fn shared_host(config: &str) -> String {
-        let driver = config
-            .find("[openshell.drivers.docker]")
-            .expect("gateway config has a Docker driver table");
-        let Some(endpoint) = config[driver..]
-            .lines()
-            .skip(1)
-            .take_while(|line| !line.trim_start().starts_with('['))
-            .find_map(|line| line.trim().strip_prefix("grpc_endpoint = "))
-        else {
-            return "127.0.0.1".to_string();
-        };
-        let endpoint = endpoint.trim_matches('"');
-        let authority = endpoint
-            .split_once("://")
-            .map_or(endpoint, |(_, rest)| rest);
-        let host = authority
-            .rsplit_once(':')
-            .map_or(authority, |(host, _)| host);
-        host.trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_string()
-    }
-
-    async fn apply(guard_port: u16) -> Self {
-        let config_path = Self::config_path();
-        let original = std::fs::read(&config_path).expect("read gateway config");
-        let config = String::from_utf8(original.clone()).expect("UTF-8 gateway config");
-        let host = Self::shared_host(&config);
-        let registration = format!(
-            "\n[[openshell.supervisor.middleware]]\nname = \"{REGISTRATION}\"\ngrpc_endpoint = \"http://{host}:{guard_port}\"\nallow_insecure_transport = true\nmax_payload_bytes = 262144\ntimeout = \"2s\"\n"
-        );
-        std::fs::write(&config_path, format!("{config}{registration}"))
-            .expect("write gateway config");
-        let guard = Self {
-            config_path,
-            original,
-        };
-        restart_gateway().await;
-        guard
-    }
-
-    async fn restore(self) {
-        std::fs::write(&self.config_path, &self.original).expect("restore gateway config");
-        restart_gateway().await;
-        std::mem::forget(self);
-    }
-}
-
-impl Drop for GatewayRegistration {
-    fn drop(&mut self) {
-        let _ = std::fs::write(&self.config_path, &self.original);
-        if let Ok(Some(gateway)) = ManagedGateway::from_env() {
-            let _ = gateway.stop();
-            let _ = gateway.start();
-        }
-    }
-}
-
-async fn restart_gateway() {
-    let gateway = ManagedGateway::from_env()
-        .expect("managed gateway metadata")
-        .expect("managed gateway");
-    gateway.stop().expect("stop gateway");
-    gateway.start().expect("start gateway");
-    wait_for_healthy(Duration::from_secs(120))
-        .await
-        .expect("gateway healthy with the middleware registered");
+fn main() -> std::process::ExitCode {
+    testkit::main()
 }
 
 /// One request the upstream served.
@@ -422,7 +275,7 @@ struct PolicyCase<'a> {
     mixed: bool,
 }
 
-fn write_policy(upstream_port: u16, case: &PolicyCase<'_>) -> NamedTempFile {
+fn policy_yaml(registration: &str, upstream_port: u16, case: &PolicyCase<'_>) -> String {
     let replacement = if case.mode == "redact" {
         "      replacement: \"[FILTERED]\"\n"
     } else {
@@ -443,7 +296,7 @@ fn write_policy(upstream_port: u16, case: &PolicyCase<'_>) -> NamedTempFile {
     } else {
         ""
     };
-    let policy = format!(
+    format!(
         r#"version: 1
 
 filesystem_policy:
@@ -471,7 +324,7 @@ process:
 network_middlewares:
   content-guard:
     name: Content guard
-    middleware: {REGISTRATION}
+    middleware: {registration}
     order: 10
     config:
       mode: {mode}
@@ -516,11 +369,7 @@ network_policies:
 "#,
         mode = case.mode,
         body_mode = case.body_mode,
-    );
-    let mut file = NamedTempFile::new().expect("create policy file");
-    file.write_all(policy.as_bytes()).expect("write policy");
-    file.flush().expect("flush policy");
-    file
+    )
 }
 
 /// Upload size larger than any `WHOLE_BODY` limit (256 KiB), so only DUPLEX can
@@ -599,22 +448,25 @@ print(json.dumps(results, sort_keys=True))
     )
 }
 
-async fn run_workload(upstream: &Upstream, case: &PolicyCase<'_>) -> Value {
-    let policy = write_policy(upstream.port, case);
-    let policy_path = policy.path().to_str().expect("UTF-8 policy path");
+async fn run_workload(
+    cx: &mut Context,
+    registration: &str,
+    upstream: &Upstream,
+    case: &PolicyCase<'_>,
+) -> testkit::Result<Value> {
     let script = workload_script(upstream.port, case);
-    let mut sandbox =
-        SandboxGuard::create(&["--policy", policy_path, "--", "python3", "-c", &script])
-            .await
-            .unwrap_or_else(|error| panic!("{} {} sandbox: {error}", case.mode, case.body_mode));
-    let result = sandbox
-        .create_output
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-        .next_back()
-        .unwrap_or_else(|| panic!("missing workload result:\n{}", sandbox.create_output));
-    sandbox.cleanup().await;
-    result
+    let sandbox = cx
+        .cli_sandbox(match (case.body_mode, case.mode) {
+            ("duplex", _) => "duplx",
+            (_, "redact") => "redct",
+            _ => "deny",
+        })
+        .image(testkit::python_image())
+        .policy_yaml(policy_yaml(registration, upstream.port, case))
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
+    sandbox.run_python(&script, &[]).await?.last_json()
 }
 
 fn assert_response(result: &Value, name: &str, status: u64, body: &str) {
@@ -630,44 +482,19 @@ fn assert_platform_error(result: &Value, name: &str, status: u64, error: &str) -
     body
 }
 
-fn should_run() -> Option<String> {
-    let required = std::env::var(REQUIRE_ENV).as_deref() == Ok("1");
-    let skip = |reason: &str| {
-        assert!(!required, "{REQUIRE_ENV}=1 but {reason}");
-        eprintln!("Skipping HTTP hook middleware e2e: {reason}");
-        None
-    };
-    if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("docker") {
-        return skip("the e2e driver is not docker");
-    }
-    if std::env::var("OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER").as_deref() == Ok("1") {
-        return skip("the external Docker driver does not read gateway config");
-    }
-    match ManagedGateway::from_env() {
-        Ok(Some(_)) => {}
-        Ok(None) => return skip("the gateway is not managed by this run"),
-        Err(error) => panic!("load managed gateway metadata: {error}"),
-    }
-    match std::env::var(BIN_ENV) {
-        Ok(binary) if !binary.is_empty() => Some(binary),
-        _ => skip(&format!(
-            "{BIN_ENV} is not set; run `mise run e2e:middleware-http-hooks`"
-        )),
-    }
-}
-
-#[tokio::test]
-#[serial(supervisor_middleware)]
-async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
-    let Some(binary) = should_run() else {
-        return;
-    };
-    let guard = ContentGuard::start(&binary).await;
+/// The registered guard inspects and transforms HTTP traffic in both body
+/// modes, and the gateway rejects policies the guard cannot enforce.
+#[testkit::test]
+async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor(
+    cx: &mut Context,
+) -> testkit::Result {
+    let registration = middleware_support::content_guard_registration()?;
     let upstream = Upstream::start().await;
-    let registration = GatewayRegistration::apply(guard.port).await;
 
     // WHOLE_BODY redaction in both directions and a preflight rejection.
     let redact = run_workload(
+        cx,
+        &registration,
         &upstream,
         &PolicyCase {
             mode: "redact",
@@ -676,7 +503,7 @@ async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
             mixed: false,
         },
     )
-    .await;
+    .await?;
     assert_response(&redact, "echo_term", 200, r#"{"note":"[FILTERED]"}"#);
     assert_response(
         &redact,
@@ -721,6 +548,8 @@ async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
     // WHOLE_BODY denial in both directions.
     let echo_bodies_before = upstream.bodies("/echo").len();
     let deny = run_workload(
+        cx,
+        &registration,
         &upstream,
         &PolicyCase {
             mode: "deny",
@@ -729,7 +558,7 @@ async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
             mixed: false,
         },
     )
-    .await;
+    .await?;
     for name in ["echo_term", "sensitive", "compressible"] {
         let body = assert_platform_error(&deny, name, 403, "middleware_denied");
         assert_eq!(body["reason_code"], "content_match", "{name}: {body}");
@@ -744,6 +573,8 @@ async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
 
     // DUPLEX: a large upload and server-sent events one by one.
     let stream = run_workload(
+        cx,
+        &registration,
         &upstream,
         &PolicyCase {
             mode: "redact",
@@ -752,7 +583,7 @@ async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
             mixed: false,
         },
     )
-    .await;
+    .await?;
     assert_response(&stream, "echo_term", 200, r#"{"note":"[FILTERED]"}"#);
     assert_eq!(stream["large_upload"]["status"], 200, "{stream}");
     assert_eq!(stream["large_upload"]["redacted"], true, "{stream}");
@@ -778,7 +609,8 @@ async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
     );
 
     // A policy that runs both HTTP hook versions for one destination is rejected.
-    let base = write_policy(
+    let base = policy_yaml(
+        &registration,
         upstream.port,
         &PolicyCase {
             mode: "redact",
@@ -787,7 +619,8 @@ async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
             mixed: false,
         },
     );
-    let mixed = write_policy(
+    let mixed = policy_yaml(
+        &registration,
         upstream.port,
         &PolicyCase {
             mode: "redact",
@@ -796,74 +629,56 @@ async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
             mixed: true,
         },
     );
-    let mut sandbox = SandboxGuard::create_keep_with_args(
-        &[
-            "--policy",
-            base.path().to_str().expect("UTF-8 policy path"),
-            "--no-tty",
-        ],
-        &["sh", "-c", "echo Ready && sleep infinity"],
-        "Ready",
+    let sandbox = cx
+        .cli_sandbox("guard")
+        .image(testkit::python_image())
+        .policy_yaml(base)
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
+    assert_policy_rejected(
+        cx,
+        sandbox.name(),
+        &mixed,
+        "separate their endpoint selectors",
     )
-    .await
-    .expect("create sandbox with the content guard");
-    let (output, exit_code) = run_cli(&[
-        "policy",
-        "set",
-        &sandbox.name,
-        "--policy",
-        mixed.path().to_str().expect("UTF-8 policy path"),
-    ])
-    .await;
-    assert_ne!(
-        exit_code, 0,
-        "a mixed-version policy is rejected:\n{output}"
-    );
-    // The CLI wraps long errors across lines.
-    let message = output
-        .replace('│', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(
-        message.contains("separate their endpoint selectors"),
-        "the rejection says how to fix the policy:\n{output}"
-    );
+    .await?;
 
     // The guard is fail-closed and cannot inspect a `tls: skip` tunnel, so a
     // policy in which it selects one is rejected.
-    let tls_skip = write_policy(
+    // The rejected policy is never used to connect; it only needs a
+    // different endpoint port from the inspected endpoint.
+    let skip_port = if upstream.port == 443 { 8443 } else { 443 };
+    let tls_skip = policy_yaml(
+        &registration,
         upstream.port,
         &PolicyCase {
             mode: "redact",
             body_mode: "whole_body",
-            tls_skip_port: Some(find_free_port()),
+            tls_skip_port: Some(skip_port),
             mixed: false,
         },
     );
-    let (output, exit_code) = run_cli(&[
-        "policy",
-        "set",
-        &sandbox.name,
-        "--policy",
-        tls_skip.path().to_str().expect("UTF-8 policy path"),
-    ])
-    .await;
-    assert_ne!(
-        exit_code, 0,
-        "a policy in which the guard selects a tls: skip endpoint is rejected:\n{output}"
-    );
-    let message = output
-        .replace('│', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(
-        message.contains("tls: skip endpoint"),
-        "the rejection names the tls: skip endpoint:\n{output}"
-    );
-    sandbox.cleanup().await;
+    assert_policy_rejected(cx, sandbox.name(), &tls_skip, "tls: skip endpoint").await
+}
 
-    registration.restore().await;
-    drop(guard);
+async fn assert_policy_rejected(
+    cx: &Context,
+    sandbox: &str,
+    policy: &str,
+    reason: &str,
+) -> testkit::Result {
+    let file = YamlFile::new(policy)?;
+    let output = cx
+        .cli(["policy", "set", sandbox, "--policy", file.path()?])
+        .await?
+        .failure()
+        .context("policy set should reject the middleware attachment")?;
+    testkit::ensure!(
+        output.report_text().contains(reason),
+        "expected policy rejection containing {reason:?}:\nstdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    Ok(())
 }

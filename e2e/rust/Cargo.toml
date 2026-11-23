@@ -214,11 +214,6 @@ path = "tests/host_gateway_alias.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
-name = "supervisor_middleware_http_hooks"
-path = "tests/supervisor_middleware_http_hooks.rs"
-required-features = ["e2e-docker"]
-
-[[test]]
 name = "workspace_namespace_managed"
 path = "tests/workspace_namespace_managed.rs"
 required-features = ["e2e-kubernetes-workspace-managed"]
@@ -270,7 +265,6 @@ tower = "0.5"
 url = "2"
 
 [dev-dependencies]
-flate2 = "1"
 openshell-ocsf-validate = { path = "../../crates/openshell-ocsf-validate" }
 serial_test = "3"
 

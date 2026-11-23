@@ -101,6 +101,13 @@ let
   # A suite that needs a feature's setup runs in that environment, so the setup
   # lands in a cached layer and other suites don't carry it.
   features = {
+    middleware-http-hooks = {
+      bases = dockerBases;
+      setup = {
+        playbooks = [ "ansible/playbooks/content-guard.yaml" ];
+        inputs.content_guard_binary = "../../artifacts/test-fixtures/${muslTarget}/supervisor-middleware-content-guard";
+      };
+    };
     # Keycloak, for the keycloak-provider-refresh suite.
     keycloak = {
       bases = dockerBases ++ podmanBases;

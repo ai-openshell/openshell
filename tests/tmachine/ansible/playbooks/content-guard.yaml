@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Run the example content-guard middleware
+  hosts: all
+  gather_facts: false
+  vars:
+    content_guard_name: content-guard-example
+    content_guard_port: 50881
+  pre_tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+  tasks:
+    - name: Install the content guard binary
+      become: true
+      ansible.builtin.copy:
+        src: "{{ content_guard_binary }}"
+        dest: /usr/local/bin/supervisor-middleware-content-guard
+        mode: "0755"
+
+    - name: Install the content guard service
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/openshell-test-content-guard.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=OpenShell test content-guard middleware
+          [Service]
+          DynamicUser=yes
+          ExecStart=/usr/local/bin/supervisor-middleware-content-guard --bind 127.0.0.1:{{ content_guard_port }}
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start the content guard
+      become: true
+      ansible.builtin.systemd_service:
+        name: openshell-test-content-guard
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Wait for the content guard to listen
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ content_guard_port }}"
+        timeout: 30
+
+    - name: Publish middleware registration for the gateway installer
+      ansible.builtin.include_role:
+        name: gateway_overrides
+      vars:
+        gateway_overrides_name: content-guard
+        gateway_overrides_content: |
+          [openshell.supervisor]
+          middleware = [
+            { name = "{{ content_guard_name }}", grpc_endpoint = "http://127.0.0.1:{{ content_guard_port }}", allow_insecure_transport = true, max_payload_bytes = 262144, timeout = "2s" },
+          ]
+
+    - name: Publish the content guard registration for the suite
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: content-guard
+        test_env_vars:
+          OPENSHELL_TEST_CONTENT_GUARD_REGISTRATION: "{{ content_guard_name }}"
