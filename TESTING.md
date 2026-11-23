@@ -22,6 +22,65 @@ tests/tmachine/        # QEMU test machines, Ansible playbooks, and the Session 
 tests/runner/          # openshell-test-runner: runs a test family in a tmachine environment
 ```
 
+## E2E suite quickstart
+
+The suites in `tests/suites/` run against a real OpenShell gateway. Tests use
+`#[testkit::test]` to get a gateway client, run CLI commands, and clean up
+sandboxes. Testkit doesn't install the gateway or its dependencies.
+
+- **Conformance** checks public behavior that must work on every driver.
+- **Feature suites** check behavior that needs a service or gateway setting,
+  such as Keycloak. Each feature is a package in the `features` workspace.
+- **Driver suites** check behavior specific to one compute driver. Each driver
+  suite is its own workspace, such as `drivers/kubernetes`.
+
+See [Where a new test goes](#where-a-new-test-goes) before adding coverage.
+
+### Run against a local gateway
+
+With Docker available, `mise run e2e:testkit` starts a gateway and runs
+conformance. To use a gateway you've already set up, select it with
+`OPENSHELL_GATEWAY` (or use the active gateway) and run the suite with Cargo.
+For example, against a Kubernetes gateway:
+
+```shell
+cargo test --locked --manifest-path tests/suites/drivers/kubernetes/Cargo.toml
+```
+
+For a feature with extra dependencies, you must also provide its settings and
+fixtures. The [testkit README](tests/testkit/README.md) explains how tests
+find the gateway and CLI.
+
+### Run in the same environment as CI
+
+**tmachine** boots a VM, sets up the engine and any add-ons, and installs
+OpenShell. **`openshell-test-runner`** runs your selected suite in that VM
+using nextest. A [CI matrix row](.github/workflows/e2e-suites.yml) pairs
+the environment and installer with the family and, for features, the package.
+
+On a host with virtualization support, build the installer inputs once with
+`nix run .#build-artifacts`. Then run a feature or driver suite:
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful-keycloak --installer deb \
+  --family features --package keycloak-provider-refresh
+
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-k3s --installer k3s \
+  --family drivers/kubernetes --gateway tmachine
+```
+
+Use `--installer k3s-ha` for the Kubernetes HA row. For a single test, add
+`--filter 'test(kubernetes_sandbox_runs_a_command)'`. Results and logs go to
+`artifacts/test-results/` by default. See
+[Running suites in a tmachine environment](#running-suites-in-a-tmachine-environment-testsrunner)
+for prerequisites and options.
+
+The **VM driver** doesn't run nested inside tmachine. Run `mise run e2e:vm`
+on a supported VM host; it starts the VM-backed gateway and runs conformance
+and the VM driver suite.
+
 ## Rust Tests
 
 Unit tests live inline with `#[cfg(test)] mod tests` blocks. Integration tests
