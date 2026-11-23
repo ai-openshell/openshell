@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# An operator's [openshell.drivers.podman] table, as the gateway passes it
+# unchanged in Configure. The gateway's request test and the driver's
+# configuration tests both read this file.
+
+allow_driver_config = true
+default_image = "openshell/sandbox:default"
+network_name = "openshell-test"
+stop_timeout_secs = 20
+enable_bind_mounts = true

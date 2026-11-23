@@ -13,6 +13,7 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_core::{AppArmorProfile, ImagePullPolicy, VERSION};
 use openshell_driver_podman::config::{DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS};
+use openshell_driver_podman::startup_config::config_from_configure;
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
 #[derive(Parser)]
@@ -203,8 +204,123 @@ struct Args {
     enable_bind_mounts: bool,
 }
 
+/// `probe` reports on stdout whether Podman is usable on this host. It takes
+/// no other arguments and starts nothing.
+fn run_probe() -> ! {
+    let result = if openshell_driver_podman::driver::is_available() {
+        openshell_driver_sdk::probe::ProbeResult::available()
+    } else {
+        openshell_driver_sdk::probe::ProbeResult::unavailable(
+            "no responsive Podman API socket found; set OPENSHELL_PODMAN_SOCKET or start the Podman service",
+        )
+    };
+    println!("{}", result.to_json());
+    std::process::exit(0);
+}
+
+/// `preflight` reads the `Configure` request the gateway would send from
+/// stdin, validates it, and reports on stdout. It starts nothing.
+fn run_preflight(arguments: &[std::ffi::OsString]) -> ! {
+    use openshell_driver_sdk::preflight::PreflightResult;
+    use std::io::Read as _;
+
+    let result = if arguments.is_empty() {
+        let mut input = Vec::new();
+        std::io::stdin()
+            .take(openshell_driver_launch::MAX_CONFIGURE_REQUEST_BYTES as u64 + 1)
+            .read_to_end(&mut input)
+            .map_err(|error| format!("failed to read the configure request: {error}"))
+            .and_then(|_| openshell_driver_launch::decode_configure_request(&input))
+            .and_then(|request| config_from_configure(&request))
+            .map_or_else(PreflightResult::rejected, |_| PreflightResult::ok())
+    } else {
+        PreflightResult::rejected("usage: preflight < configure-request")
+    };
+    println!("{}", result.to_json());
+    std::process::exit(0);
+}
+
+/// Bootstrap flags of `serve`, the mode a gateway launches the driver in.
+/// Everything else, telemetry included, arrives in the `Configure` RPC.
+#[derive(Parser)]
+#[command(name = "openshell-driver-podman serve")]
+struct ServeArgs {
+    /// Unix socket the gateway connects to.
+    #[arg(long)]
+    bind_socket: PathBuf,
+
+    /// The launching gateway's PID. Podman authorizes same-UID peers for now.
+    #[arg(long)]
+    expected_peer_pid: Option<u32>,
+
+    #[arg(long, default_value = "info")]
+    log_level: String,
+}
+
+/// Serve `DriverLaunch` at once and build the Podman driver when the gateway
+/// calls `Configure`.
+async fn run_serve(arguments: &[std::ffi::OsString]) -> Result<()> {
+    let args = ServeArgs::parse_from(
+        std::iter::once(std::ffi::OsString::from("openshell-driver-podman serve"))
+            .chain(arguments.iter().cloned()),
+    );
+    // A gateway that is killed must not leave this driver running.
+    if let Err(error) = openshell_driver_sdk::parent::die_with_parent() {
+        eprintln!("warning: {error}; a gateway crash may orphan this driver");
+    }
+    let ansi = openshell_core::color::stdout_ansi();
+    let tracing = std::sync::Arc::new(openshell_otel::install_deferred_driver_tracing(
+        openshell_driver_podman::otel_tracing::TRACING,
+        &args.log_level,
+        ansi,
+    ));
+
+    let log_level = args.log_level.clone();
+    let (launch, compute) = openshell_driver_launch::services("podman", VERSION, move |request| {
+        openshell_driver_sdk::launch::enable_export(&tracing, &request, &log_level, ansi, VERSION);
+        async move {
+            let (config, network_trust) =
+                config_from_configure(&request).map_err(tonic::Status::invalid_argument)?;
+            let driver = PodmanComputeDriver::new(config, network_trust)
+                .await
+                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+            info!("Podman compute driver configured");
+            Ok(ComputeDriverServer::new(ComputeDriverService::new(driver)))
+        }
+    });
+
+    let listener = openshell_core::external_driver_socket::bind_private(&args.bind_socket)
+        .map_err(|err| miette::miette!("{err}"))?;
+    let _cleanup =
+        openshell_core::external_driver_socket::SocketCleanup::new(args.bind_socket.clone());
+    info!(socket = %args.bind_socket.display(), "Starting Podman compute driver; waiting for Configure");
+    tonic::transport::Server::builder()
+        .layer(openshell_otel::compute_driver_rpc_layer())
+        .add_service(launch)
+        .add_service(compute)
+        .serve_with_incoming_shutdown(
+            openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
+            shutdown_signal(),
+        )
+        .await
+        .into_diagnostic()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.first().is_some_and(|arg| arg == "serve") {
+        return run_serve(&arguments[1..]).await;
+    }
+    if arguments.first().is_some_and(|arg| arg == "preflight") {
+        run_preflight(&arguments[1..]);
+    }
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "probe") {
+        if std::env::args_os().len() > 2 {
+            return Err(miette::miette!("probe takes no arguments"));
+        }
+        run_probe();
+    }
     let args = Args::parse();
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_podman::otel_tracing::TRACING,
@@ -222,55 +338,59 @@ async fn main() -> Result<()> {
     );
     args.otlp.warn_deprecated();
 
-    let supervisor_otlp = args.otlp.supervisor_otlp();
-    // External drivers have no gateway-local staged artifact. Do not accept
-    // a path or silently emulate destination-CA delivery outside the gateway.
-    let driver = PodmanComputeDriver::new(
-        PodmanComputeConfig {
-            allow_driver_config: args.admission_config_json.allow_driver_config,
-            resource_admission: args.admission_config_json.resource_admission.clone(),
-            socket_path: args.podman_socket,
-            default_image: args.sandbox_image.unwrap_or_default(),
-            image_pull_policy: args.sandbox_image_pull_policy,
-            grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-            supervisor_otlp,
-            supervisor_gateway_name: args.gateway_name.clone(),
-            gateway_port: args.gateway_port,
-            host_gateway_ip: args
-                .host_gateway_ip
-                .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
-            ssh_socket_path: args.sandbox_ssh_socket_path,
-            network_name: args.network_name,
-            stop_timeout_secs: args.stop_timeout,
-            sandbox_runtime_image: args
-                .sandbox_runtime_image
-                .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
-            supervisor_image: args
-                .supervisor_image
-                .unwrap_or_else(openshell_core::config::default_supervisor_image),
-            guest_tls_ca: args.podman_tls_ca,
-            guest_tls_cert: args.podman_tls_cert,
-            guest_tls_key: args.podman_tls_key,
-            provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
-            app_armor_profile: args.app_armor_profile,
-            sandbox_pids_limit: args.sandbox_pids_limit,
-            health_check_interval_secs: args.health_check_interval_secs,
-            https_proxy: args.sandbox_https_proxy,
-            no_proxy: args.sandbox_no_proxy,
-            proxy_auth_file: args.sandbox_proxy_auth_file,
-            proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
-            proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
-            proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
-            additional_ca_bundle: args.sandbox_additional_ca_bundle,
-            userns: args.userns,
-            uidmap: args.uidmap,
-            gidmap: args.gidmap,
-            enable_bind_mounts: args.enable_bind_mounts,
-        },
-        None,
-    )
-    .await
-    .into_diagnostic()?;
+    let (config, network_trust) = {
+        let supervisor_otlp = args.otlp.supervisor_otlp();
+        // A standalone driver has no gateway-local staged artifact. Do not
+        // accept a path or silently emulate destination-CA delivery outside
+        // the gateway.
+        (
+            PodmanComputeConfig {
+                allow_driver_config: args.admission_config_json.allow_driver_config,
+                resource_admission: args.admission_config_json.resource_admission.clone(),
+                socket_path: args.podman_socket,
+                default_image: args.sandbox_image.unwrap_or_default(),
+                image_pull_policy: args.sandbox_image_pull_policy,
+                grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+                supervisor_otlp,
+                supervisor_gateway_name: args.gateway_name.clone(),
+                gateway_port: args.gateway_port,
+                host_gateway_ip: args
+                    .host_gateway_ip
+                    .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
+                ssh_socket_path: args.sandbox_ssh_socket_path,
+                network_name: args.network_name,
+                stop_timeout_secs: args.stop_timeout,
+                sandbox_runtime_image: args
+                    .sandbox_runtime_image
+                    .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
+                supervisor_image: args
+                    .supervisor_image
+                    .unwrap_or_else(openshell_core::config::default_supervisor_image),
+                guest_tls_ca: args.podman_tls_ca,
+                guest_tls_cert: args.podman_tls_cert,
+                guest_tls_key: args.podman_tls_key,
+                provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
+                app_armor_profile: args.app_armor_profile,
+                sandbox_pids_limit: args.sandbox_pids_limit,
+                health_check_interval_secs: args.health_check_interval_secs,
+                https_proxy: args.sandbox_https_proxy,
+                no_proxy: args.sandbox_no_proxy,
+                proxy_auth_file: args.sandbox_proxy_auth_file,
+                proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
+                proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+                proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
+                additional_ca_bundle: args.sandbox_additional_ca_bundle,
+                userns: args.userns,
+                uidmap: args.uidmap,
+                gidmap: args.gidmap,
+                enable_bind_mounts: args.enable_bind_mounts,
+            },
+            None,
+        )
+    };
+    let driver = PodmanComputeDriver::new(config, network_trust)
+        .await
+        .into_diagnostic()?;
 
     let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
     if let Some(socket_path) = args.bind_socket {
