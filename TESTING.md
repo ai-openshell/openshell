@@ -833,7 +833,7 @@ Confirm a tag exists before relying on it (set `TAG` to the tag you plan to use)
 
 ```shell
 TAG=0.0.115
-skopeo inspect "docker://ghcr.io/nvidia/openshell/gateway:${TAG}"
+skopeo inspect "docker://quay.io/ai-openshell/gateway:${TAG}"
 ```
 
 `IMAGE_TAG` sets the default tag for the gateway/supervisor image pair; the CLI
