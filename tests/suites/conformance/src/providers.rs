@@ -7,9 +7,6 @@
 use testkit::policy::{self, Access, Endpoint as _};
 use testkit::{Context, Credential, Profile, ResultExt as _, YamlFile};
 
-/// The example profile that serves `client.toml` from the provider's config.
-const FILES_PROFILE: &str =
-    include_str!("../../../../examples/provider-managed-files/acme-config.yaml");
 const AUTO_CREATE_ENV: &str = "E2E_AUTO_PROVIDER_KEY";
 const AUTO_CREATE_SECRET: &str = "sk-e2e-auto-provider-test-key";
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
@@ -20,8 +17,7 @@ const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 #[testkit::test]
 async fn provider_file_open_update_and_detach(cx: &mut Context) -> testkit::Result {
     let provider = cx.name("pf");
-    let profile = FILES_PROFILE.replace("id: acme-config", &format!("id: {provider}"));
-    cx.install_provider(&provider, &profile, &[])
+    cx.install_provider(&provider, &files_profile(&provider).to_yaml()?, &[])
         .config("endpoint", "https://api.acme.example")
         .config("project", "production")
         .await?;
@@ -171,6 +167,15 @@ async fn expect_project(sandbox: &testkit::Sandbox, path: &str, project: &str) -
         "expected project {project} in the provider file:\n{content}"
     );
     Ok(())
+}
+
+/// A profile that serves `client.toml`, templated from the provider's config.
+fn files_profile(id: &str) -> Profile {
+    Profile::new(id).file(
+        "client.toml",
+        "ACME_CONFIG_FILE",
+        "endpoint = \"{{config.endpoint}}\"\nproject = \"{{config.project}}\"\n",
+    )
 }
 
 /// A profile `id` whose credential the CLI discovers in [`AUTO_CREATE_ENV`].
