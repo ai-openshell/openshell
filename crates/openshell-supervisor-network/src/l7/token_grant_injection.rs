@@ -32,6 +32,9 @@ use crate::l7::relay::L7EvalContext;
 
 /// Borrowed grant configuration for one endpoint-bound provider credential.
 pub struct TokenGrantRequest<'a> {
+    pub client_authentication:
+        Option<&'a openshell_core::proto::ProviderCredentialTokenGrantClientAuthentication>,
+    pub subject_token: Option<&'a openshell_core::proto::ProviderCredentialTokenGrantSubjectToken>,
     pub provider_key: &'a str,
     pub token_endpoint: &'a str,
     pub jwt_svid_audience: &'a str,
@@ -556,6 +559,8 @@ fn token_grant_request<'a>(
     token_grant: &'a ProviderCredentialTokenGrant,
     request_id: &'a str,
 ) -> Result<TokenGrantRequest<'a>, TokenGrantFailure> {
+    openshell_core::token_grant_config::validate_token_grant_identity(token_grant)
+        .map_err(|_| injection_configuration_failure())?;
     let cache_ttl = token_grant
         .cache_ttl
         .as_ref()
@@ -568,6 +573,8 @@ fn token_grant_request<'a>(
             )
         })?;
     Ok(TokenGrantRequest {
+        client_authentication: token_grant.client_authentication.as_ref(),
+        subject_token: token_grant.subject_token.as_ref(),
         provider_key,
         token_endpoint: &token_grant.token_endpoint,
         jwt_svid_audience: &token_grant.jwt_svid_audience,
@@ -1032,6 +1039,7 @@ pub mod test_support {
 
     fn token_grant() -> ProviderCredentialTokenGrant {
         ProviderCredentialTokenGrant {
+            client_authentication: None,
             token_endpoint: "https://auth.example.com/token".to_string(),
             audience: "api://example".to_string(),
             jwt_svid_audience: "https://auth.example.com".to_string(),

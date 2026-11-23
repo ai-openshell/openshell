@@ -31,7 +31,8 @@ never served to another.
 
 A dedicated supervisor uses `SpiffeTokenGrantResolver` with its SPIFFE Workload
 API socket. That resolver owns the instance's token cache and HTTP client and
-uses the gateway only for the intermediate exchange of RFC 8693 grants.
+uses the gateway only for intermediate exchanges with stored subject credentials.
+JWT-SVID subjects are exchanged directly, with the configured client authentication.
 Without a socket, its grants fail closed. Shared sandbox instances use
 `GatewayTokenGrantResolver`, which holds only the instance's authenticated
 gateway channel, connected on the first grant and reused. Each admitted

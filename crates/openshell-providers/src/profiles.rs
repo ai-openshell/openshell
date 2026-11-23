@@ -180,6 +180,8 @@ pub struct TokenGrantProfile {
     )]
     pub grant_type: ProviderCredentialTokenGrantType,
     pub token_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_authentication: Option<TokenGrantClientAuthenticationProfile>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub audience: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -208,7 +210,8 @@ pub struct TokenGrantProfile {
 
 impl PartialEq for TokenGrantProfile {
     fn eq(&self, other: &Self) -> bool {
-        self.grant_type == other.grant_type
+        self.client_authentication == other.client_authentication
+            && self.grant_type == other.grant_type
             && self.token_endpoint == other.token_endpoint
             && self.audience == other.audience
             && self.jwt_svid_audience == other.jwt_svid_audience
@@ -224,8 +227,23 @@ impl PartialEq for TokenGrantProfile {
 impl Eq for TokenGrantProfile {}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TokenGrantClientAuthenticationProfile {
+    pub mechanism: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<TokenGrantClientCredentialProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TokenGrantClientCredentialProfile {
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenGrantSubjectTokenProfile {
     pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credential: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub subject_token_type: String,
@@ -1549,6 +1567,16 @@ fn token_grant_from_proto(
                 .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials),
         ),
         token_endpoint: token_grant.token_endpoint.clone(),
+        client_authentication: token_grant.client_authentication.as_ref().map(|auth| {
+            TokenGrantClientAuthenticationProfile {
+                mechanism: auth.mechanism.clone(),
+                credential: auth.credential.as_ref().map(|credential| {
+                    TokenGrantClientCredentialProfile {
+                        source: credential.source.clone(),
+                    }
+                }),
+            }
+        }),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
@@ -1574,6 +1602,16 @@ fn token_grant_to_proto(
     openshell_core::proto::ProviderCredentialTokenGrant {
         grant_type: token_grant.grant_type as i32,
         token_endpoint: token_grant.token_endpoint.clone(),
+        client_authentication: token_grant.client_authentication.as_ref().map(|auth| {
+            openshell_core::proto::ProviderCredentialTokenGrantClientAuthentication {
+                mechanism: auth.mechanism.clone(),
+                credential: auth.credential.as_ref().map(|credential| {
+                    openshell_core::proto::ProviderCredentialTokenGrantClientCredential {
+                        source: credential.source.clone(),
+                    }
+                }),
+            }
+        }),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
@@ -3332,61 +3370,28 @@ fn validate_token_grant_subject_token(
     let Some(token_grant) = credential.token_grant.as_ref() else {
         return Vec::new();
     };
-    let grant_type = effective_token_grant_type(token_grant.grant_type);
     let mut diagnostics = Vec::new();
-
-    match grant_type {
-        ProviderCredentialTokenGrantType::ClientCredentials => {
-            if token_grant.subject_token.is_some() {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token",
-                    "subject_token is only valid for token_exchange grants",
-                ));
-            }
-        }
-        ProviderCredentialTokenGrantType::TokenExchange => {
-            let Some(subject_token) = token_grant.subject_token.as_ref() else {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token",
-                    "token_exchange grants require subject_token",
-                ));
-                return diagnostics;
-            };
-
-            let source_value = subject_token.source.trim();
-            if source_value != "provider_credential" {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.source",
-                    "subject_token.source must be provider_credential",
-                ));
-            }
-
-            let subject_credential = subject_token.credential.trim();
-            if subject_credential.is_empty() {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.credential",
-                    "subject_token.credential is required",
-                ));
-            } else if !credential_names.contains(subject_credential) {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.credential",
-                    format!("unknown subject token credential: {subject_credential}"),
-                ));
-            }
-        }
-        ProviderCredentialTokenGrantType::Unspecified => {
-            unreachable!("effective_token_grant_type must normalize unspecified token grant type")
-        }
+    if let Err(error) = openshell_core::token_grant_config::validate_token_grant_identity(
+        &token_grant_to_proto(token_grant),
+    ) {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            format!("credentials.token_grant.{}", error.field),
+            error.message,
+        ));
+    }
+    if let Some(subject) = token_grant.subject_token.as_ref()
+        && subject.source == "provider_credential"
+        && !subject.credential.is_empty()
+        && !credential_names.contains(subject.credential.trim())
+    {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            "credentials.token_grant.subject_token.credential",
+            format!("unknown subject token credential: {}", subject.credential),
+        ));
     }
 
     diagnostics
@@ -3785,11 +3790,11 @@ mod tests {
 
     use super::{
         DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
-        ProfileDurationWkt, ProfileError, ProviderTypeProfile, is_mcp_diagnostic_field,
-        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
-        profile_duration_to_proto, profile_to_json, profile_to_yaml, profiles_to_json,
-        profiles_to_yaml, token_grant_from_proto, token_grant_to_proto, validate_profile_duration,
-        validate_profile_set,
+        ProfileDurationWkt, ProfileError, ProviderTypeProfile, TokenGrantClientCredentialProfile,
+        is_mcp_diagnostic_field, normalize_profile_id, parse_profile_catalog_yamls,
+        parse_profile_json, parse_profile_yaml, profile_duration_to_proto, profile_to_json,
+        profile_to_yaml, profiles_to_json, profiles_to_yaml, token_grant_from_proto,
+        token_grant_to_proto, validate_profile_duration, validate_profile_set,
     };
 
     /// The example profiles in `providers/`, parsed once per test binary.
@@ -5532,6 +5537,110 @@ credentials:
             reparsed.credentials[1].token_grant,
             profile.credentials[1].token_grant
         );
+    }
+
+    #[test]
+    fn jwt_subject_authentication_combinations_validate_and_round_trip() {
+        for mechanism in ["none", "client_assertion"] {
+            for source in ["jwt_svid", "provider_credential"] {
+                let client_credential = if mechanism == "client_assertion" {
+                    "\n        credential:\n          source: jwt_svid"
+                } else {
+                    ""
+                };
+                let subject_credential = if source == "provider_credential" {
+                    "\n        credential: stored_token"
+                } else {
+                    ""
+                };
+                let yaml = format!(
+                    r"
+id: federation
+display_name: Federation
+credentials:
+  - name: stored_token
+  - name: access_token
+    auth_style: bearer
+    header_name: authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://sts.googleapis.com/v1/token
+      client_authentication:
+        mechanism: {mechanism}{client_credential}
+      subject_token:
+        source: {source}{subject_credential}
+"
+                );
+                let profile = parse_profile_yaml(&yaml).unwrap();
+                let diagnostics =
+                    validate_profile_set(&[("federation.yaml".into(), profile.clone())]);
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                let restored = ProviderTypeProfile::from_proto(&profile.to_proto());
+                let reparsed = parse_profile_yaml(&profile_to_yaml(&restored).unwrap()).unwrap();
+                assert_eq!(
+                    profile.credentials[1].token_grant,
+                    reparsed.credentials[1].token_grant
+                );
+
+                let mut invalid = profile.clone();
+                let grant = invalid.credentials[1].token_grant.as_mut().unwrap();
+                if mechanism == "none" {
+                    grant.client_assertion_type = "assertion-type".into();
+                } else {
+                    grant.client_authentication.as_mut().unwrap().credential = None;
+                }
+                assert!(!validate_profile_set(&[("invalid.yaml".into(), invalid)]).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn jwt_subject_rejects_incompatible_identity_configuration() {
+        let yaml = r"
+id: federation
+display_name: Federation
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://sts.googleapis.com/v1/token
+      client_authentication:
+        mechanism: none
+      subject_token:
+        source: jwt_svid
+";
+        let profile = parse_profile_yaml(yaml).unwrap();
+        for case in 0..7 {
+            let mut invalid = profile.clone();
+            let grant = invalid.credentials[0].token_grant.as_mut().unwrap();
+            match case {
+                0 => grant.subject_token.as_mut().unwrap().credential = "stored".into(),
+                1 => {
+                    grant.subject_token.as_mut().unwrap().subject_token_type =
+                        "urn:ietf:params:oauth:token-type:access_token".into();
+                }
+                2 => grant.subject_token.as_mut().unwrap().source = "unknown".into(),
+                3 => grant.client_authentication.as_mut().unwrap().mechanism = "bearer".into(),
+                4 => {
+                    grant.client_authentication.as_mut().unwrap().credential =
+                        Some(TokenGrantClientCredentialProfile {
+                            source: "jwt_svid".into(),
+                        });
+                }
+                5 => {
+                    grant.grant_type = ProviderCredentialTokenGrantType::ClientCredentials;
+                    grant.subject_token = None;
+                }
+                6 => grant.subject_token = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                !validate_profile_set(&[("invalid.yaml".into(), invalid)]).is_empty(),
+                "case {case}"
+            );
+        }
     }
 
     #[test]

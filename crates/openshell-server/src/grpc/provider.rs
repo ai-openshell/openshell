@@ -4885,6 +4885,8 @@ async fn exchange_provider_subject_token_inner(
         .token_grant
         .as_ref()
         .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
+    openshell_core::token_grant_config::validate_token_grant_identity(token_grant)
+        .map_err(|_| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let grant_type = ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
         .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials);
     if grant_type != ProviderCredentialTokenGrantType::TokenExchange {
@@ -4934,6 +4936,7 @@ async fn exchange_provider_subject_token_inner(
     .await?;
 
     let intermediate_cache_key = intermediate_token_cache_key(IntermediateTokenCacheKeyInput {
+        client_authentication: token_grant.client_authentication.as_ref(),
         provider: &provider,
         dynamic_credential: &req.credential_key,
         subject_credential: &subject_token.credential,
@@ -4959,8 +4962,11 @@ async fn exchange_provider_subject_token_inner(
     let token_response = perform_intermediate_token_exchange(
         &token_grant.token_endpoint,
         &TokenExchangeParams {
-            client_assertion: &gateway_jwt_svid,
-            client_assertion_type: &token_grant.client_assertion_type,
+            client_authentication: oauth::ClientAuthentication::from_config(
+                token_grant.client_authentication.as_ref(),
+                &gateway_jwt_svid,
+                &token_grant.client_assertion_type,
+            ),
             subject_token: &stored_subject_token,
             subject_token_type: &subject_token.subject_token_type,
             audience: &supervisor_claims.sub,
@@ -5073,6 +5079,8 @@ fn provider_credential_expiration_ms(
 }
 
 struct IntermediateTokenCacheKeyInput<'a> {
+    client_authentication:
+        Option<&'a openshell_core::proto::ProviderCredentialTokenGrantClientAuthentication>,
     provider: &'a Provider,
     dynamic_credential: &'a str,
     subject_credential: &'a str,
@@ -5099,7 +5107,7 @@ fn intermediate_token_cache_key(input: IntermediateTokenCacheKeyInput<'_>) -> St
         .as_ref()
         .map_or(0, |metadata| metadata.resource_version);
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}",
         provider_id,
         provider_resource_version,
         input.dynamic_credential,
@@ -5110,7 +5118,8 @@ fn intermediate_token_cache_key(input: IntermediateTokenCacheKeyInput<'_>) -> St
         input.audience,
         input.requested_token_type,
         input.supervisor_subject,
-        input.gateway_subject
+        input.gateway_subject,
+        input.client_authentication
     )
 }
 
@@ -6772,8 +6781,10 @@ pub(super) mod tests {
                 String::from_utf8_lossy(&request).to_ascii_lowercase()
             });
             let params = TokenExchangeParams {
-                client_assertion: SECRET,
-                client_assertion_type: "",
+                client_authentication: oauth::ClientAuthentication::ClientAssertion {
+                    assertion: SECRET,
+                    assertion_type: "",
+                },
                 subject_token: SECRET,
                 subject_token_type: "",
                 audience: SECRET,
@@ -6904,6 +6915,7 @@ pub(super) mod tests {
             path_template: String::new(),
             token_grant_owners: vec!["untrusted-profile-owner".to_string()],
             token_grant: Some(ProviderCredentialTokenGrant {
+                client_authentication: None,
                 grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
                 token_endpoint: "http://keycloak.default.svc.cluster.local/realms/openshell/protocol/openid-connect/token".to_string(),
                 audience: "api://default".to_string(),
@@ -8142,6 +8154,7 @@ pub(super) mod tests {
             refresh: None,
             path_template: String::new(),
             token_grant: Some(ProviderCredentialTokenGrant {
+                client_authentication: None,
                 grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
                 token_endpoint: "https://auth.example.com/token".to_string(),
                 audience: "api://default".to_string(),

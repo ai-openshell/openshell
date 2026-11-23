@@ -701,15 +701,42 @@ impl ProviderCredentialState {
     /// Searches `google_cloud::TOKEN_ENV_KEYS` in priority order (SA before
     /// ADC) atomically to avoid inconsistency during credential
     /// refresh. Returns `None` if no GCP token is configured or all are
-    /// expired. The `expires_in` defaults to 3600 when expiry is unknown.
+    /// expired. Dynamic grants return a placeholder with a 3600-second SDK
+    /// refresh interval; their real token expiry is managed by the grant cache.
+    /// Static credentials also default to 3600 when expiry is unknown.
     pub fn gcp_token_response(&self) -> Option<(String, i64)> {
         const DEFAULT_EXPIRES_IN: i64 = 3600;
         let inner = self
             .inner
             .read()
             .expect("provider credential state poisoned");
-        let resolver = inner.current_resolver.as_ref()?;
         for key in crate::google_cloud::TOKEN_ENV_KEYS {
+            // A dynamic grant has no static secret to unwrap. Its placeholder
+            // is replaced only after endpoint admission by token-grant injection.
+            if inner
+                .current
+                .dynamic_credentials
+                .values()
+                .any(|credential| {
+                    credential.env_vars.iter().any(|env| env == key)
+                        && credential.auth_style == "bearer"
+                        && !credential.token_grant_owners.is_empty()
+                        && credential.token_grant.as_ref().is_some_and(|grant| {
+                            crate::token_grant_config::validate_token_grant_identity(grant).is_ok()
+                        })
+                })
+            {
+                return Some((
+                    crate::secrets::placeholder_for_env_key_for_revision(
+                        key,
+                        inner.current.revision,
+                    ),
+                    DEFAULT_EXPIRES_IN,
+                ));
+            }
+            let Some(resolver) = inner.current_resolver.as_ref() else {
+                continue;
+            };
             let Some(placeholder) = inner.current.child_env.get(*key).cloned() else {
                 continue;
             };
@@ -3509,6 +3536,33 @@ mod tests {
                     .starts_with("openshell:resolve:env:"),
             "missing config key should not be injected with a real value"
         );
+    }
+
+    #[test]
+    fn gcp_token_response_serves_dynamic_placeholder_and_revokes_on_detach() {
+        let declaration = crate::proto::ProviderProfileCredential {
+            name: "access_token".into(),
+            env_vars: vec!["GCP_ADC_ACCESS_TOKEN".into()],
+            auth_style: "bearer".into(),
+            token_grant_owners: vec!["owner".into()],
+            token_grant: Some(crate::proto::ProviderCredentialTokenGrant {
+                token_endpoint: "https://sts.googleapis.com/v1/token".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state = ProviderCredentialState::from_environment(
+            7,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("gcp:access_token".into(), declaration)]),
+        );
+        let (placeholder, lifetime) = state.gcp_token_response().expect("dynamic metadata");
+        assert_eq!(placeholder, "openshell:resolve:env:v7_GCP_ADC_ACCESS_TOKEN");
+        assert_eq!(lifetime, 3600);
+        assert!(state.snapshot().child_env.is_empty());
+        state.install_environment(8, HashMap::new(), HashMap::new(), HashMap::new());
+        assert!(state.gcp_token_response().is_none());
     }
 
     #[test]

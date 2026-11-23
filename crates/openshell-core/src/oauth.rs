@@ -22,6 +22,7 @@ use crate::token_grant_failure::{
 pub const DEFAULT_CLIENT_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+pub use crate::token_grant_config::JWT_TOKEN_TYPE;
 const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ERROR_CONTRACT: &str = "openshell.token-grant.v1";
 const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
@@ -204,11 +205,37 @@ pub async fn post_oauth_token_grant(
     .await
 }
 
+/// Authentication to the external token endpoint, independent of the subject.
+#[derive(Clone, Copy)]
+pub enum ClientAuthentication<'a> {
+    None,
+    ClientAssertion {
+        assertion: &'a str,
+        assertion_type: &'a str,
+    },
+}
+
+impl<'a> ClientAuthentication<'a> {
+    /// Resolve a validated profile's authentication using the acquired SVID.
+    pub fn from_config(
+        config: Option<&crate::proto::ProviderCredentialTokenGrantClientAuthentication>,
+        svid: &'a str,
+        assertion_type: &'a str,
+    ) -> Self {
+        if config.is_some_and(|auth| auth.mechanism == "none") {
+            Self::None
+        } else {
+            Self::ClientAssertion {
+                assertion: svid,
+                assertion_type,
+            }
+        }
+    }
+}
+
 /// RFC 8693 token-exchange form fields.
 pub struct TokenExchangeParams<'a> {
-    /// Secret JWT client assertion sent only to the configured endpoint.
-    pub client_assertion: &'a str,
-    pub client_assertion_type: &'a str,
+    pub client_authentication: ClientAuthentication<'a>,
     /// Secret subject credential to exchange for a resource token.
     pub subject_token: &'a str,
     pub subject_token_type: &'a str,
@@ -229,17 +256,25 @@ pub async fn post_oauth_token_exchange(
     params: &TokenExchangeParams<'_>,
     request_id: Option<&str>,
 ) -> Result<OAuthTokenResponse, TokenGrantFailure> {
-    let client_assertion_type = effective_client_assertion_type(params.client_assertion_type);
     let subject_token_type = effective_token_type(params.subject_token_type);
     let requested_token_type = effective_token_type(params.requested_token_type);
-    let form_params = vec![
+    let mut form_params = vec![
         ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
-        ("client_assertion_type", client_assertion_type),
-        ("client_assertion", params.client_assertion),
         ("subject_token", params.subject_token),
         ("subject_token_type", subject_token_type),
         ("requested_token_type", requested_token_type),
     ];
+    if let ClientAuthentication::ClientAssertion {
+        assertion,
+        assertion_type,
+    } = params.client_authentication
+    {
+        form_params.push(("client_assertion", assertion));
+        form_params.push((
+            "client_assertion_type",
+            effective_client_assertion_type(assertion_type),
+        ));
+    }
     post_oauth_token_request(
         client,
         token_endpoint,
@@ -459,6 +494,7 @@ mod tests {
 
     #[derive(Debug)]
     struct CapturedRequest {
+        authorization: Option<String>,
         form: HashMap<String, String>,
         request_id: Option<String>,
     }
@@ -508,6 +544,11 @@ mod tests {
         });
         let form_body = String::from_utf8_lossy(&buf[header_end..]);
         CapturedRequest {
+            authorization: headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_string())
+            }),
             form: parse_form_body(&form_body),
             request_id,
         }
@@ -791,6 +832,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jwt_subject_exchange_without_client_authentication() {
+        let (endpoint, request) = token_endpoint_once(
+            "200 OK",
+            r#"{"access_token":"google-token","expires_in":3600}"#,
+        )
+        .await;
+        post_oauth_token_exchange(&test_client(), &endpoint, &TokenExchangeParams {
+            client_authentication: ClientAuthentication::None,
+            subject_token: "sandbox-jwt-svid",
+            subject_token_type: JWT_TOKEN_TYPE,
+            audience: "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/pool/providers/spire",
+            scopes: &["https://www.googleapis.com/auth/cloud-platform".into()],
+            requested_token_type: "",
+        }, None).await.expect("exchange");
+        let request = request.await.unwrap();
+        assert!(request.authorization.is_none());
+        assert_eq!(request.form.len(), 6);
+        assert_eq!(request.form["grant_type"], TOKEN_EXCHANGE_GRANT_TYPE);
+        assert_eq!(request.form["subject_token"], "sandbox-jwt-svid");
+        assert_eq!(request.form["subject_token_type"], JWT_TOKEN_TYPE);
+        assert_eq!(request.form["requested_token_type"], ACCESS_TOKEN_TYPE);
+        assert_eq!(
+            request.form["scope"],
+            "https://www.googleapis.com/auth/cloud-platform"
+        );
+        assert!(!request.form.contains_key("client_assertion"));
+        assert!(!request.form.contains_key("client_assertion_type"));
+    }
+
+    #[tokio::test]
     async fn posts_form_params_and_parses_success_response() {
         let (endpoint, request) = token_endpoint_once(
             "200 OK",
@@ -885,8 +956,10 @@ mod tests {
             &client,
             &endpoint,
             &TokenExchangeParams {
-                client_assertion: "jwt-svid-token",
-                client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
+                client_authentication: ClientAuthentication::ClientAssertion {
+                    assertion: "jwt-svid-token",
+                    assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
+                },
                 subject_token: "subject-access-token",
                 subject_token_type: ACCESS_TOKEN_TYPE,
                 audience: "api://resource",
@@ -952,8 +1025,10 @@ mod tests {
             &client,
             &endpoint,
             &TokenExchangeParams {
-                client_assertion: "jwt-svid-token",
-                client_assertion_type: "",
+                client_authentication: ClientAuthentication::ClientAssertion {
+                    assertion: "jwt-svid-token",
+                    assertion_type: "",
+                },
                 subject_token: "subject-token",
                 subject_token_type: "",
                 audience: "",

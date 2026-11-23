@@ -246,6 +246,8 @@ async fn obtain(
     let key = &request.get_ref().credential_key;
     let configured = grant_configuration(state, session.sandbox_id.as_str(), key).await?;
     let grant = &configured.grant;
+    openshell_core::token_grant_config::validate_token_grant_identity(grant)
+        .map_err(|_| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let ttl_override = grant
         .cache_ttl
         .as_ref()
@@ -263,7 +265,12 @@ async fn obtain(
         .map_err(|_| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     // Resolve the subject before any cache lookup, so its revocation or
     // expiry also denies cached tokens.
-    let subject = if grant_type == ProviderCredentialTokenGrantType::TokenExchange {
+    let subject = if grant_type == ProviderCredentialTokenGrantType::TokenExchange
+        && grant
+            .subject_token
+            .as_ref()
+            .is_some_and(|subject| subject.source == "provider_credential")
+    {
         let subject = grant
             .subject_token
             .as_ref()
@@ -418,7 +425,32 @@ async fn acquire(
     authorize(state, bearer).await?;
     let client = token_exchange_http_client()?;
     let subject_expiry = subject.and_then(|subject| subject.expires_at_ms);
-    let token = if let Some(subject) = subject {
+    let authentication = oauth::ClientAuthentication::from_config(
+        grant.client_authentication.as_ref(),
+        &svid.token,
+        &grant.client_assertion_type,
+    );
+    let token = if grant
+        .subject_token
+        .as_ref()
+        .is_some_and(|subject| subject.source == "jwt_svid")
+    {
+        oauth::post_oauth_token_exchange(
+            client,
+            &grant.token_endpoint,
+            &TokenExchangeParams {
+                client_authentication: authentication,
+                subject_token: &svid.token,
+                subject_token_type: oauth::JWT_TOKEN_TYPE,
+                audience: &grant.audience,
+                scopes: &grant.scopes,
+                requested_token_type: &grant.requested_token_type,
+            },
+            request_id,
+        )
+        .await
+        .map_err(TokenGrantFailure::to_status)?
+    } else if let Some(subject) = subject {
         let component_svid = fetch_gateway_jwt_svid_from(
             &audience,
             state
@@ -431,8 +463,11 @@ async fn acquire(
         let intermediate = perform_intermediate_token_exchange(
             &grant.token_endpoint,
             &TokenExchangeParams {
-                client_assertion: &component_svid,
-                client_assertion_type: &grant.client_assertion_type,
+                client_authentication: oauth::ClientAuthentication::from_config(
+                    grant.client_authentication.as_ref(),
+                    &component_svid,
+                    &grant.client_assertion_type,
+                ),
                 subject_token: &subject.value,
                 subject_token_type: &subject.token_type,
                 audience: &svid.spiffe_id,
@@ -447,8 +482,7 @@ async fn acquire(
             client,
             &grant.token_endpoint,
             &TokenExchangeParams {
-                client_assertion: &svid.token,
-                client_assertion_type: &grant.client_assertion_type,
+                client_authentication: authentication,
                 subject_token: &intermediate.access_token,
                 subject_token_type: oauth::ACCESS_TOKEN_TYPE,
                 audience: &grant.audience,
@@ -741,6 +775,26 @@ mod tests {
         assert_ne!(
             fingerprint(&session, owned, None),
             fingerprint(&session, owned, Some(""))
+        );
+        let mut configured = configured("provider:access");
+        let before = cache_key(&session, &configured, None, "gateway").unwrap();
+        configured.grant.client_authentication = Some(
+            openshell_core::proto::ProviderCredentialTokenGrantClientAuthentication {
+                mechanism: "none".into(),
+                credential: None,
+            },
+        );
+        let unauthenticated = cache_key(&session, &configured, None, "gateway").unwrap();
+        assert_ne!(before, unauthenticated);
+        configured.grant.subject_token = Some(
+            openshell_core::proto::ProviderCredentialTokenGrantSubjectToken {
+                source: "jwt_svid".into(),
+                ..Default::default()
+            },
+        );
+        assert_ne!(
+            unauthenticated,
+            cache_key(&session, &configured, None, "gateway").unwrap()
         );
     }
 

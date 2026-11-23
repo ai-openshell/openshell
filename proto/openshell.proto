@@ -2508,16 +2508,28 @@ enum ProviderCredentialTokenGrantType {
 }
 
 message ProviderCredentialTokenGrantSubjectToken {
-  // Source for the token exchange subject token. Phase one supports
-  // "provider_credential".
+  // Source for the token exchange subject: "provider_credential" or "jwt_svid".
   string source = 1;
 
-  // Provider credential key that stores the subject token.
+  // Provider credential key. Required only for provider_credential subjects.
   string credential = 2;
 
   // OAuth2 subject_token_type. If omitted, OpenShell uses
+  // urn:ietf:params:oauth:token-type:jwt for jwt_svid subjects, otherwise
   // urn:ietf:params:oauth:token-type:access_token.
   string subject_token_type = 3;
+}
+
+message ProviderCredentialTokenGrantClientCredential {
+  // Credential source. Currently supports "jwt_svid".
+  string source = 1;
+}
+
+message ProviderCredentialTokenGrantClientAuthentication {
+  // External token endpoint authentication: "client_assertion" or "none".
+  string mechanism = 1;
+  // Required for client_assertion; forbidden for none.
+  ProviderCredentialTokenGrantClientCredential credential = 2;
 }
 
 message ProviderCredentialTokenGrant {
@@ -2556,6 +2568,10 @@ message ProviderCredentialTokenGrant {
   // OAuth2 requested_token_type. If omitted for token_exchange, OpenShell uses
   // urn:ietf:params:oauth:token-type:access_token.
   string requested_token_type = 10;
+
+  // Omission preserves client_assertion authentication using a JWT-SVID.
+  // This controls the external token endpoint, not OpenShell RPC authentication.
+  ProviderCredentialTokenGrantClientAuthentication client_authentication = 11;
 }
 
 // Provider credential declaration.

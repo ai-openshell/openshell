@@ -489,6 +489,7 @@ async fn start_gateway_token_endpoint(
 // signature and audience. No new production grant type or sandbox-visible
 // credential is needed to exercise custom-header injection.
 async fn start_identity_token_endpoint(
+    jwt_subject: bool,
     port: u16,
     observations: Arc<GrantObservations>,
 ) -> FixtureHandle {
@@ -508,15 +509,32 @@ async fn start_identity_token_endpoint(
                 let form = token_form(&request);
                 let field = |name: &str| form.get(name).map_or("", String::as_str);
                 let mut access_token = None;
+                let (identity, valid_authentication) = if jwt_subject {
+                    (
+                        field("subject_token"),
+                        field("grant_type") == "urn:ietf:params:oauth:grant-type:token-exchange"
+                            && field("subject_token_type")
+                                == "urn:ietf:params:oauth:token-type:jwt"
+                            && field("requested_token_type") == TOKEN_TYPE_ACCESS_TOKEN
+                            && !form.contains_key("client_assertion")
+                            && !form.contains_key("client_assertion_type")
+                            && !request.to_ascii_lowercase().contains("\r\nauthorization:"),
+                    )
+                } else {
+                    (
+                        field("client_assertion"),
+                        field("grant_type") == "client_credentials"
+                            && field("client_assertion_type") == IDENTITY_ASSERTION_TYPE,
+                    )
+                };
                 for (index, instance) in ["a", "b"].into_iter().enumerate() {
                     let valid = request.starts_with("POST /identity-token ")
-                        && field("grant_type") == "client_credentials"
-                        && field("client_assertion_type") == IDENTITY_ASSERTION_TYPE
+                        && valid_authentication
                         && field("scope") == "identity.read"
-                        && verifies_jwt_svid(field("client_assertion"), instance);
+                        && verifies_jwt_svid(identity, instance);
                     if valid && field("audience") == format!("{IDENTITY_AUDIENCE}-{instance}") {
                         observations.identity_issued[index].fetch_add(1, Ordering::SeqCst);
-                        access_token = Some(field("client_assertion"));
+                        access_token = Some(identity);
                     } else if valid && field("audience") == format!("denied-identity-{instance}") {
                         observations.identity_denied.fetch_add(1, Ordering::SeqCst);
                     }
@@ -528,7 +546,11 @@ async fn start_identity_token_endpoint(
     FixtureHandle { task }
 }
 
-async fn start_protected_target(port: u16, observations: Arc<GrantObservations>) -> FixtureHandle {
+async fn start_protected_target(
+    jwt_subject: bool,
+    port: u16,
+    observations: Arc<GrantObservations>,
+) -> FixtureHandle {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
         .await
         .expect("bind protected target");
@@ -561,14 +583,33 @@ async fn start_protected_target(port: u16, observations: Arc<GrantObservations>)
                         .map(|(_, value)| value.trim())
                         .collect::<Vec<_>>()
                 };
-                let bearer = header_values("authorization");
-                let identity = header_values("x-workload-jwt");
+                let bearer = header_values(if jwt_subject {
+                    "x-service-token"
+                } else {
+                    "authorization"
+                });
+                let identity = header_values(if jwt_subject {
+                    "authorization"
+                } else {
+                    "x-workload-jwt"
+                });
                 let ok = ["a", "b"].into_iter().any(|instance| {
                     request.starts_with(&format!("GET /resource/{instance} "))
                         && bearer.len() == 1
-                        && bearer[0] == format!("Bearer {FINAL_ACCESS_TOKEN}-{instance}")
+                        && bearer[0]
+                            == format!(
+                                "{}{FINAL_ACCESS_TOKEN}-{instance}",
+                                if jwt_subject { "" } else { "Bearer " }
+                            )
                         && identity.len() == 1
-                        && verifies_jwt_svid(identity[0], instance)
+                        && verifies_jwt_svid(
+                            if jwt_subject {
+                                identity[0].strip_prefix("Bearer ").unwrap_or("")
+                            } else {
+                                identity[0]
+                            },
+                            instance,
+                        )
                 });
                 let (status, body) = if ok {
                     ("HTTP/1.1 200 OK", "independent-grants-ok")
@@ -615,6 +656,7 @@ async fn run_cli_ignore_error(args: &[&str]) {
 }
 
 fn write_profile(
+    jwt_subject: bool,
     profile_type: &str,
     token_port: u16,
     identity_port: u16,
@@ -688,6 +730,15 @@ binaries:
   - /**
 "
     );
+    let profile = if jwt_subject {
+        profile.replace("grant_type: client_credentials", "grant_type: token_exchange")
+            .replace("auth_style: bearer\n    header_name: Authorization", "auth_style: header\n    header_name: X-Service-Token")
+            .replace("auth_style: header\n    header_name: X-Workload-Jwt", "env_vars: [GCP_ADC_ACCESS_TOKEN]\n    auth_style: bearer\n    header_name: Authorization")
+            .replace(&format!("client_assertion_type: {IDENTITY_ASSERTION_TYPE}"),
+                     "client_authentication:\n        mechanism: none\n      subject_token:\n        source: jwt_svid")
+    } else {
+        profile
+    };
     file.write_all(profile.as_bytes())
         .expect("write provider profile");
     file.flush().expect("flush provider profile");
@@ -855,15 +906,24 @@ except urllib.error.HTTPError as error:
 }
 
 async fn create_provider_instance(
+    jwt_subject: bool,
     token_port: u16,
     identity_port: u16,
     target_port: u16,
     instance: &str,
 ) -> String {
-    let name = format!("podman-grants-{instance}-{}", std::process::id());
+    let flow = if jwt_subject { "direct" } else { "stored" };
+    let name = format!("podman-grants-{flow}-{instance}-{}", std::process::id());
     run_cli_ignore_error(&["provider", "delete", &name, "--yes"]).await;
     run_cli_ignore_error(&["profile", "delete", &name, "--yes"]).await;
-    let profile = write_profile(&name, token_port, identity_port, target_port, instance);
+    let profile = write_profile(
+        jwt_subject,
+        &name,
+        token_port,
+        identity_port,
+        target_port,
+        instance,
+    );
     let profile_path = profile
         .path()
         .to_str()
@@ -888,6 +948,15 @@ async fn create_provider_instance(
 
 #[tokio::test]
 async fn podman_provider_token_exchange_injects_independent_grants_across_sandboxes() {
+    independent_grants_across_sandboxes(false).await;
+}
+
+#[tokio::test]
+async fn podman_jwt_svid_subject_without_client_authentication() {
+    independent_grants_across_sandboxes(true).await;
+}
+
+async fn independent_grants_across_sandboxes(jwt_subject: bool) {
     let _fixture_guard = SPIFFE_FIXTURE_LOCK.lock().await;
     let gateway_socket = PathBuf::from(
         std::env::var("OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET")
@@ -909,13 +978,21 @@ async fn podman_provider_token_exchange_injects_independent_grants_across_sandbo
     let _provider_spiffe = start_spiffe_workload_api(&provider_socket, &supervisor_subject).await;
     let _gateway_token = start_gateway_token_endpoint(token_port, Arc::clone(&observations)).await;
     let _identity_token =
-        start_identity_token_endpoint(identity_port, Arc::clone(&observations)).await;
-    let _target = start_protected_target(target_port, Arc::clone(&observations)).await;
+        start_identity_token_endpoint(jwt_subject, identity_port, Arc::clone(&observations)).await;
+    let _target = start_protected_target(jwt_subject, target_port, Arc::clone(&observations)).await;
 
     let mut provider_names = Vec::new();
     for instance in ["a", "b"] {
-        provider_names
-            .push(create_provider_instance(token_port, identity_port, target_port, instance).await);
+        provider_names.push(
+            create_provider_instance(
+                jwt_subject,
+                token_port,
+                identity_port,
+                target_port,
+                instance,
+            )
+            .await,
+        );
     }
 
     let script = sandbox_script();
@@ -946,6 +1023,50 @@ async fn podman_provider_token_exchange_injects_independent_grants_across_sandbo
         sandbox_exec_http(&sandbox_b.name, target_port, "/resource/b", false),
     );
     let after_cache = observations.issued();
+    if jwt_subject {
+        // The SDK is installed in the standard E2E workload. Point ADC at the
+        // reserved metadata emulator; no SDK code or credential files are changed.
+        let script = format!(
+            r#"import os
+os.environ["GCE_METADATA_HOST"] = "127.0.0.1:8174"
+os.environ["GCE_METADATA_IP"] = "127.0.0.1:8174"
+os.environ["GOOGLE_CLOUD_PROJECT"] = "e2e-project"
+os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+import google.auth
+from google.auth.transport.requests import AuthorizedSession, Request
+credentials, project = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+credentials.refresh(Request())
+assert credentials.token.startswith("openshell:resolve:"), "ADC received a real credential"
+response = AuthorizedSession(credentials).get("http://host.openshell.internal:{target_port}/resource/a", timeout=10)
+assert response.status_code == 200, "ADC request failed"
+assert response.text == "independent-grants-ok"
+assert credentials.token.startswith("openshell:resolve:"), "ADC credential changed"
+print("adc-placeholder-ok")
+"#
+        );
+        let output = openshell_cmd()
+            .args([
+                "sandbox",
+                "exec",
+                &sandbox_a.name,
+                "--",
+                "python3",
+                "-c",
+                &script,
+            ])
+            .output()
+            .await
+            .expect("ADC probe");
+        assert!(
+            output.status.success(),
+            "ADC probe failed; exit={:?}",
+            output.status.code()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "adc-placeholder-ok"
+        );
+    }
     let target_requests = observations.target_requests.load(Ordering::SeqCst);
     // An audience override forces acquisition of only the failing credential;
     // the other credential remains cached from the successful request.
