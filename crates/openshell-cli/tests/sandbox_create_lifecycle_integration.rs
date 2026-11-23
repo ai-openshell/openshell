@@ -3265,6 +3265,62 @@ async fn ssh_profile_credentials_follow_the_selected_endpoint() {
 }
 
 #[tokio::test]
+async fn selected_ssh_profile_wins_over_an_active_profile_on_the_same_host() {
+    let server = run_server().await;
+    let xdg = helpers::tempdir().unwrap();
+    prepare_cli_xdg(&server, &xdg, "openshell");
+    write_oidc_test_credentials(&server, &xdg, "https://unused.invalid", 4_102_444_800);
+    let endpoint = server.endpoint.replace("localhost", "LOCALHOST");
+    let profiles = xdg.path().join("openshell");
+    prepare_cli_xdg(&server, &xdg, "other");
+    fs::write(profiles.join("active_gateway"), "other").unwrap();
+    fs::write(
+        profiles.join("gateways/other/metadata.json"),
+        serde_json::to_vec(&openshell_bootstrap::GatewayMetadata {
+            name: "other".into(),
+            gateway_endpoint: endpoint.clone(),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let state = &server.openshell.state;
+    state
+        .ssh_session_failures_remaining
+        .store(3, Ordering::SeqCst);
+    for (request, args) in [
+        &["-g", "openshell", "sandbox", "connect", "demo"][..],
+        &["ssh-proxy", "--server", &endpoint, "--name", "demo"],
+        &[
+            "ssh-proxy",
+            "--gateway-endpoint",
+            &endpoint,
+            "--name",
+            "demo",
+        ],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"))
+            .args(args)
+            .env("OPENSHELL_GATEWAY", "openshell")
+            .env("OPENSHELL_GATEWAY_ENDPOINT", &endpoint)
+            .env("XDG_CONFIG_HOME", xdg.path())
+            .env("OPENSHELL_TELEMETRY_ENABLED", "false")
+            .output()
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stderr).contains("sandbox is not ready"));
+        assert_eq!(
+            state.ssh_requests_with_cached_bearer.load(Ordering::SeqCst),
+            request + 1,
+            "{args:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails() {
     let server = run_server().await;
     let fake_ssh_dir = helpers::tempdir().unwrap();

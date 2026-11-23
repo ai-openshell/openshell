@@ -2461,9 +2461,6 @@ pub fn print_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-
     #[test]
     fn ssh_verbosity_reaches_nested_proxy_commands_and_respects_override() {
         for override_level in [None, Some("INFO")] {
@@ -2529,6 +2526,7 @@ mod tests {
     fn interactive_wait_survives_terminal_signals_and_reaps_child() {
         use nix::sys::signal::killpg;
         use nix::unistd::Pid;
+        use std::os::unix::process::CommandExt;
 
         struct Probe(std::process::Child);
         impl Drop for Probe {

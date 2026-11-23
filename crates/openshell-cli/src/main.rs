@@ -47,19 +47,25 @@ impl From<GpuCliRequest> for GpuResourceRequirements {
     }
 }
 
-/// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
-///
-/// Resolution priority:
-/// 1. `--gateway-endpoint` flag (direct URL, preserving metadata when available)
-/// 2. `--gateway` flag (explicit name)
-/// 3. `OPENSHELL_GATEWAY` environment variable
-/// 4. Active gateway from `~/.config/openshell/active_gateway`
-///
-/// When `--gateway-endpoint` is provided, it is used directly as the endpoint.
-/// If stored metadata can still identify the gateway, the stored gateway name
-/// is preserved so auth and TLS materials continue to resolve correctly.
-fn normalize_gateway_endpoint(endpoint: &str) -> &str {
-    endpoint.trim_end_matches('/')
+fn normalize_gateway_endpoint(endpoint: &str) -> String {
+    let endpoint = if endpoint.contains(['?', '#']) {
+        endpoint
+    } else {
+        endpoint.trim_end_matches('/')
+    };
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_owned();
+    };
+    let (authority, route) = rest.split_at(rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len()));
+    let (userinfo, host_port) = authority.split_at(authority.rfind('@').map_or(0, |i| i + 1));
+    if host_port.starts_with('[') {
+        return endpoint.to_owned();
+    }
+    let (host, port) = host_port.split_at(host_port.find(':').unwrap_or(host_port.len()));
+    format!(
+        "{scheme}://{userinfo}{}{port}{route}",
+        host.to_ascii_lowercase()
+    )
 }
 
 fn find_gateway_by_endpoint(endpoint: &str) -> Option<String> {
@@ -78,18 +84,33 @@ fn find_gateway_by_endpoint(endpoint: &str) -> Option<String> {
     })
 }
 
+/// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
+///
+/// Resolution priority:
+/// 1. `--gateway-endpoint` flag (direct URL, preserving metadata when available)
+/// 2. `--gateway` flag (explicit name)
+/// 3. `OPENSHELL_GATEWAY` environment variable
+/// 4. Active gateway from `~/.config/openshell/active_gateway`
+///
+/// When `--gateway-endpoint` is provided, it is used directly as the endpoint.
+/// If stored metadata can still identify the gateway, the stored gateway name
+/// is preserved so auth and TLS materials continue to resolve correctly.
 fn resolve_gateway(
     gateway_flag: &Option<String>,
     gateway_endpoint: &Option<String>,
+    allow_endpoint_override: bool,
 ) -> Result<GatewayContext> {
     if let Some(endpoint) = gateway_endpoint {
-        // When a gateway name is explicitly provided (via flag or env var),
-        // trust it directly — don't require metadata to exist yet. This
-        // avoids a race condition where mTLS certs are stored under the
-        // real gateway name but the CLI falls back to using the raw
-        // endpoint URL (producing a mangled path like `https___...`).
         let name = gateway_flag
-            .clone()
+            .as_ref()
+            .filter(|name| {
+                allow_endpoint_override
+                    || get_gateway_metadata(name).is_some_and(|metadata| {
+                        normalize_gateway_endpoint(&metadata.gateway_endpoint)
+                            == normalize_gateway_endpoint(endpoint)
+                    })
+            })
+            .cloned()
             .or_else(|| find_gateway_by_endpoint(endpoint))
             .unwrap_or_else(|| endpoint.clone());
         return Ok(GatewayContext {
@@ -2834,16 +2855,11 @@ async fn run_async() -> Result<()> {
         )
     };
     let current_gateway = || {
-        if let (Some(name), Some(endpoint)) = (&cli.gateway, &cli.gateway_endpoint)
-            && explicit_gateway != explicit_endpoint
-            && !get_gateway_metadata(name).is_some_and(|metadata| {
-                normalize_gateway_endpoint(&metadata.gateway_endpoint)
-                    == normalize_gateway_endpoint(endpoint)
-            })
-        {
-            return resolve_gateway(&None, &cli.gateway_endpoint);
-        }
-        resolve_gateway(&cli.gateway, &cli.gateway_endpoint)
+        resolve_gateway(
+            &cli.gateway,
+            &cli.gateway_endpoint,
+            explicit_gateway == explicit_endpoint,
+        )
     };
 
     // Resolve colorization before anything is printed, so no command can emit
@@ -4406,8 +4422,9 @@ async fn run_async() -> Result<()> {
                     gateway_name.is_none() && (!explicit_gateway || explicit_endpoint);
                 let endpoint =
                     server.or_else(|| cli.gateway_endpoint.filter(|_| use_global_endpoint));
-                let profile = gateway_name.or_else(|| cli.gateway.filter(|_| explicit_gateway));
-                let ctx = resolve_gateway(&profile, &endpoint)?;
+                let allow_endpoint_override = gateway_name.is_some() || explicit_gateway;
+                let profile = gateway_name.or(cli.gateway);
+                let ctx = resolve_gateway(&profile, &endpoint, allow_endpoint_override)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name)?;
                 run::sandbox_ssh_proxy_by_name(&ctx.endpoint, &name, &tls, &cli.workspace).await?;
@@ -5309,10 +5326,35 @@ mod tests {
             )
             .unwrap();
 
-            let ctx = resolve_gateway(&None, &Some("https://gw.example.com/".to_string())).unwrap();
+            let ctx = resolve_gateway(&None, &Some("https://GW.example.com/".to_string()), false)
+                .unwrap();
             assert_eq!(ctx.name, "edge-gateway");
-            assert_eq!(ctx.endpoint, "https://gw.example.com/");
+            assert_eq!(ctx.endpoint, "https://GW.example.com/");
         });
+    }
+
+    #[test]
+    fn endpoint_matching_preserves_userinfo_port_and_route() {
+        let endpoint = "https://User:Password@GW.example:8443/Tenant?k=Token/#Section";
+        let normalized = normalize_gateway_endpoint(endpoint);
+        assert_eq!(normalized, endpoint.replace("GW", "gw"));
+        for (from, to) in [
+            ("User", "user"),
+            ("Password", "password"),
+            ("8443", "443"),
+            ("Tenant", "tenant"),
+            ("Token", "token"),
+            ("Section", "section"),
+        ] {
+            assert_ne!(
+                normalized,
+                normalize_gateway_endpoint(&endpoint.replace(from, to))
+            );
+        }
+        assert_ne!(
+            normalize_gateway_endpoint("https://gw/?key=token/"),
+            normalize_gateway_endpoint("https://gw/?key=token")
+        );
     }
 
     #[test]
@@ -5328,6 +5370,7 @@ mod tests {
             let ctx = resolve_gateway(
                 &Some("named-gateway".to_string()),
                 &Some("https://override.example.com".to_string()),
+                true,
             )
             .unwrap();
 
