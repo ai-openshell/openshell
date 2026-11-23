@@ -610,7 +610,8 @@ mod tests {
 
     use super::super::buffer::{BatchReceiver, new_buffer};
     use super::super::enrichment::test_util::{
-        encoded_request, encoded_request_with_large_span, resource_attributes,
+        encoded_request, encoded_request_with_large_span, logs_and_metrics_requests,
+        resource_attributes,
     };
     use super::super::{BUFFER_CAPACITY, enrichment};
     use super::test_util::{connect, read_head, request, request_with_headers, send};
@@ -668,36 +669,12 @@ mod tests {
 
     #[tokio::test]
     async fn logs_and_metrics_are_enriched_and_buffered() {
-        use openshell_otel_test_support::relay::string_attribute;
         use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
         use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-        use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
-        use opentelemetry_proto::tonic::metrics::v1::ResourceMetrics;
         use opentelemetry_proto::tonic::resource::v1::Resource;
 
-        let resource = || {
-            Some(Resource {
-                attributes: vec![
-                    string_attribute("service.name", "unit-agent"),
-                    string_attribute(enrichment::SANDBOX_ID_KEY, "spoofed"),
-                ],
-                ..Default::default()
-            })
-        };
-        let logs = ExportLogsServiceRequest {
-            resource_logs: vec![ResourceLogs {
-                resource: resource(),
-                ..Default::default()
-            }],
-        }
-        .encode_to_vec();
-        let metrics = ExportMetricsServiceRequest {
-            resource_metrics: vec![ResourceMetrics {
-                resource: resource(),
-                ..Default::default()
-            }],
-        }
-        .encode_to_vec();
+        let (logs, metrics) = logs_and_metrics_requests();
+        let (logs, metrics) = (logs.encode_to_vec(), metrics.encode_to_vec());
 
         let (server, _handle, mut rx) = start(BUFFER_CAPACITY);
         let mut client = connect(&server);

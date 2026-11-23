@@ -713,7 +713,9 @@ mod tests {
     use tokio::io::AsyncWriteExt as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    use super::enrichment::test_util::{encoded_request, encoded_request_with_large_span};
+    use super::enrichment::test_util::{
+        encoded_request, encoded_request_with_large_span, logs_and_metrics_requests,
+    };
     use super::enrichment::{SANDBOX_ID_KEY, SOURCE_KEY, SOURCE_VALUE};
     use super::exporter::test_util::SilentCollector;
     use super::receiver::test_util::{connect, read_head, request, send};
@@ -905,50 +907,6 @@ mod tests {
         }));
     }
 
-    fn export_requests() -> (
-        opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest,
-        opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest,
-    ) {
-        use openshell_otel_test_support::relay::string_attribute;
-        use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
-        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-        use opentelemetry_proto::tonic::metrics::v1::ResourceMetrics;
-        use opentelemetry_proto::tonic::resource::v1::Resource;
-
-        let resource = || {
-            Some(Resource {
-                attributes: vec![
-                    string_attribute("service.name", "unit-agent"),
-                    string_attribute(SANDBOX_ID_KEY, "evil"),
-                ],
-                ..Default::default()
-            })
-        };
-        let logs = opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest {
-            resource_logs: vec![ResourceLogs {
-                resource: resource(),
-                scope_logs: vec![ScopeLogs {
-                    log_records: vec![LogRecord {
-                        body: Some(AnyValue {
-                            value: Some(any_value::Value::StringValue("agent-log".into())),
-                        }),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        };
-        let metrics =
-            opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
-                resource_metrics: vec![ResourceMetrics {
-                    resource: resource(),
-                    ..Default::default()
-                }],
-            };
-        (logs, metrics)
-    }
-
     #[tokio::test]
     async fn logs_and_metrics_reach_a_grpc_collector_with_attribution() {
         let collector = OtlpTestServer::start().await;
@@ -963,7 +921,7 @@ mod tests {
         let (mut client, boundary) = tokio::io::duplex(64 * 1024);
         tokio::spawn(reserved.handler.serve(Box::new(boundary)).unwrap());
 
-        let (logs, metrics) = export_requests();
+        let (logs, metrics) = logs_and_metrics_requests();
         for (path, body) in [
             ("/v1/logs", logs.encode_to_vec()),
             ("/v1/metrics", metrics.encode_to_vec()),
@@ -1020,7 +978,7 @@ mod tests {
         let (mut client, boundary) = tokio::io::duplex(64 * 1024);
         tokio::spawn(reserved.handler.serve(Box::new(boundary)).unwrap());
 
-        let (logs, metrics) = export_requests();
+        let (logs, metrics) = logs_and_metrics_requests();
         for (path, body) in [
             ("/v1/metrics", metrics.encode_to_vec()),
             ("/v1/logs", logs.encode_to_vec()),
