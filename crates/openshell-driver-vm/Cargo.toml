@@ -102,8 +102,7 @@ compute-driver = [
     "dep:zstd",
 ]
 ## Compile in telemetry support (forwards to openshell-core/telemetry). On by
-## default; build with `--no-default-features` for a telemetry-free VM driver
-## that reports telemetry disabled to the sandboxes it launches.
+## default; build with `--no-default-features` for a telemetry-free VM driver.
 telemetry = ["openshell-core/telemetry"]
 ## Convenience alias: every default feature except `telemetry`. Build a
 ## telemetry-free VM driver with

@@ -572,7 +572,7 @@ kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
 ```
 
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
-pod, and the gateway propagates the effective value to sandbox supervisors.
+pod.
 
 Gateway pod scheduling accepts top-level `nodeSelector`, `affinity`,
 `tolerations`, `priorityClassName`, and `topologySpreadConstraints` values for
