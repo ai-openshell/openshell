@@ -27,6 +27,7 @@ mod policy_update;
 mod port_forward;
 mod process;
 mod settings;
+mod signals_scheduling;
 mod smoke;
 mod ssh;
 mod templates;

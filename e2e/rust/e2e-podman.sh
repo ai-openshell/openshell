@@ -34,7 +34,6 @@ PODMAN_CI_TESTS=(
   podman_host_gateway
   provider_github_app
   provider_token_exchange
-  sandbox_compat_signals_sched
 )
 
 if [ -n "${E2E_TEST}" ] && [ -n "${E2E_TEST_SET}" ]; then
