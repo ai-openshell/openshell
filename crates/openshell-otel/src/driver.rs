@@ -267,6 +267,109 @@ pub fn install_driver_tracing(
     DriverTracingHandle { provider }
 }
 
+type ExportLayer =
+    Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static>;
+
+/// Driver logging installed at process start, with OTLP export added once a
+/// launching gateway sends its telemetry settings.
+pub struct DeferredDriverTracing {
+    descriptor: ComputeDriverTracing,
+    export: tracing_subscriber::reload::Handle<Option<ExportLayer>, tracing_subscriber::Registry>,
+    provider: std::sync::Mutex<Option<SdkTracerProvider>>,
+}
+
+/// Install console logging now and leave OTLP export to
+/// [`DeferredDriverTracing::enable_export`].
+#[must_use]
+pub fn install_deferred_driver_tracing(
+    descriptor: ComputeDriverTracing,
+    log_level: &str,
+    ansi: bool,
+) -> DeferredDriverTracing {
+    // The span filter sits outside the reloadable slot: a per-layer filter
+    // added by a reload would never be registered with the subscriber.
+    let (export, handle) = tracing_subscriber::reload::Layer::new(None::<ExportLayer>);
+    tracing_subscriber::registry()
+        .with(
+            export.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.is_span() && !metadata.target().starts_with("opentelemetry")
+            })),
+        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)))
+        .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+        .init();
+    DeferredDriverTracing {
+        descriptor,
+        export: handle,
+        provider: std::sync::Mutex::new(None),
+    }
+}
+
+impl DeferredDriverTracing {
+    /// Start exporting to the collector in `config`, sending `headers`. Does
+    /// nothing without an endpoint or once export is running. Setup failures
+    /// are logged, as at standalone startup.
+    pub fn enable_export(&self, config: DriverTracingConfig<'_>, headers: http::HeaderMap) {
+        let mut running = self
+            .provider
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(endpoint) = config.endpoint else {
+            return;
+        };
+        if running.is_some() {
+            return;
+        }
+        let (provider, error) = match config.transport() {
+            Ok(mut transport) => {
+                transport.headers = headers;
+                self.descriptor.provider_for(
+                    Some(endpoint),
+                    &transport,
+                    config.service_version,
+                    config.gateway_name,
+                    Some(self.descriptor.compute_driver()),
+                )
+            }
+            Err(error) => (None, Some(error.into())),
+        };
+        if let Some(error) = error {
+            tracing::error!(%error, "OTLP exporting could not be started");
+            return;
+        }
+        let Some(provider) = provider else {
+            return;
+        };
+        let layer: ExportLayer = {
+            use opentelemetry::trace::TracerProvider as _;
+            Box::new(
+                tracing_opentelemetry::layer()
+                    .with_tracer(provider.tracer(self.descriptor.service_name())),
+            )
+        };
+        if let Err(error) = self.export.reload(Some(layer)) {
+            tracing::error!(%error, "OTLP exporting could not be started");
+            return;
+        }
+        tracing::info!(endpoint, "OTLP exporting enabled");
+        *running = Some(provider);
+    }
+}
+
+impl Drop for DeferredDriverTracing {
+    fn drop(&mut self) {
+        let provider = self
+            .provider
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(provider) = provider
+            && let Err(error) = provider.shutdown()
+        {
+            tracing::warn!(%error, "OTLP tracer provider shutdown failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
