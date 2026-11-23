@@ -21,8 +21,8 @@ Monitor GitHub Actions workflow runs using the `gh` CLI.
 ## Larger hosted runner trial
 
 On the larger-hosted trial branch, CPU-heavy Linux Rust checks use
-`openshell-hosted-amd64-16` and `openshell-hosted-arm64-16`: GitHub-managed Ubuntu
-24.04 VMs with 16 CPUs, 64 GB RAM, and 600 GB SSD. These labels select hosted
+`openshell-hosted-amd64-8` and `openshell-hosted-arm64-8`: GitHub-managed Ubuntu
+24.04 VMs with 8 CPUs, 32 GB RAM, and 300 GB SSD. These labels select hosted
 runners; they do not use the GKE fleet. The definitions cap concurrency at eight
 AMD64 and four ARM64 jobs and restrict repository access to ai-openshell/openshell.
 Other runner targets, Cargo commands, cache settings, and debug profiles remain

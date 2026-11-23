@@ -6,10 +6,10 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 ## Overview
 
-PR CI runs on GitHub-hosted runners. This branch trials 16-CPU / 64-GB / 600-GB
+PR CI runs on GitHub-hosted runners. This branch trials 8-CPU / 32-GB / 300-GB
 Ubuntu 24.04 runners for Rust lint, workspace tests, build-mode checks, PostgreSQL
 tests, feature-alias verification, and gateway feature checks. Their labels are
-`openshell-hosted-amd64-16` and `openshell-hosted-arm64-16`. Lightweight checks,
+`openshell-hosted-amd64-8` and `openshell-hosted-arm64-8`. Lightweight checks,
 ARM Python, and macOS keep their existing runner targets. The trial changes
 runner targets only: commands, features, cache settings, debug profiles, and job
 structure are unchanged from main.
@@ -19,7 +19,8 @@ restricted to `ai-openshell/openshell`. Concurrency is capped at eight AMD64 job
 and four ARM64 jobs. Larger hosted runners are billable for public repositories;
 GitHub provisions a fresh VM per job and manages its teardown. External
 contributor approval requirements remain in effect. This is a separate trial
-from the GKE runner PR.
+from the GKE runner PR. The previous commit trials 16-CPU runners; this commit
+uses 8-CPU runners on the same Linux targets to compare runtime and cost.
 
 `Branch Checks` and `Helm Lint` trigger on `pull_request` and `merge_group`. Workflow runs from outside contributors wait for a maintainer to approve them in the Actions tab.
 
