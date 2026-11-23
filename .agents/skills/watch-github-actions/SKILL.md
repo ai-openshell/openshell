@@ -163,6 +163,9 @@ crypto, and test jobs beside the regular controls. Compare each architecture's
 later control completion against its combined job, and runner minutes against
 the control sum. Confirm cold versus warm target sizes; no Clippy architecture
 coverage is dropped in this experiment. Ordinary PR runs skip the comparison.
+Combined workers normally have zero idle pods; prewarm both architectures
+through the infra add-ons `combined_trial_idle_runners=1` setting before timing
+a run, and restore zero idle workers afterward. Keep their SSDs for reuse.
 See `CI.md` for trial scope and cache setup.
 
 ## View Job Logs

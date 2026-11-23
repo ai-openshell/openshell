@@ -69,7 +69,11 @@ workers each reserve eight runner CPUs; ARM64 workers each reserve twelve.
 Compare warmed runs on the same commit: parallel completion is the later
 lint/test completion; combined completion is one job. Report total runner
 minutes separately. The input defaults to false so ordinary PR checks do not
-run duplicate suites.
+run duplicate suites. The optional combined workers normally scale to zero idle
+pods while retaining their SSDs. Before measuring, prewarm them in the infra
+add-ons workspace with `-var=combined_trial_idle_runners=1`, wait for both
+workers to be ready, then run twice on the same commit. Afterward, apply the
+default zero-idle setting to release their compute.
 
 `pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive.
 
