@@ -158,11 +158,6 @@ set `CARGO_PROFILE_TEST_DEBUG=0`; debug assertions remain enabled. ARM crypto
 checks run in lint while workspace tests run separately. Gateway core features
 retain both parallel matrix jobs and all four independent feature checks.
 
-Manual `local_image_builds` runs build AMD64 gateway/sandbox/supervisor images
-and smoke-test `--help` with pushing disabled. They use production auditable
-Nix GNU/musl release commands, verify glibc/static linkage, and load images only
-into ephemeral Docker. They do not qualify ARM images or publish artifacts.
-
 For Kubernetes app-listener E2E failures during kind setup, inspect the uploaded
 `results/app-listener/cni-setup/` evidence. It includes node and Calico pod
 descriptions, events, and current/previous container logs. A CNI rollout timeout

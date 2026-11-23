@@ -52,17 +52,6 @@ AMD64 tests set `CARGO_PROFILE_TEST_DEBUG=0` and use a separate `test-debug0`
 target directory. All assertions and crypto/workspace checks remain enabled;
 backtraces contain less debug information. Other platforms retain their profiles.
 
-Manual Branch Checks runs can enable `local_image_builds` for an additional
-native AMD64 gateway/sandbox/supervisor build and `--help` smoke check. It uses
-the production Nix auditable release-binary build commands and remote BuildKit, explicitly sets
-`DOCKER_PUSH=0` and `DOCKER_OUTPUT=type=docker`, and loads results only into the
-runner's ephemeral Docker daemon. No registry login, image upload, or registry
-cache export is performed. The job uses the production Nix GNU/musl toolchain
-rather than the local Zig staging helper, verifies the glibc 2.28 floor and
-static sandbox linkage, and skips unrelated mise tool installation. This optional release/image build is measured
-separately from the normal branch-check latency and does not qualify ARM64
-images or release attestations.
-
 Native ARM lint/crypto, workspace tests, and build-mode checks all use
 `openshell-ci-arm64`. Build-mode checks retain telemetry-on/off builds,
 telemetry-marker verification, system CA roots, and prover dependency checks.
