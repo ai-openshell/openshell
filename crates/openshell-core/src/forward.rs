@@ -924,15 +924,15 @@ pub fn shell_escape(value: &str) -> String {
 
 /// Build a one-use proxy command. The handle identifies an owner-only IPC
 /// endpoint. Only the parent and proxy exchange the relay credentials.
-pub fn build_proxy_command(handle: &str, sandbox: &str, workspace: &str) -> Result<String> {
-    let exe = std::env::current_exe().into_diagnostic()?;
-    Ok(format!(
+pub fn build_proxy_command(exe: &str, handle: &str, sandbox: &str, workspace: &str) -> String {
+    format!(
         "{} ssh-proxy --sandbox {} --workspace {} --handoff {}",
-        shell_escape(&exe.to_string_lossy()).replace('%', "%%"),
-        shell_escape(sandbox).replace('%', "%%"),
-        shell_escape(workspace).replace('%', "%%"),
+        shell_escape(exe),
+        shell_escape(sandbox),
+        shell_escape(workspace),
         shell_escape(handle),
-    ))
+    )
+    .replace('%', "%%")
 }
 
 /// Build the `ssh` options shared by every sandbox session.
@@ -1327,8 +1327,12 @@ mod tests {
     #[test]
     fn build_proxy_command_escapes_shell_metacharacters() {
         // Attacker-controlled values in every escapable position.
-        let cmd =
-            build_proxy_command("handle", "x$(touch /tmp/pwn)x", "ws; touch /tmp/pwn").unwrap();
+        let cmd = build_proxy_command(
+            "/usr/local/bin/openshell",
+            "handle",
+            "x$(touch /tmp/pwn)x",
+            "ws; touch /tmp/pwn",
+        );
 
         // The `$` / backtick must only appear inside single-quoted regions.
         // A simple grep-based check: split on single-quoted runs and assert
@@ -1345,25 +1349,17 @@ mod tests {
     fn build_proxy_command_empty_values_quote_rather_than_vanish() {
         // An empty value must become `''` rather than disappearing — otherwise
         // downstream argv splitting would misalign.
-        let cmd = build_proxy_command("handle", "", "").unwrap();
+        let cmd = build_proxy_command("exe", "handle", "", "");
         assert!(cmd.contains("--sandbox ''"));
         assert!(cmd.contains("--workspace ''"));
     }
 
     #[test]
     fn build_proxy_command_contains_only_handle_and_sandbox_identity() {
-        let cmd = build_proxy_command("opaque", "sb-123", "workspace-1").unwrap();
+        let cmd = build_proxy_command("/opt/My %h/bin", "opaque", "sb-123", "workspace-1");
         assert_eq!(
-            &split_proxy_command_words(&cmd)[1..],
-            &[
-                "ssh-proxy",
-                "--sandbox",
-                "sb-123",
-                "--workspace",
-                "workspace-1",
-                "--handoff",
-                "opaque"
-            ]
+            cmd,
+            "'/opt/My %%h/bin' ssh-proxy --sandbox sb-123 --workspace workspace-1 --handoff opaque"
         );
     }
 

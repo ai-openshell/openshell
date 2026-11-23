@@ -85,6 +85,7 @@ struct SandboxState {
     ssh_requests_with_cached_bearer: Arc<AtomicUsize>,
     replace_after_first_ssh_revoke: Arc<AtomicBool>,
     ssh_session_revocations: Arc<AtomicUsize>,
+    revoked_ssh_tokens: Arc<Mutex<Vec<String>>>,
     /// Reject token-less `ForwardTcp` inits the way a gateway that predates
     /// principal-authorized TCP forwards does.
     forward_requires_session_token: Arc<AtomicBool>,
@@ -459,8 +460,8 @@ impl OpenShell for TestOpenShell {
         let request = request.into_inner();
         let sandbox_id = self.state.ssh_sandbox_id(&request.sandbox);
         Ok(Response::new(CreateSshSessionResponse {
+            token: format!("token-{sandbox_id}"),
             sandbox_id,
-            token: "test-token".to_string(),
             gateway_scheme: "https".to_string(),
             gateway_host: "localhost".to_string(),
             gateway_port: 443,
@@ -503,8 +504,13 @@ impl OpenShell for TestOpenShell {
 
     async fn revoke_ssh_session(
         &self,
-        _request: tonic::Request<RevokeSshSessionRequest>,
+        request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
+        self.state
+            .revoked_ssh_tokens
+            .lock()
+            .await
+            .push(request.into_inner().token);
         self.state
             .ssh_session_revocations
             .fetch_add(1, Ordering::SeqCst);
@@ -892,7 +898,9 @@ impl OpenShell for TestOpenShell {
                     "authorization_token is required for ForwardTcp",
                 ));
             }
-        } else if init.authorization_token != "test-token" {
+        } else if init.authorization_token
+            != format!("token-{}", self.state.ssh_sandbox_id(&init.sandbox))
+        {
             return Err(Status::unauthenticated("SSH session token not found"));
         }
 
@@ -3009,7 +3017,10 @@ async fn copy_retry_refuses_and_revokes_a_same_name_replacement() {
                     "{err:?}"
                 );
                 assert_eq!(state.ssh_session_requests.load(Ordering::SeqCst), 2);
-                assert_eq!(state.ssh_session_revocations.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    *state.revoked_ssh_tokens.lock().await,
+                    ["token-id-copy", "token-replacement-copy"]
+                );
                 assert_eq!(fs::read(&file).unwrap(), b"original data");
             }
         })
@@ -4153,7 +4164,7 @@ async fn service_forward_falls_back_to_session_tokens_once_for_a_legacy_gateway(
     echo_through_local_forward(&forward, port, b"first connection").await;
     wait_for_count(&state.ssh_session_revocations, 1, "revocation").await;
     let inits = state.forward_inits.lock().await.clone();
-    assert_eq!(forward_tokens(&inits), vec!["", "test-token"]);
+    assert_eq!(forward_tokens(&inits), vec!["", "token-id-svc-sandbox"]);
     assert_eq!(state.forward_token_rejections.load(Ordering::SeqCst), 1);
     assert_eq!(state.ssh_session_requests.load(Ordering::SeqCst), 1);
 
@@ -4162,7 +4173,10 @@ async fn service_forward_falls_back_to_session_tokens_once_for_a_legacy_gateway(
     echo_through_local_forward(&forward, port, b"second connection").await;
     wait_for_count(&state.ssh_session_revocations, 2, "revocations").await;
     let inits = state.forward_inits.lock().await.clone();
-    assert_eq!(forward_tokens(&inits), vec!["", "test-token", "test-token"]);
+    assert_eq!(
+        forward_tokens(&inits),
+        vec!["", "token-id-svc-sandbox", "token-id-svc-sandbox"]
+    );
     assert_eq!(state.forward_token_rejections.load(Ordering::SeqCst), 1);
     assert_eq!(state.ssh_session_requests.load(Ordering::SeqCst), 2);
     assert!(
