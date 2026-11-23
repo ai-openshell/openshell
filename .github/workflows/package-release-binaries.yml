@@ -63,6 +63,9 @@ jobs:
           - artifact: openshell-driver-vm-aarch64-apple-darwin
             binary: openshell-driver-vm
             package: driver-vm-macos
+          - artifact: openshell-driver-podman-aarch64-apple-darwin
+            binary: openshell-driver-podman
+            package: driver-podman-macos
           - artifact: openshell-prover-x86_64-unknown-linux-musl
             binary: openshell-prover
             package: prover-binary-linux-amd64
