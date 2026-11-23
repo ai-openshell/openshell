@@ -2236,27 +2236,32 @@ fn host_alias(name: &str, workspace: &str) -> String {
 
 fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<String> {
     let exe = std::env::current_exe().into_diagnostic()?;
-    let selector = if let Some(authority) = gateway
-        .strip_prefix("https://")
-        .or_else(|| gateway.strip_prefix("http://"))
-    {
-        if authority
-            .strip_suffix('/')
-            .unwrap_or(authority)
-            .contains(['/', '@', '?', '#', '\\'])
+    let (selector, target) = match gateway.split_once("://") {
+        Some((scheme, rest))
+            if (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+                && !rest.contains('@')
+                && rest
+                    .strip_suffix('/')
+                    .unwrap_or(rest)
+                    .parse::<hyper::http::uri::Authority>()
+                    .is_ok() =>
         {
+            (
+                "--server",
+                format!("{}://{rest}", scheme.to_ascii_lowercase()),
+            )
+        }
+        None if !gateway.contains(['/', '\r', '\n']) => ("--gateway-name", gateway.to_owned()),
+        _ => {
             return Err(miette::miette!(
                 "A saved SSH configuration needs a named gateway profile for this private endpoint. Register the endpoint with `openshell gateway add <endpoint> --name <profile>`."
             ));
         }
-        "--server"
-    } else {
-        "--gateway-name"
     };
     let proxy_cmd = format!(
         "{} ssh-proxy {selector} {} --name {} --workspace {}",
         shell_escape(&exe.to_string_lossy()).replace('%', "%%"),
-        shell_escape(gateway).replace('%', "%%"),
+        shell_escape(&target).replace('%', "%%"),
         shell_escape(name).replace('%', "%%"),
         shell_escape(workspace).replace('%', "%%"),
     );
@@ -2944,9 +2949,8 @@ mod tests {
 
     #[test]
     fn render_ssh_config_includes_workspace_in_proxy_command() {
-        assert!(render_ssh_config("https://gw/private/..", "demo", "beta").is_err());
-        assert!(render_ssh_config("https://user:pw@gw/?key=value", "demo", "beta").is_err());
         let config = render_ssh_config("my-gw", "demo", "beta").unwrap();
+        assert!(config.contains("--gateway-name my-gw"));
         assert!(
             config.contains("Host openshell-demo.beta"),
             "host alias should be workspace-qualified: {config}"
@@ -2955,6 +2959,36 @@ mod tests {
             config.contains("--workspace beta"),
             "ProxyCommand should include --workspace: {config}"
         );
+    }
+
+    #[test]
+    fn ssh_config_only_saves_direct_http_origins() {
+        for scheme in ["http", "https", "HTTP", "HtTpS"] {
+            for suffix in [
+                "user:pw@gw",
+                "gw/private/..",
+                "gw/?key=value",
+                "gw/#private",
+                "gw\\private",
+            ] {
+                let endpoint = format!("{scheme}://{suffix}");
+                let err = render_ssh_config(&endpoint, "demo", "beta").unwrap_err();
+                assert!(!err.to_string().contains(&endpoint));
+            }
+            let endpoint = format!("{scheme}://[::1]:8443/");
+            let config = render_ssh_config(&endpoint, "demo", "beta").unwrap();
+            assert!(config.contains(&format!(
+                "--server {}",
+                shell_escape(&endpoint.to_ascii_lowercase())
+            )));
+        }
+        for endpoint in [
+            " https://user:pw@gw",
+            "unknown://user:pw@gw",
+            "https:/private",
+        ] {
+            assert!(render_ssh_config(endpoint, "demo", "beta").is_err());
+        }
     }
 
     #[test]
