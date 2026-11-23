@@ -630,6 +630,15 @@ impl OpaEngine {
     /// Authorize egress and return all connection metadata from one Rego result
     /// evaluated against one policy generation.
     pub fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
+        use crate::metrics::{Scope, evaluate};
+        evaluate(
+            Scope::Connection,
+            || self.authorize_egress_inner(input),
+            |decision| matches!(decision.action, NetworkAction::Allow { .. }),
+        )
+    }
+
+    fn authorize_egress_inner(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
         #[cfg(test)]
         record_test_opa_query();
 

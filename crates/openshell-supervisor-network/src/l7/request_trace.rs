@@ -11,6 +11,7 @@ use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use super::correlation::HttpOutcome;
+use crate::metrics::{self, InspectionType, Outcome, ResultLabel, Scope, Stage, Timer};
 
 const MAX_TRACEPARENT_BYTES: usize = 256;
 
@@ -19,6 +20,9 @@ pub(super) struct RequestTrace {
     span: Span,
     outcome: &'static str,
     failure_reason: Option<&'static str>,
+    inspection: Option<Timer>,
+    inspection_type: InspectionType,
+    admission: Outcome,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,7 +88,53 @@ impl RequestTrace {
             span,
             outcome: "incomplete",
             failure_reason: None,
+            inspection: None,
+            inspection_type: InspectionType::Http,
+            admission: Outcome::Allow,
         }
+    }
+
+    pub(super) fn start_inspection(&mut self) {
+        self.inspection = Some(Timer::new(Stage::Inspection(
+            Scope::Request,
+            self.inspection_type,
+        )));
+    }
+
+    pub(super) fn select_inspector(&mut self, inspection_type: InspectionType) {
+        self.inspection_type = inspection_type;
+        if let Some(timer) = self.inspection.as_mut() {
+            timer.set_stage(Stage::Inspection(Scope::Request, inspection_type));
+        }
+    }
+
+    pub(super) fn note_admission(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Audit if !matches!(self.admission, Outcome::FailOpen) => {
+                self.admission = outcome;
+            }
+            Outcome::FailOpen => self.admission = outcome,
+            _ => {}
+        }
+    }
+
+    pub(super) fn inspection_timer(&mut self) -> Option<&mut Timer> {
+        self.inspection.as_mut()
+    }
+
+    pub(super) fn finish_inspection(&mut self, result: ResultLabel) {
+        let Some(timer) = self.inspection.take() else {
+            return;
+        };
+        let outcome = match result {
+            ResultLabel::Success => Some(self.admission),
+            ResultLabel::Deny => Some(Outcome::Deny),
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            metrics::decision(Scope::Request, outcome, self.inspection_type);
+        }
+        timer.finish(result);
     }
 
     pub(super) fn span(&self) -> Span {
@@ -110,6 +160,9 @@ impl RequestTrace {
     }
 
     pub(super) fn record_outcome(&mut self, outcome: HttpOutcome) {
+        if matches!(outcome, HttpOutcome::Denied) {
+            self.finish_inspection(ResultLabel::Deny);
+        }
         let outcome = match outcome {
             _ if self.outcome == "failed" => "failed",
             HttpOutcome::Allowed if self.outcome == "denied" => "denied",
@@ -137,6 +190,7 @@ impl RequestTrace {
 
 impl Drop for RequestTrace {
     fn drop(&mut self) {
+        self.finish_inspection(ResultLabel::Cancelled);
         // Finalize exported timing after the request's child stages.
         self.span.in_scope(|| {
             self.span.record("openshell.request.outcome", self.outcome);

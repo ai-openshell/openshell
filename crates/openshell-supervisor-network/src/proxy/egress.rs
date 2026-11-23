@@ -12,6 +12,7 @@
 //! drifting as more adapters are added.
 
 use super::destination::DestinationValidationPlan;
+use crate::metrics::Outcome;
 use crate::opa::NetworkAction;
 use openshell_isolation_interface::contract::ProcessInstance;
 use openshell_ocsf::Process;
@@ -282,13 +283,13 @@ pub(super) fn traced_authorization<T>(
     let result = span.in_scope(|| authorize(intent));
     match &decision(&result).action {
         NetworkAction::Allow { matched_policy } => {
-            span.record("openshell.policy.decision", "allow");
+            span.record("openshell.policy.decision", Outcome::Allow.label());
             if let Some(name) = matched_policy {
                 span.record("openshell.policy.name", name.as_str());
             }
         }
         NetworkAction::Deny { .. } => {
-            span.record("openshell.policy.decision", "deny");
+            span.record("openshell.policy.decision", Outcome::Deny.label());
         }
     }
     result

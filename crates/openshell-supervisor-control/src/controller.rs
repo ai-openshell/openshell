@@ -354,6 +354,7 @@ struct Inner {
     observed: Mutex<Observed>,
     /// This replica's peer endpoint, sent in every `HostAccepted`.
     peer_endpoint: Mutex<String>,
+    supervisor_metrics: Mutex<Vec<u8>>,
     /// Size limits of the pool and each member.
     limits: Mutex<PoolLimits>,
     /// Live gateway replicas serving the pool, which scale its capacity.
@@ -409,6 +410,7 @@ impl SupervisorHostController {
                 membership: watch::Sender::new(0),
                 observed: Mutex::new(Observed::default()),
                 peer_endpoint: Mutex::new(String::new()),
+                supervisor_metrics: Mutex::new(Vec::new()),
                 limits: Mutex::new(PoolLimits::default()),
                 gateway_replicas: AtomicUsize::new(1),
             }),
@@ -446,6 +448,11 @@ impl SupervisorHostController {
     /// Call it before any host attaches.
     pub fn set_peer_endpoint(&self, peer_endpoint: String) {
         *lock(&self.inner.peer_endpoint) = peer_endpoint;
+    }
+
+    /// Set the collector configuration sent to authenticated supervisors.
+    pub fn set_supervisor_metrics(&self, configuration: Vec<u8>) {
+        *lock(&self.inner.supervisor_metrics) = configuration;
     }
 
     /// Offer every instance's runtime `recovery_timeout_secs` instead of
@@ -899,6 +906,7 @@ impl SupervisorHostController {
         let expires_at = identity.expires_at;
         let (session_id, superseded) = self.begin_session(identity, &hello)?;
         let peer_endpoint = lock(&self.inner.peer_endpoint).clone();
+        let supervisor_metrics = lock(&self.inner.supervisor_metrics).clone();
         tx.send(Ok(HostGatewayMessage {
             payload: Some(host_gateway_message::Payload::Accepted(HostAccepted {
                 session_id: session_id.to_string(),
@@ -907,6 +915,7 @@ impl SupervisorHostController {
                     nanos: 0,
                 }),
                 peer_endpoint,
+                supervisor_metrics,
             })),
         }))
         .await

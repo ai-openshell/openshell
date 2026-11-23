@@ -257,6 +257,20 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    use crate::metrics::{self, ActiveConnection, InspectionType, Outcome, Scope};
+
+    let protocol = match &context.policy {
+        PreparedHttpPolicy::Inspect { configs, .. } if configs.len() == 1 => {
+            Some(configs[0].protocol)
+        }
+        _ => None,
+    };
+    let inspection = protocol.map_or(InspectionType::Http, InspectionType::from_protocol);
+    let _connection = ActiveConnection::new(inspection);
+    if protocol != Some(crate::l7::L7Protocol::Sql) {
+        metrics::decision(Scope::Connection, Outcome::Allow, inspection);
+    }
+
     match context.policy {
         PreparedHttpPolicy::Inspect { configs, evaluator } if configs.len() == 1 => {
             let generation_guard = evaluator.generation_guard().clone();
@@ -348,6 +362,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    let _connection = crate::metrics::ActiveConnection::new(crate::metrics::InspectionType::Tcp);
     tokio::select! {
         result = tokio::io::copy_bidirectional(client, upstream) => {
             result.into_diagnostic()?;

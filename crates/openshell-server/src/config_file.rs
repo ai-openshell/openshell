@@ -416,7 +416,7 @@ pub struct MetricsTlsFileConfig {
 ///
 /// `endpoint` is the collector for every enabled signal, and on its own
 /// enables trace export. `[otlp.traces]` overrides the trace endpoint;
-/// `[otlp.metrics]` with `enabled = true` exports gateway metrics;
+/// `[otlp.metrics]` with `enabled = true` exports gateway and supervisor metrics;
 /// `[otlp.ocsf]` with `enabled = true` exports OCSF events as log records; and
 /// `[otlp.agent]` with `enabled = true` relays workload traces. Each signal
 /// can use a different endpoint. SDK tuning knobs are deliberately absent —
@@ -435,7 +435,7 @@ pub struct OtlpConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traces: Option<OtlpTracesConfig>,
 
-    /// Gateway metric export, when enabled.
+    /// Gateway and supervisor metric export, when enabled.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -518,6 +518,7 @@ impl OtlpConfig {
             traces: self.traces.as_ref().map(|traces| traces.collector.export()),
             ocsf: self.ocsf.as_ref().map(|ocsf| ocsf.collector.export()),
             agent: self.agent.as_ref().map(|agent| agent.collector.export()),
+            metrics: self.metrics.as_ref().map(OtlpCollectorConfig::export),
         }
     }
 }
@@ -884,7 +885,7 @@ impl OtlpCollectorConfig {
         }
     }
 
-    fn export(&self) -> openshell_core::sandbox_env::OtlpExport {
+    pub(crate) fn export(&self) -> openshell_core::sandbox_env::OtlpExport {
         openshell_core::sandbox_env::OtlpExport {
             endpoint: self.endpoint.clone(),
             protocol: self.protocol,
@@ -928,7 +929,7 @@ pub struct AgentOtlpConfig {
 #[serde(deny_unknown_fields)]
 struct RawOtlpConfig {
     #[serde(default)]
-    metrics: Option<RawOtlpMetrics>,
+    metrics: Option<RawEnabledOtlp>,
     #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
@@ -950,33 +951,12 @@ struct RawOtlpConfig {
     #[serde(default)]
     ocsf: Option<RawOcsfOtlp>,
     #[serde(default)]
-    agent: Option<RawAgentOtlp>,
+    agent: Option<RawEnabledOtlp>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawAgentOtlp {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    endpoint: Option<String>,
-    #[serde(default)]
-    protocol: Option<OtlpProtocol>,
-    #[serde(default)]
-    headers: Option<BTreeMap<String, String>>,
-    #[serde(default)]
-    headers_file: Option<PathBuf>,
-    #[serde(default)]
-    ca_file: Option<PathBuf>,
-    #[serde(default)]
-    cert_file: Option<PathBuf>,
-    #[serde(default)]
-    key_file: Option<PathBuf>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawOtlpMetrics {
+struct RawEnabledOtlp {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
@@ -2296,6 +2276,7 @@ service_name = "openshell-gateway-dev"
         assert!(otlp.service_name.is_none());
         assert_eq!(otlp.ocsf, None);
         assert!(otlp.metrics.is_none());
+        assert!(otlp.supervisor_otlp().metrics.is_none());
     }
 
     #[test]
@@ -2310,6 +2291,7 @@ service_name = "openshell-gateway-dev"
         let metrics = config.metrics.as_ref().unwrap();
         assert_eq!(metrics.endpoint, "http://shared:4318");
         assert_eq!(metrics.protocol, OtlpProtocol::HttpProtobuf);
+        assert_eq!(config.supervisor_otlp().metrics, Some(metrics.export()));
         assert_eq!(
             metrics.headers.header_map()["authorization"],
             "Bearer shared"
@@ -2331,6 +2313,7 @@ service_name = "openshell-gateway-dev"
              [openshell.gateway.otlp.metrics]\n",
         );
         assert!(disabled.metrics.is_none());
+        assert!(disabled.supervisor_otlp().metrics.is_none());
 
         let own = otlp(
             "[openshell.gateway.otlp.metrics]\nenabled = true\n\
@@ -2340,6 +2323,7 @@ service_name = "openshell-gateway-dev"
         assert_eq!(metrics.endpoint, "http://metrics:4318");
         assert_eq!(metrics.protocol, OtlpProtocol::HttpProtobuf);
         assert!(own.traces.is_none());
+        assert_eq!(own.supervisor_otlp().metrics, Some(metrics.export()));
 
         let error = toml::from_str::<OtlpConfig>(
             "[metrics]\nenabled = true\n[traces]\nendpoint = 'http://traces:4317'\n",
@@ -2477,6 +2461,7 @@ service_name = "openshell-gateway-dev"
                 traces: export("http://shared:4318", OtlpProtocol::HttpProtobuf),
                 ocsf: export("http://shared:4318", OtlpProtocol::HttpProtobuf),
                 agent: export("http://agents:4317", OtlpProtocol::Grpc),
+                metrics: None,
             },
             "lanes without an endpoint inherit the shared protocol; a lane \
              with its own endpoint does not"
