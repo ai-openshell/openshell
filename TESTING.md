@@ -268,8 +268,8 @@ is one. CI rows can opt in with `test_threads`.
 `openshell-test-runner build --family <family> --out <dir>` builds a family's
 test bundle for the guest without booting a VM, and `run --bundle <dir>` runs
 it instead of building one. `--package` then selects the tests to run from the
-bundle, which must hold those packages. Branch E2E builds the `features` and
-`drivers/podman` bundles once and passes them to their rows this way. Two runs on one host
+bundle, which must hold those packages. Branch E2E builds the feature and driver
+bundles once and passes them to their rows this way. Two runs on one host
 need different `TMACHINE_SSH_PORT` values (default 2222). The installer
 inputs, such as the Debian package and the images, come from `artifacts/`,
 built by `nix run .#build-artifacts` or downloaded by CI.
@@ -458,7 +458,24 @@ def test_multiply(sandbox):
 | `sandbox_client` | session | gRPC client connected to the active gateway |
 | `sandbox` | function | Factory returning a `Sandbox` context manager |
 
+### Where a new test goes
+
+| If the test needs… | Put it here |
+|---|---|
+| A public contract that applies to every driver | `tests/suites/conformance` |
+| A service or fixed gateway setting | `tests/suites/features/<name>`; add a tmachine add-on if the setup is missing (see [Adding a feature suite](#adding-a-feature-suite)) |
+| Driver-specific behavior | `tests/suites/drivers/{docker,podman,kubernetes,vm}`. Kubernetes runs on `k3s` and `k3s-ha`; VM runs on the existing VM host lane. |
+| A GPU or a gateway restart or reconfiguration during the test | No home yet. Use [continuity suites](#continuity-suites-testssuitescontinuity) if the runner can apply the disruption between test phases. |
+
+For a GPU or mid-test restart or reconfiguration case that cannot move yet,
+link a porting issue under [#5281](https://github.com/ai-openshell/openshell/issues/5281)
+and ask a maintainer for `test:e2e-rust-exception`. After a label change, rerun
+the Rust E2E Freeze job so it reads the current labels.
+
 ### Rust CLI E2E (`e2e/rust/`)
+
+This tree is frozen to new tests. You can edit or delete existing tests.
+See [Where a new test goes](#where-a-new-test-goes) for alternatives.
 
 Rust-based e2e tests that exercise the `openshell` CLI binary as a subprocess.
 They live in the `openshell-e2e` crate and use a shared harness for sandbox
