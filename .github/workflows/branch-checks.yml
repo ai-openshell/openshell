@@ -410,8 +410,6 @@ jobs:
 
       - name: Test
         shell: nix develop -c bash -euo pipefail {0}
-        env:
-          OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
           cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
@@ -446,7 +444,6 @@ jobs:
         shell: nix develop -c bash -euo pipefail {0}
         env:
           CONTAINER_ENGINE: docker
-          OPENSHELL_TELEMETRY_ENABLED: "false"
         run: tasks/scripts/run-postgres-tests.sh --locked --profile ci
 
   rust-build-modes:
@@ -479,12 +476,6 @@ jobs:
       - name: Verify build modes
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo build --locked -p openshell-gateway --bin openshell-gateway
-          tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
-          cargo build --locked -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
-          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
-          cargo build --locked -p openshell-supervisor --bin openshell-supervisor
-          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor
           cargo check --locked -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots
 
       - name: Verify system CA roots dependency boundary
@@ -506,29 +497,6 @@ jobs:
             cat /tmp/openshell-prover-dependencies.txt >&2
             exit 1
           fi
-
-  rust-feature-alias:
-    name: Rust feature alias
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: ./.github/actions/setup-nix
-        with:
-          prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-
-      - uses: ./.github/actions/setup-rust
-        with:
-          cache-key: rust-checks-v2
-          save-cache: "false"
-
-      - name: Verify defaults-without-telemetry feature alias
-        shell: nix develop -c bash -euo pipefail {0}
-        run: |
-          tasks/scripts/verify-defaults-without-telemetry.sh
-          git diff --exit-code HEAD -- ':(glob)**/Cargo.lock'
 
   rust-gateway-core-features:
     name: Rust gateway core features

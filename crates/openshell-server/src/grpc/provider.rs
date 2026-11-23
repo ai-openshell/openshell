@@ -29,9 +29,6 @@ use openshell_core::proto::{
     ProviderProfile, ProviderProfileCredential, Sandbox, StaticCredentialBinding,
     StaticCredentialEndpointBinding,
 };
-use openshell_core::telemetry::{
-    LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
-};
 use openshell_credential_issuer::refresh::CredentialRefresh;
 use openshell_credential_issuer::refresh::{minter, secret_refs};
 use openshell_policy::ProviderPolicyLayer;
@@ -2948,11 +2945,6 @@ pub(super) async fn handle_create_provider(
         .await?
         .ensure_active()?;
     let Some(mut provider) = req.provider else {
-        emit_provider_lifecycle(
-            "custom",
-            LifecycleOperation::Create,
-            TelemetryOutcome::Failure,
-        );
         return Err(Status::invalid_argument("provider is required"));
     };
     if let Some(metadata) = provider.metadata.as_mut() {
@@ -2963,7 +2955,6 @@ pub(super) async fn handle_create_provider(
             "provider.credential_handles is internal gateway state and cannot be supplied",
         ));
     }
-    let provider_type = provider.r#type.clone();
     let _mutation_guard = state
         .compute
         .mutation_guard(MutationScope::Workspace(&workspace))
@@ -2980,36 +2971,19 @@ pub(super) async fn handle_create_provider(
     if state.credentials.stores_provider_credentials() && !provider.credentials.is_empty() {
         state.compute.ensure_workspace(&workspace).await?;
     }
-    let result = create_provider_record_validating(
+    let provider = create_provider_record_validating(
         state.store.as_ref(),
         &workspace,
         &catalog,
         provider,
         Some(&state.credentials),
     )
-    .await;
-    match result {
-        Ok(provider) => {
-            emit_provider_lifecycle(
-                &provider.r#type,
-                LifecycleOperation::Create,
-                TelemetryOutcome::Success,
-            );
-            publish_provider_change(state, &workspace, provider.object_name());
-            Ok(Response::new(ProviderResponse {
-                provider: Some(provider),
-                ..Default::default()
-            }))
-        }
-        Err(err) => {
-            emit_provider_lifecycle(
-                &provider_type,
-                LifecycleOperation::Create,
-                TelemetryOutcome::Failure,
-            );
-            Err(err)
-        }
-    }
+    .await?;
+    publish_provider_change(state, &workspace, provider.object_name());
+    Ok(Response::new(ProviderResponse {
+        provider: Some(provider),
+        ..Default::default()
+    }))
 }
 
 pub(super) async fn handle_get_provider(
@@ -4594,14 +4568,8 @@ pub(super) async fn handle_update_provider(
             super::persistence_error_to_status(error, "acquire provider mutation lock")
         })?;
     let Some(mut provider) = req.provider else {
-        emit_provider_lifecycle(
-            "custom",
-            LifecycleOperation::Update,
-            TelemetryOutcome::Failure,
-        );
         return Err(Status::invalid_argument("provider is required"));
     };
-    let provider_type = provider.r#type.clone();
     provider
         .credential_expiration_times
         .extend(req.credential_expiration_times);
@@ -4619,7 +4587,7 @@ pub(super) async fn handle_update_provider(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
-    let result = update_provider_record_validating(
+    let provider = update_provider_record_validating(
         state.store.as_ref(),
         &state.refresh,
         &workspace,
@@ -4628,48 +4596,31 @@ pub(super) async fn handle_update_provider(
         &req.clear_credential_expiration_keys,
         Some(&state.credentials),
     )
-    .await;
-    match result {
-        Ok(provider) => {
-            let provider_version = provider
-                .metadata
-                .as_ref()
-                .map_or(0, |metadata| metadata.resource_version);
-            let mut target_receipts = Vec::with_capacity(targets.len());
-            for sandbox in &targets {
-                target_receipts.push(
-                    super::provider_readiness::record_provider_mutation(
-                        state,
-                        sandbox,
-                        provider.object_name(),
-                        openshell_core::proto::ProviderMutationKind::Update,
-                        Some((provider.object_id(), provider_version)),
-                        &mutation_id,
-                    )
-                    .await?,
-                );
-            }
-            emit_provider_lifecycle(
-                &provider.r#type,
-                LifecycleOperation::Update,
-                TelemetryOutcome::Success,
-            );
-            publish_provider_change(state, &workspace, provider.object_name());
-            Ok(Response::new(ProviderResponse {
-                provider: Some(provider),
-                target_receipts,
-                mutation_id,
-            }))
-        }
-        Err(err) => {
-            emit_provider_lifecycle(
-                &provider_type,
-                LifecycleOperation::Update,
-                TelemetryOutcome::Failure,
-            );
-            Err(err)
-        }
+    .await?;
+    let provider_version = provider
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+    let mut target_receipts = Vec::with_capacity(targets.len());
+    for sandbox in &targets {
+        target_receipts.push(
+            super::provider_readiness::record_provider_mutation(
+                state,
+                sandbox,
+                provider.object_name(),
+                openshell_core::proto::ProviderMutationKind::Update,
+                Some((provider.object_id(), provider_version)),
+                &mutation_id,
+            )
+            .await?,
+        );
     }
+    publish_provider_change(state, &workspace, provider.object_name());
+    Ok(Response::new(ProviderResponse {
+        provider: Some(provider),
+        target_receipts,
+        mutation_id,
+    }))
 }
 
 /// Exchange a supervisor's attached provider credential with safe failure details.
@@ -6266,87 +6217,20 @@ pub(super) async fn handle_delete_provider(
         .await
         .map_err(|e| super::persistence_error_to_status(e, "acquire provider mutation lock"))?;
     let name = req.name;
-    let provider_profile = provider_profile_for_name(state.store.as_ref(), &workspace, &name).await;
-    let result = delete_provider_record_with_credentials(
+    let deleted = delete_provider_record_with_credentials(
         state.store.as_ref(),
         &state.refresh,
         &workspace,
         &state.credentials,
         &name,
     )
-    .await;
-    match result {
-        Ok(deleted) => {
-            let outcome = TelemetryOutcome::from_success(deleted || req.allow_missing);
-            emit_provider_profile_lifecycle(
-                provider_profile.unwrap_or(TelemetryProviderProfile::Custom),
-                LifecycleOperation::Delete,
-                outcome,
-            );
-            if deleted {
-                publish_provider_change(state, &workspace, &name);
-            }
-            Ok(Response::new(DeleteProviderResponse {
-                outcome: super::deletion_outcome(deleted, req.allow_missing, "provider")?,
-            }))
-        }
-        Err(err) => {
-            emit_provider_profile_lifecycle(
-                provider_profile.unwrap_or(TelemetryProviderProfile::Custom),
-                LifecycleOperation::Delete,
-                TelemetryOutcome::Failure,
-            );
-            Err(err)
-        }
+    .await?;
+    if deleted {
+        publish_provider_change(state, &workspace, &name);
     }
-}
-
-fn emit_provider_lifecycle(
-    provider_type: &str,
-    operation: LifecycleOperation,
-    outcome: TelemetryOutcome,
-) {
-    let provider_profile = telemetry_provider_profile(provider_type);
-    emit_provider_profile_lifecycle(provider_profile, operation, outcome);
-}
-
-fn emit_provider_profile_lifecycle(
-    provider_profile: TelemetryProviderProfile,
-    operation: LifecycleOperation,
-    outcome: TelemetryOutcome,
-) {
-    openshell_core::telemetry::emit_provider_lifecycle(operation, outcome, provider_profile);
-}
-
-async fn provider_profile_for_name(
-    store: &Store,
-    workspace: &str,
-    name: &str,
-) -> Option<TelemetryProviderProfile> {
-    store
-        .get_message_by_name::<Provider>(workspace, name)
-        .await
-        .ok()
-        .flatten()
-        .map(|provider| telemetry_provider_profile(&provider.r#type))
-}
-
-/// Bucket a provider type for telemetry.
-///
-/// Matches the profile ID exactly. Any ID without a bucket, including every
-/// operator-authored profile, reports as `Custom`.
-fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
-    match normalize_profile_id(provider_type).as_deref() {
-        Some("anthropic") => TelemetryProviderProfile::Anthropic,
-        Some("claude-code") => TelemetryProviderProfile::Claude,
-        Some("codex") => TelemetryProviderProfile::Codex,
-        Some("copilot") => TelemetryProviderProfile::Copilot,
-        Some("deepinfra") => TelemetryProviderProfile::Deepinfra,
-        Some("github") => TelemetryProviderProfile::Github,
-        Some("nvidia") => TelemetryProviderProfile::Nvidia,
-        Some("openai") => TelemetryProviderProfile::Openai,
-        _ => TelemetryProviderProfile::Custom,
-    }
+    Ok(Response::new(DeleteProviderResponse {
+        outcome: super::deletion_outcome(deleted, req.allow_missing, "provider")?,
+    }))
 }
 
 #[cfg(test)]
@@ -6827,60 +6711,6 @@ pub(super) mod tests {
         };
 
         validate_provider_create_credentials(&profile, &provider).unwrap();
-    }
-
-    #[test]
-    fn telemetry_provider_profile_maps_unknown_to_custom() {
-        assert_eq!(
-            telemetry_provider_profile("CLAUDE-CODE"),
-            TelemetryProviderProfile::Claude
-        );
-        // A legacy alias is not a profile ID, so it buckets as custom.
-        assert_eq!(
-            telemetry_provider_profile("claude"),
-            TelemetryProviderProfile::Custom
-        );
-        assert_eq!(
-            telemetry_provider_profile("github"),
-            TelemetryProviderProfile::Github
-        );
-        // Legacy aliases are not profile IDs.
-        assert_eq!(
-            telemetry_provider_profile("gh"),
-            TelemetryProviderProfile::Custom
-        );
-        assert_eq!(
-            telemetry_provider_profile("glab"),
-            TelemetryProviderProfile::Custom
-        );
-        assert_eq!(
-            telemetry_provider_profile("gitlab"),
-            TelemetryProviderProfile::Custom
-        );
-        assert_eq!(
-            telemetry_provider_profile("opencode"),
-            TelemetryProviderProfile::Custom
-        );
-        assert_eq!(
-            telemetry_provider_profile("outlook"),
-            TelemetryProviderProfile::Custom
-        );
-        assert_eq!(
-            telemetry_provider_profile("generic"),
-            TelemetryProviderProfile::Custom
-        );
-        assert_eq!(
-            telemetry_provider_profile("unknown-private"),
-            TelemetryProviderProfile::Custom
-        );
-        assert_eq!(
-            telemetry_provider_profile("acme-internal"),
-            TelemetryProviderProfile::Custom
-        );
-        assert_eq!(
-            telemetry_provider_profile("corp-llm-prod"),
-            TelemetryProviderProfile::Custom
-        );
     }
 
     #[test]

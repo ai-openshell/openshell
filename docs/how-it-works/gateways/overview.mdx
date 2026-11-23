@@ -33,6 +33,23 @@ A gateway provisions sandboxes through the compute driver configured for that ga
 
 All compute drivers expose the same gateway API surface. Sandboxes, policies, and providers work the same after the CLI registers the gateway endpoint. The difference is how the gateway creates sandbox workloads and how operators expose the gateway to users.
 
+### Build a Gateway with Selected Drivers
+
+The gateway exposes separate Cargo features for its built-in compute drivers: `compute-driver-kubernetes`, `compute-driver-docker`, `compute-driver-podman`, `compute-driver-vm`, and `compute-driver-mxc`. Disable the default feature set, then enable only the drivers the target binary needs:
+
+```shell
+# Docker only.
+cargo build --release -p openshell-gateway --no-default-features --features compute-driver-docker
+
+# Docker and VM only.
+cargo build --release -p openshell-gateway --no-default-features --features compute-driver-docker,compute-driver-vm
+
+# Windows MXC only, with prebuilt Z3.
+cargo build --release -p openshell-gateway --no-default-features --features compute-driver-mxc,openshell-server/prebuilt-z3
+```
+
+Regular builds keep their platform driver set through the default `in-tree-compute-drivers` compatibility feature. On Windows, `compute-driver-mxc` selects MXC and the other four features install unsupported-driver stubs. On other platforms, MXC is excluded.
+
 <Tip>
 For driver setup, including Docker, Podman, MicroVM, and Kubernetes paths, refer to [Installation](/about/installation).
 

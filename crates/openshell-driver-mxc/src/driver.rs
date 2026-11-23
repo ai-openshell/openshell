@@ -874,7 +874,6 @@ async fn run_lifecycle(
                 provider_credentials: None,
                 agent_proposals: openshell_core::proposals::AgentProposals::default(),
                 denial_tx: None,
-                activity_tx: None,
             },
         )
         .await

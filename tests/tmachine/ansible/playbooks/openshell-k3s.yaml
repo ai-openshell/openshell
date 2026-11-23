@@ -125,7 +125,6 @@
               allowUnauthenticatedUsers: true
             disableTls: true
             hostGatewayIP: "{{ k3s_node_ipv4 }}"
-            telemetryEnabled: false
 
     - name: Write OpenShell Helm values overlay
       ansible.builtin.copy:

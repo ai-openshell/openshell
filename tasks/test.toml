@@ -156,7 +156,6 @@ run = "bash tasks/scripts/e2e-gpu-build-images.sh"
 ["test:rust"]
 description = "Run Rust tests"
 depends = ["rust:lockfiles:check"]
-env = { OPENSHELL_TELEMETRY_ENABLED = "false" }
 run = [
   # Prove the facade contract without the default backend's compiled features.
   "cargo test -p openshell-crypto --no-default-features --test independent_backend",

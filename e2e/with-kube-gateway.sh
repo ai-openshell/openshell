@@ -1417,7 +1417,7 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     external_driver="${OPENSHELL_EXTERNAL_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-kubernetes}"
     if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
       cargo build -p openshell-gateway --bin openshell-gateway \
-        --no-default-features --features telemetry,vendored-z3
+        --no-default-features --features vendored-z3
     fi
     if [ -z "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" ]; then
       cargo build -p openshell-driver-kubernetes --bin openshell-driver-kubernetes
@@ -1559,7 +1559,6 @@ fi
 
 helm_extra_args=()
 helm_post_renderer_args=()
-helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
 helm_extra_args+=(--set supervisor.sandboxRuntime.networkPolicyEnforced=true)
 if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
   helm_extra_args+=(--set "supervisor.network.additionalCaConfigMapName=${ADDITIONAL_CA_SOURCE_CONFIG_MAP}")

@@ -139,7 +139,6 @@ network_policies:
         None,
         None,
         None,
-        None,
         ready_rx,
         &upstream_proxy::UpstreamProxyArgs::default(),
         None,
@@ -433,7 +432,6 @@ network_policies:
                     Arc::new(None),
                     None,
                     secret_resolver,
-                    None,
                     None,
                     None,
                 ))
@@ -853,7 +851,6 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
-                None,
                 None,
                 None,
                 None,

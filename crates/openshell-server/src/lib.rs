@@ -56,7 +56,6 @@ mod supervisor_owner;
 mod supervisor_pool;
 pub mod supervisor_session;
 mod supervisor_spread;
-mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod tls;
@@ -74,7 +73,6 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::token_grant_failure::TokenGrantFailure;
 use openshell_core::{Config, Error, NetworkSupervisorTrustBundle, ObjectLabels, Result};
 use openshell_extension_core::{
@@ -353,9 +351,6 @@ pub struct ServerState {
 
     /// In-memory bus for server process logs.
     pub tracing_log_bus: TracingLogBus,
-
-    /// In-memory anonymous telemetry accounting for active sandbox sessions.
-    pub(crate) telemetry: telemetry::TelemetryState,
 
     /// Active SSH tunnel connection counts per session token.
     pub ssh_connections_by_token: Mutex<HashMap<String, u32>>,
@@ -690,7 +685,6 @@ impl ServerState {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
-            telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             service_connections_by_sandbox: Mutex::new(HashMap::new()),
@@ -1903,7 +1897,6 @@ pub struct ComputeDriverRegistration {
     detection_priority: u16,
     detect: Option<fn() -> bool>,
     factory: Arc<dyn ComputeDriverFactory>,
-    telemetry_category: TelemetryComputeDriver,
     in_process_tracing: Option<openshell_otel::ComputeDriverTracing>,
 }
 
@@ -1933,17 +1926,8 @@ impl ComputeDriverRegistration {
             detection_priority,
             detect,
             factory: Arc::new(factory),
-            telemetry_category: TelemetryComputeDriver::custom(),
             in_process_tracing: None,
         })
-    }
-
-    /// Assign a bounded telemetry category chosen by the binary composition
-    /// boundary. Runtime driver names are never used as telemetry values.
-    #[must_use]
-    pub fn with_telemetry_category(mut self, category: TelemetryComputeDriver) -> Self {
-        self.telemetry_category = category;
-        self
     }
 
     /// Attach process-wide tracing for this in-process compiled driver.
@@ -2310,7 +2294,6 @@ async fn build_compute_runtime(
         &config.log_level,
         driver_startup,
     )?;
-    let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     let admission = match &driver {
         ConfiguredComputeDriver::Registered(registration) => registration
             .factory
@@ -2438,7 +2421,7 @@ async fn build_compute_runtime(
                 .with_provisioning_repair_window_seconds(config.provisioning_repair_window_seconds)
         })
         .map_err(Error::config)?;
-    Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
+    Ok(runtime)
 }
 
 #[derive(Debug, Clone)]
@@ -2452,17 +2435,6 @@ impl ConfiguredComputeDriver {
         match self {
             Self::Registered(registration) => &registration.name,
             Self::Remote { name } => name,
-        }
-    }
-
-    fn telemetry_compute_driver(&self, registry: &ComputeDriverRegistry) -> TelemetryComputeDriver {
-        match self {
-            Self::Registered(registration) => registration.telemetry_category,
-            Self::Remote { name } => registry
-                .get(name)
-                .map_or_else(TelemetryComputeDriver::custom, |registration| {
-                    registration.telemetry_category
-                }),
         }
     }
 }
@@ -2996,12 +2968,7 @@ mod tests {
                         None,
                         TestComputeDriverFactory,
                     )
-                    .unwrap()
-                    .with_telemetry_category(
-                        openshell_core::telemetry::TelemetryComputeDriver::anonymous_category(
-                            "registered",
-                        ),
-                    ),
+                    .unwrap(),
                 )
                 .unwrap();
         }
@@ -3976,10 +3943,6 @@ mod tests {
         let driver =
             configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
                 .unwrap();
-        assert_eq!(
-            driver.telemetry_compute_driver(&registry).as_str(),
-            "registered"
-        );
         assert!(matches!(
             driver,
             ConfiguredComputeDriver::Registered(registration) if registration.name == "beta"
@@ -3994,10 +3957,6 @@ mod tests {
         let driver =
             configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
                 .unwrap();
-        assert_eq!(
-            driver.telemetry_compute_driver(&registry).as_str(),
-            "custom"
-        );
 
         match driver {
             ConfiguredComputeDriver::Remote { name } => {
@@ -4022,10 +3981,6 @@ mod tests {
         let driver =
             configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
                 .unwrap();
-        assert_eq!(
-            driver.telemetry_compute_driver(&registry).as_str(),
-            "registered"
-        );
         assert!(matches!(
             driver,
             ConfiguredComputeDriver::Remote { name } if name == "alpha"

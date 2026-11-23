@@ -139,8 +139,6 @@ spec:
         # dedicated writable volume for both StatefulSet and Deployment modes.
         - name: XDG_STATE_HOME
           value: /var/lib/openshell-state
-        - name: OPENSHELL_TELEMETRY_ENABLED
-          value: {{ .Values.server.telemetryEnabled | quote }}
         {{- if $spiffeSocketPath }}
         - name: OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET
           value: {{ $spiffeSocketPath | quote }}

@@ -106,7 +106,7 @@ if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
     echo "==> Building driver-free openshell-gateway"
     cargo build \
       -p openshell-gateway --bin openshell-gateway \
-      --no-default-features --features telemetry
+      --no-default-features
   else
     build_packages+=(-p openshell-gateway)
   fi

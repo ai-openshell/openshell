@@ -101,27 +101,6 @@ description = "Verify cargo-deny rejects crypto dependencies that bypass the fac
 run = "uv run --no-project python tasks/scripts/test-crypto-dependency-policy.py"
 
 
-["rust:verify:telemetry-off"]
-description = "Verify telemetry emission code is compiled out with --no-default-features"
-run = [
-  # Positive control: the default (telemetry-on) gateway must contain the
-  # markers, so the absent checks below can never become silently vacuous.
-  "cargo build -p openshell-gateway --bin openshell-gateway",
-  "tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway",
-  # Guard: telemetry-free builds must contain no telemetry markers. Built
-  # through the `defaults-without-telemetry` alias, which is how the docs tell
-  # operators to produce these artifacts.
-  "cargo build -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry",
-  "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway",
-  # The supervisor has no telemetry feature; its default build must stay clean.
-  "cargo build -p openshell-supervisor --bin openshell-supervisor",
-  "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor",
-]
-
-["rust:verify:defaults-without-telemetry"]
-description = "Verify the defaults-without-telemetry feature alias matches default minus telemetry and cannot be used additively"
-run = "tasks/scripts/verify-defaults-without-telemetry.sh"
-
 ["rust:verify:system-ca-roots"]
 description = "Verify system CA roots build mode compiles and excludes bundled Mozilla root crates"
 run = [

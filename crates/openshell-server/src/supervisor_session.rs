@@ -2463,7 +2463,6 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
             "failed to persist supervisor session state; reconnect",
         ));
     }
-    state.telemetry.sandbox_session_connected(&sandbox_id);
 
     if outbound_tx.send(accepted).await.is_err() {
         // Only evict ourselves — a faster reconnect may already have
@@ -2837,7 +2836,6 @@ async fn finish_supervisor_session(
         return;
     };
     info!(sandbox_id, session_id, "supervisor session: ended");
-    state.telemetry.sandbox_session_disconnected(sandbox_id);
     tokio::spawn(
         crate::grpc::policy::retry_endpoint_status_after_supervisor_disconnect(
             Arc::clone(state),

@@ -487,8 +487,6 @@ server:
   # -- Additional environment variables for the gateway container, such as
   # OTEL_* exporter settings. Entries can read from a Secret with valueFrom.
   extraEnv: []
-  # -- Enable anonymous OpenShell telemetry from the gateway.
-  telemetryEnabled: true
   # -- Namespace where sandbox pods are created. Defaults to the Helm release
   # namespace (.Release.Namespace) when left empty.
   sandboxNamespace: ""

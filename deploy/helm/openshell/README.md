@@ -793,7 +793,6 @@ for peer identity policies, multi-node registrations, and authorization.
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.sandboxUid | string | `""` | UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift SCC namespace annotation if present, otherwise the driver default. Must be an integer between 1 and 4294967294. |
 | server.serviceHostnameFormat | string | `""` | Hostname format for exposed sandbox services. Empty or "readable" keeps readable `<workspace>--<sandbox>[--<service>]` hostnames; "hashed" mints opaque one-label hostnames discriminated by the gateway installation name (server.name, defaulting to the release name). The name must be unique among all gateways sharing the service base domain, and renaming the installation changes every minted hostname. |
-| server.telemetryEnabled | bool | `true` | Enable anonymous OpenShell telemetry from the gateway. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Only used when enableMtls is true. Set to "" to disable client certificate verification for HTTPS-only mode. |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |

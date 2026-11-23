@@ -103,7 +103,6 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl"),
             &allowed_decision(EgressIntent::connect("target.example".to_string(), 8443)),
             &None,
-            &None,
         )
         .await
         .unwrap();
@@ -151,7 +150,6 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
                 "target.example".to_string(),
                 8080,
             )),
-            None,
             None,
             Some(&correlation),
         )
@@ -553,7 +551,6 @@ network_policies:
                             Arc::new(None),
                             Arc::new(None),
                             Arc::new(None),
-                            None,
                             None,
                             None,
                             None,

@@ -3292,7 +3292,6 @@ async fn profile_commands_dispatch_scope_and_output_to_gateway() {
             let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
             command
                 .env("XDG_CONFIG_HOME", config.path())
-                .env("OPENSHELL_TELEMETRY_ENABLED", "false")
                 .env_remove("OPENSHELL_GATEWAY")
                 .env_remove("COMPLETE")
                 .args([

@@ -5,7 +5,7 @@
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use openshell_core::proto::{
-    GetSandboxConfigRequest, NetworkActivitySummary, PolicyChunk, SubmitPolicyAnalysisRequest,
+    DenialSummary, GetSandboxConfigRequest, PolicyChunk, SubmitPolicyAnalysisRequest,
     UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
 use openshell_crypto::jwt::encode;
@@ -113,15 +113,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client
         .submit_policy_analysis(SubmitPolicyAnalysisRequest {
             name: sandbox_name.clone(),
-            network_activity_summaries: vec![NetworkActivitySummary {
-                network_activity_count: 1,
+            summaries: vec![DenialSummary {
+                host: "denied.example".to_string(),
+                port: 443,
                 ..Default::default()
             }],
-            analysis_mode: "activity".to_string(),
+            analysis_mode: "mechanistic".to_string(),
             ..Default::default()
         })
         .await
-        .map_err(|status| format!("telemetry-only policy analysis was denied: {status}"))?;
+        .map_err(|status| format!("denial-summary policy analysis was denied: {status}"))?;
 
     let after = client
         .get_sandbox_config(GetSandboxConfigRequest {
@@ -138,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    println!("authenticated governance bypasses denied; telemetry accepted; policy unchanged");
+    println!("authenticated governance bypasses denied; denial summaries accepted; policy unchanged");
     Ok(())
 }
 

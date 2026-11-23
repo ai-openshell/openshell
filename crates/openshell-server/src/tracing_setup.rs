@@ -4,8 +4,6 @@
 //! Process-wide tracing subscriber setup for the gateway.
 //!
 //! This module routes gateway logs and spans to configured diagnostic outputs.
-//! `OpenShell` product telemetry collected for maintainers is handled by
-//! [`crate::telemetry`].
 
 use openshell_ocsf::OcsfJsonlLayer;
 use opentelemetry_sdk::trace::SdkTracerProvider;

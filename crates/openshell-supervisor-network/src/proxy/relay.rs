@@ -7,7 +7,6 @@ use super::{EgressDecision, L7RouteSnapshot, emit_l7_tunnel_close_after_policy_c
 use crate::l7::relay::L7EvalContext;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::activity::ActivitySender;
 use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::secrets::SecretResolver;
 use std::sync::Arc;
@@ -36,8 +35,6 @@ pub(super) struct RelayContext<'a> {
 
 /// Non-blocking observation channels attached to an authorized HTTP relay.
 pub(super) struct RelaySignals {
-    /// Receives general sandbox network activity.
-    pub(super) activity: Option<ActivitySender>,
     /// Receives terminal tool server results for endpoint status reporting.
     pub(super) endpoint_observation: Option<EndpointObservationSender>,
 }
@@ -96,7 +93,6 @@ pub(super) fn http_context(
         provider_credential_revision: None,
         provider_credential_installation_id: None,
         body_classifier: None,
-        activity_tx: signals.activity,
         token_grant_resolver,
         agent_proposals,
         workspace,
@@ -410,7 +406,6 @@ mod tests {
             provider_credential_revision: None,
             provider_credential_installation_id: None,
             body_classifier: None,
-            activity_tx: None,
             token_grant_resolver: None,
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
             workspace: String::new(),

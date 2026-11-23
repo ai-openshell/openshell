@@ -20,11 +20,6 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 | `ubuntu-snap-docker-preflight` | `ubuntu-latest` | Verifies that `install.sh` rejects the OpenShell snap path when Docker is absent or supplied by the Docker snap, without installing OpenShell. |
 | `kubernetes` | `ubuntu-latest` + kind | Installs the dev Helm chart, reaches the in-cluster gateway, and creates, executes in, and deletes a sandbox using the published runtime images. |
 
-All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
-`OPENSHELL_TELEMETRY_ENABLED=false` through the service environment, and the
-Kubernetes job installs with `server.telemetryEnabled=false`, so smoke traffic
-does not contribute to product usage metrics.
-
 The workflow sets `OPENSHELL_VERSION=dev` for every `install.sh` job. Positive
 jobs consume the rolling dev release produced by the triggering workflow. The
 system-Docker snap lane tracks `latest/edge`; the missing-Docker lane exits
@@ -118,7 +113,6 @@ helm install openshell oci://ghcr.io/ai-openshell/openshell/helm-chart \
   --version 0.0.0-dev \
   --namespace openshell --create-namespace \
   --set server.disableTls=true \
-  --set server.telemetryEnabled=false \
   --wait --timeout 5m
 
 kubectl wait --namespace openshell \

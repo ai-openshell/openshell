@@ -9,7 +9,6 @@
 //! - Common error types
 //! - Build version metadata
 
-pub mod activity;
 pub mod app_listener;
 pub mod auth;
 pub mod color;
@@ -65,7 +64,6 @@ pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
-pub mod telemetry;
 pub mod time;
 pub mod token_endpoint;
 pub mod token_grant_failure;

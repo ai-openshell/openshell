@@ -9,11 +9,11 @@ cd "${ROOT}"
 
 echo "Building gateway without compiled compute drivers..."
 cargo build -p openshell-gateway --bin openshell-gateway \
-  --no-default-features --features telemetry
+  --no-default-features
 cargo check -p openshell-core --no-default-features --all-targets
 
 dependency_tree="$(cargo tree -p openshell-gateway \
-  --no-default-features --features telemetry --edges normal)"
+  --no-default-features --edges normal)"
 server_dependency_tree="$(cargo tree -p openshell-server --edges normal)"
 for driver in \
   openshell-driver-docker \

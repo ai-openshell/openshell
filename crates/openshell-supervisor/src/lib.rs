@@ -7,7 +7,6 @@
 
 #![forbid(unsafe_code)]
 
-mod activity_aggregator;
 pub mod app_listener;
 pub mod backend_setup;
 mod config_runtime;
@@ -741,7 +740,6 @@ pub async fn run_network_proxy(
         },
         None,
         None,
-        None,
         AgentProposals::new(initial_agent_proposals_enabled),
         workspace_rx,
         &upstream_proxy_args,
@@ -1379,18 +1377,6 @@ pub async fn run_sandbox_instance(
         (None, None)
     };
 
-    // Anonymous activity channel: same orchestrator-owned pattern as the
-    // denial channel. The proxy and the bypass monitor both emit per-event
-    // activity records; the orchestrator-side aggregator drains, sanitizes,
-    // and flushes anonymous summaries to the gateway.
-    let (activity_tx, activity_rx) = if sandbox_id.is_some() {
-        let (tx, rx) =
-            tokio::sync::mpsc::channel(openshell_core::activity::ACTIVITY_EVENT_QUEUE_CAPACITY);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
     // Endpoint observations are bounded and never backpressure proxied traffic.
     // Reports are authorized by the currently accepted supervisor session.
     let (endpoint_observation_tx, endpoint_status_rx) = if sandbox_id.is_some() {
@@ -1471,7 +1457,6 @@ pub async fn run_sandbox_instance(
                 proxy_tls,
             },
             denial_tx,
-            activity_tx,
             endpoint_observation_tx.clone(),
             agent_proposals.clone(),
             workspace_rx.clone(),
@@ -1567,51 +1552,6 @@ pub async fn run_sandbox_instance(
                         }
                     },
                     move || !denial_workspace_gate.borrow().is_empty(),
-                )
-                .await;
-        });
-    }
-
-    // Spawn the activity-aggregator flush task. The aggregator drains
-    // anonymous activity events from the proxy, sanitizes deny groups,
-    // and ships periodic summaries to the gateway.
-    if let (Some(rx), Some(gateway)) = (activity_rx, gateway.as_ref()) {
-        let agg_name = sandbox_name_for_agg
-            .clone()
-            .or_else(|| sandbox_id.clone())
-            .unwrap_or_default();
-        let agg_gateway = gateway.clone();
-        let flush_interval_secs = activity_aggregator::activity_flush_interval_secs_from_env(
-            std::env::var("OPENSHELL_ACTIVITY_FLUSH_INTERVAL_SECS")
-                .ok()
-                .as_deref(),
-        );
-
-        let aggregator = activity_aggregator::ActivityAggregator::new(rx, flush_interval_secs);
-        let activity_workspace_gate = workspace_rx.clone();
-        let activity_workspace_rx = workspace_rx.clone();
-
-        tokio::spawn(async move {
-            aggregator
-                .run(
-                    move |summary| {
-                        let gateway = agg_gateway.clone();
-                        let sandbox_name = agg_name.clone();
-                        let workspace = activity_workspace_rx.borrow().clone();
-                        async move {
-                            if let Err(e) = flush_activity_to_gateway(
-                                &gateway,
-                                &sandbox_name,
-                                &workspace,
-                                summary,
-                            )
-                            .await
-                            {
-                                warn!(error = %e, "Failed to flush activity summary to gateway");
-                            }
-                        }
-                    },
-                    move || !activity_workspace_gate.borrow().is_empty(),
                 )
                 .await;
         });
@@ -2143,59 +2083,7 @@ async fn flush_proposals_to_gateway(
     );
 
     client
-        .submit_policy_analysis(
-            sandbox_name,
-            proto_summaries,
-            proposals,
-            Vec::new(),
-            "mechanistic",
-        )
-        .await?;
-
-    Ok(())
-}
-
-/// Flush an anonymous activity summary to the gateway via `SubmitPolicyAnalysis`.
-async fn flush_activity_to_gateway(
-    gateway: &openshell_core::grpc_client::GatewayEndpoint,
-    sandbox_name: &str,
-    workspace: &str,
-    summary: activity_aggregator::FlushableActivitySummary,
-) -> Result<()> {
-    use openshell_core::grpc_client::CachedOpenShellClient;
-    use openshell_core::proto::{DenialGroupCount, NetworkActivitySummary};
-
-    let client = CachedOpenShellClient::connect(gateway).await?;
-    client.set_workspace(workspace.to_string());
-
-    let proto_summary = NetworkActivitySummary {
-        network_activity_count: summary.network_activity_count,
-        denied_action_count: summary.denied_action_count,
-        denials_by_group: summary
-            .denials_by_group
-            .into_iter()
-            .map(|(group, count)| DenialGroupCount {
-                deny_group: group,
-                denied_count: count,
-            })
-            .collect(),
-    };
-
-    info!(
-        sandbox_name = %sandbox_name,
-        network_activity_count = proto_summary.network_activity_count,
-        denied_action_count = proto_summary.denied_action_count,
-        "Flushed activity summary to gateway"
-    );
-
-    client
-        .submit_policy_analysis(
-            sandbox_name,
-            Vec::new(),
-            Vec::new(),
-            vec![proto_summary],
-            "activity",
-        )
+        .submit_policy_analysis(sandbox_name, proto_summaries, proposals, "mechanistic")
         .await?;
 
     Ok(())

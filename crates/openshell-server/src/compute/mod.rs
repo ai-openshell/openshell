@@ -50,7 +50,6 @@ use openshell_core::proto::{
     SandboxRestartPolicy, SandboxSpec, SandboxStatus, SandboxTemplate, SandboxWorkloadTemplate,
     ServiceEndpoint, SshSession,
 };
-use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace, SetResourceVersion};
 use prost::Message;
 use std::collections::HashMap;
@@ -933,7 +932,6 @@ pub struct ComputeRuntime {
     image_update_driver: Option<SharedComputeDriverConfigurationUpdates>,
     app_endpoint_resolver: Option<SharedComputeDriverAppEndpoints>,
     driver_info: ComputeDriverInfoSnapshot,
-    telemetry_compute_driver: TelemetryComputeDriver,
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     image_preparation_timeout_seconds: u32,
@@ -1056,7 +1054,6 @@ impl ComputeRuntime {
             admission: openshell_core::resource_admission::DriverAdmissionConfig::default(),
             admission_acknowledgement: capabilities.resource_admission_policy,
             driver_info,
-            telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process,
             default_image,
             image_preparation_timeout_seconds: 1800,
@@ -1429,20 +1426,6 @@ impl ComputeRuntime {
             )
             .await
             .map(tonic::Response::into_inner)
-    }
-
-    #[must_use]
-    pub(crate) fn telemetry_compute_driver(&self) -> TelemetryComputeDriver {
-        self.telemetry_compute_driver
-    }
-
-    #[must_use]
-    pub(crate) fn with_telemetry_compute_driver(
-        mut self,
-        telemetry_compute_driver: TelemetryComputeDriver,
-    ) -> Self {
-        self.telemetry_compute_driver = telemetry_compute_driver;
-        self
     }
 
     pub(crate) async fn ensure_workspace(&self, workspace: &str) -> Result<(), Status> {
@@ -8810,7 +8793,6 @@ pub fn new_test_runtime_with_driver(
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
         },
-        telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
         image_preparation_timeout_seconds: 1800,
@@ -10109,7 +10091,6 @@ mod tests {
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
             },
-            telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             image_preparation_timeout_seconds: 1800,

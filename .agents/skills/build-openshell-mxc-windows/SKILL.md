@@ -386,8 +386,8 @@ The gateway's `compute-driver-mxc` feature independently links and registers
 MXC on Windows. Each other `compute-driver-*` feature installs its own Windows
 rejection stub without linking that driver crate. The default
 `in-tree-compute-drivers` alias enables all five features. An MXC-only build
-uses `--no-default-features --features compute-driver-mxc` (add `telemetry`
-and `openshell-server/prebuilt-z3` as needed).
+uses `--no-default-features --features compute-driver-mxc` (add
+`openshell-server/prebuilt-z3` as needed).
 
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|

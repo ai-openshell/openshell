@@ -27,7 +27,6 @@ use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use crate::telemetry::egress_emit;
 use futures::FutureExt;
 use miette::{IntoDiagnostic, Result, miette};
-use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
 use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
@@ -85,8 +84,6 @@ pub struct L7EvalContext {
     /// await and the final static-credential scoping before the upstream write.
     pub(crate) provider_credential_installation_id: Option<String>,
     pub(crate) body_classifier: Option<Arc<secrets::body::BodyCredentialClassifier>>,
-    /// Anonymous activity counter channel.
-    pub(crate) activity_tx: Option<ActivitySender>,
     /// Dynamic token grant resolver for endpoint-bound credentials.
     pub(crate) token_grant_resolver:
         Option<Arc<dyn crate::l7::token_grant_injection::TokenGrantResolver>>,
@@ -391,7 +388,6 @@ where
                 } else {
                     egress_emit!(event);
                 }
-                emit_activity(ctx, true, "l7_parse_rejection");
                 let body = serde_json::json!({
                     "error": "invalid_mcp_request",
                     "detail": reason,
@@ -500,14 +496,6 @@ where
     } else {
         egress_emit!(event);
     }
-    let deny_group = match error {
-        crate::l7::mcp::McpProtocolVersionError::NotAllowed(_) => "l7_policy",
-        crate::l7::mcp::McpProtocolVersionError::InvalidHeader
-        | crate::l7::mcp::McpProtocolVersionError::UnsupportedHeaderValue
-        | crate::l7::mcp::McpProtocolVersionError::InvalidRequestMetadata
-        | crate::l7::mcp::McpProtocolVersionError::MethodNotAllowed => "l7_parse_rejection",
-    };
-    emit_activity(ctx, true, deny_group);
     let body = serde_json::json!({
         "error": error.response_code(),
         "detail": reason,
@@ -1450,7 +1438,6 @@ fn emit_parse_rejection(ctx: &L7EvalContext, detail: &str, engine_type: &str) {
         .status_detail(detail)
         .build();
     egress_emit!(event);
-    emit_activity(ctx, true, "l7_parse_rejection");
 }
 
 fn engine_type_for_protocol(protocol: L7Protocol) -> &'static str {
@@ -2262,7 +2249,6 @@ fn emit_l7_request_log(
         protocol_summary,
     );
     egress_emit!(event);
-    emit_activity(ctx, decision_str == "deny", "l7_policy");
 }
 
 fn build_l7_request_event(
@@ -2322,12 +2308,6 @@ fn l7_protocol_log_summary(
     }
 
     None
-}
-
-fn emit_activity(ctx: &L7EvalContext, denied: bool, deny_group: &'static str) {
-    if let Some(tx) = &ctx.activity_tx {
-        let _ = try_record_activity(tx, denied, deny_group);
-    }
 }
 
 pub(crate) async fn websocket_middleware_preflight(
@@ -11428,17 +11408,13 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn route_selected_unmatched_path_emits_denied_policy_activity() {
+    async fn route_selected_unmatched_path_is_denied() {
         let engine = OpaEngine::from_strings(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY).unwrap();
         let tunnel_engine = engine
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
         let configs = encoded_slash_scoping_configs();
-        let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel(1);
-        let ctx = L7EvalContext {
-            activity_tx: Some(activity_tx),
-            ..encoded_slash_scoping_ctx()
-        };
+        let ctx = encoded_slash_scoping_ctx();
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -11478,12 +11454,6 @@ network_policies:
             .await,
             Err(_) | Ok(Ok(0))
         ));
-        let activity = tokio::time::timeout(std::time::Duration::from_secs(1), activity_rx.recv())
-            .await
-            .expect("policy activity should be emitted")
-            .expect("activity channel should remain open");
-        assert!(activity.denied);
-        assert_eq!(activity.deny_group, "l7_policy");
 
         drop(app);
         tokio::time::timeout(std::time::Duration::from_secs(1), relay)
@@ -11505,11 +11475,7 @@ network_policies:
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
         let configs = encoded_slash_scoping_configs();
-        let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel(1);
-        let ctx = L7EvalContext {
-            activity_tx: Some(activity_tx),
-            ..encoded_slash_scoping_ctx()
-        };
+        let ctx = encoded_slash_scoping_ctx();
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
@@ -11552,12 +11518,6 @@ network_policies:
             matches!(result, Err(_) | Ok(Ok(0))),
             "request must not reach upstream"
         );
-        let activity = tokio::time::timeout(std::time::Duration::from_secs(1), activity_rx.recv())
-            .await
-            .expect("parse rejection activity should be emitted")
-            .expect("activity channel should remain open");
-        assert!(activity.denied);
-        assert_eq!(activity.deny_group, "l7_parse_rejection");
 
         drop(app);
         tokio::time::timeout(std::time::Duration::from_secs(1), relay)

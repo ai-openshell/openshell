@@ -74,7 +74,6 @@ async fn proxy_exits_with_stdin_open(relay_status: tonic::Status) {
             "test-token",
         ])
         .env("XDG_CONFIG_HOME", config.path())
-        .env("OPENSHELL_TELEMETRY_ENABLED", "false")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

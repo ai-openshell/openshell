@@ -455,26 +455,6 @@ tests:
           path: spec.template.spec.containers[0].name
           value: openshell-gateway
 
-  - it: enables anonymous telemetry by default
-    template: templates/statefulset.yaml
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_TELEMETRY_ENABLED
-            value: "true"
-
-  - it: disables anonymous telemetry when configured
-    template: templates/statefulset.yaml
-    set:
-      server.telemetryEnabled: false
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_TELEMETRY_ENABLED
-            value: "false"
-
   - it: renders OTLP tracing configuration when configured
     template: templates/gateway-config.yaml
     set:

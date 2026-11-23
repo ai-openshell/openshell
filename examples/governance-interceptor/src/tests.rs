@@ -923,14 +923,10 @@ fn automatic_proposal_approval_settings_are_denied() {
 }
 
 #[test]
-fn sandbox_policy_analysis_allows_telemetry_but_denies_proposals() {
+fn sandbox_policy_analysis_allows_denial_summaries_but_denies_proposals() {
     let service = service();
 
     for operation in [
-        json!({
-            "name": "demo",
-            "networkActivitySummaries": [{"networkActivityCount": 1}],
-        }),
         json!({
             "name": "demo",
             "summaries": [{"host": "denied.example", "port": 443}],

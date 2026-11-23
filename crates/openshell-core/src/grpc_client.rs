@@ -29,11 +29,10 @@ use crate::proto::{
     DenialSummary, EndpointObservation as ProtoEndpointObservation,
     EndpointResult as ProtoEndpointResult, ExchangeProviderSubjectTokenRequest,
     GetDraftPolicyRequest, GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, IssueSandboxTokenRequest, NetworkActivitySummary,
-    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
-    ReportEndpointStatusRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
-    open_shell_client::OpenShellClient,
+    GetSandboxProviderEnvironmentResponse, IssueSandboxTokenRequest, PolicyChunk, PolicySource,
+    PolicyStatus, RefreshSandboxTokenRequest, ReportEndpointStatusRequest,
+    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
 use crate::time::{duration_to_std, timestamp_to_millis};
@@ -2472,7 +2471,6 @@ impl CachedOpenShellClient {
         sandbox_name: &str,
         summaries: Vec<DenialSummary>,
         proposed_chunks: Vec<PolicyChunk>,
-        network_activity_summaries: Vec<NetworkActivitySummary>,
         analysis_mode: &str,
     ) -> Result<SubmitPolicyAnalysisResponse> {
         let response = self
@@ -2482,7 +2480,6 @@ impl CachedOpenShellClient {
                 name: sandbox_name.to_string(),
                 summaries,
                 proposed_chunks,
-                network_activity_summaries,
                 analysis_mode: analysis_mode.to_string(),
                 workspace_scope: Some(crate::proto::workspace_selector(self.workspace())),
             })

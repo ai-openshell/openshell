@@ -44,9 +44,6 @@ use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
     SandboxRestartPolicy, SandboxTemplate, SshSession,
 };
-use openshell_core::telemetry::{
-    LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
-};
 use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
 use prost_types::{Struct, Value, value::Kind};
@@ -298,21 +295,9 @@ pub(super) async fn handle_create_sandbox(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    let create_request = request.get_ref().clone();
     // Sandbox creation retains large configuration values across awaits.
     // Box the inner future to keep this wrapper small for every caller.
-    let result = Box::pin(handle_create_sandbox_inner(state, request)).await;
-    let created_sandbox = result
-        .as_ref()
-        .ok()
-        .and_then(|response| response.get_ref().sandbox.as_ref());
-    emit_sandbox_create_telemetry(
-        state,
-        &create_request,
-        created_sandbox,
-        TelemetryOutcome::from_success(result.is_ok()),
-    );
-    result
+    Box::pin(handle_create_sandbox_inner(state, request)).await
 }
 
 /// Only the workload image is mutable in the first update contract. Runtime
@@ -482,76 +467,6 @@ fn staging_token_in_spec(spec: &SandboxSpec, driver_name: &str) -> Option<String
     {
         Kind::StringValue(token) => Some(token.clone()),
         _ => None,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SandboxCreateTelemetryAttrs {
-    requested_gpu: bool,
-    provider_count: u64,
-    has_custom_policy: bool,
-    template_source: SandboxTemplateSource,
-}
-
-fn emit_sandbox_create_telemetry(
-    state: &Arc<ServerState>,
-    request: &CreateSandboxRequest,
-    created_sandbox: Option<&Sandbox>,
-    outcome: TelemetryOutcome,
-) {
-    let compute_driver = state.compute.telemetry_compute_driver();
-    let attrs = sandbox_create_telemetry_attrs(request, created_sandbox);
-    openshell_core::telemetry::emit_sandbox_create(
-        outcome,
-        attrs.requested_gpu,
-        attrs.provider_count,
-        attrs.has_custom_policy,
-        attrs.template_source,
-        compute_driver,
-    );
-}
-
-fn sandbox_create_telemetry_attrs(
-    request: &CreateSandboxRequest,
-    created_sandbox: Option<&Sandbox>,
-) -> SandboxCreateTelemetryAttrs {
-    if !request.workload_template.trim().is_empty() {
-        let spec = created_sandbox
-            .and_then(|sandbox| sandbox.spec.as_ref())
-            .or(request.spec.as_ref());
-        return SandboxCreateTelemetryAttrs {
-            requested_gpu: spec.is_some_and(|spec| {
-                openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref())
-            }),
-            provider_count: spec.map_or(0, |spec| spec.providers.len() as u64),
-            has_custom_policy: spec.is_some_and(|spec| spec.policy.is_some()),
-            template_source: SandboxTemplateSource::WorkloadTemplate,
-        };
-    }
-    let Some(spec) = request.spec.as_ref() else {
-        return SandboxCreateTelemetryAttrs {
-            requested_gpu: false,
-            provider_count: 0,
-            has_custom_policy: false,
-            template_source: SandboxTemplateSource::Undefined,
-        };
-    };
-    let template_source = if spec
-        .template
-        .as_ref()
-        .is_some_and(|template| !template.image.trim().is_empty())
-    {
-        SandboxTemplateSource::Image
-    } else {
-        SandboxTemplateSource::Default
-    };
-    let gpu_requested =
-        openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref());
-    SandboxCreateTelemetryAttrs {
-        requested_gpu: gpu_requested,
-        provider_count: spec.providers.len() as u64,
-        has_custom_policy: spec.policy.is_some(),
-        template_source,
     }
 }
 
@@ -1794,23 +1709,6 @@ pub(super) async fn handle_delete_sandbox(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxRequest>,
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
-    let result = handle_delete_sandbox_inner(state, request).await;
-    let outcome = match &result {
-        Ok(_) => TelemetryOutcome::Success,
-        _ => TelemetryOutcome::Failure,
-    };
-    openshell_core::telemetry::emit_lifecycle(
-        LifecycleResource::Sandbox,
-        LifecycleOperation::Delete,
-        outcome,
-    );
-    result
-}
-
-async fn handle_delete_sandbox_inner(
-    state: &Arc<ServerState>,
-    request: Request<DeleteSandboxRequest>,
-) -> Result<Response<DeleteSandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let name = req.name;
@@ -1848,9 +1746,6 @@ async fn handle_delete_sandbox_inner(
             preconditions,
         )
         .await?;
-    if !result.sandbox_id.is_empty() {
-        state.telemetry.end_sandbox_session(&result.sandbox_id);
-    }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse {
         outcome: result.outcome.into(),
@@ -1859,23 +1754,6 @@ async fn handle_delete_sandbox_inner(
 }
 
 pub(super) async fn handle_stop_sandbox(
-    state: &Arc<ServerState>,
-    request: Request<StopSandboxRequest>,
-) -> Result<Response<SandboxResponse>, Status> {
-    let result = handle_stop_sandbox_inner(state, request).await;
-    openshell_core::telemetry::emit_lifecycle(
-        LifecycleResource::Sandbox,
-        LifecycleOperation::Stop,
-        if result.is_ok() {
-            TelemetryOutcome::Success
-        } else {
-            TelemetryOutcome::Failure
-        },
-    );
-    result
-}
-
-async fn handle_stop_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<StopSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
@@ -1902,23 +1780,6 @@ async fn handle_stop_sandbox_inner(
 }
 
 pub(super) async fn handle_start_sandbox(
-    state: &Arc<ServerState>,
-    request: Request<StartSandboxRequest>,
-) -> Result<Response<SandboxResponse>, Status> {
-    let result = handle_start_sandbox_inner(state, request).await;
-    openshell_core::telemetry::emit_lifecycle(
-        LifecycleResource::Sandbox,
-        LifecycleOperation::Start,
-        if result.is_ok() {
-            TelemetryOutcome::Success
-        } else {
-            TelemetryOutcome::Failure
-        },
-    );
-    result
-}
-
-async fn handle_start_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<StartSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
@@ -1962,23 +1823,6 @@ pub(super) async fn handle_suspend_sandbox(
     state: &Arc<ServerState>,
     request: Request<SuspendSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    let result = handle_suspend_sandbox_inner(state, request).await;
-    openshell_core::telemetry::emit_lifecycle(
-        LifecycleResource::Sandbox,
-        LifecycleOperation::Suspend,
-        if result.is_ok() {
-            TelemetryOutcome::Success
-        } else {
-            TelemetryOutcome::Failure
-        },
-    );
-    result
-}
-
-async fn handle_suspend_sandbox_inner(
-    state: &Arc<ServerState>,
-    request: Request<SuspendSandboxRequest>,
-) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let resolved = resolve_and_authorize_sandbox_name(
@@ -2002,23 +1846,6 @@ async fn handle_suspend_sandbox_inner(
 }
 
 pub(super) async fn handle_resume_sandbox(
-    state: &Arc<ServerState>,
-    request: Request<ResumeSandboxRequest>,
-) -> Result<Response<SandboxResponse>, Status> {
-    let result = handle_resume_sandbox_inner(state, request).await;
-    openshell_core::telemetry::emit_lifecycle(
-        LifecycleResource::Sandbox,
-        LifecycleOperation::Resume,
-        if result.is_ok() {
-            TelemetryOutcome::Success
-        } else {
-            TelemetryOutcome::Failure
-        },
-    );
-    result
-}
-
-async fn handle_resume_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<ResumeSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
@@ -4527,74 +4354,6 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_create_telemetry_uses_resolved_template_gpu_request() {
-        let request = CreateSandboxRequest {
-            request_id: String::new(),
-            spec: Some(SandboxSpec {
-                providers: vec!["github".to_string()],
-                policy: Some(openshell_core::proto::SandboxPolicy::default()),
-                ..SandboxSpec::default()
-            }),
-            workload_template: "gpu-kata".to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                "default".to_string(),
-            )),
-            ..CreateSandboxRequest::default()
-        };
-        let created = Sandbox {
-            spec: Some(SandboxSpec {
-                providers: vec!["github".to_string()],
-                policy: Some(openshell_core::proto::SandboxPolicy::default()),
-                resource_requirements: Some(ResourceRequirements {
-                    gpu: Some(GpuResourceRequirements { count: Some(1) }),
-                }),
-                ..SandboxSpec::default()
-            }),
-            created_from_workload_template: Some(SandboxWorkloadTemplateProvenance {
-                name: "gpu-kata".to_string(),
-                resource_version: "7".to_string(),
-            }),
-            ..Sandbox::default()
-        };
-
-        assert_eq!(
-            sandbox_create_telemetry_attrs(&request, Some(&created)),
-            SandboxCreateTelemetryAttrs {
-                requested_gpu: true,
-                provider_count: 1,
-                has_custom_policy: true,
-                template_source: SandboxTemplateSource::WorkloadTemplate,
-            }
-        );
-    }
-
-    #[test]
-    fn sandbox_create_telemetry_falls_back_to_request_for_unresolved_template() {
-        let request = CreateSandboxRequest {
-            request_id: String::new(),
-            spec: Some(SandboxSpec {
-                providers: vec!["github".to_string()],
-                ..SandboxSpec::default()
-            }),
-            workload_template: "missing-template".to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                "default".to_string(),
-            )),
-            ..CreateSandboxRequest::default()
-        };
-
-        assert_eq!(
-            sandbox_create_telemetry_attrs(&request, None),
-            SandboxCreateTelemetryAttrs {
-                requested_gpu: false,
-                provider_count: 1,
-                has_custom_policy: false,
-                template_source: SandboxTemplateSource::WorkloadTemplate,
-            }
-        );
-    }
-
-    #[test]
     fn shell_escape_safe_chars_pass_through() {
         assert_eq!(shell_escape("ls").unwrap(), "ls");
         assert_eq!(shell_escape("/usr/bin/python").unwrap(), "/usr/bin/python");
@@ -6446,7 +6205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_handler_ends_telemetry_for_the_resolved_sandbox_id() {
+    async fn delete_handler_targets_the_resolved_sandbox_id() {
         let state = test_server_state().await;
         let mut original = test_sandbox("reused-name", Vec::new());
         original.metadata.as_mut().unwrap().id = "sandbox-original".to_string();
@@ -6462,7 +6221,7 @@ mod tests {
             .unwrap();
         let delete_state = state.clone();
         let delete = tokio::spawn(async move {
-            handle_delete_sandbox_inner(
+            handle_delete_sandbox(
                 &delete_state,
                 authed_request(DeleteSandboxRequest {
                     request_id: String::new(),
@@ -6498,6 +6257,7 @@ mod tests {
             response.outcome(),
             openshell_core::proto::DeletionOutcome::Completed
         );
+        assert_eq!(response.sandbox_id, original.object_id());
         assert!(
             state
                 .store
@@ -6505,10 +6265,6 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
-        );
-        assert_eq!(
-            state.telemetry.ended_sandbox_sessions(),
-            [original.object_id().to_string()]
         );
     }
 

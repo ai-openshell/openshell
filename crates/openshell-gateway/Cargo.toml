@@ -40,7 +40,7 @@ tracing = { workspace = true, optional = true }
 openshell-driver-mxc = { path = "../openshell-driver-mxc", optional = true }
 
 [features]
-default = ["telemetry", "in-tree-compute-drivers"]
+default = ["in-tree-compute-drivers"]
 in-tree-compute-drivers = [
     "compute-driver-docker",
     "compute-driver-kubernetes",
@@ -63,15 +63,9 @@ compute-driver-vm = [
     "dep:tower",
     "dep:tracing",
 ]
-telemetry = ["openshell-core/telemetry", "openshell-server/telemetry"]
-## Convenience alias: every default feature except `telemetry`. Build a
-## telemetry-free gateway with
-## `--no-default-features --features defaults-without-telemetry` and stay
-## correct as new default features are added. Cargo cannot subtract a single
-## default feature, so this alias must be paired with `--no-default-features`;
-## enabling it alongside `telemetry` is a compile error rather than a silent
-## telemetry-on build. Kept in sync with `default` by
-## `rust:verify:defaults-without-telemetry`.
+## Deprecated no-ops: this crate contains no anonymous usage telemetry. Kept
+## so builds that still pass these features keep working.
+telemetry = []
 defaults-without-telemetry = ["in-tree-compute-drivers"]
 vendored-z3 = ["openshell-server/vendored-z3"]
 

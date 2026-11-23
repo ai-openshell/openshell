@@ -6,32 +6,9 @@
 //! The server remains backend-agnostic. This crate is the composition boundary
 //! that links first-party compute drivers into the distributed gateway binary.
 
-// `defaults-without-telemetry` is an alias for the default feature set minus
-// `telemetry`, not a switch that turns telemetry off. Cargo cannot subtract a
-// default feature, so adding it on top of the defaults would otherwise produce
-// a telemetry-on build that reads as telemetry-free. Fail the build instead.
-#[cfg(all(feature = "telemetry", feature = "defaults-without-telemetry"))]
-compile_error!(
-    "features `telemetry` and `defaults-without-telemetry` are mutually exclusive; \
-     build a telemetry-free gateway with `--no-default-features --features defaults-without-telemetry`"
-);
-
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 mod vm;
 
-#[cfg(any(
-    all(target_os = "windows", feature = "compute-driver-mxc"),
-    all(
-        not(target_os = "windows"),
-        any(
-            feature = "compute-driver-docker",
-            feature = "compute-driver-kubernetes",
-            feature = "compute-driver-podman",
-            feature = "compute-driver-vm"
-        )
-    )
-))]
-use openshell_core::telemetry::TelemetryComputeDriver;
 #[cfg(any(
     target_os = "windows",
     feature = "compute-driver-docker",
@@ -72,8 +49,7 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
 #[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
 fn install_mxc_compute_driver(registry: &mut ComputeDriverRegistry) {
     let registration = ComputeDriverRegistration::new("mxc", u16::MAX, None, MxcFactory)
-        .expect("first-party driver name is valid")
-        .with_telemetry_category(TelemetryComputeDriver::anonymous_category("mxc"));
+        .expect("first-party driver name is valid");
     registry
         .install(registration)
         .expect("first-party driver names are unique");
@@ -189,9 +165,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
             KubernetesFactory,
         )
         .map(|registration| {
-            registration
-                .with_telemetry_category(TelemetryComputeDriver::anonymous_category("kubernetes"))
-                .with_in_process_tracing(openshell_driver_kubernetes::otel_tracing::TRACING)
+            registration.with_in_process_tracing(openshell_driver_kubernetes::otel_tracing::TRACING)
         }),
         #[cfg(feature = "compute-driver-podman")]
         ComputeDriverRegistration::new(
@@ -201,9 +175,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
             PodmanFactory,
         )
         .map(|registration| {
-            registration
-                .with_telemetry_category(TelemetryComputeDriver::anonymous_category("podman"))
-                .with_in_process_tracing(openshell_driver_podman::otel_tracing::TRACING)
+            registration.with_in_process_tracing(openshell_driver_podman::otel_tracing::TRACING)
         }),
         #[cfg(feature = "compute-driver-docker")]
         ComputeDriverRegistration::new(
@@ -213,14 +185,10 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
             DockerFactory,
         )
         .map(|registration| {
-            registration
-                .with_telemetry_category(TelemetryComputeDriver::anonymous_category("docker"))
-                .with_in_process_tracing(openshell_driver_docker::otel_tracing::TRACING)
+            registration.with_in_process_tracing(openshell_driver_docker::otel_tracing::TRACING)
         }),
         #[cfg(feature = "compute-driver-vm")]
-        ComputeDriverRegistration::new("vm", u16::MAX, None, VmFactory).map(|registration| {
-            registration.with_telemetry_category(TelemetryComputeDriver::anonymous_category("vm"))
-        }),
+        ComputeDriverRegistration::new("vm", u16::MAX, None, VmFactory),
     ];
     for registration in registrations {
         registry

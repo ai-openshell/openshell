@@ -5,10 +5,6 @@
 # Shared helpers for local gateway-backed e2e wrappers. Driver-specific setup,
 # cleanup, and runtime behavior stay in the Docker/Podman wrapper scripts.
 
-# E2E traffic is synthetic and must not contribute to product usage metrics.
-# Keep an explicit override so telemetry-specific tests can opt back in.
-export OPENSHELL_TELEMETRY_ENABLED="${OPENSHELL_TELEMETRY_ENABLED:-false}"
-
 # Resolve a test image override. Repository-only values inherit the caller's
 # tag, while tagged and digest-pinned references are already complete.
 e2e_image_reference_is_complete() {
@@ -504,7 +500,7 @@ e2e_build_gateway_binaries() {
     if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
       cargo build ${jobs[@]+"${jobs[@]}"} \
         -p openshell-gateway --bin openshell-gateway \
-        --no-default-features --features telemetry
+        --no-default-features
     else
       cargo build ${jobs[@]+"${jobs[@]}"} \
         -p openshell-gateway --bin openshell-gateway

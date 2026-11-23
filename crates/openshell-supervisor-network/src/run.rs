@@ -25,7 +25,6 @@ use openshell_ocsf::{
     ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx,
 };
 
-use openshell_core::activity::ActivitySender;
 use openshell_core::denial::DenialEvent;
 use openshell_core::proposals::AgentProposals;
 use tokio::sync::mpsc::UnboundedSender;
@@ -286,7 +285,6 @@ pub async fn run_networking(
     provider_credentials: &ProviderCredentialState,
     instance: SandboxInstanceNetwork,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
-    activity_tx: Option<ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
@@ -610,7 +608,6 @@ pub async fn run_networking(
             Some(provider_credentials.clone()),
             Some(policy_local_ctx.clone()),
             denial_tx.clone(),
-            activity_tx.clone(),
             endpoint_observation_tx,
             engine_ready_rx,
             upstream_proxy_args,
@@ -658,7 +655,6 @@ pub async fn run_networking(
             entrypoint_pid,
             agent_proposals,
             denial_tx,
-            activity_tx,
             upstream_proxy_args,
             transparent_engine_ready_rx,
         )?;

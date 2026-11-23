@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use miette::Result;
-use openshell_core::activity::ActivitySender;
 use openshell_core::denial::DenialEvent;
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::proposals::AgentProposals;
@@ -54,7 +53,6 @@ pub struct HostProxyConfig {
     /// Shared feature state for the policy.local agent proposal surface.
     pub agent_proposals: AgentProposals,
     pub denial_tx: Option<UnboundedSender<DenialEvent>>,
-    pub activity_tx: Option<ActivitySender>,
 }
 
 /// RAII handle for a host-side proxy. Dropping it aborts the proxy accept loop.
@@ -216,7 +214,6 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         config.provider_credentials,
         Some(policy_local_ctx.clone()),
         config.denial_tx,
-        config.activity_tx,
         None,
         ready_rx,
         &upstream_proxy_args,
@@ -263,7 +260,6 @@ mod tests {
             provider_credentials: None,
             agent_proposals: AgentProposals::new(true),
             denial_tx: None,
-            activity_tx: None,
         }
     }
 
