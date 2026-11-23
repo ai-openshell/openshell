@@ -158,6 +158,16 @@ jobs on `openshell-ci-amd64-pd-gateway-a/b`, with separate exclusive caches and
 eight reserved runner CPUs. Inspect both jobs and all four named feature steps;
 measure the later completion rather than summing durations. Fork jobs retain
 hosted Ubuntu. A failed lane must fail the Branch Checks workflow gate.
+The AMD64 speed trial selects C3 nodes for persistent-cache lanes and disables
+test debug information only on the trusted AMD64 test job. Verify its
+`test-debug0` target path, initial size, and C3 node placement. Compare a first
+population pass and a warm rerun; both hardware and debug information change,
+so avoid attributing gains to either alone. Debug assertions stay enabled.
+The manual `local_image_builds` input additionally stages release binaries,
+builds all three native AMD64 images, and runs local `--help` smoke checks.
+It uses explicit Docker local output and no publication or image artifact
+upload. Diagnose binary staging separately from image assembly. Keep optional
+image-build timing separate from ordinary branch-check latency.
 See `CI.md` for trial scope and cache setup.
 
 ## View Job Logs

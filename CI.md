@@ -37,6 +37,25 @@ Inspect the job's
 runner name to confirm whether it ran on GKE. Hosted ARM, macOS, and fork jobs
 do not use the cluster-local cache endpoint.
 
+The AMD64 speed trial moves the persistent lint/test and gateway core lanes to
+`c3-standard-22` Ubuntu nodes in the same zone, retaining their SSDs, images,
+and per-runner CPU/memory settings. The general scale set and system pool now use N2 nodes.
+Only the trusted AMD64 test job sets `CARGO_PROFILE_TEST_DEBUG=0`; it retains
+all crypto/workspace checks and debug assertions, with less backtrace detail.
+Setup places these artifacts under a separate `test-debug0` target directory.
+Measure the first population pass and a warm rerun separately. This trial
+changes hardware and debug information together, so its result measures their
+combined effect. ARM64, macOS, hosted forks, and lint debug settings are unchanged.
+
+Manual Branch Checks runs can enable `local_image_builds` for an additional
+native AMD64 gateway/sandbox/supervisor build and `--help` smoke check. It uses
+the normal release-binary staging tasks and remote BuildKit, explicitly sets
+`DOCKER_PUSH=0` and `DOCKER_OUTPUT=type=docker`, and loads results only into the
+runner's ephemeral Docker daemon. No registry login, image upload, or registry
+cache export is performed. This optional release/image build is measured
+separately from the normal branch-check latency and does not qualify ARM64
+images or release attestations.
+
 The ARM trial uses native `t2a-standard-16` Ubuntu nodes (minimum two, maximum
 four), an ARM64 runner image with baked Nix shells, and separate 200 GiB SSDs
 for lint/tests. Each ARM lane has one ready worker, reserves 12 CPUs for the

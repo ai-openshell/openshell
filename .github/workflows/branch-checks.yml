@@ -5,6 +5,11 @@ on:
     types: [checks_requested]
   pull_request:
   workflow_dispatch:
+    inputs:
+      local_image_builds:
+        description: Build and smoke-test native AMD64 images locally without publishing
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -403,6 +408,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
+      - name: Disable test debug information on the AMD64 trial
+        if: matrix.runner == 'openshell-ci-amd64-pd-test'
+        run: echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-nix
@@ -481,6 +490,50 @@ jobs:
 
       - name: Shared sccache statistics
         if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && (startsWith(runner.name, 'openshell-ci-amd64-') || startsWith(runner.name, 'openshell-ci-arm64-')) }}
+        run: sccache --show-stats
+
+  local-image-build-trial:
+    name: Local image build trial (amd64, no push)
+    if: github.event_name == 'workflow_dispatch' && inputs.local_image_builds && github.repository == 'ai-openshell/openshell'
+    runs-on: openshell-ci-amd64
+    timeout-minutes: 90
+    env:
+      CONTAINER_ENGINE: docker
+      DOCKER_PLATFORM: linux/amd64
+      DOCKER_PUSH: "0"
+      DOCKER_OUTPUT: type=docker
+      DOCKER_BUILDER: openshell-local-trial
+      IMAGE_REGISTRY: localhost/openshell-ci
+      IMAGE_TAG: ${{ github.sha }}
+      PREBUILT_ARCH: amd64
+      PREBUILT_AUTO_STAGE: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: local-image-build-trial
+          save-cache: "false"
+      - name: Stage real release binaries
+        shell: nix develop -c bash -euo pipefail {0}
+        run: mise run build:docker:prebuilt
+      - name: Build and verify local images
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          docker buildx create --name "$DOCKER_BUILDER" --driver remote "$BUILDKIT_HOST"
+          trap 'docker buildx rm "$DOCKER_BUILDER"' EXIT
+          for component in gateway sandbox supervisor; do
+            mise run "docker:build:$component"
+            image="$IMAGE_REGISTRY/$component:$IMAGE_TAG"
+            test "$(docker image inspect --format '{{.Architecture}}' "$image")" = amd64
+            docker run --rm --network none "$image" --help
+          done
+      - name: Shared sccache statistics
+        if: always() && env.RUSTC_WRAPPER != ''
         run: sccache --show-stats
 
   rust-postgres-test:

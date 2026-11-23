@@ -61,6 +61,10 @@ runs:
         test "$OPENSHELL_PERSISTENT_CACHE" = /mnt/ci-cache
         mountpoint -q "$OPENSHELL_PERSISTENT_CACHE"
         cache_root="$OPENSHELL_PERSISTENT_CACHE/ai-openshell-openshell/$NIX_SHELL_HASH"
+        # Keep the no-debug experiment separate from the existing test artifacts.
+        if [[ "${CARGO_PROFILE_TEST_DEBUG:-}" == "0" ]]; then
+          cache_root="$cache_root/test-debug0"
+        fi
         mkdir -p "$cache_root/target"
         echo "CARGO_TARGET_DIR=$cache_root/target" >> "$GITHUB_ENV"
         echo "Persistent cache lane: $OPENSHELL_CACHE_LANE"
