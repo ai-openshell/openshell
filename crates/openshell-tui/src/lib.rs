@@ -100,6 +100,28 @@ pub async fn run(
     workspace: &str,
     theme_mode: ThemeMode,
 ) -> Result<()> {
+    run_with_gateway_insecure(
+        channel,
+        interceptor,
+        gateway_name,
+        endpoint,
+        workspace,
+        theme_mode,
+        false,
+    )
+    .await
+}
+
+/// Launch the TUI with the TLS verification setting used to open its initial channel.
+pub async fn run_with_gateway_insecure(
+    channel: Channel,
+    interceptor: EdgeAuthInterceptor,
+    gateway_name: &str,
+    endpoint: &str,
+    workspace: &str,
+    theme_mode: ThemeMode,
+    gateway_insecure: bool,
+) -> Result<()> {
     // Detect theme *before* entering raw/alternate-screen mode.
     // The OSC 11 query temporarily enters raw mode itself; calling it
     // after our own enable_raw_mode() would conflict.
@@ -113,6 +135,7 @@ pub async fn run(
         workspace.to_string(),
         detected_theme,
     );
+    app.gateway_insecure = gateway_insecure;
 
     enable_raw_mode().into_diagnostic()?;
     let mut stdout = io::stdout();
@@ -570,6 +593,7 @@ async fn handle_gateway_switch(app: &mut App, tx: mpsc::UnboundedSender<Event>) 
             app.client = OpenShellClient::with_interceptor(channel, interceptor);
             app.gateway_name = name;
             app.endpoint = endpoint;
+            app.gateway_insecure = false;
             app.reset_sandbox_state();
             refresh_health(app).await;
             refresh_global_settings(app).await;
@@ -975,6 +999,7 @@ async fn handle_shell_connect(
         id,
     );
     target.cleanup.clone_from(cleanup);
+    target.gateway_insecure = app.gateway_insecure;
     run_sandbox_ssh(app, terminal, events, &target, &[]).await
 }
 
@@ -985,7 +1010,10 @@ async fn run_sandbox_ssh(
     target: &SshTarget,
     args: &[String],
 ) -> Result<()> {
-    if target.gateway_name != app.gateway_name || target.endpoint != app.endpoint {
+    if target.gateway_name != app.gateway_name
+        || target.endpoint != app.endpoint
+        || target.gateway_insecure != app.gateway_insecure
+    {
         app.status_text = "Gateway changed before SSH startup".into();
         return Ok(());
     }
@@ -1329,6 +1357,7 @@ fn spawn_create_sandbox(
 
     let endpoint = app.endpoint.clone();
     let gateway_name = app.gateway_name.clone();
+    let gateway_insecure = app.gateway_insecure;
     let need_ready = !ports.is_empty() || !app.pending_exec_command.is_empty();
     let workspace = app.current_workspace.clone();
 
@@ -1401,49 +1430,12 @@ fn spawn_create_sandbox(
             created.object_id(),
         );
         target.cleanup = cleanup;
+        target.gateway_insecure = gateway_insecure;
         // If ports or command are set, wait for Ready before finishing.
         if need_ready {
-            let mut attempts = 0;
-            loop {
-                attempts += 1;
-                if attempts > 150 {
-                    let _ = tx.send(Event::CreateResult(Err(
-                        "timed out waiting for sandbox to be ready".to_string(),
-                    )));
-                    return;
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-
-                let req = openshell_core::proto::GetSandboxRequest {
-                    name: target.name.clone(),
-                    workspace_scope: Some(openshell_core::proto::workspace_selector(
-                        target.workspace.clone(),
-                    )),
-                };
-                // Retry on transient errors.
-                if let Ok(resp) = client
-                    .get_sandbox(openshell_core::replica_routing::with_owner_hint(req))
-                    .await
-                    && let Some(sandbox) = resp.get_ref().sandbox.as_ref()
-                {
-                    if sandbox.object_id() != target.id {
-                        let _ = tx.send(Event::CreateResult(Err(
-                            "sandbox was replaced while waiting for readiness".into(),
-                        )));
-                        return;
-                    }
-                    if sandbox.phase() == SandboxPhase::Ready as i32 {
-                        target.replica = openshell_core::replica_routing::owner_replica(&resp)
-                            .and_then(|owner| owner.to_str().ok().map(str::to_owned));
-                        break;
-                    }
-                    if sandbox.phase() == SandboxPhase::Error as i32 {
-                        let _ = tx.send(Event::CreateResult(Err(
-                            "sandbox entered error state".to_string()
-                        )));
-                        return;
-                    }
-                }
+            if let Err(error) = wait_for_ssh_target(&mut client, &mut target).await {
+                let _ = tx.send(Event::CreateResult(Err(error.to_string())));
+                return;
             }
 
             // Start port forwards if requested.
@@ -1457,6 +1449,35 @@ fn spawn_create_sandbox(
 
         let _ = tx.send(Event::CreateResult(Ok(target)));
     });
+}
+
+async fn wait_for_ssh_target(client: &mut TuiClient, target: &mut SshTarget) -> Result<()> {
+    tokio::time::timeout(Duration::from_mins(5), async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let response = match client.get_sandbox(target.lookup_request()).await {
+                Ok(response) => response,
+                Err(status)
+                    if matches!(
+                        status.code(),
+                        Code::NotFound | Code::Unavailable | Code::DeadlineExceeded | Code::Aborted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(status) => return Err(status).into_diagnostic(),
+            };
+            let phase = target.observe_lookup(&response)?.phase();
+            if phase == SandboxPhase::Ready as i32 {
+                return Ok(());
+            }
+            if phase == SandboxPhase::Error as i32 {
+                return Err(miette::miette!("sandbox entered error state"));
+            }
+        }
+    })
+    .await
+    .map_err(|_| miette::miette!("timed out waiting for sandbox to be ready"))?
 }
 
 /// Start SSH port forwards for a sandbox that is already Ready.

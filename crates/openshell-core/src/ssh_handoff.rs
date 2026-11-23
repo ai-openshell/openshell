@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! One SSH transport gets one grant. The issuing client retains ownership
-//! until the proxy opens `ForwardTcp`, disconnects, or the SSH command exits.
+//! Hand the proxy the selected gateway and SSH route over private IPC. The
+//! issuer retains any legacy session grant until admission or cancellation.
 
 #[cfg(unix)]
 mod unix;
@@ -13,14 +13,20 @@ use unix as ipc;
 #[cfg(windows)]
 use windows as ipc;
 
-use crate::forward::{build_proxy_command, validate_ssh_session_response};
-use crate::proto::{
-    CreateSshSessionRequest, CreateSshSessionResponse, RevokeSshSessionRequest,
-    open_shell_client::OpenShellClient, workspace_selector,
+use crate::forward::{
+    build_proxy_command, supports_direct_ssh, validate_ssh_sandbox_id,
+    validate_ssh_session_response,
 };
+use crate::metadata::ObjectId;
+use crate::proto::{
+    CreateSshSessionRequest, CreateSshSessionResponse, GetSandboxRequest, RevokeSshSessionRequest,
+    Sandbox, SandboxResponse, open_shell_client::OpenShellClient, workspace_selector,
+};
+use crate::replica_routing::{owner_replica, with_owner_hint};
+use crate::time::{duration_from_std, duration_to_std};
 use miette::{IntoDiagnostic, Result};
 use prost::Message;
-use std::{future::Future, time::Duration};
+use std::{borrow::Cow, future::Future, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tonic::{
@@ -31,6 +37,39 @@ use uuid::Uuid;
 
 type Client<I> = OpenShellClient<InterceptedService<Channel, I>>;
 
+// Room for a unary session response plus the endpoint, profile and routing hint.
+const MAX_HANDOFF_SIZE: usize = 5 * 1024 * 1024;
+/// The gateway refused direct admission. End this operation, including automatic recovery.
+pub const DIRECT_SSH_REFUSED: u8 = 2;
+
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+pub enum SshAdmissionError {
+    #[error("{0}")]
+    Rpc(tonic::Status),
+    #[error("gateway refused direct SSH admission")]
+    Refused,
+    #[error("sandbox was replaced before opening the SSH relay")]
+    Replaced,
+    #[error("gateway stopped advertising direct SSH")]
+    CapabilityLost,
+}
+
+impl SshAdmissionError {
+    pub fn is_retryable(&self) -> bool {
+        let Self::Rpc(status) = self else {
+            return false;
+        };
+        match status.code() {
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => true,
+            tonic::Code::Unknown | tonic::Code::Internal | tonic::Code::Cancelled => {
+                std::error::Error::source(status)
+                    .is_some_and(crate::transport_errors::is_expected_transport_close_error)
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SshTarget {
     pub endpoint: String,
@@ -38,14 +77,17 @@ pub struct SshTarget {
     pub name: String,
     pub workspace: String,
     pub id: String,
+    /// Capability from the selected sandbox's `GetSandbox` reply. Look it up if unknown.
+    pub direct_ssh: Option<bool>,
     pub replica: Option<String>,
+    pub gateway_insecure: bool,
     pub cleanup: SshCleanup,
 }
 
 #[derive(Message)]
 pub struct RelayGrant {
-    #[prost(message, required, tag = "1")]
-    pub session: CreateSshSessionResponse,
+    #[prost(oneof = "RelayAuthorization", tags = "1, 5")]
+    pub authorization: Option<RelayAuthorization>,
     #[prost(string, tag = "2")]
     pub endpoint: String,
     #[prost(string, tag = "3")]
@@ -54,10 +96,57 @@ pub struct RelayGrant {
     pub replica: Option<String>,
 }
 
+#[derive(prost::Oneof)]
+pub enum RelayAuthorization {
+    #[prost(message, tag = "1")]
+    Session(CreateSshSessionResponse),
+    #[prost(message, tag = "5")]
+    Direct(DirectSshRelay),
+}
+
+#[derive(Message)]
+pub struct DirectSshRelay {
+    #[prost(string, tag = "1")]
+    pub sandbox_id: String,
+    #[prost(bool, tag = "2")]
+    pub gateway_insecure: bool,
+    #[prost(message, optional, tag = "3")]
+    pub registration_timeout: Option<prost_types::Duration>,
+}
+
+impl DirectSshRelay {
+    pub fn registration_timeout(&self) -> Result<Option<Duration>> {
+        self.registration_timeout
+            .as_ref()
+            .map(duration_to_std)
+            .transpose()
+            .into_diagnostic()
+    }
+}
+
+impl RelayGrant {
+    fn validate(&self) -> Result<&str> {
+        match &self.authorization {
+            Some(RelayAuthorization::Session(session)) => {
+                validate_ssh_session_response(session).map_err(|err| {
+                    miette::miette!("gateway returned invalid SSH session response: {err}")
+                })?;
+                Ok(&session.sandbox_id)
+            }
+            Some(RelayAuthorization::Direct(direct)) => {
+                validate_ssh_sandbox_id(&direct.sandbox_id).into_diagnostic()?;
+                direct.registration_timeout()?;
+                Ok(&direct.sandbox_id)
+            }
+            None => Err(miette::miette!("missing SSH handoff authorization")),
+        }
+    }
+}
+
 pub struct PreparedProxy {
     command: String,
     cancel: oneshot::Sender<()>,
-    cleanup: tokio::task::JoinHandle<Option<Duration>>,
+    cleanup: tokio::task::JoinHandle<Result<Option<Duration>>>,
 }
 
 /// Work that must finish before an SSH command or TUI releases its runtime.
@@ -86,9 +175,40 @@ impl SshTarget {
             name: name.into(),
             workspace: workspace.into(),
             id: id.into(),
+            direct_ssh: None,
             replica: None,
+            gateway_insecure: false,
             cleanup: SshCleanup::default(),
         }
+    }
+
+    pub fn lookup_request(&self) -> tonic::Request<GetSandboxRequest> {
+        with_owner_hint(GetSandboxRequest {
+            name: self.name.clone(),
+            workspace_scope: Some(workspace_selector(self.workspace.clone())),
+        })
+    }
+
+    pub fn observe_lookup<'a>(
+        &mut self,
+        response: &'a tonic::Response<SandboxResponse>,
+    ) -> Result<&'a Sandbox> {
+        let sandbox = response
+            .get_ref()
+            .sandbox
+            .as_ref()
+            .ok_or_else(|| miette::miette!("sandbox not found"))?;
+        if sandbox.object_id() != self.id {
+            return Err(SshAdmissionError::Replaced.into());
+        }
+        let advertised = supports_direct_ssh(response)?;
+        if self.direct_ssh == Some(true) && !advertised {
+            return Err(SshAdmissionError::CapabilityLost.into());
+        }
+        self.direct_ssh = Some(advertised);
+        self.replica =
+            owner_replica(response).and_then(|owner| owner.to_str().ok().map(str::to_owned));
+        Ok(sandbox)
     }
 
     pub async fn prepare<I: Interceptor + Clone + Send + Sync + 'static>(
@@ -96,32 +216,62 @@ impl SshTarget {
         mut client: Client<I>,
         registration_timeout: Option<Duration>,
     ) -> Result<PreparedProxy> {
-        let request = CreateSshSessionRequest {
-            sandbox: self.name.clone(),
-            workspace_scope: Some(workspace_selector(self.workspace.clone())),
-        };
-        let deadline = registration_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
-        let session = loop {
-            match client.create_ssh_session(request.clone()).await {
-                Ok(response) => break response.into_inner(),
-                Err(status)
-                    if status.code() == tonic::Code::FailedPrecondition
-                        && deadline.is_some_and(|end| tokio::time::Instant::now() < end) =>
-                {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut target = Cow::Borrowed(self);
+        if target.direct_ssh.is_none() {
+            let response = client
+                .get_sandbox(target.lookup_request())
+                .await
+                .map_err(SshAdmissionError::Rpc)?;
+            target.to_mut().observe_lookup(&response)?;
+        }
+        let authorization = if target.direct_ssh == Some(true) {
+            RelayAuthorization::Direct(DirectSshRelay {
+                sandbox_id: target.id.clone(),
+                gateway_insecure: target.gateway_insecure,
+                registration_timeout: registration_timeout
+                    .map(duration_from_std)
+                    .transpose()
+                    .into_diagnostic()?,
+            })
+        } else {
+            let request = CreateSshSessionRequest {
+                sandbox: self.name.clone(),
+                workspace_scope: Some(workspace_selector(self.workspace.clone())),
+            };
+            let started = tokio::time::Instant::now();
+            let session = loop {
+                match client.create_ssh_session(request.clone()).await {
+                    Ok(response) => break response.into_inner(),
+                    Err(status)
+                        if status.code() == tonic::Code::FailedPrecondition
+                            && registration_timeout
+                                .is_some_and(|timeout| started.elapsed() < timeout) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(status) => return Err(SshAdmissionError::Rpc(status).into()),
                 }
-                Err(status) => return Err(status).into_diagnostic(),
-            }
+            };
+            RelayAuthorization::Session(session)
         };
-        let revoke = revoke_grant(client, session.token.clone());
+        let revoke = match &authorization {
+            RelayAuthorization::Session(session) => {
+                Some(revoke_grant(client, session.token.clone()))
+            }
+            RelayAuthorization::Direct(_) => None,
+        };
+        let grant = RelayGrant {
+            authorization: Some(authorization),
+            endpoint: target.endpoint.clone(),
+            gateway_name: target.gateway_name.clone(),
+            replica: target.replica.clone(),
+        };
         let setup = || {
-            validate_ssh_session_response(&session).map_err(|err| {
-                miette::miette!("gateway returned invalid SSH session response: {err}")
-            })?;
-            if session.sandbox_id != self.id {
-                return Err(miette::miette!(
-                    "sandbox was replaced before opening the SSH relay"
-                ));
+            if grant.validate()? != self.id {
+                return Err(SshAdmissionError::Replaced.into());
+            }
+            if grant.encoded_len() > MAX_HANDOFF_SIZE {
+                return Err(miette::miette!("SSH handoff exceeds the size limit"));
             }
             let id = Uuid::new_v4();
             let listener = ipc::Listener::bind(id).into_diagnostic()?;
@@ -134,41 +284,58 @@ impl SshTarget {
         let (listener, command) = match setup() {
             Ok(parts) => parts,
             Err(error) => {
-                self.cleanup.spawn(revoke).await.into_diagnostic()?;
+                if let Some(revoke) = revoke {
+                    self.cleanup.spawn(revoke).await.into_diagnostic()?;
+                }
                 return Err(error);
             }
         };
-        let payload = RelayGrant {
-            session,
-            endpoint: self.endpoint.clone(),
-            gateway_name: self.gateway_name.clone(),
-            replica: self.replica.clone(),
-        }
-        .encode_to_vec();
-        let (cancel, cancelled) = oneshot::channel();
+        let payload = grant.encode_to_vec();
+        let (cancel, mut cancelled) = oneshot::channel();
         let cleanup = self.cleanup.spawn(async move {
+            let direct = revoke.is_none();
             let serve = async {
                 let mut peer = listener.accept().await?;
                 peer.write_u32(u32::try_from(payload.len()).map_err(std::io::Error::other)?)
                     .await?;
                 peer.write_all(&payload).await?;
-                if peer.read_u8().await? != 1 {
+                let reply = peer.read_u8().await?;
+                if reply != 1 && (reply != DIRECT_SSH_REFUSED || !direct) {
                     return Err(std::io::ErrorKind::InvalidData.into());
                 }
-                Ok::<_, std::io::Error>(peer)
+                Ok::<_, std::io::Error>((peer, reply))
             };
             // Keep the peer until the issuing client has attempted revocation.
             let peer = tokio::select! {
                 result = serve => result.ok(),
-                _ = cancelled => None,
+                _ = &mut cancelled => None,
             };
             let started = std::time::Instant::now();
-            revoke.await;
-            if let Some(mut peer) = peer {
+            if let Some(revoke) = revoke {
+                revoke.await;
+            }
+            if let Some((mut peer, reply)) = peer {
                 let _ = peer.write_u8(1).await;
-                Some(started.elapsed())
+                let handshake_wait = started.elapsed();
+                if reply == DIRECT_SSH_REFUSED {
+                    return Err(SshAdmissionError::Refused.into());
+                }
+                if direct {
+                    // gRPC can deliver a refusal in trailers after sending response headers.
+                    tokio::select! {
+                        biased;
+                        status = peer.read_u8() => {
+                            if matches!(status, Ok(DIRECT_SSH_REFUSED)) {
+                                let _ = peer.write_u8(1).await;
+                                return Err(SshAdmissionError::Refused.into());
+                            }
+                        }
+                        _ = cancelled => {}
+                    }
+                }
+                Ok(Some(handshake_wait))
             } else {
-                None
+                Ok(None)
             }
         });
         Ok(PreparedProxy {
@@ -203,15 +370,15 @@ impl PreparedProxy {
             .map(|(value, _)| value)
     }
 
-    /// An admitted proxy waits for revocation before it can carry SSH bytes.
-    /// Return that interval so it does not count as time attached to a sandbox.
+    /// Return the time an admitted proxy spent waiting for any legacy revocation
+    /// so callers can exclude it from time attached to the sandbox.
     pub async fn run_with_admission<T>(
         self,
         operation: impl Future<Output = Result<T>>,
     ) -> Result<(T, Option<Duration>)> {
         let result = operation.await;
         drop(self.cancel);
-        let revocation_wait = self.cleanup.await.into_diagnostic()?;
+        let revocation_wait = self.cleanup.await.into_diagnostic()??;
         Ok((result?, revocation_wait))
     }
 }
@@ -227,23 +394,97 @@ pub async fn receive(handle: &str) -> Result<(RelayGrant, impl AsyncRead + Async
     #[cfg(windows)]
     let mut peer = ipc::connect(id, pid).into_diagnostic()?;
     let size = peer.read_u32().await.into_diagnostic()? as usize;
-    // The session response comes from a unary gRPC call; allow its default
-    // message limit plus room for the endpoint, profile and routing hint.
-    if size > 5 * 1024 * 1024 {
+    if size > MAX_HANDOFF_SIZE {
         return Err(miette::miette!("SSH handoff exceeds the size limit"));
     }
     let mut payload = vec![0; size];
     peer.read_exact(&mut payload).await.into_diagnostic()?;
-    Ok((
-        RelayGrant::decode(&payload[..])
-            .map_err(|_| miette::miette!("invalid SSH handoff message"))?,
-        peer,
-    ))
+    let grant = RelayGrant::decode(&payload[..])
+        .map_err(|_| miette::miette!("invalid SSH handoff message"))?;
+    grant.validate()?;
+    Ok((grant, peer))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_loss_requires_a_local_cause_for_ambiguous_statuses() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let local = tonic::Status::from_error(Box::new(reset));
+        assert_eq!(local.code(), tonic::Code::Unknown);
+        assert!(SshAdmissionError::Rpc(local).is_retryable());
+        for code in [
+            tonic::Code::Unknown,
+            tonic::Code::Internal,
+            tonic::Code::Cancelled,
+            tonic::Code::PermissionDenied,
+        ] {
+            let remote = tonic::Status::new(code, "connection reset");
+            assert!(!SshAdmissionError::Rpc(remote).is_retryable());
+        }
+    }
+
+    #[test]
+    fn a_replacement_cannot_authorize_the_selected_target() {
+        let mut target = SshTarget::new("endpoint", "gateway", "box", "team", "original");
+        let mut response = tonic::Response::new(SandboxResponse {
+            sandbox: Some(Sandbox {
+                metadata: Some(crate::proto::datamodel::v1::ObjectMeta {
+                    id: "replacement".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        response
+            .metadata_mut()
+            .insert(crate::forward::DIRECT_SSH_HEADER, "1".parse().unwrap());
+        assert!(target.observe_lookup(&response).is_err());
+        assert_eq!(target.direct_ssh, None);
+    }
+
+    #[tokio::test]
+    async fn direct_handoff_observes_admission_without_session_rpcs() {
+        let endpoint = "http://127.0.0.1:0";
+        let client = OpenShellClient::with_interceptor(
+            Channel::from_static(endpoint).connect_lazy(),
+            |_| panic!("observed direct handoff issued an unexpected gateway RPC"),
+        );
+        let mut target = SshTarget::new(endpoint, "gateway", "box", "team", "id-1");
+        target.direct_ssh = Some(true);
+        target.gateway_insecure = true;
+        target.replica = Some("owner".into());
+
+        let timeout = Duration::from_nanos(2_500_003);
+        let proxy = target.prepare(client.clone(), Some(timeout)).await.unwrap();
+        let handle = proxy.command().rsplit_once(' ').unwrap().1.to_owned();
+        let ((), admitted) = proxy
+            .run_with_admission(async {
+                let (grant, mut peer) = receive(&handle).await?;
+                let Some(RelayAuthorization::Direct(direct)) = grant.authorization else {
+                    panic!("missing direct SSH target");
+                };
+                assert_eq!(direct.sandbox_id, "id-1");
+                assert!(direct.gateway_insecure);
+                assert_eq!(direct.registration_timeout()?, Some(timeout));
+                assert_eq!(grant.endpoint, endpoint);
+                assert_eq!(grant.gateway_name, "gateway");
+                assert_eq!(grant.replica.as_deref(), Some("owner"));
+                peer.write_u8(1).await.into_diagnostic()?;
+                assert_eq!(peer.read_u8().await.into_diagnostic()?, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(admitted.is_some());
+
+        let proxy = target.prepare(client, None).await.unwrap();
+        let ((), admitted) = proxy.run_with_admission(async { Ok(()) }).await.unwrap();
+        assert!(admitted.is_none());
+    }
 
     #[tokio::test]
     async fn proxy_rejects_a_different_issuer_pid_before_reading_a_grant() {

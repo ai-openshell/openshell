@@ -14,13 +14,15 @@ use miette::{IntoDiagnostic, Report, Result, WrapErr};
 use nix::sys::signal::Signal;
 use openshell_core::forward::{
     ForwardSpec, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args, shell_escape,
-    validate_ssh_session_response, write_forward_pid,
+    supports_direct_ssh, validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{
     CreateSshSessionRequest, CreateSshSessionResponse, GetSandboxRequest, SandboxPhase,
     SshRelayTarget, TcpForwardFrame, TcpForwardInit, tcp_forward_init,
 };
-use openshell_core::ssh_handoff::{PreparedProxy, SshCleanup, SshTarget};
+use openshell_core::ssh_handoff::{
+    PreparedProxy, RelayAuthorization, SshAdmissionError, SshCleanup, SshTarget,
+};
 use openshell_core::upload::{
     DestinationKind as UploadDestinationKind, ExpectedDestination, UploadPlan,
 };
@@ -120,11 +122,13 @@ async fn ssh_session_config(
 ) -> Result<SshSessionConfig> {
     let mut client = grpc_client(server, tls).await?;
 
-    let (sandbox, replica) = lookup_ssh_sandbox(&mut client, name, workspace).await?;
+    let (sandbox, replica, direct_ssh) = lookup_ssh_sandbox(&mut client, name, workspace).await?;
     let gateway_name = tls
         .gateway_name()
         .ok_or_else(|| miette::miette!("gateway name is required to build SSH proxy command"))?;
     let mut target = SshTarget::new(server, gateway_name, name, workspace, sandbox.object_id());
+    target.direct_ssh = Some(direct_ssh);
+    target.gateway_insecure = tls.gateway_insecure;
     target.replica = replica
         .as_ref()
         .and_then(|v| v.to_str().ok())
@@ -424,6 +428,9 @@ fn next_connect_retry_delay(delay: Duration) -> Duration {
 }
 
 fn connect_error_is_retryable(error: &Report) -> bool {
+    if let Some(error) = error.downcast_ref::<SshAdmissionError>() {
+        return error.is_retryable();
+    }
     let message = format!("{error:?}").to_ascii_lowercase();
     [
         "broken pipe",
@@ -455,6 +462,7 @@ async fn sandbox_connect_supervised(
     cleanup: &SshCleanup,
 ) -> Result<i32> {
     let mut selected_id = None;
+    let mut require_direct = false;
     let mut recovery_deadline = None;
     let mut retry_delay = CONNECT_RETRY_INITIAL_DELAY;
     let mut cancellation = ConnectCancellation::new()?;
@@ -475,6 +483,10 @@ async fn sandbox_connect_supervised(
                 {
                     return Err(miette::miette!("sandbox was replaced before reconnecting"));
                 }
+                if require_direct && session.target.direct_ssh != Some(true) {
+                    return Err(SshAdmissionError::CapabilityLost.into());
+                }
+                require_direct = session.target.direct_ssh == Some(true);
                 Ok((session.prepare().await?, session.main_terminal))
             },
         )))
@@ -1777,6 +1789,9 @@ where
 }
 
 fn sync_error_is_retryable(error: &Report) -> bool {
+    if let Some(error) = error.downcast_ref::<SshAdmissionError>() {
+        return error.is_retryable();
+    }
     if let Some(error) = error.downcast_ref::<upload::UploadError>() {
         return error.is_retryable();
     }
@@ -1997,7 +2012,11 @@ async fn lookup_ssh_sandbox(
     client: &mut GrpcClient,
     name: &str,
     workspace: &str,
-) -> Result<(openshell_core::proto::Sandbox, Option<AsciiMetadataValue>)> {
+) -> Result<(
+    openshell_core::proto::Sandbox,
+    Option<AsciiMetadataValue>,
+    bool,
+)> {
     let response = client
         .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
@@ -2006,17 +2025,18 @@ async fn lookup_ssh_sandbox(
             )),
         }))
         .await
-        .into_diagnostic()?;
+        .map_err(SshAdmissionError::Rpc)?;
     let replica = owner_replica(&response);
+    let direct_ssh = supports_direct_ssh(&response)?;
     let sandbox = response
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    Ok((sandbox, replica))
+    Ok((sandbox, replica, direct_ssh))
 }
 
-/// Mint the token inside the proxy so neither SSH nor its other children inherit it.
+/// Connect a saved SSH profile to the sandbox selected by this invocation.
 pub async fn sandbox_ssh_proxy_by_name(
     server: &str,
     name: &str,
@@ -2024,8 +2044,25 @@ pub async fn sandbox_ssh_proxy_by_name(
     workspace: &str,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let (sandbox, replica) = lookup_ssh_sandbox(&mut client, name, workspace).await?;
+    let (sandbox, replica, direct_ssh) = lookup_ssh_sandbox(&mut client, name, workspace).await?;
     let mut cancellation = ConnectCancellation::new()?;
+    if direct_ssh {
+        return cancellation
+            .wait(async {
+                let relay = open_direct_ssh(
+                    &mut client,
+                    name,
+                    workspace,
+                    sandbox.object_id(),
+                    replica.as_ref(),
+                    None,
+                )
+                .await?;
+                relay_ssh_proxy(relay).await
+            })
+            .await
+            .map_err(|_| miette::miette!("SSH proxy interrupted"))?;
+    }
     let session = cancellation
         .wait(client.create_ssh_session(CreateSshSessionRequest {
             sandbox: name.to_string(),
@@ -2071,14 +2108,75 @@ pub async fn relay_prepared_ssh(
         .map(str::parse)
         .transpose()
         .into_diagnostic()?;
+    let direct = matches!(&grant.authorization, Some(RelayAuthorization::Direct(_)));
+    let open = async {
+        match grant
+            .authorization
+            .ok_or_else(|| miette::miette!("missing SSH relay authorization"))?
+        {
+            RelayAuthorization::Session(session) => {
+                open_ssh_relay(
+                    &grant.endpoint,
+                    name,
+                    tls,
+                    workspace,
+                    &session,
+                    replica.as_ref(),
+                )
+                .await
+            }
+            RelayAuthorization::Direct(direct) => {
+                let mut tls = tls.clone();
+                tls.gateway_insecure = direct.gateway_insecure;
+                let mut client = grpc_client(&grant.endpoint, &tls).await?;
+                open_direct_ssh(
+                    &mut client,
+                    name,
+                    workspace,
+                    &direct.sandbox_id,
+                    replica.as_ref(),
+                    direct.registration_timeout()?,
+                )
+                .await
+            }
+        }
+    };
     let opened = tokio::select! {
-        result = open_ssh_relay(&grant.endpoint, name, tls, workspace, &grant.session, replica.as_ref()) => result?,
+        result = open => result,
         _ = peer.read_u8() => return Err(miette::miette!("SSH handoff closed before relay admission")),
     };
-    peer.write_u8(1).await.into_diagnostic()?;
-    peer.read_u8().await.into_diagnostic()?;
-    drop(peer);
-    relay_ssh_proxy(opened).await
+    let result = match opened {
+        Ok(relay) => {
+            notify_ssh_issuer(&mut peer, 1).await?;
+            if !direct {
+                drop(peer);
+                return relay_ssh_proxy(relay).await;
+            }
+            relay_ssh_proxy(relay).await
+        }
+        Err(error) => Err(error),
+    };
+    if direct
+        && let Err(error) = &result
+        && error
+            .downcast_ref::<SshAdmissionError>()
+            .is_some_and(|rpc| !rpc.is_retryable())
+    {
+        let _ = notify_ssh_issuer(&mut peer, openshell_core::ssh_handoff::DIRECT_SSH_REFUSED).await;
+    }
+    result
+}
+
+async fn notify_ssh_issuer(
+    peer: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    reply: u8,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    peer.write_u8(reply).await.into_diagnostic()?;
+    if peer.read_u8().await.into_diagnostic()? != 1 {
+        return Err(miette::miette!("invalid SSH handoff acknowledgement"));
+    }
+    Ok(())
 }
 
 type SshRelay = (
@@ -2133,7 +2231,7 @@ async fn relay_ssh_proxy((tx, mut response): SshRelay) -> Result<()> {
             let frame = match response.message().await {
                 Ok(Some(frame)) => frame,
                 Ok(None) => return Ok::<_, Report>(()),
-                Err(error) => return Err(error).into_diagnostic(),
+                Err(status) => return Err(SshAdmissionError::Rpc(status).into()),
             };
             let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
             else {
@@ -2213,21 +2311,66 @@ async fn open_ssh_relay(
         None => lookup_ssh_sandbox(&mut client, name, workspace)
             .await
             .ok()
-            .and_then(|(_, owner)| owner),
+            .and_then(|(_, owner, _)| owner),
     };
+    open_ssh_stream(
+        &mut client,
+        name,
+        workspace,
+        tcp_forward_init::Target::Ssh(SshRelayTarget {}),
+        &session.token,
+        owner.as_ref(),
+    )
+    .await
+    .into_diagnostic()
+}
+
+async fn open_direct_ssh(
+    client: &mut GrpcClient,
+    name: &str,
+    workspace: &str,
+    sandbox_id: &str,
+    replica: Option<&AsciiMetadataValue>,
+    registration_timeout: Option<Duration>,
+) -> Result<SshRelay> {
+    openshell_core::forward::validate_ssh_sandbox_id(sandbox_id).into_diagnostic()?;
+    let started = Instant::now();
+    loop {
+        let target = tcp_forward_init::Target::DirectSshSandboxId(sandbox_id.to_owned());
+        match open_ssh_stream(client, name, workspace, target, "", replica).await {
+            Err(status)
+                if status.code() == tonic::Code::FailedPrecondition
+                    && status.message() == "sandbox is not ready"
+                    && registration_timeout.is_some_and(|timeout| started.elapsed() < timeout) =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            result => return result.map_err(|status| Report::new(SshAdmissionError::Rpc(status))),
+        }
+    }
+}
+
+async fn open_ssh_stream(
+    client: &mut GrpcClient,
+    name: &str,
+    workspace: &str,
+    target: tcp_forward_init::Target,
+    token: &str,
+    replica: Option<&AsciiMetadataValue>,
+) -> std::result::Result<SshRelay, tonic::Status> {
     let init = TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
                 sandbox: name.to_string(),
                 workspace: workspace.to_string(),
                 service_id: format!("ssh-proxy:{name}"),
-                target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
-                authorization_token: session.token.clone(),
+                target: Some(target),
+                authorization_token: token.to_owned(),
             },
         )),
     };
-    let (tx, response) = open_forward_tcp(&mut client, init, owner.as_ref()).await;
-    Ok((tx, response.into_diagnostic()?.into_inner()))
+    let (tx, response) = open_forward_tcp(client, init, replica).await;
+    Ok((tx, response?.into_inner()))
 }
 
 fn host_alias(name: &str, workspace: &str) -> String {
@@ -2884,6 +3027,11 @@ mod tests {
 
     #[test]
     fn connect_retry_filter_rejects_authentication_failures() {
+        let denied = Report::new(SshAdmissionError::Rpc(tonic::Status::permission_denied(
+            "connection unavailable",
+        )));
+        assert!(!connect_error_is_retryable(&denied));
+        assert!(!sync_error_is_retryable(&denied));
         let transient = miette::miette!("transport error: connection reset by peer");
         assert!(connect_error_is_retryable(&transient));
 
