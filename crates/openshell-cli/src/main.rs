@@ -2821,19 +2821,29 @@ fn run_main() -> Result<()> {
 async fn run_async() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
-    let (cli, explicit_gateway) = {
+    let (cli, explicit_gateway, explicit_endpoint) = {
         let mut args = Cli::command().get_matches();
         let explicit_gateway =
             args.value_source("gateway") == Some(clap::parser::ValueSource::CommandLine);
-        if explicit_gateway
-            && args.value_source("gateway_endpoint") == Some(clap::parser::ValueSource::EnvVariable)
-        {
-            args.remove_one::<String>("gateway_endpoint");
-        }
+        let explicit_endpoint =
+            args.value_source("gateway_endpoint") == Some(clap::parser::ValueSource::CommandLine);
         (
             Cli::from_arg_matches_mut(&mut args).unwrap_or_else(|err| err.exit()),
             explicit_gateway,
+            explicit_endpoint,
         )
+    };
+    let current_gateway = || {
+        if let (Some(name), Some(endpoint)) = (&cli.gateway, &cli.gateway_endpoint)
+            && explicit_gateway != explicit_endpoint
+            && !get_gateway_metadata(name).is_some_and(|metadata| {
+                normalize_gateway_endpoint(&metadata.gateway_endpoint)
+                    == normalize_gateway_endpoint(endpoint)
+            })
+        {
+            return resolve_gateway(&None, &cli.gateway_endpoint);
+        }
+        resolve_gateway(&cli.gateway, &cli.gateway_endpoint)
     };
 
     // Resolve colorization before anything is printed, so no command can emit
@@ -2939,7 +2949,7 @@ async fn run_async() -> Result<()> {
                 run::gateway_select(name.as_deref(), &cli.gateway)?;
             }
             GatewayCommands::Info { output } => {
-                if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                if let Ok(ctx) = current_gateway() {
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
                     run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
@@ -2975,7 +2985,7 @@ async fn run_async() -> Result<()> {
         // -----------------------------------------------------------
         Some(Commands::Status { output }) => {
             // A gateway named on the command line must be registered.
-            let resolved = match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+            let resolved = match current_gateway() {
                 Err(err) if cli.gateway.is_some() => return Err(err),
                 resolved => resolved,
             };
@@ -3012,7 +3022,7 @@ async fn run_async() -> Result<()> {
         // Top-level current identity
         // -----------------------------------------------------------
         Some(Commands::Whoami { output }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             run::whoami(&ctx.endpoint, &tls, output.as_str()).await?;
@@ -3128,7 +3138,7 @@ async fn run_async() -> Result<()> {
                 target_host,
                 local,
             } => {
-                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let ctx = current_gateway()?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3150,7 +3160,7 @@ async fn run_async() -> Result<()> {
                 background,
             } => {
                 let spec = openshell_core::forward::ForwardSpec::parse(&port)?;
-                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let ctx = current_gateway()?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3181,7 +3191,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Service {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match command {
@@ -3247,7 +3257,7 @@ async fn run_async() -> Result<()> {
             source,
             level,
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3274,7 +3284,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match policy_cmd {
@@ -3436,7 +3446,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Settings {
             command: Some(settings_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
 
@@ -3515,7 +3525,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Rule {
             command: Some(draft_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match draft_cmd {
@@ -3685,7 +3695,7 @@ async fn run_async() -> Result<()> {
                         || expose.is_some();
                     let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
@@ -3736,7 +3746,7 @@ async fn run_async() -> Result<()> {
                     dest,
                     no_git_ignore,
                 } => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
                     let local = std::path::Path::new(&local_path);
@@ -3756,7 +3766,7 @@ async fn run_async() -> Result<()> {
                     sandbox_path,
                     dest,
                 } => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
                     let local_dest = dest.as_deref().unwrap_or(".");
@@ -3773,7 +3783,7 @@ async fn run_async() -> Result<()> {
                     eprintln!("{} Download complete", "✓".green().bold());
                 }
                 other => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
@@ -4076,7 +4086,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Workspace {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
@@ -4146,7 +4156,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Provider {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
@@ -4340,14 +4350,14 @@ async fn run_async() -> Result<()> {
         Some(Commands::Profile {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             command.run(endpoint, &cli.workspace, &tls).await?;
         }
         Some(Commands::Term { theme }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
@@ -4392,21 +4402,11 @@ async fn run_async() -> Result<()> {
             } else {
                 // A saved profile resolves its own endpoint. A local --server
                 // can explicitly pair an endpoint with the chosen profile.
-                let (profile, endpoint) = if server.is_some() {
-                    (
-                        gateway_name.or_else(|| cli.gateway.filter(|_| explicit_gateway)),
-                        server,
-                    )
-                } else if gateway_name.is_some() {
-                    (gateway_name, None)
-                } else if cli.gateway_endpoint.is_some() {
-                    (
-                        cli.gateway.filter(|_| explicit_gateway),
-                        cli.gateway_endpoint,
-                    )
-                } else {
-                    (cli.gateway, cli.gateway_endpoint)
-                };
+                let use_global_endpoint =
+                    gateway_name.is_none() && (!explicit_gateway || explicit_endpoint);
+                let endpoint =
+                    server.or_else(|| cli.gateway_endpoint.filter(|_| use_global_endpoint));
+                let profile = gateway_name.or_else(|| cli.gateway.filter(|_| explicit_gateway));
                 let ctx = resolve_gateway(&profile, &endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name)?;
@@ -4453,7 +4453,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Secret {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;

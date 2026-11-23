@@ -3166,12 +3166,21 @@ async fn ssh_profile_credentials_follow_the_selected_endpoint() {
     let xdg = helpers::tempdir().unwrap();
     prepare_cli_xdg(&server, &xdg, "openshell");
     write_oidc_test_credentials(&server, &xdg, "https://unused.invalid", 4_102_444_800);
+    let cli = || {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
+        command
+            .env_remove("OPENSHELL_GATEWAY")
+            .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
+            .env("XDG_CONFIG_HOME", xdg.path())
+            .env("OPENSHELL_TELEMETRY_ENABLED", "false");
+        command
+    };
     let state = &server.openshell.state;
     state
         .ssh_session_failures_remaining
         .store(3, Ordering::SeqCst);
     for args in [
-        vec!["--gateway", "openshell", "sandbox", "connect", "demo"],
+        vec!["ssh-proxy", "--gateway-name", "openshell", "--name", "demo"],
         vec!["ssh-proxy", "--gateway", "openshell", "--name", "demo"],
         vec![
             "--gateway",
@@ -3183,11 +3192,9 @@ async fn ssh_profile_credentials_follow_the_selected_endpoint() {
             "demo",
         ],
     ] {
-        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"))
+        let output = cli()
             .args(args)
             .env("OPENSHELL_GATEWAY_ENDPOINT", "http://127.0.0.1:1")
-            .env("XDG_CONFIG_HOME", xdg.path())
-            .env("OPENSHELL_TELEMETRY_ENABLED", "false")
             .output()
             .await
             .unwrap();
@@ -3215,19 +3222,40 @@ async fn ssh_profile_credentials_follow_the_selected_endpoint() {
     let other_state = &other.openshell.state;
     other_state
         .ssh_session_failures_remaining
-        .store(2, Ordering::SeqCst);
+        .store(3, Ordering::SeqCst);
+    let status = cli()
+        .args(["-g", "openshell", "status", "--output", "json"])
+        .env("OPENSHELL_GATEWAY_ENDPOINT", &other.endpoint)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["server"], other.endpoint);
+    assert_eq!(status["gateway"], "other");
+    assert_eq!(status["status"], "connected");
+
+    let connect = cli()
+        .args(["-g", "openshell", "sandbox", "connect", "demo"])
+        .env("OPENSHELL_GATEWAY_ENDPOINT", &other.endpoint)
+        .output()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&connect.stderr).contains("sandbox is not ready"));
     for flag in ["--server", "--gateway-endpoint"] {
-        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"))
+        let output = cli()
             .args(["ssh-proxy", flag, &other.endpoint, "--name", "demo"])
             .env("OPENSHELL_GATEWAY", "openshell")
-            .env("XDG_CONFIG_HOME", xdg.path())
-            .env("OPENSHELL_TELEMETRY_ENABLED", "false")
             .output()
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&output.stderr).contains("sandbox is not ready"));
     }
-    assert_eq!(other_state.ssh_session_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(other_state.ssh_session_requests.load(Ordering::SeqCst), 3);
     assert_eq!(
         other_state
             .ssh_requests_with_cached_bearer
