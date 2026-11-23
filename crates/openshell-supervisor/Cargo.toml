@@ -61,10 +61,12 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [features]
-default = ["telemetry", "bundled-ca-roots"]
-system-ca-roots = ["telemetry"]
+default = ["bundled-ca-roots"]
+system-ca-roots = []
+## Deprecated no-ops: this crate contains no anonymous usage telemetry. Kept
+## so builds that still pass these features keep working.
+telemetry = []
 defaults-without-telemetry = ["bundled-ca-roots"]
-telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]

@@ -483,7 +483,7 @@ jobs:
           tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
           cargo build --locked -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
           tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
-          cargo build --locked -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry
+          cargo build --locked -p openshell-supervisor --bin openshell-supervisor
           tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor
           cargo check --locked -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots
 

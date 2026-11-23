@@ -113,7 +113,8 @@ run = [
   # operators to produce these artifacts.
   "cargo build -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway",
-  "cargo build -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry",
+  # The supervisor has no telemetry feature; its default build must stay clean.
+  "cargo build -p openshell-supervisor --bin openshell-supervisor",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor",
 ]
 

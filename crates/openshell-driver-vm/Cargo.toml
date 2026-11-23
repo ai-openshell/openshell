@@ -66,7 +66,7 @@ zstd = { version = "0.14", optional = true }
 [features]
 # Portable test instrumentation, independent of the compute runtime.
 allocation-tracking = []
-default = ["compute-driver", "telemetry"]
+default = ["compute-driver"]
 ## Build the standalone compute driver and its host runtime implementation.
 compute-driver = [
     "dep:base64",
@@ -101,17 +101,9 @@ compute-driver = [
     "dep:url",
     "dep:zstd",
 ]
-## Compile in telemetry support (forwards to openshell-core/telemetry). On by
-## default; build with `--no-default-features` for a telemetry-free VM driver.
-telemetry = ["openshell-core/telemetry"]
-## Convenience alias: every default feature except `telemetry`. Build a
-## telemetry-free VM driver with
-## `--no-default-features --features defaults-without-telemetry` and stay
-## correct as new default features are added. Cargo cannot subtract a single
-## default feature, so this alias must be paired with `--no-default-features`;
-## enabling it alongside `telemetry` is a compile error rather than a silent
-## telemetry-on build. Kept in sync with `default` by
-## `rust:verify:defaults-without-telemetry`.
+## Deprecated no-ops: this crate contains no anonymous usage telemetry. Kept
+## so builds that still pass these features keep working.
+telemetry = []
 defaults-without-telemetry = ["compute-driver"]
 
 [dev-dependencies]

@@ -23,8 +23,6 @@ set -euo pipefail
 # `defaults-without-telemetry`.
 CRATES=(
   openshell-gateway
-  openshell-supervisor
-  openshell-driver-vm
 )
 
 if ! command -v jq >/dev/null 2>&1; then
