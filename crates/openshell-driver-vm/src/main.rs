@@ -1071,6 +1071,19 @@ mod tests {
         assert!(args.provider_spiffe_allow_guest_tcp);
     }
 
+    /// A flag renamed in `Args` must also be renamed in the list, or the
+    /// conflict check silently stops guarding it.
+    #[test]
+    fn every_flag_covered_by_config_is_a_real_argument() {
+        let command = <Args as clap::CommandFactory>::command();
+        for name in crate::FLAGS_COVERED_BY_CONFIG {
+            assert!(
+                command.get_arguments().any(|arg| arg.get_id() == *name),
+                "{name} is not an argument"
+            );
+        }
+    }
+
     #[test]
     fn config_cannot_be_combined_with_a_flag_it_covers() {
         let dir = tempfile::tempdir().unwrap();

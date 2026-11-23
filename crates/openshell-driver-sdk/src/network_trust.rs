@@ -7,6 +7,7 @@
 //! certificate count. The driver reads the bounded artifact once, checks it
 //! against those values, and keeps its own immutable copy.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -14,7 +15,6 @@ use std::path::Path;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use openshell_core::NetworkSupervisorTrustBundle;
 use openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
-use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 
@@ -47,7 +47,14 @@ pub fn load_staged_bundle(
     // staged-artifact drift; trust comes from the gateway's
     // normalization and TLS verification. Classified as a non-security
     // identity hash in openshell-crypto/README.md.
-    let actual_digest = format!("sha256:{:x}", Sha256::digest(&pem));
+    let digest = openshell_crypto::sha256(&pem)
+        .map_err(|error| format!("failed to hash additional CA artifact: {error}"))?;
+    let actual_digest = digest
+        .iter()
+        .fold(String::from("sha256:"), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        });
     if actual_digest != expected_digest {
         return Err(format!(
             "additional CA artifact '{}' does not match expected digest {}",

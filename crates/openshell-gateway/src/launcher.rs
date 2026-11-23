@@ -302,6 +302,7 @@ fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
 pub async fn launch(
     driver: &DriverProcess<'_>,
     otlp_config: Option<&OtlpConfig>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     build_document: impl FnOnce(&Path) -> Result<openshell_driver_sdk::StartupDocument>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     let name = driver.name;
@@ -339,6 +340,8 @@ pub async fn launch(
         Arc::downgrade(&process),
         name.to_string(),
         EXIT_POLL_INTERVAL,
+        shutdown,
+        SHUTDOWN_GRACE,
         |message| {
             tracing::error!("{message}");
             std::process::exit(1);
@@ -375,6 +378,17 @@ fn run_bounded(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("failed to run '{}': {error}", binary.display()))?;
+    // Read while the process runs, so output beyond the pipe buffer cannot
+    // block it. Reading stops one byte past the limit, which closes the pipe.
+    let reader = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            stdout
+                .take(max_output as u64 + 1)
+                .read_to_end(&mut output)
+                .map(|_| output)
+        })
+    });
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -390,15 +404,20 @@ fn run_bounded(
             Err(error) => return Err(format!("failed to wait for the process: {error}")),
         }
     };
+    let output = match reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| "output reader panicked".to_string())?
+            .map_err(|error| format!("failed to read output: {error}"))?,
+        None => Vec::new(),
+    };
+    // Output past the limit closes the pipe on the process, which then ends
+    // with SIGPIPE. Hand it back so the caller reports the size, not the signal.
+    if output.len() > max_output {
+        return Ok(output);
+    }
     if !status.success() {
         return Err(format!("exited with {status}"));
-    }
-    let mut output = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        stdout
-            .take(max_output as u64 + 1)
-            .read_to_end(&mut output)
-            .map_err(|error| format!("failed to read output: {error}"))?;
     }
     Ok(output)
 }
@@ -502,20 +521,31 @@ pub fn preflight(
 #[cfg(unix)]
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long the watcher waits for the gateway's own shutdown to begin after a
+/// driver exits. A stop signal reaches the driver and the gateway together, so
+/// the driver can end a moment before the gateway notices it must shut down.
+#[cfg(unix)]
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 /// Call `on_exit` with a message naming the driver if the process ends while
-/// the gateway still holds it. A driver the gateway shut down is not reported.
-/// The gateway cannot serve sandboxes without its driver, so the caller exits
-/// and leaves a restart to the init system.
+/// the gateway still holds it and is not shutting down. The gateway cannot
+/// serve sandboxes without its driver, so the caller exits and leaves a
+/// restart to the init system.
 #[cfg(unix)]
 fn watch_for_exit(
     process: std::sync::Weak<ManagedDriverProcess>,
     name: String,
     interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    grace: Duration,
     on_exit: impl FnOnce(String) + Send + 'static,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
+            if *shutdown.borrow() {
+                return;
+            }
             let Some(process) = process.upgrade() else {
                 return;
             };
@@ -523,6 +553,13 @@ fn watch_for_exit(
                 DriverProcessState::Running => {}
                 DriverProcessState::Released => return,
                 DriverProcessState::Exited(status) => {
+                    drop(process);
+                    if tokio::time::timeout(grace, shutdown.wait_for(|stopping| *stopping))
+                        .await
+                        .is_ok()
+                    {
+                        return;
+                    }
                     on_exit(format!(
                         "{name} compute driver exited unexpectedly with status {status}"
                     ));
@@ -615,6 +652,7 @@ fn write_startup_document(
         .open(path)
         .and_then(|mut file| file.write_all(text.as_bytes()))
         .map_err(|error| {
+            let _ = std::fs::remove_file(path);
             Error::execution(format!(
                 "failed to write startup document '{}': {error}",
                 path.display()
@@ -641,12 +679,18 @@ fn apply_trace_headers_env(command: &mut Command, otlp_config: Option<&OtlpConfi
 pub async fn launch(
     _driver: &DriverProcess<'_>,
     _otlp_config: Option<&OtlpConfig>,
+    _shutdown: tokio::sync::watch::Receiver<bool>,
     _build_document: impl FnOnce(&Path) -> Result<openshell_driver_sdk::StartupDocument>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     Err(Error::config(
         "launched compute drivers require unix domain socket support",
     ))
 }
+
+/// Readiness polls, 100 ms apart. The Podman driver retries its API ping for
+/// about ten seconds before it binds its socket, so the wait is longer.
+#[cfg(unix)]
+const READY_POLLS: u32 = 300;
 
 #[cfg(unix)]
 #[tracing::instrument(
@@ -664,7 +708,7 @@ async fn wait_for_compute_driver(
     child: &mut tokio::process::Child,
 ) -> Result<Channel> {
     let mut last_error: Option<String> = None;
-    for _ in 0..100 {
+    for _ in 0..READY_POLLS {
         let try_wait_result = child.try_wait().map_err(|e| {
             Error::execution(format!("failed to poll {name} compute driver process: {e}"))
         })?;
@@ -1092,10 +1136,13 @@ mod tests {
             .unwrap();
         let process = Arc::new(ManagedDriverProcess::new(child, dir.path().join("d.sock")));
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         watch_for_exit(
             Arc::downgrade(&process),
             "vm".to_string(),
             Duration::from_millis(10),
+            shutdown,
+            Duration::from_millis(50),
             move |message| {
                 let _ = sender.send(message);
             },
@@ -1119,10 +1166,13 @@ mod tests {
             dir.path().join("d.sock"),
         ));
         let (sender, mut receiver) = tokio::sync::oneshot::channel::<String>();
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         watch_for_exit(
             Arc::downgrade(&process),
             "vm".to_string(),
             Duration::from_millis(10),
+            shutdown,
+            Duration::from_millis(50),
             move |message| {
                 let _ = sender.send(message);
             },
@@ -1130,6 +1180,44 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(receiver.try_recv().is_err());
         drop(process);
+    }
+
+    /// A stop signal reaches the driver and the gateway together. A driver that
+    /// ends while the gateway is shutting down is not a failure.
+    #[tokio::test]
+    async fn a_driver_that_exits_during_gateway_shutdown_is_not_reported() {
+        let dir = tempdir().unwrap();
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let process = Arc::new(ManagedDriverProcess::new(child, dir.path().join("d.sock")));
+        let (sender, mut receiver) = tokio::sync::oneshot::channel::<String>();
+        let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        watch_for_exit(
+            Arc::downgrade(&process),
+            "vm".to_string(),
+            Duration::from_millis(10),
+            shutdown,
+            Duration::from_secs(5),
+            move |message| {
+                let _ = sender.send(message);
+            },
+        );
+        // The driver has exited by the time the watcher notices. The gateway
+        // begins its own shutdown inside the grace period.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown_tx.send_replace(true);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn output_beyond_the_limit_is_not_mistaken_for_a_timeout() {
+        let dir = tempdir().unwrap();
+        let binary = probe_script(dir.path(), "head -c 300000 /dev/zero | tr '\\0' x");
+        let output = super::run_bounded(&binary, &[], Duration::from_secs(5), 4096).unwrap();
+        assert_eq!(output.len(), 4097);
     }
 
     fn probe_script(dir: &Path, body: &str) -> PathBuf {

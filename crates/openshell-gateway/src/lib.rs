@@ -510,6 +510,7 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
             tls_ca: context.guest_tls_ca(),
             otlp_config: context.otlp_config(),
             network_trust: context.network_trust_bundle(),
+            shutdown: context.shutdown_receiver(),
             driver_config,
         })
         .await?;
@@ -570,6 +571,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             tls_ca: context.guest_tls_ca(),
             otlp_config: context.otlp_config(),
             network_trust: context.network_trust_bundle(),
+            shutdown: context.shutdown_receiver(),
             settings: &settings,
             driver_config,
         })

@@ -21,6 +21,14 @@ impl Fixture {
         let tools = root.path().join("tools");
         fs::create_dir(&tools).expect("tools directory");
         let config = root.path().join("gateway.toml");
+        // The driver validates its own configuration. These tests are about
+        // the host tools, so a stand-in driver accepts any document.
+        let drivers = root.path().join("drivers");
+        fs::create_dir(&drivers).expect("drivers directory");
+        let driver = drivers.join("openshell-driver-vm");
+        fs::write(&driver, "#!/bin/sh\necho '{\"ok\":true}'\n").expect("driver fixture");
+        fs::set_permissions(&driver, fs::Permissions::from_mode(0o755)).expect("driver mode");
+        fs::set_permissions(&drivers, fs::Permissions::from_mode(0o755)).expect("drivers mode");
         let fixture = Self {
             root,
             tools,
@@ -41,8 +49,10 @@ impl Fixture {
         // TOML serialization preserves quotes and escapes in the fixture path.
         let state_dir = toml::Value::try_from(self.root.path().join("vm-state"))
             .expect("serialize VM state directory");
+        let driver_dir = toml::Value::try_from(self.root.path().join("drivers"))
+            .expect("serialize driver directory");
         fs::write(&self.config, format!(
-            "[openshell]\nversion = 2\n[openshell.gateway]\ndisable_tls = true\n{selector}[openshell.drivers.vm]\nbootstrap_image = 'unreachable.invalid/vm:must-not-pull'\nstate_dir = {state_dir}\n"
+            "[openshell]\nversion = 2\n[openshell.gateway]\ndisable_tls = true\n{selector}[openshell.drivers.vm]\nbootstrap_image = 'unreachable.invalid/vm:must-not-pull'\nstate_dir = {state_dir}\ndriver_dir = {driver_dir}\n"
         )).expect("gateway configuration");
     }
 
@@ -114,7 +124,6 @@ fn normalized_diagnostic(output: &Output) -> String {
 }
 
 #[tokio::test]
-
 async fn local_vm_reports_tools_without_starting_driver_or_creating_state() {
     let fixture = Fixture::new();
     let output = fixture.run(&[]).await;
@@ -136,7 +145,6 @@ async fn local_vm_reports_tools_without_starting_driver_or_creating_state() {
 }
 
 #[tokio::test]
-
 async fn config_file_retains_selected_tool_error_and_corrective_guidance() {
     let fixture = Fixture::new();
     fixture.tool("debugfs", "echo 'fixture loader failure' >&2\nexit 42");
@@ -159,7 +167,6 @@ async fn config_file_retains_selected_tool_error_and_corrective_guidance() {
 }
 
 #[tokio::test]
-
 async fn local_vm_rejects_nonexecutable_and_unsupported_tools() {
     let fixture = Fixture::new();
     fs::set_permissions(
@@ -180,7 +187,6 @@ async fn local_vm_rejects_nonexecutable_and_unsupported_tools() {
 }
 
 #[tokio::test]
-
 async fn local_vm_rejects_hanging_tool_with_deadline() {
     let fixture = Fixture::new();
     fixture.tool("mke2fs", "exec /bin/sleep 30");
@@ -196,7 +202,6 @@ async fn local_vm_rejects_hanging_tool_with_deadline() {
 }
 
 #[tokio::test]
-
 async fn signals_stop_probe_wrapper_and_descendants_before_cli_exit() {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
@@ -222,7 +227,9 @@ async fn signals_stop_probe_wrapper_and_descendants_before_cli_exit() {
             .expect("preflight process");
         let pid =
             Pid::from_raw(i32::try_from(child.id().expect("gateway PID")).expect("valid PID"));
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Startup of a debug gateway under parallel tests is slow; only the
+        // cleanup after the signal is time-sensitive.
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !ready.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

@@ -285,6 +285,12 @@ async fn main() -> Result<()> {
         run_probe();
     }
     let (args, document) = parse_args().map_err(|err| miette::miette!("{err}"))?;
+    // A gateway that is killed must not leave this driver running.
+    if document.is_some()
+        && let Err(error) = openshell_driver_sdk::parent::die_with_parent()
+    {
+        eprintln!("warning: {error}; a gateway crash may orphan this driver");
+    }
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_podman::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {

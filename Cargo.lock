@@ -4793,9 +4793,9 @@ dependencies = [
  "clap",
  "libc",
  "openshell-core",
+ "openshell-crypto",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.20",
  "toml",
 ]

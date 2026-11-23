@@ -24,6 +24,8 @@ pub struct PodmanLaunch<'a> {
     pub tls_ca: Option<&'a Path>,
     pub otlp_config: Option<&'a OtlpConfig>,
     pub network_trust: Option<&'a NetworkSupervisorTrustBundle>,
+    /// Becomes true when the gateway begins shutting down.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
     /// The operator's `[openshell.drivers.podman]` table, passed through.
     pub driver_config: toml::Table,
 }
@@ -85,6 +87,7 @@ pub fn preflight(
                 tls_ca: None,
                 otlp_config: None,
                 network_trust: None,
+                shutdown: tokio::sync::watch::channel(false).1,
                 driver_config,
             },
             socket_path,
@@ -103,7 +106,8 @@ pub async fn spawn(launch: PodmanLaunch<'_>) -> Result<AcquiredRemoteDriverEndpo
         state_dir: &state_dir,
     };
     let otlp_config = launch.otlp_config;
-    launcher::launch(&process, otlp_config, |socket_path| {
+    let shutdown = launch.shutdown.clone();
+    launcher::launch(&process, otlp_config, shutdown, |socket_path| {
         podman_startup_document(launch, socket_path)
     })
     .await
@@ -168,6 +172,7 @@ mod tests {
                 tls_ca: None,
                 otlp_config: Some(&otlp),
                 network_trust: Some(&trust),
+                shutdown: tokio::sync::watch::channel(false).1,
                 driver_config: fixture.driver_config.clone(),
             },
             Path::new("/var/lib/openshell/podman-driver/run/compute-driver.sock"),

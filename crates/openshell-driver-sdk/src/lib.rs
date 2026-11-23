@@ -24,6 +24,7 @@
 #[cfg(feature = "clap")]
 pub mod cli;
 pub mod network_trust;
+pub mod parent;
 pub mod preflight;
 pub mod probe;
 
