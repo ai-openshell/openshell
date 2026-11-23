@@ -1716,17 +1716,32 @@ async fn bridge_process(
 ) -> Result<(), String> {
     let _guard = process.acquire_attachment()?;
     let (mut reader, mut writer) = tokio::io::split(stream);
+    let is_exec = process.kind == ProcessKindWire::Exec;
     let input_process = process.clone();
     let input = async move {
         while let Some((channel, payload)) = read_stream_frame(&mut reader).await? {
             match channel {
                 STREAM_STDIN => {
                     let mut stdin = input_process.stdin.lock().await;
-                    let Some(stdin) = stdin.as_mut() else {
+                    let Some(child_stdin) = stdin.as_mut() else {
+                        if is_exec {
+                            continue;
+                        }
                         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed"));
                     };
-                    stdin.write_all(&payload).await?;
-                    stdin.flush().await?;
+                    let result = async {
+                        child_stdin.write_all(&payload).await?;
+                        child_stdin.flush().await
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        if !is_exec || error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error);
+                        }
+                        // The child can close stdin and still produce output.
+                        // Keep reading client frames so disconnect still ends the relay.
+                        stdin.take();
+                    }
                 }
                 STREAM_STDIN_CLOSED => {
                     input_process.stdin.lock().await.take();
@@ -1752,7 +1767,7 @@ async fn bridge_process(
             }
             event = cursor.recv() => {
                 let Some(event) = event else { return Ok(()) };
-                if process.kind == ProcessKindWire::Exec && event.sequence != expected_sequence {
+                if is_exec && event.sequence != expected_sequence {
                     let _ = process.terminate().await;
                     let diagnostic = b"openshell: exec output could not be delivered intact\n";
                     write_stream_frame(&mut writer, STREAM_STDERR, diagnostic)
@@ -2365,6 +2380,77 @@ mod tests {
             2000
         );
         assert!(String::from_utf8_lossy(&stderr).contains("last-error"));
+    }
+
+    #[tokio::test]
+    async fn exec_relays_output_after_child_closes_stdin() {
+        // A command can close stdin and keep running. Late input from the client
+        // must leave the relay open for the command's stdout, stderr, and exit
+        // code. Hold the command's final output until after the late writes so
+        // they exercise the relay while it still has output to deliver.
+        let mut process = ManagedProcess::spawn(
+            "closed-stdin-test".into(),
+            ProcessKindWire::Exec,
+            std::env::var("COMSPEC").expect("Windows command interpreter"),
+            [
+                "/d",
+                "/c",
+                "set /p unused=&echo stdout&1>&2 echo stderr&exit /b 7",
+            ]
+            .map(String::from)
+            .into(),
+            None,
+            None,
+            HashMap::new(),
+        )
+        .expect("launch exec process");
+
+        // Substitute a pipe whose read end has closed. Keep the command's
+        // original stdin so the test can let it finish after sending input.
+        let (read_end, write_end) = io::pipe().expect("create test pipe");
+        drop(read_end);
+        let closed_stdin =
+            std::process::ChildStdin::from(std::os::windows::io::OwnedHandle::from(write_end));
+        let closed_stdin = tokio::process::ChildStdin::from_std(closed_stdin).unwrap();
+        let command_stdin = process.stdin.get_mut().replace(closed_stdin).unwrap();
+
+        let (mut client, server) = tokio::io::duplex(1);
+        let exchange = async {
+            write_stream_frame(&mut client, STREAM_STDIN, b"late input")
+                .await
+                .expect("send late input");
+            // The one-byte buffer makes the relay handle each late write before
+            // the next frame can finish sending. Check the relay's result below
+            // for the actual error if it closes the connection.
+            let _ = write_stream_frame(&mut client, STREAM_STDIN, b"more late input").await;
+            let _ = write_stream_frame(&mut client, STREAM_STDIN_CLOSED, b"").await;
+            drop(command_stdin);
+
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            while let Some((channel, payload)) = read_stream_frame(&mut client).await.unwrap() {
+                match channel {
+                    STREAM_STDOUT => stdout.extend(payload),
+                    STREAM_STDERR => stderr.extend(payload),
+                    STREAM_EXIT => {
+                        let status = serde_json::from_slice::<ExitStatusWire>(&payload).unwrap();
+                        return Some((stdout, stderr, status));
+                    }
+                    _ => panic!("unexpected output channel {channel}"),
+                }
+            }
+            None
+        };
+        let (bridge, output) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(bridge_process(server, Arc::new(process)), exchange)
+        })
+        .await
+        .expect("exec attachment finishes");
+        bridge.expect("closed child stdin must leave the relay open for output");
+        let (stdout, stderr, status) = output.expect("exec reports the child's exit status");
+        assert_eq!(stdout, b"stdout\r\n");
+        assert_eq!(stderr, b"stderr\r\n");
+        assert_eq!(status, ExitStatusWire::Exited(7));
     }
 
     #[tokio::test]
