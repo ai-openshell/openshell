@@ -522,8 +522,8 @@ feature variable (`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURE
 `e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
 it skips them. Unset or empty values select the driver's default Rust
 features. The selector is handled by the runner; it is not a Cargo feature.
-The wrappers use nextest. Set `NEXTEST_TEST_THREADS` to change the
-worker count from the default of one. For a standalone run without nextest,
+The wrappers use nextest, which runs one test per CPU by default. Set
+`NEXTEST_TEST_THREADS` to change the worker count. For a standalone run without nextest,
 invoke `openshell-conformance run` directly.
 
 ```shell

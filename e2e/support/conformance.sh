@@ -90,8 +90,6 @@ e2e_run_openshell_conformance() (
   "${program}" nextest-metadata "${work}" || return
   cat > "${work}/nextest.toml" <<'EOF'
 [profile.openshell]
-# Tests share one gateway. NEXTEST_TEST_THREADS overrides this.
-test-threads = 1
 slow-timeout = { period = "900s", terminate-after = 1, grace-period = "10s" }
 
 [profile.openshell.junit]
