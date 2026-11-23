@@ -6,12 +6,10 @@ self-hosted-runner:
     - openshell-ci-amd64
     - openshell-ci-amd64-pd-lint
     - openshell-ci-amd64-pd-test
-    - openshell-ci-amd64-pd-combined
     - openshell-ci-amd64-pd-gateway-a
     - openshell-ci-amd64-pd-gateway-b
     - openshell-ci-arm64-pd-lint
     - openshell-ci-arm64-pd-test
-    - openshell-ci-arm64-pd-combined
     - ubuntu-26.04
     - windows-arm64
 
