@@ -1,0 +1,91 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.driver.launch.v1;
+
+// Served by a gateway-launched compute driver on its bootstrap socket, next to
+// ComputeDriver. ComputeDriver RPCs return UNAVAILABLE until Configure
+// succeeds.
+service DriverLaunch {
+  // Protocol versions and features the driver supports. Callable at any time.
+  rpc GetLaunchInfo(GetLaunchInfoRequest) returns (GetLaunchInfoResponse);
+  // Build the driver. Succeeds at most once per process; a failed call can be
+  // retried.
+  rpc Configure(ConfigureRequest) returns (ConfigureResponse);
+}
+
+message GetLaunchInfoRequest {}
+
+message GetLaunchInfoResponse {
+  repeated uint32 protocol_versions = 1;
+  repeated string features = 2;
+  string driver_name = 3;
+  string driver_version = 4;
+}
+
+message ConfigureRequest {
+  // One of GetLaunchInfoResponse.protocol_versions.
+  uint32 protocol_version = 1;
+  // Features the driver must honour. A driver rejects any it does not know.
+  repeated string required_features = 2;
+  GatewayContext gateway = 3;
+  // Absent when the gateway has no network trust bundle.
+  NetworkTrust network_trust = 4;
+  // The operator's driver table, TOML-encoded. Opaque to the gateway.
+  string driver_config_toml = 5;
+  // Gateway-resolved overrides the driver applies over driver_config.
+  ImageOverrides image_overrides = 6;
+  // Absent when the gateway exports no telemetry.
+  Telemetry telemetry = 7;
+}
+
+message GatewayContext {
+  uint32 gateway_port = 1;
+  // Path of the gateway's guest TLS CA, empty when the gateway does not serve TLS.
+  string tls_ca_path = 2;
+  string gateway_name = 3;
+}
+
+// OTLP settings for the driver's own trace export and for the supervisors it
+// starts. The driver logs to stderr from process start and begins exporting
+// when Configure arrives.
+message Telemetry {
+  OtlpExport traces = 1;
+  OtlpExport ocsf = 2;
+  OtlpExport agent = 3;
+  // TLS files for the driver's trace collector.
+  CollectorTls collector = 4;
+  // Secret. Headers for the driver's trace export, as comma-separated
+  // name=value pairs.
+  string trace_headers = 5;
+}
+
+message OtlpExport {
+  string endpoint = 1;
+  // "grpc" (default when empty) or "http/protobuf".
+  string protocol = 2;
+}
+
+message CollectorTls {
+  string ca_file = 1;
+  string cert_file = 2;
+  string key_file = 3;
+}
+
+// The gateway's staged bundle file. Drivers load it once, check it against the
+// digest and count, and bind-mount it into sandboxes, re-verifying it first.
+message NetworkTrust {
+  string artifact_path = 1;
+  // "sha256:<lowercase hex>" of the normalized PEM.
+  string digest = 2;
+  uint32 certificate_count = 3;
+}
+
+message ImageOverrides {
+  optional string sandbox_runtime_image = 1;
+  optional string supervisor_image = 2;
+}
+
+message ConfigureResponse {}

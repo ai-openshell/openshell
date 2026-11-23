@@ -630,6 +630,7 @@ mod tests {
         let mut isolation_methods = BTreeSet::new();
         let mut sandbox_protocol_methods = BTreeSet::new();
         let mut supervisor_host_methods = BTreeSet::new();
+        let mut driver_launch_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
             for service in &file.service {
@@ -660,6 +661,16 @@ mod tests {
                     supervisor_host_methods.extend(service.method.iter().map(|method| {
                         method.name.as_deref().expect("supervisor host method name")
                     }));
+                }
+                // Private gateway-to-launched-driver protocol: served by the
+                // driver, never by the gateway.
+                if package == "openshell.driver.launch.v1" {
+                    assert_eq!(service_name, "DriverLaunch");
+                    driver_launch_methods.extend(
+                        service.method.iter().map(|method| {
+                            method.name.as_deref().expect("driver launch method name")
+                        }),
+                    );
                 }
                 if !matches!(
                     (package, service_name),
@@ -701,6 +712,10 @@ mod tests {
             BTreeSet::from(["Exchange", "Mediate"])
         );
         assert_eq!(supervisor_host_methods, BTreeSet::from(["Attach"]));
+        assert_eq!(
+            driver_launch_methods,
+            BTreeSet::from(["Configure", "GetLaunchInfo"])
+        );
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -726,7 +741,8 @@ mod tests {
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
                 + sandbox_protocol_methods.len()
-                + supervisor_host_methods.len(),
+                + supervisor_host_methods.len()
+                + driver_launch_methods.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
