@@ -670,7 +670,13 @@ async fn winning_claim_retry_cannot_republish_an_ended_launch() {
 #[tokio::test]
 async fn warm_and_active_reservations_share_capacity_and_claim_needs_no_free_slot() {
     let (fixture, pool, prepared) = setup().await;
-    fixture.fill("m1", "p1", MAX_ASSIGNED_INSTANCES - 1).await;
+    fixture
+        .fill(
+            "m1",
+            "p1",
+            openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER - 1,
+        )
+        .await;
     let overflow = preparation(&fixture, "rt-overflow-0123456789").await;
     assert!(pool.prepare_runtime(overflow.clone()).await.is_err());
     assert!(
@@ -684,7 +690,7 @@ async fn warm_and_active_reservations_share_capacity_and_claim_needs_no_free_slo
         .unwrap();
     assert_eq!(
         pool.capacity("m1").await.unwrap().payload.routes.len(),
-        MAX_ASSIGNED_INSTANCES
+        openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER
     );
 }
 

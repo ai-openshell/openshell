@@ -60,10 +60,10 @@ use openshell_supervisor_control::proto::{
     SandboxInstanceAssignment, SandboxInstancePhase, SandboxInstanceStatus, SandboxInstanceTakeover,
 };
 use openshell_supervisor_control::{
-    ActivationRequest, ConnectedMember, InstanceOwner, InstancePlacement,
-    MemberReport, MemberView, PlacementFuture, PlacementRequest, PoolView,
-    PreparationRelease, PreparationRequest, PreparationRetirement, PreparationRevision,
-    PreparedRuntime, PreparedRuntimeOwner, SupervisorHostController,
+    ActivationRequest, ConnectedMember, InstanceOwner, InstancePlacement, MemberReport, MemberView,
+    PlacementFuture, PlacementRequest, PoolView, PreparationRelease, PreparationRequest,
+    PreparationRetirement, PreparationRevision, PreparedRuntime, PreparedRuntimeOwner,
+    SupervisorHostController,
 };
 use prost::Message as _;
 use serde::{Deserialize, Serialize};

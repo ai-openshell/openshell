@@ -671,7 +671,8 @@ impl SharedHost {
                 .keys()
                 .cloned(),
         );
-        let (admitted, unstarted) = within_capacity(snapshot, &hosted, self.limits.max_instances_per_member());
+        let (admitted, unstarted) =
+            within_capacity(snapshot, &hosted, self.limits.max_instances_per_member());
         if !unstarted.is_empty() {
             tracing::warn!(
                 assigned = snapshot.instances.len(),
@@ -1782,6 +1783,7 @@ mod tests {
     #[test]
     fn capacity_admits_new_instances_only_up_to_the_configured_cap() {
         let assignment = |route: &str| SandboxInstanceAssignment {
+            prepared: false,
             sandbox_id: route.to_string(),
             route: route.to_string(),
             generation: "generation".to_string(),

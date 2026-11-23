@@ -378,7 +378,6 @@ impl RuntimeRouter {
             tls: tls.clone(),
             spares,
             parked,
-            connected: AtomicBool::new(false),
         }))
     }
 
@@ -410,8 +409,6 @@ pub struct RouteRegistration {
     tls: SandboxTlsClientConfig,
     spares: Arc<SpareQueue>,
     parked: Arc<AtomicUsize>,
-    /// The runtime has delivered at least one authenticated connection.
-    connected: AtomicBool,
 }
 
 impl std::fmt::Debug for RouteRegistration {
@@ -460,7 +457,6 @@ impl RouteRegistration {
             if parked.claim.send(send).is_ok()
                 && let Ok(stream) = receive.await
             {
-                self.connected.store(true, Ordering::Relaxed);
                 return Ok(stream);
             }
         }
@@ -471,11 +467,6 @@ impl RouteRegistration {
     #[must_use]
     pub fn has_parked_connection(&self) -> bool {
         self.parked.load(Ordering::Acquire) != 0
-    }
-
-    /// Whether the runtime has connected for this sandbox instance before.
-    pub(crate) fn has_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
     }
 }
 

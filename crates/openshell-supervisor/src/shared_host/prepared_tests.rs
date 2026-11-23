@@ -50,6 +50,7 @@ fn prepared(route: &str) -> PreparedRuntimeRegistration {
 
 fn host(root: &Path) -> Arc<SharedHost> {
     SharedHost::start(SharedHostConfig {
+        limits: PoolLimits::default(),
         gateway_endpoint: "https://gateway.invalid".into(),
         instance_root: root.join("instances"),
         runtime_listen: "127.0.0.1:0".parse().unwrap(),
@@ -363,7 +364,7 @@ async fn prepared_routes_share_capacity_with_active_instances_and_activation_use
         ..snapshot(instances)
     };
     let mut assignments = Vec::new();
-    for index in 0..MAX_ASSIGNED_INSTANCES - 1 {
+    for index in 0..openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER - 1 {
         let mut registration = template.clone();
         registration.route = format!("rt-prepared-{index:04}-0123456789");
         if let SandboxTransport::RuntimeInitiatedRouted { route, .. } =
@@ -378,7 +379,7 @@ async fn prepared_routes_share_capacity_with_active_instances_and_activation_use
         .unwrap();
     assert_eq!(
         host.prepared.lock().unwrap().len(),
-        MAX_ASSIGNED_INSTANCES - 1
+        openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER - 1
     );
     let overflow = prepared("rt-zz-overflow-012345678")
         .to_assignment()
@@ -390,7 +391,7 @@ async fn prepared_routes_share_capacity_with_active_instances_and_activation_use
     assert!(host.status(&overflow.route).is_none());
     assert_eq!(
         host.prepared.lock().unwrap().len(),
-        MAX_ASSIGNED_INSTANCES - 1
+        openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER - 1
     );
 
     // Replacing one preparation with an active assignment does not need a
@@ -401,7 +402,11 @@ async fn prepared_routes_share_capacity_with_active_instances_and_activation_use
         host.prepared.lock().unwrap().keys().cloned().collect();
     hosted.insert(active_route.into());
     let activation = with_active(assignments);
-    let (admitted, unstarted) = within_capacity(&activation, &hosted);
+    let (admitted, unstarted) = within_capacity(
+        &activation,
+        &hosted,
+        openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER,
+    );
     assert!(
         admitted
             .iter()
