@@ -527,7 +527,7 @@ Branch E2E packages `openshell-conformance` with nextest, so `run` can
 schedule tests without an installed nextest. With a bundled binary, pass
 nextest options after `--`, for example `run -- --test-threads 4`. The
 driver wrappers accept whitespace-separated options in
-`OPENSHELL_CONFORMANCE_NEXTEST_ARGS` when using a prebuilt binary. Plain
+`OPENSHELL_TESTKIT_NEXTEST_ARGS` when using a prebuilt binary. Plain
 Cargo builds run serially.
 
 ```shell

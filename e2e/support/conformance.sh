@@ -86,11 +86,11 @@ e2e_run_openshell_conformance() {
   echo "==> Running conformance suites against the ${gateway_label} gateway"
   "${program}" ready || return
   local args=(--junit "${junit}")
-  if [[ -n "${OPENSHELL_CONFORMANCE_BIN:-}" && -n "${OPENSHELL_CONFORMANCE_NEXTEST_ARGS:-}" ]]; then
+  if [[ -n "${OPENSHELL_CONFORMANCE_BIN:-}" && -n "${OPENSHELL_TESTKIT_NEXTEST_ARGS:-}" ]]; then
     local -a nextest_args
     # Simple whitespace-separated CI flags. Callers with quoted values can
     # pass them as arguments to this function instead.
-    read -r -a nextest_args <<< "${OPENSHELL_CONFORMANCE_NEXTEST_ARGS}"
+    read -r -a nextest_args <<< "${OPENSHELL_TESTKIT_NEXTEST_ARGS}"
     set -- "${nextest_args[@]}" "$@"
   fi
   if (($#)); then
