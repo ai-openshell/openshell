@@ -390,7 +390,9 @@ Pre-release builds, then publishes and calls `release-qualification.yml` in
 parallel within the same run, using native job dependencies.
 Its platform package artifacts are uploaded after versioned images and the chart,
 so the installer can use them while qualification runs or after it fails.
-The pre-release snap artifact is published to the `latest/beta` channel.
+Dev and pre-release snap publishing to `latest/edge` and `latest/beta` is disabled
+pending migration to the upcoming packages repository under `ai-openshell`.
+Snap artifacts remain available in the GitHub Releases.
 Stable release publication pushes the public `proto/` module to
 `buf.build/openshell/core`, labeled with the release tag (for example,
 `v0.1.7`) and linked to the release source commit. Prereleases do not publish
@@ -739,7 +741,7 @@ CI builds push SHA-tagged images to the private CI registry, `ghcr.io/<owner>/op
 | `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable releases. Stable releases reuse the promoted prerelease's preview when available. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance, continuity, and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
-| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |
+| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release uses `latest/stable` for the stable rebuild. Dev and pre-release publishing to `latest/edge` and `latest/beta` is disabled pending migration to the upcoming packages repository under `ai-openshell`. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |
 | `.github/workflows/sdk-typescript-publish.yml` | Publishes the deprecated `@nvidia/openshell-sdk` stub to GitHub Packages. Manual dispatch only: run it for a stable tag after ai-openshell/sdk-typescript publishes the matching `@ai-openshell/sdk` release. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 

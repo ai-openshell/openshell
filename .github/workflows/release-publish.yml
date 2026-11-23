@@ -536,7 +536,9 @@ jobs:
   publish-prerelease-snap:
     name: Publish Prerelease Snap
     needs: release
-    if: inputs.is-prerelease
+    # TODO: Move prerelease snap publishing to the upcoming packages repository
+    # under ai-openshell. Keep disabled here until that migration.
+    if: ${{ inputs.is-prerelease && false }}
     permissions:
       actions: read
       contents: read
@@ -572,9 +574,7 @@ jobs:
         run: |
           set -euo pipefail
           expected=(assemble tag-ghcr-release release-helm release)
-          if [[ "${IS_PRERELEASE}" == "true" ]]; then
-            expected+=(publish-prerelease-snap)
-          elif [[ "${MAKE_LATEST}" == "true" ]]; then
+          if [[ "${IS_PRERELEASE}" != "true" && "${MAKE_LATEST}" == "true" ]]; then
             expected+=(publish-snap)
           fi
           failed=0
