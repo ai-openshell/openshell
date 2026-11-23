@@ -158,11 +158,15 @@ jobs on `openshell-ci-amd64-pd-gateway-a/b`, with separate exclusive caches and
 eight reserved runner CPUs. Inspect both jobs and all four named feature steps;
 measure the later completion rather than summing durations. Fork jobs retain
 hosted Ubuntu. A failed lane must fail the Branch Checks workflow gate.
-The AMD64 speed trial selects C3 nodes for persistent-cache lanes and disables
-test debug information only on the trusted AMD64 test job. Verify its
-`test-debug0` target path, initial size, and C3 node placement. Compare a first
-population pass and a warm rerun; both hardware and debug information change,
-so avoid attributing gains to either alone. Debug assertions stay enabled.
+The AMD64 speed trial selects C4 nodes for persistent-cache lanes and disables
+test debug information only on the trusted AMD64 test job. General x86
+workers/system nodes use N4. AMD64 caches are Hyperdisk Balanced; ARM still uses
+SSD Persistent Disk. The generation-four migration recreates AMD64 caches, so
+record initial target size before comparing timings. Verify its
+`test-debug0` target path, initial size, and C4 node placement. Compare a first
+population pass and a warm rerun. The earlier N2/C3 trial introduced no-debug
+tests; N4/C4 retains that setting and changes CPU/storage generation. Avoid
+attributing all gains to one factor. Debug assertions stay enabled.
 The manual `local_image_builds` input additionally stages release binaries,
 builds all three native AMD64 images, and runs local `--help` smoke checks.
 It builds auditable binaries with the production Nix GNU/musl toolchains,

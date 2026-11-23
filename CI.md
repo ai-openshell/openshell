@@ -25,7 +25,7 @@ Rust jobs use the shared memcached sccache backend and report cache statistics;
 the standard runner jobs retain the existing GitHub Rust target/registry cache.
 The x86 lint/test jobs instead use `openshell-ci-amd64-pd-lint` and
 `openshell-ci-amd64-pd-test`. Each trial scale set has one worker and an exclusive
-200 GiB SSD persistent disk, mounted at `/mnt/ci-cache`. Setup verifies the mount
+200 GiB persistent cache disk, mounted at `/mnt/ci-cache`. Setup verifies the mount
 and selects a repository/Nix-shell-specific target directory shared by that
 job's Cargo commands. It skips GitHub Cargo cache restore/save entirely.
 Check the initial target size and runner pod name to distinguish an empty-disk
@@ -38,14 +38,19 @@ runner name to confirm whether it ran on GKE. Hosted ARM, macOS, and fork jobs
 do not use the cluster-local cache endpoint.
 
 The AMD64 speed trial moves the persistent lint/test and gateway core lanes to
-`c3-standard-22` Ubuntu nodes in the same zone, retaining their SSDs, images,
-and per-runner CPU/memory settings. The general scale set and system pool now use N2 nodes.
+`c4-standard-24` Ubuntu nodes in the same zone. The general workers use
+`n4-standard-16`, and the system pool uses `n4-standard-8`. Images and
+per-runner CPU/memory settings are unchanged. Fourth-generation nodes require
+Hyperdisk boot/cache storage. The four AMD64 caches were recreated as empty
+200 GiB Hyperdisk Balanced claims (6,000 IOPS, 250 MiB/s), and their old SSD
+Persistent Disks were deleted. ARM keeps its T2A nodes and existing SSD claims.
 Only the trusted AMD64 test job sets `CARGO_PROFILE_TEST_DEBUG=0`; it retains
 all crypto/workspace checks and debug assertions, with less backtrace detail.
 Setup places these artifacts under a separate `test-debug0` target directory.
-Measure the first population pass and a warm rerun separately. This trial
-changes hardware and debug information together, so its result measures their
-combined effect. ARM64, macOS, hosted forks, and lint debug settings are unchanged.
+Measure the first population pass and a warm rerun separately. The earlier
+N2/C3 trial introduced the no-debug setting; the N4/C4 migration keeps it and
+changes CPU/storage generation. These trials do not isolate every factor.
+ARM64, macOS, hosted forks, and lint debug settings are unchanged.
 
 Manual Branch Checks runs can enable `local_image_builds` for an additional
 native AMD64 gateway/sandbox/supervisor build and `--help` smoke check. It uses
@@ -72,7 +77,7 @@ configurations retain those checks in the test job.
 Gateway core-feature checks run in two parallel matrix lanes: no-driver plus
 Kubernetes in `base-kubernetes`, and Docker plus Podman in `docker-podman`.
 Trusted jobs use `openshell-ci-amd64-pd-gateway-a` and
-`openshell-ci-amd64-pd-gateway-b`, each with an exclusive 200 GiB SSD, eight
+`openshell-ci-amd64-pd-gateway-b`, each with an exclusive 200 GiB Hyperdisk, eight
 reserved runner CPUs, and shared memcached sccache. Fork jobs use hosted Ubuntu.
 All four commands keep `--all-targets --no-default-features`; each driver is
 checked independently. The matrix keeps running both lanes after a failure,
