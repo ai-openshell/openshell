@@ -66,9 +66,8 @@
     # address must be the one of the node the tests run on. QEMU user
     # networking gives every boot the same guest address (10.0.2.15), so the
     # value stays valid when the disk is reused.
-    # A dual-stack node also lists an IPv6 address, first on an IPv6-first
-    # cluster. Take the IPv4 one: the servers tests start for sandboxes to
-    # reach (tests/support/host-server) listen on IPv4 only.
+    # A dual-stack node lists both addresses, the IPv6 one first on an
+    # IPv6-first cluster (playbooks/k3s-ipv6.yaml). Take the first.
     - name: Discover the K3s node address
       ansible.builtin.command:
         argv:
@@ -93,13 +92,13 @@
       changed_when: false
       failed_when: k3s_nodes.rc != 0 or k3s_nodes.stdout_lines | length != 1
 
-    # On an IPv6-first cluster (playbooks/k3s-ipv6.yaml) the node lists its
-    # IPv6 address first, and the gateway and supervisor must listen on IPv6.
-    - name: Select the K3s node IPv4 address and listen address
+    - name: Select the K3s node address
       ansible.builtin.set_fact:
-        k3s_node_ipv4: "{{ k3s_node_address.stdout.split() | select('match', '^[0-9.]+$') | first }}"
-        k3s_listen_address: "{{ '::' if ':' in k3s_node_address.stdout.split()[0] else '0.0.0.0' }}"
+        k3s_node_ip: "{{ k3s_node_address.stdout.split()[0] }}"
+        k3s_ipv6: "{{ ':' in k3s_node_address.stdout.split()[0] }}"
 
+    # On an IPv6-first cluster the gateway and supervisor listen on IPv6, and
+    # policy DNS answers AAAA queries, so sandboxes reach the node over IPv6.
     - name: Write OpenShell Helm values
       ansible.builtin.copy:
         dest: /var/lib/openshell/artifacts/values.yaml
@@ -109,7 +108,7 @@
             image:
               registry: ""
           gateway:
-            listenAddress: "{{ k3s_listen_address }}"
+            listenAddress: "{{ '::' if k3s_ipv6 else '0.0.0.0' }}"
             image:
               repository: openshell/gateway
               tag: tmachine
@@ -120,7 +119,7 @@
               tag: tmachine
               pullPolicy: never
           supervisor:
-            listenAddress: "{{ k3s_listen_address }}"
+            listenAddress: "{{ '::' if k3s_ipv6 else '0.0.0.0' }}"
             image:
               repository: openshell/supervisor
               tag: tmachine
@@ -131,8 +130,13 @@
             auth:
               allowUnauthenticatedUsers: true
             disableTls: true
-            hostGatewayIP: "{{ k3s_node_ipv4 }}"
+            hostGatewayIP: "{{ k3s_node_ip }}"
             telemetryEnabled: false
+          {% if k3s_ipv6 %}
+          gatewayConfig:
+            openshell.drivers.kubernetes:
+              policy_dns_ipv6_egress: enabled
+          {% endif %}
 
     - name: Write OpenShell Helm values overlay
       ansible.builtin.copy:
