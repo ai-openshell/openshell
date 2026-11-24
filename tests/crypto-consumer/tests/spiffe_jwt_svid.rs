@@ -18,10 +18,8 @@ fn install_backend() {
         #[cfg(feature = "runtime")]
         {
             // Ring-backed consumer context (same as selected_backend.rs)
-            openshell_crypto::install_default_context(CryptoContext::new(Box::new(
-                RingConsumer,
-            )))
-            .unwrap();
+            openshell_crypto::install_default_context(CryptoContext::new(Box::new(RingConsumer)))
+                .unwrap();
         }
         #[cfg(feature = "openssl-runtime")]
         {
@@ -53,13 +51,26 @@ impl openshell_crypto::CryptoBackend for RingConsumer {
             .and_then(|mut f| f.read_exact(buf))
             .map_err(|_| openshell_crypto::CryptoError::Random)
     }
-    fn sha256_digest(&self) -> Result<Box<dyn openshell_crypto::Digest>, openshell_crypto::CryptoError> {
+    fn sha256_digest(
+        &self,
+    ) -> Result<Box<dyn openshell_crypto::Digest>, openshell_crypto::CryptoError> {
         Err(openshell_crypto::CryptoError::Operation)
     }
-    fn seal(&self, _: &[u8; 32], _: &[u8], _: &[u8]) -> Result<openshell_crypto::aead::Sealed, openshell_crypto::CryptoError> {
+    fn seal(
+        &self,
+        _: &[u8; 32],
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<openshell_crypto::aead::Sealed, openshell_crypto::CryptoError> {
         Err(openshell_crypto::CryptoError::Operation)
     }
-    fn open(&self, _: &[u8; 32], _: &[u8], _: &[u8; 12], _: &[u8]) -> Result<Vec<u8>, openshell_crypto::CryptoError> {
+    fn open(
+        &self,
+        _: &[u8; 32],
+        _: &[u8],
+        _: &[u8; 12],
+        _: &[u8],
+    ) -> Result<Vec<u8>, openshell_crypto::CryptoError> {
         Err(openshell_crypto::CryptoError::Authentication)
     }
 }
