@@ -13,8 +13,9 @@
 //! The request keeps the service URL's scheme. A gateway listening on
 //! loopback reports `http` service URLs and accepts plaintext service
 //! requests on its TLS listener. Over TLS, testkit verifies the gateway's
-//! certificate against the endpoint's host and presents the registered
-//! gateway's client certificate.
+//! certificate against the endpoint's host. A registered mTLS gateway's CA
+//! verifies it and testkit presents its client certificate; otherwise the
+//! system roots verify it, as the SDK does.
 
 use std::path::Path;
 use std::time::Duration;
@@ -50,7 +51,7 @@ impl Context {
     ) -> Result<ServiceResponse> {
         let cli = self.cli_handle();
         let request = ServiceRequest::new(cli.gateway(), service_url)?;
-        let mut builder = client(cli.gateway())?
+        let mut builder = client(cli.gateway(), &request)?
             .get(request.target)
             .header(HOST, &request.host);
         for (name, value) in headers {
@@ -101,10 +102,10 @@ fn parse(url: &str, what: &str) -> Result<Url> {
         .context(format!("parse {what} {url}"))
 }
 
-/// An HTTP client that trusts the gateway's CA and presents its client
-/// certificate. Without a registered mTLS gateway it trusts no certificate,
-/// so only plaintext requests succeed.
-fn client(gateway: &Gateway) -> Result<reqwest::Client> {
+/// An HTTP client for `request`. With a registered mTLS gateway it trusts the
+/// gateway's CA and presents its client certificate. Otherwise an `https`
+/// request trusts the system roots, and a plaintext one needs none.
+fn client(gateway: &Gateway, request: &ServiceRequest) -> Result<reqwest::Client> {
     let builder = openshell_crypto::tls::client_builder();
     let tls = match gateway.mtls_dir() {
         Some(dir) => {
@@ -124,6 +125,9 @@ fn client(gateway: &Gateway) -> Result<reqwest::Client> {
                 .map_err(Error::from_display)
                 .context("use the gateway client certificate")?
         }
+        None if request.target.scheme() == "https" => builder
+            .with_root_certificates(system_roots()?)
+            .with_no_client_auth(),
         None => builder
             .with_root_certificates(RootCertStore::empty())
             .with_no_client_auth(),
@@ -135,6 +139,17 @@ fn client(gateway: &Gateway) -> Result<reqwest::Client> {
         .timeout(SERVICE_REQUEST_TIMEOUT)
         .build()
         .context("build the service HTTP client")
+}
+
+fn system_roots() -> Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    if roots.is_empty() {
+        return Err(Error::msg(
+            "no system root certificates to verify the https gateway, which has no registered mTLS bundle",
+        ));
+    }
+    Ok(roots)
 }
 
 fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -161,7 +176,34 @@ mod tests {
     fn client_accepts_the_tls_configuration() {
         let gateway =
             Gateway::from_endpoint("http://127.0.0.1:8080".to_string(), "default".to_string());
-        client(&gateway).expect("service HTTP client");
+        let request = ServiceRequest::new(&gateway, "http://default--sb.openshell.localhost:8080/")
+            .expect("service request");
+        client(&gateway, &request).expect("service HTTP client");
+    }
+
+    /// An `https` gateway without a registered mTLS bundle is verified
+    /// against the system roots, as the SDK does. Without any, the client
+    /// fails up front instead of failing every handshake.
+    #[test]
+    fn https_without_mtls_trusts_the_system_roots() {
+        let gateway = Gateway::from_endpoint(
+            "https://gateway.example:8443".to_string(),
+            "default".to_string(),
+        );
+        let request = ServiceRequest::new(&gateway, "https://default--sb.gateway.example/")
+            .expect("service request");
+        match super::system_roots() {
+            Ok(_) => {
+                client(&gateway, &request).expect("service HTTP client");
+            }
+            Err(error) => {
+                let message = client(&gateway, &request)
+                    .expect_err("no roots")
+                    .to_string();
+                assert!(message.contains("no system root certificates"), "{message}");
+                assert!(error.to_string().contains("no system root certificates"));
+            }
+        }
     }
 
     fn request(endpoint: &str, service_url: &str) -> ServiceRequest {
