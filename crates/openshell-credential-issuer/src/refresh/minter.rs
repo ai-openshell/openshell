@@ -1993,7 +1993,7 @@ KfNSI8uuA8PLqmUY30I9KFWzN6VDLu00eKa90F4w3CeWRRQWXW1+007tTz3V1mNw
 pM2zFU8SeVkvHKlEuoHaP0s=
 -----END PRIVATE KEY-----";
 
-    fn secret_bound_refresh_request(token_url: String, allowed: &str) -> MintRequest {
+    fn secret_bound_refresh_request(token_url: String, stored_endpoint: &str) -> MintRequest {
         MintRequest {
             strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
             material: HashMap::from([
@@ -2002,9 +2002,7 @@ pM2zFU8SeVkvHKlEuoHaP0s=
                 ("refresh_token".into(), "refresh-token".into()),
             ]),
             token_url,
-            secret_endpoint_allowlists: vec![vec![
-                crate::endpoint::normalize_token_endpoint(allowed).unwrap(),
-            ]],
+            secret_endpoint_allowlists: vec![vec![stored_endpoint.to_owned()]],
             ..Default::default()
         }
     }
@@ -2023,6 +2021,49 @@ pM2zFU8SeVkvHKlEuoHaP0s=
                 ensure_endpoint_allowed(denied, &stored).is_err(),
                 "{denied}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_bound_mint_sends_the_exact_persisted_path() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        for path in ["/a^b", "/a%5Eb"] {
+            let endpoint = format!("http://{address}{path}");
+            let request = secret_bound_refresh_request(endpoint.clone(), &endpoint);
+            // wiremock reparses the request URI as a URL before exposing it to matchers.
+            let receive = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert_eq!(line, format!("POST {path} HTTP/1.1\r\n"));
+                let stream = reader.get_mut();
+                let response = concat!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+                    r#"{"access_token":"minted-token","expires_in":3600}"#,
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut rest = String::new();
+                reader.read_to_string(&mut rest).await.unwrap();
+                assert!(rest.contains("client_secret=shared-client-secret"));
+            };
+            let exchange = async {
+                tokio::join!(receive, async {
+                    assert_eq!(
+                        mint_credential(&request).await.unwrap().access_token,
+                        "minted-token"
+                    );
+                });
+            };
+            tokio::time::timeout(Duration::from_secs(10), exchange)
+                .await
+                .expect("loopback token exchange timed out");
         }
     }
 
@@ -2053,16 +2094,23 @@ pM2zFU8SeVkvHKlEuoHaP0s=
             .expect(0)
             .mount(&mock_server)
             .await;
-        let request = secret_bound_refresh_request(
-            format!("{}/token", mock_server.uri()),
-            "https://login.example.com/token",
-        );
-        let failure = mint_credential(&request).await.err().unwrap();
-        assert_eq!(failure.failure_code, "secret_endpoint_not_allowed");
-        assert_eq!(
-            failure.recovery_action,
-            ProviderCredentialRefreshRecoveryAction::FixConfiguration
-        );
+        let base = mock_server.uri();
+        for (requested, stored) in [
+            (
+                format!("{base}/token"),
+                "https://login.example.com/token".to_owned(),
+            ),
+            (format!("{base}/a^b"), format!("{base}/a%5Eb")),
+            (format!("{base}/a%5Eb"), format!("{base}/a^b")),
+        ] {
+            let request = secret_bound_refresh_request(requested, &stored);
+            let failure = mint_credential(&request).await.err().unwrap();
+            assert_eq!(failure.failure_code, "secret_endpoint_not_allowed");
+            assert_eq!(
+                failure.recovery_action,
+                ProviderCredentialRefreshRecoveryAction::FixConfiguration
+            );
+        }
     }
 
     #[tokio::test]
