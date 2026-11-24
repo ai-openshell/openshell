@@ -71,6 +71,9 @@ navigation:
     - page: Schema Reference
       path: ../pages-dev/how-it-works/policies/schema.mdx
       slug: schema
+    - page: Cedar Policies
+      path: ../pages-dev/how-it-works/policies/cedar.mdx
+      slug: cedar
   - page: Inference
     path: ../pages-dev/how-it-works/inference.mdx
 - section: Extensibility
