@@ -11,6 +11,10 @@ use std::time::Duration;
 
 use testkit::{Context, Poll, ResultExt as _, poll_until};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 const SERVICE_PORT: &str = "4500";
 const BEARER_TOKEN: &str = "Bearer openshell-e2e-application-token";
 /// How long an exposed service may take to start answering, or to apply a
