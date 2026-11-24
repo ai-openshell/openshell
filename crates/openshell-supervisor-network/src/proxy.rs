@@ -10410,8 +10410,8 @@ network_policies:
     #[tokio::test]
     async fn staged_transparent_open_dials_pinned_ipv6_for_synthetic_ipv6() {
         use crate::policy_dns::{
-            AddressFamily, NormalizedName, PolicyEndpointId, PublishRequest, ResolvedEndpointStore,
-            ResolvedPortContract, StoreConfig, SyntheticPools,
+            AddressFamily, NormalizedName, PublishRequest, ResolvedEndpointStore, StoreConfig,
+            SyntheticPools,
         };
 
         let engine = Arc::new(
@@ -10454,19 +10454,9 @@ process:
                 PublishRequest {
                     normalized_name: NormalizedName::parse("api.example.com").unwrap(),
                     family: AddressFamily::Ipv6,
-                    allocation_identity: [7; 32],
                     policy_generation: engine.current_generation(),
                     ttl: std::time::Duration::from_secs(30),
-                    eligible_ports: std::collections::BTreeSet::from([443]),
-                    contracts: vec![ResolvedPortContract {
-                        endpoint_id: PolicyEndpointId {
-                            policy_name: "allowed".to_string(),
-                            endpoint_index: 0,
-                        },
-                        port: 443,
-                        destination_plan: build_pinned_validation_plan(vec![upstream]).unwrap(),
-                        pinned_addresses: vec![upstream],
-                    }],
+                    pinned_addresses: vec![upstream],
                 },
                 engine.current_generation(),
                 std::time::Instant::now(),
@@ -10879,19 +10869,53 @@ process:
             );
         }
 
-        // A policy reload starts a new generation; the old IPv6 mapping is
-        // stale and no longer authorizes a connection.
+        // An unchanged policy keeps the IPv6 placeholder usable, while each
+        // new connection is authorized by the current policy.
         engine
             .reload(
                 include_str!("../data/sandbox-policy.rego"),
                 MEDIATED_IPV6_POLICY,
             )
             .unwrap();
+        let (pending, completion) = open(Ok(curl_identity()), SocketAddr::new(synthetic[0], 443));
+        let accepted = preauthorize_transparent_open(
+            pending,
+            Some(&runtime.service),
+            &engine,
+            &BinaryIdentityCache::new(),
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("unchanged policy preserves the cached IPv6 destination");
+        assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+        let (_, connector) = accepted
+            .3
+            .and_then(|open| open.authorization)
+            .expect("transparent authorization after reload");
+        assert_eq!(
+            connector.addrs(),
+            [SocketAddr::new(
+                "2606:4700::6810:84e5".parse().unwrap(),
+                443
+            )]
+        );
+
+        // Removing the hostname revokes access through the same placeholder.
+        engine
+            .reload(
+                include_str!("../data/sandbox-policy.rego"),
+                &MEDIATED_IPV6_POLICY.replacen("host: v6.example", "host: removed.example", 1),
+            )
+            .unwrap();
         assert_denied(
             &runtime.service,
             &network_engine,
             open(Ok(curl_identity()), SocketAddr::new(synthetic[0], 443)),
-            "stale policy generation",
+            "hostname removed from current policy",
         )
         .await;
     }
