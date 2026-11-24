@@ -16,6 +16,11 @@ name = "host-gateway"
 path = "tests/host_gateway.rs"
 harness = false
 
+[[test]]
+name = "host-gateway-response-eof"
+path = "tests/response_eof.rs"
+harness = false
+
 [dependencies]
 host-server-support = { path = "../../../support/host-server" }
 openshell-testkit = { path = "../../../testkit/testkit" }

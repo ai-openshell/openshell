@@ -10,6 +10,10 @@ use container_engine_support::Engine;
 use testkit::sdk::SandboxPhase;
 use testkit::{Context, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 /// Where the driver mounts the sandbox's bootstrap JWT.
 const TOKEN_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 /// How long the gateway may take to report a stopped workload as Error.

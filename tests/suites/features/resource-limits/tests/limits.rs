@@ -11,6 +11,10 @@
 
 use testkit::{Context, Error};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 const CGROUP_READ_POLICY: &str = "version: 1
 filesystem_policy:
   include_workdir: true

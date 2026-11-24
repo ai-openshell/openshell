@@ -9,6 +9,10 @@ use sandbox_clients_support::{ReadEnd, http_raw};
 use testkit::policy;
 use testkit::{Context, PYTHON_BINARIES, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 /// Responses the server sends, then closes the connection. Each ends the
 /// response a different way: an HTTP/1.0 body length, `Connection: close`
 /// with a body length, and `Connection: close` with a chunked body.

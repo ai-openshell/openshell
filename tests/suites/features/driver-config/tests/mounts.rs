@@ -16,6 +16,10 @@ use std::path::Path;
 use container_engine_support::Engine;
 use testkit::{Context, Error, Result, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 const VOLUME_TARGET: &str = "/sandbox/e2e-volume";
 const OCI_VOLUME_TARGET: &str = "/workspace/project/e2e-volume";
 const BIND_TARGET: &str = "/sandbox/e2e-bind";

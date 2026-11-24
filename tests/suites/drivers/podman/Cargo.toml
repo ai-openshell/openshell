@@ -13,6 +13,11 @@ repository = "https://github.com/ai-openshell/openshell"
 publish = false
 
 [[test]]
+name = "podman-lifecycle"
+path = "tests/lifecycle.rs"
+harness = false
+
+[[test]]
 name = "podman-oci-identity"
 path = "tests/oci_identity.rs"
 harness = false

@@ -12,14 +12,18 @@ use std::time::Duration;
 
 use container_engine_support::Engine;
 use host_server_support::{HttpRecorder, TEST_HOST};
+use ocsf_records::{JSON_MARKER, json_records};
 use sandbox_clients_support::{Request, connect, http};
 use testkit::policy;
 use testkit::sdk::raw::proto;
 use testkit::sdk::raw::proto::setting_value::Value as SettingValue;
 use testkit::{Context, Error, PYTHON_BINARIES, Poll, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 const JSON_SETTING: &str = "ocsf_json_enabled";
-const JSON_MARKER: &str = " OCSF-JSON ";
 /// An endpoint the policy doesn't allow, for a Network Activity denial.
 const DENIED_HOST: &str = "1.1.1.1";
 const DENIED_PORT: u16 = 443;
@@ -152,22 +156,6 @@ fn l7_policy(port: u16) -> testkit::Result<proto::SandboxPolicy> {
     ))
 }
 
-/// The JSON records in `stderr`, one per ` OCSF-JSON ` line. Each must be a
-/// whole JSON object with no terminal escapes.
-fn json_records(stderr: &str) -> testkit::Result<Vec<serde_json::Value>> {
-    stderr
-        .lines()
-        .filter_map(|line| line.split_once(JSON_MARKER).map(|(_, payload)| payload))
-        .map(|payload| {
-            testkit::ensure!(
-                !payload.contains('\x1b'),
-                "an OCSF JSON line has terminal escapes: {payload:?}"
-            );
-            serde_json::from_str(payload).context(format!("parse OCSF JSON line {payload:?}"))
-        })
-        .collect()
-}
-
 fn is_denied_connect(record: &serde_json::Value) -> bool {
     record["class_uid"] == 4001
         && record["dst_endpoint"]["port"] == DENIED_PORT
@@ -212,22 +200,4 @@ fn check_record(
     );
     openshell_ocsf_validate::validate_event(record)
         .map_err(|reason| Error::msg(format!("does not conform to the OCSF schema: {reason}")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn json_records_reads_marked_lines_only() {
-        let stderr = "2026 INFO OCSF NET:OPEN [MED] DENIED\n\
-                      2026 INFO OCSF-JSON {\"class_uid\":4001}\n";
-        let records = json_records(stderr).unwrap();
-        assert_eq!(records, vec![serde_json::json!({"class_uid": 4001})]);
-    }
-
-    #[test]
-    fn json_records_rejects_escapes() {
-        assert!(json_records("x OCSF-JSON \x1b[1m{}\n").is_err());
-    }
 }

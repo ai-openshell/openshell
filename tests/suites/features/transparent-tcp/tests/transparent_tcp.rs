@@ -20,6 +20,10 @@ use sandbox_clients_support::{Http, Python, http_raw};
 use testkit::sdk::raw::proto;
 use testkit::{Context, Error, PYTHON_BINARIES, Sandbox, policy};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 /// A name no policy allows. Policy DNS refuses it, and the denial must not
 /// break later exec sessions.
 const UNLISTED_HOST: &str = "unlisted-exec-recovery.openshell.test";

@@ -8,8 +8,17 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
-repository = "https://github.com/NVIDIA/OpenShell"
+repository = "https://github.com/ai-openshell/openshell"
 publish = false
+
+[lib]
+name = "ocsf_records"
+path = "src/lib.rs"
+
+[[test]]
+name = "ocsf"
+path = "tests/ocsf_stderr.rs"
+harness = false
 
 [dependencies]
 container-engine-support = { path = "../../../support/container-engine" }
