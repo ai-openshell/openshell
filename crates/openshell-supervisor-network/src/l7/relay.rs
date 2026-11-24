@@ -4521,8 +4521,9 @@ where
             .as_ref()
             .filter(|_| ctx.token_grant_resolver.is_some())
             .and_then(EndpointObservationSender::capture);
-        let middleware_selection =
+        let mut middleware_selection =
             middleware.map(|mw| mw.select(&middleware_network_input(ctx), generation_guard));
+        let selected_generation = generation_guard.captured_generation();
         let inspected = matches!(
             &middleware_selection,
             Some(Ok(Some((chain, _)))) if !chain.is_empty()
@@ -4563,6 +4564,19 @@ where
         }
         if close_if_stale(generation_guard, ctx) {
             return Ok(());
+        }
+
+        if generation_guard.captured_generation() != selected_generation
+            || matches!(&middleware_selection, Some(Ok(None)))
+        {
+            middleware_selection =
+                middleware.map(|mw| mw.select(&middleware_network_input(ctx), generation_guard));
+            // Parsing already used the original selection's inspection mode.
+            if let Some(Ok(Some((chain, _)))) = &middleware_selection
+                && chain.is_empty() == inspected
+            {
+                return Ok(());
+            }
         }
 
         request_count += 1;
@@ -16511,7 +16525,11 @@ network_policies:
                 &mut relay_upstream,
                 &ctx,
                 &generation_guard,
-                Some(relay_engine.as_ref()),
+                Some(
+                    &PolicyEngine::from(relay_engine)
+                        .passthrough_middleware()
+                        .unwrap(),
+                ),
             )
             .await
         });

@@ -138,6 +138,7 @@ impl ConnectionPolicyContract {
     /// middleware selection, so a baseline and its re-checks share one path.
     pub(super) fn new(
         authorization: &EgressAuthorization,
+        raw_endpoints: Vec<(String, regorus::Value)>,
         middleware_chain: Vec<ChainEntry>,
         middleware_registry_epoch: u64,
     ) -> Self {
@@ -145,21 +146,26 @@ impl ConnectionPolicyContract {
             (!middleware_chain.is_empty()).then_some(middleware_registry_epoch);
         Self {
             action: authorization.action.clone(),
-            matched_endpoints: authorization
-                .matched_endpoints
+            matched_endpoints: raw_endpoints
                 .iter()
-                .map(|endpoint| {
-                    (
-                        endpoint.policy_name.clone(),
-                        semantic_endpoint(&endpoint.endpoint),
-                    )
-                })
+                .map(|(name, endpoint)| (name.clone(), semantic_endpoint(endpoint)))
                 .collect(),
             exact_declared_endpoint_host: authorization.exact_declared_endpoint_host,
             middleware_chain,
             middleware_registry_epoch,
-            policy_hash: stamped_policy_hash(authorization),
+            policy_hash: raw_endpoints
+                .iter()
+                .find_map(|(_, endpoint)| match &endpoint["policy_hash"] {
+                    regorus::Value::String(hash) if !hash.is_empty() => Some(hash.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn policy_hash(&self) -> &str {
+        &self.policy_hash
     }
 
     fn allows(&self) -> bool {
@@ -227,21 +233,6 @@ fn same_middleware_chain(left: &[ChainEntry], right: &[ChainEntry]) -> bool {
                 && config == other_config
                 && on_error == other_on_error
         })
-}
-
-/// The complete-policy hash proto conversion stamps into every endpoint of a
-/// generation, taken from any endpoint this authorization matched. Empty when
-/// the policy carries none, as YAML policies do.
-fn stamped_policy_hash(authorization: &EgressAuthorization) -> String {
-    authorization
-        .matched_endpoints
-        .iter()
-        .map(|endpoint| &endpoint.endpoint)
-        .find_map(|endpoint| match &endpoint["policy_hash"] {
-            regorus::Value::String(hash) if !hash.is_empty() => Some(hash.to_string()),
-            _ => None,
-        })
-        .unwrap_or_default()
 }
 
 /// Copy an endpoint object without keys that change on every reload.
@@ -475,9 +466,13 @@ impl OpaEngine {
         if generation > current {
             return self.generation_guard(generation);
         }
-        let guard =
-            PolicyGenerationGuard::pinned(generation, &self.generation, &self.generation_tx)
-                .with_revalidator(Some(revalidator));
+        let guard = super::generation_guard_for(
+            generation,
+            generation,
+            &self.generation,
+            &self.generation_tx,
+        )?
+        .with_revalidator(Some(revalidator));
         if guard.is_stale() {
             return Err(miette::miette!(
                 "policy changed before the relay started in a way that affects this connection \
@@ -486,5 +481,17 @@ impl OpaEngine {
             ));
         }
         Ok(guard)
+    }
+}
+
+impl openshell_policy_runtime_interface::policy_types::ConnectionRevalidator for PolicyRevalidator {
+    fn follow(&self, pin: &AtomicU64, live: &AtomicU64) -> bool {
+        if self.is_invalidated() {
+            return false;
+        }
+        self.follow(pin, live)
+    }
+    fn pinned_policy_hash(&self, generation: u64) -> Option<String> {
+        self.pinned_policy_hash(generation)
     }
 }

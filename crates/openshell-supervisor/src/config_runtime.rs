@@ -1201,7 +1201,7 @@ fn publish_credential_change(
     {
         return;
     }
-    if let Err(error) = ctx.opa_engine.publish_credential_change() {
+    if let Err(error) = ctx.engine.publish_credential_change() {
         warn!(
             error = %error,
             "Provider credentials changed but open connections were not notified"
@@ -4369,7 +4369,7 @@ mod tests {
             snapshot.provider_env_revision = snapshot_revision;
             snapshot.readiness_reason = readiness_reason.into();
             snapshot.values[0].classification = classification.into();
-            let before = ctx.opa_engine.current_generation();
+            let before = ctx.engine.current_generation();
 
             let result = runtime
                 .apply_delivered_sandbox(&ctx, &client, desired, snapshot)
@@ -4385,7 +4385,7 @@ mod tests {
                 "{expected_code}: static credentials must be revoked"
             );
             assert!(
-                ctx.opa_engine.current_generation() > before,
+                ctx.engine.current_generation() > before,
                 "{expected_code}: revocation must publish a generation"
             );
         }
@@ -4431,7 +4431,7 @@ mod tests {
             ConfigApplyOutcome::FailedRetainedLastKnownGood
         );
         assert!(ctx.provider_credentials.resolver().is_none());
-        let after_first = ctx.opa_engine.current_generation();
+        let after_first = ctx.engine.current_generation();
 
         for revision in [3, 4] {
             let (desired, snapshot) = unavailable(revision);
@@ -4447,7 +4447,7 @@ mod tests {
                 result.failure.as_ref().unwrap().code,
                 "provider_environment_unavailable"
             );
-            assert_eq!(ctx.opa_engine.current_generation(), after_first);
+            assert_eq!(ctx.engine.current_generation(), after_first);
         }
     }
 }

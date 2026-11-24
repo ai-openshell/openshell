@@ -127,9 +127,14 @@ pub(super) fn http_context(
 /// credentials, or `None` when it never does.
 pub(super) fn pin_policy_generation(
     network_engine: &PolicyEngine,
-    expected_generation: u64,
+    decision: &EgressDecision,
+    credentials: Option<&ProviderCredentialState>,
 ) -> Result<PolicyGenerationGuard> {
-    network_engine.generation_guard(expected_generation)
+    network_engine.connection_generation_guard(
+        decision.policy_input(),
+        decision.policy_generation,
+        credentials,
+    )
 }
 
 /// Reloads [`pin_l7_evaluator`] follows between pinning and cloning before
@@ -144,30 +149,20 @@ const L7_EVALUATOR_PIN_ATTEMPTS: usize = 3;
 /// the matched endpoints, which the contract shows unchanged.
 pub(super) fn pin_l7_evaluator(
     network_engine: &PolicyEngine,
+    decision: &EgressDecision,
     expected_generation: u64,
     credentials: Option<&ProviderCredentialState>,
 ) -> Result<TunnelPolicyEngine> {
     let mut last_error = None;
     for _ in 0..L7_EVALUATOR_PIN_ATTEMPTS {
-        let generation = opa_engine
-            .revalidating_generation_guard(
-                decision.policy_input(),
-                expected_generation,
-                credentials,
-            )?
-            .captured_generation();
-        match opa_engine.clone_engine_for_tunnel(generation) {
-            Ok(evaluator) => {
-                // The baseline must come from the generation the evaluator is
-                // pinned to, so that every later generation is checked.
-                let revalidator = PolicyRevalidator::capture(
-                    opa_engine,
-                    decision.policy_input(),
-                    generation,
-                    credentials,
-                );
-                return Ok(evaluator.with_revalidator(revalidator));
-            }
+        let guard = network_engine.connection_generation_guard(
+            decision.policy_input(),
+            expected_generation,
+            credentials,
+        )?;
+        let generation = guard.captured_generation();
+        match network_engine.tunnel_engine(generation) {
+            Ok(evaluator) => return Ok(evaluator.with_generation_guard(guard)),
             // Another reload landed after the pin followed: follow it too.
             Err(error) => last_error = Some(error),
         }
@@ -226,7 +221,7 @@ pub(super) fn prepare_http_relay<'a>(
     let credentials = request.provider_credentials.as_ref();
     let policy = if let Some(inspected) = route.filter(|route| !route.configs.is_empty()) {
         let generation = decision.policy_generation;
-        let evaluator = match pin_l7_evaluator(opa_engine, decision, generation, credentials) {
+        let evaluator = match pin_l7_evaluator(network_engine, decision, generation, credentials) {
             Ok(evaluator) => evaluator,
             Err(error) => {
                 refuse(error);
@@ -249,18 +244,17 @@ pub(super) fn prepare_http_relay<'a>(
             evaluator: Box::new(evaluator),
         }
     } else {
-        let generation_guard =
-            match pin_policy_generation(network_engine, decision.policy_generation) {
-                Ok(guard) => guard,
-                Err(error) => {
-                    emit_l7_tunnel_close_after_policy_change(
-                        &decision.intent.destination.host,
-                        decision.intent.destination.port,
-                        error,
-                    );
-                    return None;
-                }
-            };
+        let generation_guard = match pin_policy_generation(network_engine, decision, credentials) {
+            Ok(guard) => guard,
+            Err(error) => {
+                emit_l7_tunnel_close_after_policy_change(
+                    &decision.intent.destination.host,
+                    decision.intent.destination.port,
+                    error,
+                );
+                return None;
+            }
+        };
         let middleware = match network_engine.passthrough_middleware() {
             Ok(middleware) => middleware,
             Err(error) => {
@@ -274,7 +268,10 @@ pub(super) fn prepare_http_relay<'a>(
             refuse(error);
             return None;
         }
-        PreparedHttpPolicy::Passthrough { generation_guard }
+        PreparedHttpPolicy::Passthrough {
+            generation_guard,
+            middleware,
+        }
     };
 
     Some(RelayContext { request, policy })
@@ -290,7 +287,7 @@ pub(super) fn prepare_raw_relay(
     network_engine: &PolicyEngine,
     decision: &EgressDecision,
 ) -> Option<PolicyGenerationGuard> {
-    let pinned = pin_policy_generation(opa_engine, decision, None).and_then(|guard| {
+    let pinned = pin_policy_generation(network_engine, decision, None).and_then(|guard| {
         validate_route_generation(route, decision.policy_generation, &guard).map(|()| guard)
     });
     match pinned {
@@ -862,6 +859,7 @@ network_policies:
             },
             policy_generation: 0,
             identity: ProcessIdentityEvidence::Available,
+            engine: "opa",
             endpoint: EndpointDecision::default(),
             binary: Some(std::path::PathBuf::from("/usr/bin/curl")),
             binary_pid: None,
@@ -905,7 +903,8 @@ network_policies:
         reload: impl FnOnce(&OpaEngine),
         wait: std::time::Duration,
     ) -> bool {
-        let guard = prepare_raw_relay(None, engine, decision).expect("current decision pins");
+        let guard = prepare_raw_relay(None, &PolicyEngine::from(engine.clone()), decision)
+            .expect("current decision pins");
         let request = request_context();
         let (_client_peer, mut proxy_client) = tokio::io::duplex(64);
         let (_upstream_peer, mut proxy_upstream) = tokio::io::duplex(64);
@@ -954,7 +953,8 @@ network_policies:
 
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
         let decision = authorized_decision(&engine);
-        let guard = prepare_raw_relay(None, &engine, &decision).expect("current decision pins");
+        let guard = prepare_raw_relay(None, &PolicyEngine::from(engine.clone()), &decision)
+            .expect("current decision pins");
         let request = request_context();
         let (mut client_peer, mut proxy_client) = tokio::io::duplex(64);
         let (mut upstream_peer, mut proxy_upstream) = tokio::io::duplex(64);
@@ -1061,7 +1061,8 @@ network_policies:
         let decision = authorized_decision(&engine);
         let route = inspected_route(&decision);
         let request = request_context();
-        let context = prepare_http_relay(Some(&route), &engine, &decision, &request).unwrap();
+        let network = PolicyEngine::from(engine.clone());
+        let context = prepare_http_relay(Some(&route), &network, &decision, &request).unwrap();
         let PreparedHttpPolicy::Inspect { evaluator, .. } = context.policy else {
             panic!("an L7 route should use a tunnel evaluator");
         };
@@ -1085,7 +1086,8 @@ network_policies:
         let decision = authorized_decision(&engine);
         let route = inspected_route(&decision);
         let request = request_context();
-        let context = prepare_http_relay(Some(&route), &engine, &decision, &request).unwrap();
+        let network = PolicyEngine::from(engine.clone());
+        let context = prepare_http_relay(Some(&route), &network, &decision, &request).unwrap();
         let PreparedHttpPolicy::Inspect { evaluator, .. } = context.policy else {
             panic!("an L7 route should use a tunnel evaluator");
         };
@@ -1106,8 +1108,12 @@ network_policies:
         let credentials = empty_provider_credentials();
         let mut request = request_context();
         request.provider_credentials = Some(credentials.clone());
-        let context = prepare_http_relay(None, &engine, &decision, &request).unwrap();
-        let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
+        let network = PolicyEngine::from(engine.clone());
+        let context = prepare_http_relay(None, &network, &decision, &request).unwrap();
+        let PreparedHttpPolicy::Passthrough {
+            generation_guard, ..
+        } = context.policy
+        else {
             panic!("route-less relay should use a generation guard");
         };
 
@@ -1149,8 +1155,12 @@ network_policies:
         decision: &EgressDecision,
         request: &L7EvalContext,
     ) -> PolicyGenerationGuard {
-        let context = prepare_http_relay(None, engine, decision, request).unwrap();
-        let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
+        let network = PolicyEngine::from(engine.clone());
+        let context = prepare_http_relay(None, &network, decision, request).unwrap();
+        let PreparedHttpPolicy::Passthrough {
+            generation_guard, ..
+        } = context.policy
+        else {
             panic!("route-less relay should use a generation guard");
         };
         generation_guard
@@ -1387,7 +1397,11 @@ network_policies:
                 &mut relay_upstream,
                 &request,
                 &guard,
-                Some(relay_engine.as_ref()),
+                Some(
+                    &PolicyEngine::from(relay_engine)
+                        .passthrough_middleware()
+                        .unwrap(),
+                ),
             )
             .await
         });
@@ -1513,13 +1527,14 @@ network_policies:
         engine: &Arc<OpaEngine>,
         decision: &EgressDecision,
         request: &L7EvalContext,
-    ) -> Box<TunnelPolicyEngine> {
+    ) -> TunnelPolicyEngine {
         let route = inspected_route(decision);
-        let context = prepare_http_relay(Some(&route), engine, decision, request).unwrap();
+        let network = PolicyEngine::from(engine.clone());
+        let context = prepare_http_relay(Some(&route), &network, decision, request).unwrap();
         let PreparedHttpPolicy::Inspect { evaluator, .. } = context.policy else {
             panic!("an L7 route should use a tunnel evaluator");
         };
-        evaluator
+        *evaluator
     }
 
     /// A gateway-delivered policy: `endpoint` (example.com:80) for curl, plus
@@ -1579,6 +1594,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ..Default::default()
         }
     }
 
@@ -2150,7 +2166,8 @@ network_policies:
             },
         );
         request.request_default_port = Some(80);
-        let context = prepare_http_relay(Some(&route), &engine, &decision, &request).unwrap();
+        let network = PolicyEngine::from(engine.clone());
+        let context = prepare_http_relay(Some(&route), &network, &decision, &request).unwrap();
 
         let (mut app, mut client) = tokio::io::duplex(8192);
         let (mut upstream, mut server) = tokio::io::duplex(8192);
@@ -2496,7 +2513,7 @@ network_policies:
             .unwrap();
         assert!(engine.current_generation() > decision.policy_generation);
 
-        let guard = pin_policy_generation(&engine, &decision, None)
+        let guard = pin_policy_generation(&PolicyEngine::from(engine.clone()), &decision, None)
             .expect("an unrelated reload does not refuse the connection");
         assert_eq!(guard.captured_generation(), engine.current_generation());
         assert!(!guard.is_stale());
@@ -2510,12 +2527,17 @@ network_policies:
             .reload(POLICY_REGO, CURL_EXAMPLE_AND_OTHER_POLICY)
             .unwrap();
 
-        let guard = prepare_raw_relay(None, &engine, &decision).expect("raw relay starts");
+        let guard = prepare_raw_relay(None, &PolicyEngine::from(engine.clone()), &decision)
+            .expect("raw relay starts");
         assert_eq!(guard.captured_generation(), engine.current_generation());
         let request = request_context();
-        let context = prepare_http_relay(None, &engine, &decision, &request)
+        let network = PolicyEngine::from(engine.clone());
+        let context = prepare_http_relay(None, &network, &decision, &request)
             .expect("passthrough relay starts");
-        let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
+        let PreparedHttpPolicy::Passthrough {
+            generation_guard, ..
+        } = context.policy
+        else {
             panic!("route-less relay should use a generation guard");
         };
         assert_eq!(
@@ -2535,7 +2557,8 @@ network_policies:
             .unwrap();
         let request = request_context();
 
-        let context = prepare_http_relay(Some(&route), &engine, &decision, &request)
+        let network = PolicyEngine::from(engine.clone());
+        let context = prepare_http_relay(Some(&route), &network, &decision, &request)
             .expect("inspected relay starts");
         let PreparedHttpPolicy::Inspect { evaluator, .. } = context.policy else {
             panic!("a REST route should be inspected");
@@ -2560,8 +2583,16 @@ network_policies:
         route.l7_policy_generation = engine.current_generation();
         let request = request_context();
 
-        assert!(prepare_http_relay(Some(&route), &engine, &decision, &request).is_some());
-        assert!(prepare_raw_relay(Some(&route), &engine, &decision).is_some());
+        assert!(
+            prepare_http_relay(
+                Some(&route),
+                &PolicyEngine::from(engine.clone()),
+                &decision,
+                &request
+            )
+            .is_some()
+        );
+        assert!(prepare_raw_relay(Some(&route), &PolicyEngine::from(engine), &decision).is_some());
     }
 
     #[test]
@@ -2575,12 +2606,30 @@ network_policies:
             .unwrap();
         let request = request_context();
 
-        assert!(pin_policy_generation(&engine, &decision, None).is_err());
-        assert!(prepare_raw_relay(None, &engine, &decision).is_none());
-        assert!(prepare_http_relay(Some(&route), &engine, &decision, &request).is_none());
+        assert!(
+            pin_policy_generation(&PolicyEngine::from(engine.clone()), &decision, None).is_err()
+        );
+        assert!(prepare_raw_relay(None, &PolicyEngine::from(engine.clone()), &decision).is_none());
+        assert!(
+            prepare_http_relay(
+                Some(&route),
+                &PolicyEngine::from(engine.clone()),
+                &decision,
+                &request
+            )
+            .is_none()
+        );
         let mut hydrated_later = route;
         hydrated_later.l7_policy_generation = engine.current_generation();
-        assert!(prepare_http_relay(Some(&hydrated_later), &engine, &decision, &request).is_none());
+        assert!(
+            prepare_http_relay(
+                Some(&hydrated_later),
+                &PolicyEngine::from(engine),
+                &decision,
+                &request
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2589,7 +2638,9 @@ network_policies:
         let decision = authorized_decision(&engine);
         engine.enter_fail_closed("test quarantine").unwrap();
 
-        assert!(pin_policy_generation(&engine, &decision, None).is_err());
-        assert!(prepare_raw_relay(None, &engine, &decision).is_none());
+        assert!(
+            pin_policy_generation(&PolicyEngine::from(engine.clone()), &decision, None).is_err()
+        );
+        assert!(prepare_raw_relay(None, &PolicyEngine::from(engine), &decision).is_none());
     }
 }

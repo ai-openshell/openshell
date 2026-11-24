@@ -201,6 +201,13 @@ struct PublishedGeneration {
     middleware_registry_epoch: u64,
 }
 
+// Unlike transport endpoint projections, this retains every request rule.
+#[derive(serde::Deserialize)]
+struct RawMatchedEndpoint {
+    policy_name: String,
+    endpoint: regorus::Value,
+}
+
 #[cfg(test)]
 static TEST_OPA_QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -757,12 +764,41 @@ impl OpaEngine {
             published.generation,
         )?;
         let middleware_chain = if matches!(authorization.action, NetworkAction::Allow { .. }) {
-            query_middleware_chain_locked(&mut published.engine, input)?
+            middleware_configs_from_rego(
+                &query_middleware_config_value(&mut published.engine)?,
+                &input.host,
+            )?
+            .select(&input.host)?
         } else {
             Vec::new()
         };
+        // Transport projections intentionally omit request rules. Keep the raw
+        // endpoints for contract equality so an L7 narrowing invalidates relays.
+        let raw = if published.fail_closed_reason.is_some() {
+            regorus::Value::Undefined
+        } else {
+            published
+                .engine
+                .eval_rule("data.openshell.sandbox.egress_authorization".into())
+                .map_err(|e| miette::miette!("{e}"))?
+        };
+        let raw_endpoints: Vec<RawMatchedEndpoint> = get_field(&raw, "matched_endpoints")
+            .map_or_else(
+                || Ok(Vec::new()),
+                |value| list_from_rego(value, "connection contract endpoints"),
+            )?;
+        if raw_endpoints.len() != authorization.matched_endpoints.len() {
+            return Err(miette::miette!(
+                "connection contract endpoint projection differs from authorization"
+            ));
+        }
+        let raw_endpoints = raw_endpoints
+            .into_iter()
+            .map(|entry| (entry.policy_name, entry.endpoint))
+            .collect();
         Ok(ConnectionPolicyContract::new(
             &authorization,
+            raw_endpoints,
             middleware_chain,
             published.middleware_registry_epoch,
         ))
@@ -806,9 +842,6 @@ impl OpaEngine {
         let result = engine
             .eval_rule("data.openshell.sandbox.egress_authorization".into())
             .map_err(|e| miette::miette!("{e}"))?;
-        // Regorus values own their data; conversion must not serialize other
-        // requests behind the evaluator lock. The generation was captured above.
-        drop(engine);
         let action_str = get_str(&result, "action").unwrap_or_default();
         let matched_policy = get_str(&result, "matched_policy").filter(|name| !name.is_empty());
         let endpoint_configs = get_field(&result, "endpoint_configs")
@@ -12548,10 +12581,10 @@ network_policies:
 
         assert_eq!(before.action, after.action);
         assert_ne!(before.endpoint_configs, after.endpoint_configs);
-        let hash = |configs: &[regorus::Value]| {
+        let hash = |configs: &[EndpointConfig]| {
             configs
                 .iter()
-                .map(|config| config["policy_hash"].clone())
+                .map(|config| config.policy_hash.clone())
                 .collect::<Vec<_>>()
         };
         assert_ne!(
@@ -12891,20 +12924,17 @@ network_policies:
             .unwrap();
 
         assert_eq!(authorization.matched_endpoints.len(), 3);
-        let extended: Vec<&regorus::Value> = authorization
+        let extended = authorization
             .matched_endpoints
             .iter()
-            .map(|matched| &matched.endpoint)
-            .filter(|endpoint| {
-                matches!(
-                    &endpoint["protocol"],
-                    regorus::Value::String(protocol) if protocol.as_ref() == "rest"
-                )
+            .filter(|matched| {
+                matched.endpoint.protocol
+                    == crate::policy_types::EndpointProtocol::L7(crate::l7::L7Protocol::Rest)
             })
-            .collect();
+            .count();
+        assert_eq!(authorization.endpoint_configs.len(), extended);
         assert_eq!(
-            authorization.endpoint_configs.iter().collect::<Vec<_>>(),
-            extended,
+            extended, 1,
             "only the inspected endpoint carries extended configuration"
         );
     }
@@ -13071,11 +13101,12 @@ network_policies:
     // --- Policy hash for endpoint status after a re-pin ---
 
     fn stamped_hash_for(engine: &OpaEngine, input: &NetworkInput) -> String {
-        let authorization = engine.authorize_egress(input).unwrap();
-        match &authorization.matched_endpoints[0].endpoint["policy_hash"] {
-            regorus::Value::String(hash) => hash.to_string(),
-            other => panic!("proto endpoints carry a policy hash, got {other:?}"),
-        }
+        engine
+            .connection_policy_contract(input)
+            .unwrap()
+            .0
+            .policy_hash()
+            .to_owned()
     }
 
     #[test]

@@ -18,13 +18,13 @@ use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::correlation::{HttpOutcome, RequestStage};
 use crate::l7::tls::ProxyTlsState;
 #[cfg(any(test, feature = "test-support"))]
+use crate::policy_dns::ResolvedEndpointStore;
+#[cfg(any(test, feature = "test-support"))]
 use crate::policy_dns::SocketTrustedResolver;
 use crate::policy_dns::{
     ConnectLookupError, MappingLookup, MappingLookupError, PolicyDnsService, TrustedResolver,
 };
 use crate::policy_engine::PolicyEngine;
-#[cfg(test)]
-use crate::policy_dns::ResolvedEndpointStore;
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::policy_types::{NetworkAction, PolicyGenerationGuard};
 use crate::telemetry::egress_emit;
@@ -975,8 +975,7 @@ pub(crate) struct StagedOpenOutcome {
     pub(crate) decision: TcpOpenDecision,
     /// The addresses the admitted connection may dial; empty when refused.
     pub(crate) dial_addresses: Vec<SocketAddr>,
-    /// Whether the decision's matched endpoints correlate with the policy DNS
-    /// mapping, which the transparent TCP listener also requires.
+    /// Whether the admitted decision names the policy-backed DNS mapping.
     pub(crate) correlated: bool,
 }
 
@@ -1044,15 +1043,16 @@ pub(crate) async fn stage_transparent_open_for_test(
         };
     };
     let correlated = store
-        .lookup(
+        .lookup_intent(
             destination.ip(),
             destination.port(),
-            egress.policy_generation,
             std::time::Instant::now(),
         )
         .ok()
-        .and_then(|mapping| correlated_endpoint(&egress.endpoint.matched_endpoints, &mapping))
-        .is_some();
+        .is_some_and(|mapping| {
+            !mapping.record.is_observation()
+                && mapping.record.normalized_name.as_str() == egress.intent.destination.host
+        });
     StagedOpenOutcome {
         decision,
         dial_addresses: connector.addrs().to_vec(),
@@ -1253,12 +1253,22 @@ async fn pinned_transparent_plan<R: TrustedResolver>(
         .destination
         .as_ref()
         .ok_or(MappingLookupError::InvalidMapping)?;
-    dns.lookup_for_pin(destination.ip(), destination.port())
+    let pinned = dns
+        .lookup_for_pin(destination.ip(), destination.port())
         .await?
-        .pinned_plan(plan)
+        .pinned_plan(plan)?;
+    let destination::AddressAuthorization::PinnedResolved(addresses) = pinned.address_authorization
+    else {
+        return Err(MappingLookupError::InvalidMapping);
+    };
+    destination::build_pinned_validation_plan(policy_admitted_addresses(
+        decision,
+        destination.port(),
+        addresses,
+    ))
+    .map_err(|_| MappingLookupError::InvalidMapping)
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn policy_admitted_addresses(
     decision: &EgressDecision,
     port: u16,
@@ -1402,25 +1412,6 @@ impl Drop for TransparentTcpHandle {
             join.abort();
         }
     }
-}
-
-/// Returns the first endpoint an egress decision matched that the policy DNS
-/// mapping the connection dialed also contains.
-///
-/// `None` means the decision and the mapping name no common endpoint, so the
-/// transparent TCP listener refuses the connection.
-#[cfg(any(target_os = "linux", feature = "test-support"))]
-pub(crate) fn correlated_endpoint(
-    matched_endpoints: &[crate::policy_types::MatchedEndpoint],
-    mapping: &MappingLookup,
-) -> Option<PolicyEndpointId> {
-    matched_endpoints
-        .iter()
-        .map(|endpoint| PolicyEndpointId {
-            policy_name: endpoint.policy_name.clone(),
-            endpoint_index: endpoint.endpoint_index,
-        })
-        .find(|candidate| mapping.endpoint_ids().any(|mapped| mapped == candidate))
 }
 
 #[cfg(target_os = "linux")]
@@ -1748,7 +1739,7 @@ enum TransparentPinRefusal {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn pin_transparent_tcp<R: TrustedResolver>(
     dns: &PolicyDnsService<R>,
-    opa_engine: &Arc<OpaEngine>,
+    network_engine: &PolicyEngine,
     trusted_host_gateway: Option<IpAddr>,
     original: SocketAddr,
     decision: &mut EgressDecision,
@@ -1758,22 +1749,19 @@ async fn pin_transparent_tcp<R: TrustedResolver>(
 > {
     hydrate_destination_plan(decision, trusted_host_gateway, None)
         .map_err(TransparentPinRefusal::Destination)?;
-    let plan = decision
-        .endpoint
-        .destination
-        .clone()
-        .ok_or(TransparentPinRefusal::Mapping(
-            MappingLookupError::InvalidMapping,
-        ))?;
-    let generation_guard = relay::pin_policy_generation(opa_engine, decision, None)
+    let generation_guard = relay::pin_policy_generation(network_engine, decision, None)
         .map_err(|_| TransparentPinRefusal::Mapping(MappingLookupError::PolicyChanged))?;
-    let connector = dns
-        .lookup_for_pin(original.ip(), original.port())
-        .await
-        .map_err(TransparentPinRefusal::Mapping)?
-        .connector_for(&plan)
+    let plan = pinned_transparent_plan(dns, original, decision)
         .await
         .map_err(TransparentPinRefusal::Mapping)?;
+    let connector = validate_destination(DestinationRequest {
+        host: &decision.intent.destination.host,
+        port: original.port(),
+        sandbox_entrypoint_pid: 0,
+        plan: &plan,
+    })
+    .await
+    .map_err(|_| TransparentPinRefusal::Mapping(MappingLookupError::InvalidMapping))?;
     Ok((generation_guard, connector))
 }
 
@@ -9227,8 +9215,11 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         let (open, completion) = staged_curl_open(destination, engine.current_generation());
         let admitted = preauthorize_transparent_open(
             open,
-            Some(&policy_dns_test_service(store, engine)),
-            engine,
+            Some(&policy_dns_test_service(
+                store,
+                &PolicyEngine::from(engine.clone()),
+            )),
+            &PolicyEngine::from(engine.clone()),
             &BinaryIdentityCache::new(),
             None,
             None,
@@ -9251,13 +9242,18 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         destination: SocketAddr,
         trusted_host_gateway: Option<IpAddr>,
     ) -> std::result::Result<Vec<SocketAddr>, String> {
-        let target =
-            resolve_transparent_target(destination, Some(&policy_dns_test_service(store, engine)))
-                .await
-                .map_err(|error| error.to_string())?;
+        let target = resolve_transparent_target(
+            destination,
+            Some(&policy_dns_test_service(
+                store,
+                &PolicyEngine::from(engine.clone()),
+            )),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let (open, _) = staged_curl_open(destination, engine.current_generation());
         let mut decision = authorize_supplied_identity(
-            engine,
+            &PolicyEngine::from(engine.clone()),
             &BinaryIdentityCache::new(),
             EgressIntent::transparent_tcp(target.host, destination.port()),
             &open.binary_identity,
@@ -9266,8 +9262,8 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             return Err(format!("policy denied: {reason}"));
         }
         pin_transparent_tcp(
-            &policy_dns_test_service(store, engine),
-            engine,
+            &policy_dns_test_service(store, &PolicyEngine::from(engine.clone())),
+            &PolicyEngine::from(engine.clone()),
             trusted_host_gateway,
             destination,
             &mut decision,
@@ -9278,13 +9274,13 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
     }
 
     /// curl's policy decision for a transparent TCP connection to `host`.
-    fn direct_decision(engine: &OpaEngine, host: &str, port: u16) -> EgressDecision {
+    fn direct_decision(engine: &Arc<OpaEngine>, host: &str, port: u16) -> EgressDecision {
         let (open, _) = staged_curl_open(
             SocketAddr::new("198.18.0.2".parse().unwrap(), port),
             engine.current_generation(),
         );
         authorize_supplied_identity(
-            engine,
+            &PolicyEngine::from(engine.clone()),
             &BinaryIdentityCache::new(),
             EgressIntent::transparent_tcp(host.to_string(), port),
             &open.binary_identity,
@@ -9318,7 +9314,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         );
         let store = policy_dns_test_store();
         let answer = crate::policy_dns::test_service(
-            engine.clone(),
+            PolicyEngine::from(engine.clone()),
             store.clone(),
             vec!["10.2.3.4".parse().unwrap(), "8.8.8.8".parse().unwrap()],
         )
@@ -9355,8 +9351,8 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             )
             .unwrap();
         let (guard, _) = pin_transparent_tcp(
-            &policy_dns_test_service(&store, &engine),
-            &engine,
+            &policy_dns_test_service(&store, &PolicyEngine::from(engine.clone())),
+            &PolicyEngine::from(engine.clone()),
             None,
             destination,
             &mut decision,
@@ -9374,8 +9370,8 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .unwrap();
         assert!(matches!(
             pin_transparent_tcp(
-                &policy_dns_test_service(&store, &engine),
-                &engine,
+                &policy_dns_test_service(&store, &PolicyEngine::from(engine.clone())),
+                &PolicyEngine::from(engine.clone()),
                 None,
                 destination,
                 &mut decision
@@ -9395,8 +9391,8 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let observed = publish_observation(&store, "pypi.org", engine.current_generation());
         assert!(matches!(
             pin_transparent_tcp(
-                &policy_dns_test_service(&store, &engine),
-                &engine,
+                &policy_dns_test_service(&store, &PolicyEngine::from(engine.clone())),
+                &PolicyEngine::from(engine.clone()),
                 None,
                 SocketAddr::new(observed.synthetic_address, 80),
                 &mut direct_decision(&engine, "pypi.org", 80),
@@ -9411,8 +9407,8 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .unwrap();
         assert!(matches!(
             pin_transparent_tcp(
-                &policy_dns_test_service(&store, &engine),
-                &engine,
+                &policy_dns_test_service(&store, &PolicyEngine::from(engine.clone())),
+                &PolicyEngine::from(engine.clone()),
                 None,
                 SocketAddr::new(mapped.synthetic_address, 5432),
                 &mut direct_decision(&engine, "db.example", 5432),
@@ -9432,8 +9428,8 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let mapped = publish_mapping(&store, "db.example", engine.current_generation());
         let mut decision = direct_decision(&engine, "db.example", 5432);
         let (guard, connector) = pin_transparent_tcp(
-            &policy_dns_test_service(&store, &engine),
-            &engine,
+            &policy_dns_test_service(&store, &PolicyEngine::from(engine.clone())),
+            &PolicyEngine::from(engine.clone()),
             None,
             SocketAddr::new(mapped.synthetic_address, 5432),
             &mut decision,
@@ -9454,7 +9450,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
         let store = policy_dns_test_store();
         let dns = crate::policy_dns::test_service(
-            engine.clone(),
+            PolicyEngine::from(engine.clone()),
             store.clone(),
             vec!["8.8.8.8".parse().unwrap()],
         );
@@ -9504,7 +9500,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     ) -> IpAddr {
         let rego = include_str!("../data/sandbox-policy.rego");
         let dns = crate::policy_dns::test_service_with_gateway(
-            engine.clone(),
+            PolicyEngine::from(engine.clone()),
             store.clone(),
             addresses,
             trusted_host_gateway,
@@ -9573,8 +9569,11 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let (open, completion) = staged_curl_open(destination, engine.current_generation());
         let accepted = preauthorize_transparent_open(
             open,
-            Some(&policy_dns_test_service(store, engine)),
-            engine,
+            Some(&policy_dns_test_service(
+                store,
+                &PolicyEngine::from(engine.clone()),
+            )),
+            &PolicyEngine::from(engine.clone()),
             &BinaryIdentityCache::new(),
             trusted_host_gateway,
             None,
@@ -9632,8 +9631,11 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             staged_curl_open(SocketAddr::new(kept, 22), engine.current_generation());
         let accepted = preauthorize_transparent_open(
             open,
-            Some(&policy_dns_test_service(&store, &engine)),
-            &engine,
+            Some(&policy_dns_test_service(
+                &store,
+                &PolicyEngine::from(engine.clone()),
+            )),
+            &PolicyEngine::from(engine.clone()),
             &BinaryIdentityCache::new(),
             None,
             None,
@@ -9684,14 +9686,18 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             staged_connector(&store, &engine, SocketAddr::new(kept, 80), None).await,
             Ok(vec!["8.8.8.8:80".parse().unwrap()])
         );
-        let fresh = crate::policy_dns::test_service(engine.clone(), store.clone(), resolved)
-            .answer_query(
-                "pypi.org",
-                crate::policy_dns::AddressFamily::Ipv4,
-                std::time::Instant::now(),
-            )
-            .await
-            .unwrap();
+        let fresh = crate::policy_dns::test_service(
+            PolicyEngine::from(engine.clone()),
+            store.clone(),
+            resolved,
+        )
+        .answer_query(
+            "pypi.org",
+            crate::policy_dns::AddressFamily::Ipv4,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             staged_connector(&store, &engine, SocketAddr::new(fresh.address, 80), None).await,
             Ok(vec![
@@ -9736,7 +9742,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
         let store = policy_dns_test_store();
         let dns = crate::policy_dns::test_service(
-            engine.clone(),
+            PolicyEngine::from(engine.clone()),
             store.clone(),
             vec!["140.82.112.3".parse().unwrap()],
         );
@@ -9946,14 +9952,19 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination)
             )
         );
-        let target =
-            resolve_transparent_target(cached, Some(&policy_dns_test_service(&store, &engine)))
-                .await
-                .expect("the kept answer still names pypi.org");
+        let target = resolve_transparent_target(
+            cached,
+            Some(&policy_dns_test_service(
+                &store,
+                &PolicyEngine::from(engine.clone()),
+            )),
+        )
+        .await
+        .expect("the kept answer still names pypi.org");
         assert_eq!(target.host, "pypi.org");
         let (open, _) = staged_curl_open(cached, engine.current_generation());
         let mut decision = authorize_supplied_identity(
-            &engine,
+            &PolicyEngine::from(engine.clone()),
             &BinaryIdentityCache::new(),
             EgressIntent::connect("pypi.org".to_string(), 80),
             &open.binary_identity,
@@ -9961,13 +9972,17 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         assert!(matches!(decision.action, NetworkAction::Allow { .. }));
         hydrate_destination_plan(&mut decision, None, None).unwrap();
         assert!(matches!(
-            pinned_transparent_plan(&policy_dns_test_service(&store, &engine), cached, &decision)
-                .await,
+            pinned_transparent_plan(
+                &policy_dns_test_service(&store, &PolicyEngine::from(engine.clone())),
+                cached,
+                &decision
+            )
+            .await,
             Err(MappingLookupError::InvalidMapping)
         ));
 
         let dns = crate::policy_dns::test_service(
-            engine.clone(),
+            PolicyEngine::from(engine.clone()),
             store.clone(),
             vec!["8.8.8.8".parse().unwrap()],
         );
@@ -10040,7 +10055,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         );
         let store = policy_dns_test_store();
         let dns = crate::policy_dns::test_service(
-            engine.clone(),
+            PolicyEngine::from(engine.clone()),
             store.clone(),
             vec!["10.2.3.4".parse().unwrap(), "8.8.8.8".parse().unwrap()],
         );
@@ -10067,8 +10082,11 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let (open, completion) = staged_curl_open(destination, engine.current_generation());
         let (_, _, _, transparent) = preauthorize_transparent_open(
             open,
-            Some(&policy_dns_test_service(&store, &engine)),
-            &engine,
+            Some(&policy_dns_test_service(
+                &store,
+                &PolicyEngine::from(engine.clone()),
+            )),
+            &PolicyEngine::from(engine.clone()),
             &BinaryIdentityCache::new(),
             None,
             None,
@@ -10881,7 +10899,7 @@ process:
         let accepted = preauthorize_transparent_open(
             pending,
             Some(&runtime.service),
-            &engine,
+            &PolicyEngine::from(engine.clone()),
             &BinaryIdentityCache::new(),
             None,
             None,

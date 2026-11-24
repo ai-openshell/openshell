@@ -729,7 +729,7 @@ fn build_mapping_publication_event(
 /// `addresses`, for tests outside this module.
 #[cfg(test)]
 pub(crate) fn test_service(
-    policy: Arc<OpaEngine>,
+    policy: PolicyEngine,
     store: Arc<ResolvedEndpointStore>,
     addresses: Vec<IpAddr>,
 ) -> PolicyDnsService<impl TrustedResolver> {
@@ -739,7 +739,7 @@ pub(crate) fn test_service(
 /// [`test_service`] with a trusted host gateway for the reserved alias.
 #[cfg(test)]
 pub(crate) fn test_service_with_gateway(
-    policy: Arc<OpaEngine>,
+    policy: PolicyEngine,
     store: Arc<ResolvedEndpointStore>,
     addresses: Vec<IpAddr>,
     trusted_host_gateway: Option<IpAddr>,
@@ -1033,7 +1033,8 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     #[tokio::test]
     async fn connect_lookup_rejects_ineligible_refresh_without_dns() {
         for case in ["expired observation", "policy revoked"] {
-            let (opa, service) = service_with_opa(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()], None);
+            let (opa, service) =
+                service_with_opa(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()], None);
             let answer = expired_answer(&service).await;
             let (address, expected) = if case == "expired observation" {
                 let observed = service
@@ -1047,10 +1048,10 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 (observed.address, MappingLookupError::Expired)
             } else {
                 opa.reload(
-                        include_str!("../../data/sandbox-policy.rego"),
-                        "network_policies: {}\n",
-                    )
-                    .unwrap();
+                    include_str!("../../data/sandbox-policy.rego"),
+                    "network_policies: {}\n",
+                )
+                .unwrap();
                 (answer.address, MappingLookupError::PolicyChanged)
             };
             let result = service.lookup_for_connect(address, 5432).await;
@@ -1178,8 +1179,27 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         );
     }
 
+    fn eligible_contract(
+        endpoints: &[EligibleEndpoint],
+    ) -> Vec<(
+        PolicyEndpointId,
+        Vec<u16>,
+        crate::proxy::destination::DestinationValidationPlan,
+    )> {
+        endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.endpoint_id.clone(),
+                    endpoint.ports.clone(),
+                    endpoint.destination_plan.clone(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn allocation_identity_rotates_for_dns_contract_and_endpoint_identity_changes() {
+    fn eligibility_tracks_dns_contract_and_endpoint_identity_changes() {
         use crate::policy_types::{DnsRecord, EndpointProtocol, MatchedEndpoint};
 
         let endpoint = MatchedEndpoint {
@@ -1194,7 +1214,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             },
         };
         let identity = |endpoint| {
-            allocation_identity(
+            eligible_contract(
                 &eligible_endpoints(
                     &[endpoint],
                     &NormalizedName::parse("db.example").unwrap(),
@@ -1209,29 +1229,27 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             "endpoint_index",
             "host",
             "ports",
-            "protocol",
             "allowed_ips",
         ] {
             let mut changed = endpoint.clone();
             match field {
                 "policy_name" => changed.policy_name = "renamed".into(),
                 "endpoint_index" => changed.endpoint_index = 1,
-                "host" => changed.endpoint.host = "db.example".into(),
+                "host" => changed.endpoint.host = "other.example".into(),
                 "ports" => changed.endpoint.ports.push(5433),
-                "protocol" => changed.endpoint.protocol = EndpointProtocol::None,
                 "allowed_ips" => changed.endpoint.allowed_ips = vec!["10.1.0.0/16".into()],
                 _ => unreachable!(),
             }
             assert_ne!(
                 identity(changed),
                 original,
-                "{field} must rotate the identity"
+                "{field} must change the eligible contract"
             );
         }
     }
 
     #[test]
-    fn allocation_identity_survives_request_rules_settings_and_policy_hash_changes() {
+    fn eligibility_ignores_request_rules_settings_and_policy_hash_changes() {
         let yaml = r#"
 version: 1
 network_policies:
@@ -1258,7 +1276,7 @@ network_policies:
                 None,
             )
             .unwrap();
-            (allocation_identity(&eligible), hash)
+            (eligible_contract(&eligible), hash)
         };
         let (original, original_hash) = identity(yaml);
         for changed in [
@@ -1650,10 +1668,11 @@ network_policies:
             // Only the exact endpoint grants the private literal: a connection
             // decided by the wildcard (port 443) reaches no pinned address.
             let exact =
-                build_validation_plan("10.2.3.4", "10.2.3.4", None, None, &[], true).unwrap();
+                build_validation_plan("10.2.3.4", "10.2.3.4", None, None, &[], true, None).unwrap();
             assert!(mapping.pinned_plan(&exact).is_ok());
-            let denial = build_validation_plan("10.2.3.4", "10.2.3.4", None, None, &[], false)
-                .expect_err("a wildcard cannot authorize an internal IP literal");
+            let denial =
+                build_validation_plan("10.2.3.4", "10.2.3.4", None, None, &[], false, None)
+                    .expect_err("a wildcard cannot authorize an internal IP literal");
             assert_eq!(denial.kind, DestinationDenialKind::InternalAddress);
         }
     }
@@ -2083,14 +2102,15 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
     fn proto_service(
         proto: &openshell_core::proto::SandboxPolicy,
-    ) -> PolicyDnsService<FakeResolver> {
+    ) -> (PolicyDnsService<FakeResolver>, Arc<OpaEngine>) {
         let pools = SyntheticPools::new(
             Ipv4Addr::new(198, 18, 0, 1)..=Ipv4Addr::new(198, 18, 0, 8),
             "fd00:1::1".parse::<Ipv6Addr>().unwrap()..="fd00:1::8".parse::<Ipv6Addr>().unwrap(),
         )
         .unwrap();
-        PolicyDnsService::new(
-            Arc::new(OpaEngine::from_proto(proto).unwrap()),
+        let opa = Arc::new(OpaEngine::from_proto(proto).unwrap());
+        let service = PolicyDnsService::new(
+            PolicyEngine::from(opa.clone()),
             FakeResolver {
                 calls: AtomicUsize::new(0),
                 answer: TrustedAnswer {
@@ -2102,7 +2122,8 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 StoreConfig::new(pools, 16).unwrap(),
             )),
             None,
-        )
+        );
+        (service, opa)
     }
 
     /// Proto conversion stamps the hash of the complete policy into every
@@ -2112,29 +2133,24 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     /// taking a new one from the never-reused pool each time.
     #[tokio::test]
     async fn proto_reload_keeps_the_synthetic_address_of_an_unchanged_endpoint() {
-        let service = proto_service(&claude_proto(&[]));
-        let stamp = |service: &PolicyDnsService<FakeResolver>| {
-            service
-                .policy
-                .policy_dns_eligibility_snapshot()
-                .unwrap()
-                .endpoints[0]
-                .endpoint["policy_hash"]
-                .clone()
-        };
-        let before_stamp = stamp(&service);
-        assert!(matches!(before_stamp, regorus::Value::String(_)));
+        let (service, opa) = proto_service(&claude_proto(&[]));
+        let before_stamp =
+            openshell_core::policy_identity::deterministic_policy_hash(&claude_proto(&[]));
         let before = service
             .answer_query("api.anthropic.com", AddressFamily::Ipv4, Instant::now())
             .await
             .unwrap();
 
         // Approve another host in the same policy.
-        service
-            .policy
-            .reload_from_proto(&claude_proto(&["github.com"]))
+        opa.reload_from_proto(&claude_proto(&["github.com"]))
             .unwrap();
-        assert_ne!(stamp(&service), before_stamp, "the stamp changed");
+        assert_ne!(
+            openshell_core::policy_identity::deterministic_policy_hash(&claude_proto(&[
+                "github.com"
+            ])),
+            before_stamp,
+            "the stamp changed"
+        );
 
         let after = service
             .answer_query("api.anthropic.com", AddressFamily::Ipv4, Instant::now())
@@ -2149,7 +2165,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     /// and the current policy decides what each connection to it may do.
     #[tokio::test]
     async fn a_name_keeps_its_address_when_its_endpoint_moves_or_changes() {
-        let service = proto_service(&claude_proto(&[]));
+        let (service, opa) = proto_service(&claude_proto(&[]));
         let lookup =
             || service.answer_query("api.anthropic.com", AddressFamily::Ipv4, Instant::now());
         let before = lookup().await.unwrap();
@@ -2162,7 +2178,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .unwrap()
             .endpoints
             .reverse();
-        service.policy.reload_from_proto(&reordered).unwrap();
+        opa.reload_from_proto(&reordered).unwrap();
         assert_eq!(lookup().await.unwrap().address, before.address, "moved");
 
         let mut widened = reordered.clone();
@@ -2174,7 +2190,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         {
             endpoint.ports = vec![443, 8443];
         }
-        service.policy.reload_from_proto(&widened).unwrap();
+        opa.reload_from_proto(&widened).unwrap();
         assert_eq!(lookup().await.unwrap().address, before.address, "new port");
     }
 

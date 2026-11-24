@@ -209,7 +209,7 @@ running sandbox. The startup sections do not:
 | Added filesystem paths | The saved policy can change, but the running workload keeps its existing filesystem permissions. | Recreate the sandbox. |
 | Removed filesystem paths, or changed `include_workdir`, Landlock, or process settings | OpenShell rejects the change after the workload starts. | Recreate the sandbox. |
 
-When new network rules take effect, OpenShell re-checks every open connection,
+For YAML policies, when new network rules take effect, OpenShell re-checks every open connection,
 including HTTP keep-alive connections, tunnels, WebSocket connections, and
 long-lived streams, against the new rules. A connection stays open only if the
 new rules treat it exactly as the old ones did: the same allow decision, the
@@ -230,6 +230,8 @@ connections. Some changes always close connections:
   revoking it after a failed provider refresh. Connections that never carried
   that credential stay open, including when other providers are attached,
   detached, or rotated.
+
+Cedar policies in development builds close open connections when their policy changes.
 
 OpenShell validates every change twice before it takes effect:
 
