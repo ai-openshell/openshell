@@ -1484,7 +1484,7 @@ async fn handle_transparent_tcp_connection(
     }
 
     let (generation_guard, connector) = match pin_transparent_tcp(
-        dns,
+        dns.as_ref(),
         &network_engine,
         trusted_host_gateway,
         original,
