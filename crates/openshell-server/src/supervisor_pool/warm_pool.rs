@@ -6,10 +6,12 @@ use super::{
     CLEANUP_PER_PASS, PersistenceError, RecordPhase, SandboxInstanceAssignment, SupervisorPool,
     TRANSITION_ATTEMPTS, WriteCondition, assignment_object_id, now_ms,
 };
-use openshell_supervisor_control::warm_pool::{WarmPoolSnapshot, WarmPoolState, WarmPoolUpdate};
+use openshell_supervisor_control::warm_pool::{
+    DISCONNECTED_MS, WarmPoolEntry, WarmPoolSnapshot, WarmPoolState, WarmPoolUpdate,
+};
 
-use crate::persistence::ObjectListQuery;
-use openshell_core::proto::{Sandbox, SandboxWorkloadTemplate};
+use crate::persistence::{ObjectListQuery, Store};
+use openshell_core::proto::{Sandbox, SandboxTemplateWarmPoolStatus, SandboxWorkloadTemplate};
 use openshell_supervisor_control::warm_pool::WarmPoolTarget;
 
 const OBJECT_TYPE: &str = "warm_pool_journal";
@@ -443,6 +445,51 @@ fn decode_journal(
     Ok(state)
 }
 
+/// Read-only view of a template's journal, counted the way the reconciler
+/// counts its last pass.
+pub async fn template_warm_pool_status(
+    store: &Store,
+    template: &SandboxWorkloadTemplate,
+) -> Result<Option<SandboxTemplateWarmPoolStatus>, PersistenceError> {
+    let Some(metadata) = template.metadata.as_ref() else {
+        return Ok(None);
+    };
+    let pool_id = format!("tpl-{}", metadata.id);
+    let Ok(id) = identity(&metadata.workspace, &pool_id) else {
+        return Ok(None);
+    };
+    let Some(row) = store.get(OBJECT_TYPE, &id).await? else {
+        return Ok(None);
+    };
+    if row.workspace != metadata.workspace || row.name != pool_id {
+        return Err(PersistenceError::Decode(
+            "warm-pool journal scope changed".into(),
+        ));
+    }
+    Ok(Some(warm_pool_status(&decode_journal(&row)?, now_ms())))
+}
+
+fn warm_pool_status(state: &WarmPoolState, now: i64) -> SandboxTemplateWarmPoolStatus {
+    let count = |keep: &dyn Fn(&WarmPoolEntry) -> bool| {
+        u32::try_from(state.entries.iter().filter(|entry| keep(entry)).count()).unwrap_or(u32::MAX)
+    };
+    let retiring = count(&|entry| entry.retiring);
+    let ready = count(&|entry| {
+        !entry.retiring
+            && entry
+                .last_ready_at_ms
+                .is_some_and(|last| now.saturating_sub(last) < DISCONNECTED_MS)
+    });
+    SandboxTemplateWarmPoolStatus {
+        target: state.policy.as_ref().map_or(0, |policy| policy.target_size),
+        ready,
+        pending: count(&|entry| !entry.retiring) - ready,
+        retiring,
+        revision: state.revision,
+        suspended: state.suspended,
+    }
+}
+
 fn template_target(template: &SandboxWorkloadTemplate) -> Result<Option<WarmPoolTarget>, String> {
     let metadata = template
         .metadata
@@ -475,7 +522,6 @@ fn template_target(template: &SandboxWorkloadTemplate) -> Result<Option<WarmPool
 mod tests {
     use super::super::tests::Fixture;
     use super::*;
-    use openshell_supervisor_control::warm_pool::WarmPoolEntry;
 
     fn update() -> WarmPoolUpdate {
         WarmPoolUpdate {
@@ -496,6 +542,7 @@ mod tests {
                     resource_uid: None,
                     auth_epoch: None,
                 }],
+                suspended: false,
             },
         }
     }
@@ -576,6 +623,63 @@ mod tests {
             .unwrap()
             .ready_within = None;
         assert!(template_target(&template).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn template_status_counts_the_recorded_journal() {
+        use openshell_supervisor_control::warm_pool::WarmPoolPolicy;
+
+        let fixture = Fixture::new().await;
+        let pool = fixture.replica("a");
+        let template = template();
+        pool.store.put_message(&template).await.unwrap();
+        assert!(
+            template_warm_pool_status(&pool.store, &template)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let now = now_ms();
+        let mut journal = update();
+        journal.pool_id = "tpl-original-template".into();
+        journal.state.suspended = true;
+        journal.state.policy = Some(WarmPoolPolicy {
+            target_size: 2,
+            max_size: 4,
+            max_age_secs: 600,
+            preparation_timeout_secs: 120,
+        });
+        let entry = journal.state.entries[0].clone();
+        journal.state.entries = [
+            (Some(now - 5_000), false),
+            (Some(now - DISCONNECTED_MS), false),
+            (None, false),
+            (Some(now), true),
+        ]
+        .into_iter()
+        .map(|(last_ready_at_ms, retiring)| WarmPoolEntry {
+            session_id: openshell_core::SandboxSessionId::new(),
+            last_ready_at_ms,
+            retiring,
+            ..entry.clone()
+        })
+        .collect();
+        assert!(pool.update_warm_pool(journal).await.unwrap());
+        let status = template_warm_pool_status(&pool.store, &template)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            status,
+            SandboxTemplateWarmPoolStatus {
+                target: 2,
+                ready: 1,
+                pending: 2,
+                retiring: 1,
+                revision: 1,
+                suspended: true,
+            }
+        );
     }
 
     #[tokio::test]

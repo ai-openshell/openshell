@@ -733,7 +733,7 @@ async fn restore_resource<
 }
 
 macro_rules! resource_mutation {
-    ($req:ty, $resp:ident, $method:literal, $handler:path, $field:ident, $auth:expr) => {
+    ($req:ty, $resp:ident, $method:literal, $handler:path, $field:ident, $auth:expr $(, $unset:ident)*) => {
         impl Mutation for $req {
             type Output = $resp;
             const METHOD: &'static str = $method;
@@ -759,6 +759,7 @@ macro_rules! resource_mutation {
             async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status> {
                 Ok($resp {
                     $field: Some(restore_resource(store, success).await?),
+                    $($unset: None,)*
                 })
             }
         }
@@ -832,7 +833,8 @@ resource_mutation!(
     template,
     async |req: &CreateSandboxTemplateRequest, state: &ServerState, principal: &Principal| {
         template_scope(state, principal, req.workspace_scope.as_ref()).await
-    }
+    },
+    warm_pool
 );
 deletion_mutation!(
     DeleteSandboxTemplateRequest,

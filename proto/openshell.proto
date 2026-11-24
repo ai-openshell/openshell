@@ -1516,6 +1516,29 @@ message DeleteSandboxTemplateRequest {
 
 message SandboxTemplateResponse {
   SandboxWorkloadTemplate template = 1;
+  // Set only by GetSandboxTemplate, once the gateway has recorded a warm pool
+  // for this template.
+  SandboxTemplateWarmPoolStatus warm_pool = 2;
+}
+
+// Spares recorded by the latest warm-pool reconciliation. Claimed spares
+// belong to their sandboxes and are not counted.
+message SandboxTemplateWarmPoolStatus {
+  // Spares the pool keeps, after the gateway's warm_pool.max_size cap. Zero
+  // while the pool drains.
+  uint32 target = 1;
+  // Spares whose supervisor was connected during the last minute.
+  uint32 ready = 2;
+  // Spares still starting, or not seen connected during the last minute.
+  uint32 pending = 3;
+  // Spares being removed. They still count against warm_pool.max_size.
+  uint32 retiring = 4;
+  // Operator warm_pool.revision recorded for the pool.
+  uint64 revision = 5;
+  // The last reconciling gateway replica stopped creating spares because its
+  // configuration differs from the recorded pool. Cleanup continues. Deploy a
+  // higher warm_pool.revision to resume.
+  bool suspended = 6;
 }
 
 message ListSandboxTemplatesResponse {

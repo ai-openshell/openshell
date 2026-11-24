@@ -1175,6 +1175,7 @@ fn pool_config() -> crate::config::WarmPoolConfig {
         max_size: 2,
         max_age_secs: 600,
         preparation_timeout_secs: 120,
+        refill_per_pass: 4,
         spec: SandboxSpec {
             template: Some(SandboxTemplate {
                 image: "workload-image".into(),
@@ -1654,6 +1655,51 @@ async fn retirement_winner_tries_another_spare_or_commits_cold_creation() {
     }
 }
 
+#[tokio::test]
+async fn claim_metrics_count_pooled_creates_by_outcome() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use openshell_supervisor_control::warm_pool::metrics::{CLAIM_DURATION_SECONDS, CLAIMS_TOTAL};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let state = Arc::new(Mutex::new(State::default()));
+    let (driver, request, _) = Box::pin(ready_pool(state.clone(), 1)).await;
+    for id in ["warm-hit", "cold-fallback"] {
+        driver
+            .try_claim_warm_runtime(&claiming_sandbox(&request, id), "openshell")
+            .await
+            .unwrap();
+    }
+    // Discovery failures fall back to cold before any pool is known.
+    state.lock().unwrap().fail_placement = Some("targets");
+    driver
+        .try_claim_warm_runtime(&claiming_sandbox(&request, "unpooled"), "openshell")
+        .await
+        .unwrap();
+    let mut claims = BTreeMap::new();
+    let mut timings = BTreeMap::new();
+    for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+        let key = key.key();
+        let outcome = key.labels().next().unwrap().value().to_string();
+        match value {
+            DebugValue::Counter(count) if key.name() == CLAIMS_TOTAL => {
+                claims.insert(outcome, count);
+            }
+            DebugValue::Histogram(samples) if key.name() == CLAIM_DURATION_SECONDS => {
+                timings.insert(outcome, samples.len());
+            }
+            _ => {}
+        }
+    }
+    let expected = BTreeMap::from([("cold".to_string(), 1), ("warm".to_string(), 1)]);
+    assert_eq!(claims, expected);
+    assert_eq!(
+        timings,
+        BTreeMap::from([("cold".into(), 1), ("warm".into(), 1)])
+    );
+}
+
 async fn ready_pool(
     state: Arc<Mutex<State>>,
     ready: usize,
@@ -1823,6 +1869,7 @@ async fn gateway_reservation_blocks_retirement_and_recovers_without_a_create_ret
                     fingerprint: "a".repeat(64),
                     policy: None,
                     entries: Vec::new(),
+                    suspended: false,
                 },
             });
         let guard = restarted

@@ -6,3 +6,4 @@ gatewayConfig:
   openshell.drivers.kubernetes:
     warm_pool:
       max_size: 2
+      refill_per_pass: 2

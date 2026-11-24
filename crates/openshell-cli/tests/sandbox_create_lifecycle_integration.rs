@@ -258,6 +258,7 @@ impl OpenShell for TestOpenShell {
             .push(request);
         Ok(Response::new(SandboxTemplateResponse {
             template: Some(template),
+            warm_pool: None,
         }))
     }
 
@@ -287,6 +288,7 @@ impl OpenShell for TestOpenShell {
                 }),
                 spec: None,
             }),
+            warm_pool: None,
         }))
     }
 

@@ -265,9 +265,12 @@ tombstones that drain old inventory, even after restart. Recreating a name gets 
 new pool. Disabling pooling persists a zero target without affecting claimed
 sandboxes; a higher revision is required to re-enable it.
 
-Each pool attempts at most four operations concurrently per pass, retries
-unfinished operations no sooner than 30 seconds later, and bounds an operation
-to 25 seconds. Pending intents, retiring resources and untracked physical CRs
+Each pool attempts at most `warm_pool.refill_per_pass` (default four)
+operations concurrently per pass, retries unfinished operations no sooner than
+30 seconds later, and bounds an operation to 25 seconds. The setting is local
+pacing, not journal policy, so changing it needs no revision increase. Each pass
+records `last_ready_at_ms` and whether this replica suspended the pool in the
+journal, which `GetSandboxTemplate` reports as pool status. Pending intents, retiring resources and untracked physical CRs
 all consume the pool maximum. Retirement resumes after restart, and late CR
 writes for completed intents are collected as untracked resources. A missing
 or replaced observed CR is retired rather than recreated. Failed inventory or

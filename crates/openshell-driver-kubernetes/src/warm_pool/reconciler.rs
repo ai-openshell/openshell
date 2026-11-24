@@ -4,14 +4,13 @@
 use super::*;
 use crate::config::WarmPoolConfig;
 use openshell_supervisor_control::warm_pool::{
-    WarmPoolEntry, WarmPoolPolicy, WarmPoolState, WarmPoolUpdate,
+    DISCONNECTED_MS, WarmPoolEntry, WarmPoolPolicy, WarmPoolState, WarmPoolUpdate,
 };
 use std::collections::BTreeSet;
 
 const BURST: usize = 4;
 const INTERVAL: Duration = Duration::from_secs(5);
 const RETRY_MS: i64 = 30_000;
-const DISCONNECTED_MS: i64 = 60_000;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Snapshot of one successful inventory/plan pass. Readiness is observed from
@@ -117,10 +116,11 @@ fn plan(
         .collect();
     let useful = state.entries.iter().filter(|entry| !entry.retiring).count();
     let occupied = state.entries.len() + orphans.len();
+    let burst = pool.refill_per_pass as usize;
     let refill = (pool.target_size as usize)
         .saturating_sub(useful)
         .min((pool.max_size as usize).saturating_sub(occupied))
-        .min(BURST);
+        .min(burst);
     for _ in 0..if prepare.is_some() { refill } else { 0 } {
         state.entries.push(WarmPoolEntry {
             session_id: SandboxSessionId::new(),
@@ -135,7 +135,7 @@ fn plan(
     let mut actions = Vec::new();
     // Repair late physical writes after a retired intent was completed. They
     // count against capacity and are never adopted as fresh preparations.
-    for resource in orphans.into_iter().take(BURST) {
+    for resource in orphans.into_iter().take(burst) {
         actions.push(Action {
             entry: WarmPoolEntry {
                 session_id: resource.session_id,
@@ -166,7 +166,7 @@ fn plan(
     candidates.sort_by_key(|entry| (entry.last_attempt_at_ms, entry.created_at_ms));
     for entry in candidates
         .into_iter()
-        .take(BURST.saturating_sub(actions.len()))
+        .take(burst.saturating_sub(actions.len()))
     {
         entry.last_attempt_at_ms = Some(now);
         actions.push(Action {
@@ -190,6 +190,21 @@ fn plan(
         ..Default::default()
     };
     (actions, report)
+}
+
+/// Every replica reconciles every pool, so each one reports the whole
+/// inventory. Pools whose pass failed keep no stale contribution.
+fn record_pass(reports: &[WarmPoolReport]) {
+    use openshell_supervisor_control::warm_pool::metrics::{
+        LABEL_STATE, SPARES, STATE_PENDING, STATE_READY, STATE_RETIRING, SUSPENDED_POOLS,
+    };
+    let total = |count: fn(&WarmPoolReport) -> usize| {
+        f64::from(u32::try_from(reports.iter().map(count).sum::<usize>()).unwrap_or(u32::MAX))
+    };
+    metrics::gauge!(SPARES, LABEL_STATE => STATE_READY).set(total(|r| r.ready));
+    metrics::gauge!(SPARES, LABEL_STATE => STATE_PENDING).set(total(|r| r.pending));
+    metrics::gauge!(SPARES, LABEL_STATE => STATE_RETIRING).set(total(|r| r.retiring));
+    metrics::gauge!(SUSPENDED_POOLS).set(total(|r| usize::from(r.suspended)));
 }
 
 impl KubernetesComputeDriver {
@@ -221,6 +236,7 @@ impl KubernetesComputeDriver {
                         max_size: settings.max_size,
                         max_age_secs: settings.max_age_secs,
                         preparation_timeout_secs: settings.preparation_timeout_secs,
+                        refill_per_pass: settings.refill_per_pass,
                         spec: target.spec.unwrap_or_default(),
                     })
                     .collect()
@@ -348,6 +364,7 @@ impl KubernetesComputeDriver {
                     .clone(),
                 policy: Some(policy(pool)),
                 entries: Vec::new(),
+                suspended: false,
             },
         };
         let compatible = fingerprint
@@ -431,6 +448,7 @@ impl KubernetesComputeDriver {
             prepare,
         );
         report.suspended = suspended;
+        state.suspended = suspended;
         let finish_drain = pool.revision == u64::MAX
             && state.entries.is_empty()
             && actions.is_empty()
@@ -465,7 +483,7 @@ impl KubernetesComputeDriver {
                 .map_err(|_| invalid("warm pool operation timed out; its intent is retained"))?
             }
         }))
-        .buffer_unordered(BURST)
+        .buffer_unordered(pool.refill_per_pass as usize)
         .collect::<Vec<_>>()
         .await;
         for result in results {
@@ -572,7 +590,7 @@ impl KubernetesComputeDriver {
                             Ok(pools) => pools,
                             Err(error) => { warn!(%error, "warm template inventory unavailable"); continue; }
                         };
-                        if pools.is_empty() { continue; }
+                        if pools.is_empty() { record_pass(&[]); continue; }
                         let scopes = pools.iter().map(|p| (p.workspace.clone(), p.name.clone())).collect();
                         let mut inventories = match supervision.pending_warm_claims(scopes, None).await {
                             Ok(inventories) => inventories,
@@ -587,14 +605,14 @@ impl KubernetesComputeDriver {
                                     Some(Err(error)) => Err(KubernetesDriverError::Message(error)),
                                     None => Err(invalid("missing warm claim inventory")),
                                 };
-                                if let Err(error) = result {
-                                    warn!(workspace = %pool.workspace, pool = %pool.name, %error, "warm pool reconciliation deferred");
-                                }
+                                result
+                                    .inspect_err(|error| warn!(workspace = %pool.workspace, pool = %pool.name, %error, "warm pool reconciliation deferred"))
+                                    .ok()
                             }
                         });
-                        let pass = futures::stream::iter(jobs).buffer_unordered(BURST).collect::<Vec<_>>();
+                        let pass = futures::stream::iter(jobs).buffer_unordered(BURST).filter_map(std::future::ready).collect::<Vec<_>>();
                         tokio::select! {
-                            _ = pass => {}
+                            reports = pass => record_pass(&reports),
                             _ = shutdown.changed() => { break; }
                         }
                     }

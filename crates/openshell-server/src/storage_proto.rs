@@ -240,9 +240,10 @@ mod tests {
     // updates use a separate capability/service and add one classified RPC.
     // Discovery RPCs move to ServiceDiscovery. Application URL maps add two
     // public-only messages alongside main's public APIs; durable schemas
-    // and the public/durable overlap remain unchanged.
+    // and the public/durable overlap remain unchanged. Template warm-pool
+    // status is a public-only response field that is never persisted.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3f6f958d6907255c148c366a45bd998beddd39432f2165bebe6c060eb28ef10c";
+        "4b0c92bb84adf7cbb378a9fec4d6951d1c9dfe052fe976883a2d615affd799de";
     // The storage.v2 refresh root adds retired handles and the first mint's
     // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
@@ -795,7 +796,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (367, 31),
+                (368, 31),
                 (102, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

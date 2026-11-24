@@ -75,6 +75,7 @@ mod prepared;
 mod prepared_tests;
 mod registration_watch;
 mod warm_pool;
+pub use warm_pool::template_warm_pool_status;
 
 use crate::auth::sandbox_jwt::SandboxSessionJwtAuthority;
 use crate::auth::sandbox_session::{

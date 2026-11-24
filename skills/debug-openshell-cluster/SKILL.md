@@ -1385,6 +1385,10 @@ Template-driven warm pooling is enabled by default in managed, shared and operat
 workspaces with TLS and JWT signing. No spares exist until a template requests both
 `--ready-within` and positive `--max-burst`. Inspect the template's startup tuning,
 its workload shape, and `warm_pool.enabled` before investigating missing capacity.
+`openshell sandbox template get <name>` shows the pool's target, ready, pending
+and retiring spares, recorded revision, and whether it is suspended. The
+`openshell_warm_pool_*` gateway metrics report warm and cold creates, claim
+latency, and spares; `warm_pool.refill_per_pass` (default 4) paces refill.
 Check gateway logs for `warm template inventory unavailable`,
 `warm pool reconciliation deferred`, and `warm pool operation will be reconciled`.
 `warm pool discovery unavailable; considering cold creation` means a create could

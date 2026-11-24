@@ -20,6 +20,7 @@ use metrics::{
 };
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_util::layers::FanoutBuilder;
+use openshell_supervisor_control::warm_pool::metrics as warm_pool;
 use tonic::{Code, Status};
 
 mod otlp_recorder;
@@ -70,13 +71,14 @@ const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
 
 /// Only these names render as Prometheus histograms. Every existing `*_duration_seconds` metric
 /// keeps its summary format, so current dashboards are unaffected.
-const BUCKETED_HISTOGRAMS: [&str; 6] = [
+const BUCKETED_HISTOGRAMS: [&str; 7] = [
     RELAY_CLAIM_DURATION_SECONDS,
     PEER_REQUEST_DURATION_SECONDS,
     SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
     SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
     MUTATION_LOCK_WAIT_SECONDS,
     MUTATION_LOCK_HOLD_SECONDS,
+    warm_pool::CLAIM_DURATION_SECONDS,
 ];
 
 /// Protocol the supervisor is asked to relay. Never label metrics with the target address.
@@ -376,6 +378,26 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         Unit::Seconds,
         "Time a mutation lock was held, from acquisition to release, including requests cancelled while holding it."
     );
+    describe_counter!(
+        warm_pool::CLAIMS_TOTAL,
+        Unit::Count,
+        "Sandbox creates that a template warm pool could serve, by whether they claimed a spare, fell back to a cold start, or failed."
+    );
+    describe_histogram!(
+        warm_pool::CLAIM_DURATION_SECONDS,
+        Unit::Seconds,
+        "Time a create spent selecting and claiming a warm spare, including the search before a cold fallback."
+    );
+    describe_gauge!(
+        warm_pool::SPARES,
+        Unit::Count,
+        "Unclaimed warm spares across all template pools in the last reconcile pass, by state."
+    );
+    describe_gauge!(
+        warm_pool::SUSPENDED_POOLS,
+        Unit::Count,
+        "Template pools this replica cannot refill because its configuration differs from the recorded pool."
+    );
 
     // `increment(0)` registers a series without overwriting a value recorded earlier.
     gauge!(SUPERVISOR_SESSIONS).increment(0.0);
@@ -408,6 +430,13 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         counter!(PROVISIONING_DEADLINE_SKIPS_TOTAL, LABEL_OVERDUE => overdue_label(overdue))
             .increment(0);
     }
+    for outcome in warm_pool::OUTCOMES {
+        counter!(warm_pool::CLAIMS_TOTAL, warm_pool::LABEL_OUTCOME => outcome).increment(0);
+    }
+    for state in warm_pool::STATES {
+        gauge!(warm_pool::SPARES, warm_pool::LABEL_STATE => state).increment(0.0);
+    }
+    gauge!(warm_pool::SUSPENDED_POOLS).increment(0.0);
     if let Some(capacity) = mutation_lock_connections {
         describe_gauge!(
             MUTATION_LOCK_CONNECTIONS_IN_USE,
@@ -737,6 +766,13 @@ mod tests {
                 "openshell_server_provisioning_deadline_skips_total{overdue=\"true\"}",
                 0,
             ),
+            ("openshell_warm_pool_claims_total{outcome=\"warm\"}", 0),
+            ("openshell_warm_pool_claims_total{outcome=\"cold\"}", 0),
+            ("openshell_warm_pool_claims_total{outcome=\"error\"}", 0),
+            ("openshell_warm_pool_spares{state=\"ready\"}", 0),
+            ("openshell_warm_pool_spares{state=\"pending\"}", 0),
+            ("openshell_warm_pool_spares{state=\"retiring\"}", 0),
+            ("openshell_warm_pool_suspended_pools", 0),
         ] {
             assert_eq!(metrics.value(series), Some(expected), "{series}");
         }
@@ -861,6 +897,11 @@ mod tests {
         )
         .record(sample);
         histogram!("openshell_gateway_interceptor_latency_seconds").record(sample);
+        histogram!(
+            warm_pool::CLAIM_DURATION_SECONDS,
+            warm_pool::LABEL_OUTCOME => warm_pool::OUTCOME_WARM
+        )
+        .record(sample);
 
         let rendered = metrics.render();
         for name in BUCKETED_HISTOGRAMS {

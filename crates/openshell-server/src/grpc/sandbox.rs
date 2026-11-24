@@ -1244,6 +1244,7 @@ pub(super) async fn handle_create_sandbox_template(
 
     Ok(Response::new(SandboxTemplateResponse {
         template: Some(resolved),
+        warm_pool: None,
     }))
 }
 
@@ -1273,8 +1274,14 @@ pub(super) async fn handle_get_sandbox_template(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox template not found"))?;
+    let warm_pool = crate::supervisor_pool::template_warm_pool_status(&state.store, &template)
+        .await
+        .inspect_err(|error| warn!(template = %req.name, %error, "warm pool status unavailable"))
+        .ok()
+        .flatten();
     Ok(Response::new(SandboxTemplateResponse {
         template: Some(template),
+        warm_pool,
     }))
 }
 

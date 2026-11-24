@@ -150,6 +150,7 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
     .await;
     assert_eq!(code, 0, "{output}");
     let spare = ready_spare(None).await;
+    assert_ready_pool_status().await;
     let workspace_namespace = spare["metadata"]["namespace"].as_str().unwrap();
     assert_no_workspace_secret_reads(workspace_namespace).await;
     let record: serde_json::Value = serde_json::from_str(
@@ -448,6 +449,26 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
     })
     .await
     .expect("deleting the template must drain unclaimed capacity");
+}
+
+async fn assert_ready_pool_status() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (output, code) =
+                run_cli(&["sandbox", "template", "get", "e2e-warm", "-o", "json"]).await;
+            assert_eq!(code, 0, "{output}");
+            let status = &serde_json::from_str::<serde_json::Value>(&output).unwrap()["warm_pool"];
+            if status["ready"] == 1 {
+                assert_eq!(status["target"], 1, "{status}");
+                assert_eq!(status["revision"], 1, "{status}");
+                assert_eq!(status["suspended"], false, "{status}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("template status must report the ready spare");
 }
 
 async fn assert_no_workspace_secret_reads(namespace: &str) {

@@ -8,6 +8,9 @@ use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{CredentialEpoch, SessionRotation, SessionVerificationKey};
 use serde::{Deserialize, Serialize};
 
+/// A spare not seen connected for this long is retired, and is not reported ready.
+pub const DISCONNECTED_MS: i64 = 60_000;
+
 /// Public trust only; no logical Sandbox credentials are minted for a spare.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +71,29 @@ pub struct WarmPoolState {
     #[serde(default)]
     pub policy: Option<WarmPoolPolicy>,
     pub entries: Vec<WarmPoolEntry>,
+    /// The last reconciling replica could not refill this pool. Status only;
+    /// never consulted when planning or admitting claims.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub suspended: bool,
+}
+
+/// Warm-pool metric names. Compute drivers record them; the gateway describes
+/// them. Labels are the bounded values below, never a pool or sandbox id.
+pub mod metrics {
+    pub const CLAIMS_TOTAL: &str = "openshell_warm_pool_claims_total";
+    pub const CLAIM_DURATION_SECONDS: &str = "openshell_warm_pool_claim_duration_seconds";
+    pub const SPARES: &str = "openshell_warm_pool_spares";
+    pub const SUSPENDED_POOLS: &str = "openshell_warm_pool_suspended_pools";
+    pub const LABEL_OUTCOME: &str = "outcome";
+    pub const LABEL_STATE: &str = "state";
+    pub const OUTCOME_WARM: &str = "warm";
+    pub const OUTCOME_COLD: &str = "cold";
+    pub const OUTCOME_ERROR: &str = "error";
+    pub const OUTCOMES: [&str; 3] = [OUTCOME_WARM, OUTCOME_COLD, OUTCOME_ERROR];
+    pub const STATE_READY: &str = "ready";
+    pub const STATE_PENDING: &str = "pending";
+    pub const STATE_RETIRING: &str = "retiring";
+    pub const STATES: [&str; 3] = [STATE_READY, STATE_PENDING, STATE_RETIRING];
 }
 
 #[derive(Clone, Debug)]

@@ -286,6 +286,9 @@ fn is_dns_label(value: &str) -> bool {
         && !value.ends_with('-')
 }
 
+/// Each pass may run this many Kubernetes operations concurrently per pool.
+pub const MAX_REFILL_PER_PASS: u32 = 64;
+
 /// Operator limits for template-driven spare capacity. Templates supply the
 /// workload and desired count; this switch only disables the optimization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +301,9 @@ pub struct WarmPoolSettings {
     pub max_size: u32,
     pub max_age_secs: u64,
     pub preparation_timeout_secs: u64,
+    /// Pool operations (new spares, resumptions, retirements) started per
+    /// template on each reconcile pass. Local pacing, not journal policy.
+    pub refill_per_pass: u32,
 }
 
 impl Default for WarmPoolSettings {
@@ -308,6 +314,7 @@ impl Default for WarmPoolSettings {
             max_size: 16,
             max_age_secs: 3600,
             preparation_timeout_secs: 300,
+            refill_per_pass: 4,
         }
     }
 }
@@ -322,6 +329,7 @@ pub struct WarmPoolConfig {
     pub max_size: u32,
     pub max_age_secs: u64,
     pub preparation_timeout_secs: u64,
+    pub refill_per_pass: u32,
     pub spec: openshell_core::proto::compute::v1::DriverSandboxSpec,
 }
 
@@ -336,6 +344,7 @@ impl WarmPoolConfig {
             || !(60..=86_400).contains(&self.max_age_secs)
             || !(30..=3600).contains(&self.preparation_timeout_secs)
             || self.preparation_timeout_secs > self.max_age_secs
+            || !(1..=MAX_REFILL_PER_PASS).contains(&self.refill_per_pass)
         {
             return Err("invalid template warm-pool plan".into());
         }
@@ -624,8 +633,9 @@ impl KubernetesComputeConfig {
             || !(60..=86_400).contains(&pool.max_age_secs)
             || !(30..=3600).contains(&pool.preparation_timeout_secs)
             || pool.preparation_timeout_secs > pool.max_age_secs
+            || !(1..=MAX_REFILL_PER_PASS).contains(&pool.refill_per_pass)
         {
-            return Err("warm_pool requires a positive revision below u64::MAX, max_size 1..256, age 60..86400s, and preparation timeout 30..3600s <= age".into());
+            return Err("warm_pool requires a positive revision below u64::MAX, max_size 1..256, age 60..86400s, preparation timeout 30..3600s <= age, and refill_per_pass 1..64".into());
         }
         Ok(())
     }

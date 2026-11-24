@@ -65,6 +65,22 @@ If a gateway restarts during creation and the reserved runtime has disappeared,
 recovery marks the pending sandbox as failed. You can delete it and create a new
 sandbox from the same template.
 
+### Check Pool Status
+
+`openshell sandbox template get agents` adds a warm pool section once the
+gateway has reconciled the pool. Use `-o json` to read it as `warm_pool`:
+
+| Field | Meaning |
+|---|---|
+| Target | Spares the pool keeps, after the gateway's capacity limit. `0` while draining. |
+| Ready | Spares whose supervisor connected within the last minute, available to claim. |
+| Pending | Spares still starting, or not seen connected within the last minute. |
+| Retiring | Spares being removed. They still count against the capacity limit. |
+| Revision | Operator `warm_pool.revision` recorded for the pool. |
+| Suspended | The last reconciling gateway replica stopped creating spares because its configuration does not match the pool. See [Experimental warm capacity](/how-it-works/gateways/configuration#experimental-warm-capacity). |
+
+Claimed spares belong to their sandboxes and leave these counts.
+
 ### Identify Warm Pods
 
 A warm Kubernetes Sandbox resource and its workload Pod use the physical name

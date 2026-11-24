@@ -35,6 +35,20 @@ pub(in crate::driver) fn claim_pending(object: &DynamicObject) -> bool {
             })
 }
 
+fn record_claim(selected: &Result<Option<String>, KubernetesDriverError>, elapsed: Duration) {
+    use openshell_supervisor_control::warm_pool::metrics::{
+        CLAIM_DURATION_SECONDS, CLAIMS_TOTAL, LABEL_OUTCOME, OUTCOME_COLD, OUTCOME_ERROR,
+        OUTCOME_WARM,
+    };
+    let outcome = match selected {
+        Ok(Some(_)) => OUTCOME_WARM,
+        Ok(None) => OUTCOME_COLD,
+        Err(_) => OUTCOME_ERROR,
+    };
+    metrics::counter!(CLAIMS_TOTAL, LABEL_OUTCOME => outcome).increment(1);
+    metrics::histogram!(CLAIM_DURATION_SECONDS, LABEL_OUTCOME => outcome).record(elapsed);
+}
+
 impl KubernetesComputeDriver {
     pub(in crate::driver) async fn try_claim_warm_runtime(
         &self,
@@ -44,7 +58,15 @@ impl KubernetesComputeDriver {
         if self.warm_supervision().is_err() {
             return Ok(None);
         }
-        if let Some(identity) = self.select_warm_runtime(sandbox, namespace).await? {
+        let started = std::time::Instant::now();
+        let mut pooled = false;
+        let selected = self
+            .select_warm_runtime(sandbox, namespace, &mut pooled)
+            .await;
+        if pooled {
+            record_claim(&selected, started.elapsed());
+        }
+        if let Some(identity) = selected? {
             return Ok(Some(identity));
         }
         // Fence delayed warm selection before creating cold infrastructure.
@@ -62,10 +84,13 @@ impl KubernetesComputeDriver {
         Ok(None)
     }
 
+    /// Sets `pooled` once a pool with a positive target could serve this
+    /// create; claim recovery and pool-less creates stay out of the metrics.
     async fn select_warm_runtime(
         &self,
         sandbox: &Sandbox,
         namespace: &str,
+        pooled: &mut bool,
     ) -> Result<Option<String>, KubernetesDriverError> {
         let supervision = self.warm_supervision()?;
         let api = self
@@ -128,6 +153,7 @@ impl KubernetesComputeDriver {
         if pools.is_empty() {
             return Ok(None);
         }
+        *pooled = true;
         let trust = supervision
             .warm_runtime_trust()
             .await

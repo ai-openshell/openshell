@@ -80,6 +80,7 @@ async fn authorize_preparation(fixture: &Fixture, request: &PreparationRequest) 
             fingerprint: "a".repeat(64),
             policy: None,
             entries: Vec::new(),
+            suspended: false,
         },
         |snapshot| snapshot.state,
     );
