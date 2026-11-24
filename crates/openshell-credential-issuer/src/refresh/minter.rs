@@ -622,7 +622,7 @@ async fn request_token(
     // the body to the new location.
     let secret_bound = !endpoint_allowlists.is_empty();
     if secret_bound {
-        ensure_endpoint_allowed(token_url, endpoint_allowlists)?;
+        ensure_endpoint_allowed(parsed.as_str(), endpoint_allowlists)?;
     }
     openshell_crypto::tls::ensure_default_provider();
     let mut client = reqwest::Client::builder().timeout(Duration::from_secs(30));

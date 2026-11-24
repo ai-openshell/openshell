@@ -639,11 +639,14 @@ impl JwksCache {
         }
 
         // Discover JWKS URI from the OIDC discovery endpoint.
-        let discovery_url = url::Url::parse(&format!(
-            "{}/.well-known/openid-configuration",
-            config.issuer.trim_end_matches('/')
-        ))
-        .map_err(|error| format!("failed to construct OIDC discovery URL: {error}"))?;
+        let discovery_url = validate_oidc_url(
+            &format!(
+                "{}/.well-known/openid-configuration",
+                config.issuer.trim_end_matches('/')
+            ),
+            "OIDC discovery URL",
+            config.dangerously_allow_insecure_http,
+        )?;
         info!(url = %discovery_url, "Discovering OIDC configuration");
 
         let discovery: OidcDiscovery = fetch_bounded_json(
@@ -1139,9 +1142,14 @@ mod tests {
 
     #[tokio::test]
     async fn oidc_refuses_ambiguous_discovery_and_signing_key_paths() {
-        let config = transport_test_config("https://issuer.example/a^b");
-        let error = JwksCache::new(&config).await.unwrap_err();
-        assert!(error.contains("literal caret"), "{error}");
+        for issuer in [
+            "https://issuer.example/a^b",
+            "https://issuer.example/a^b/.. ",
+        ] {
+            let config = transport_test_config(issuer);
+            let error = JwksCache::new(&config).await.unwrap_err();
+            assert!(error.contains("literal caret"), "{error}");
+        }
 
         let issuer = url::Url::parse("https://issuer.example/a%5Eb").unwrap();
         let config = transport_test_config(issuer.as_str());

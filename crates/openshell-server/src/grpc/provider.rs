@@ -3956,10 +3956,9 @@ async fn bind_material_secrets(
         token_url: token_url.to_string(),
         ..Default::default()
     })?;
-    let endpoint = openshell_credential_issuer::endpoint::normalize_token_endpoint(&endpoint)
-        .map_err(|reason| {
-            Status::failed_precondition(format!("refresh token endpoint {reason}"))
-        })?;
+    let endpoint = openshell_credential_issuer::endpoint::parse_token_endpoint(&endpoint)
+        .map_err(|reason| Status::failed_precondition(format!("refresh token endpoint {reason}")))?
+        .to_string();
     for (material_key, name) in material_secrets {
         let secret = super::secret::get_live_secret(&state.store, workspace, name)
             .await?

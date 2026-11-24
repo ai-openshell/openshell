@@ -37,7 +37,7 @@ pub fn parse_auth_url(raw: &str) -> Result<url::Url, &'static str> {
 ///
 /// Returns a short description of why the URL is not an acceptable endpoint.
 pub fn normalize_token_endpoint(raw: &str) -> Result<String, &'static str> {
-    parse_token_endpoint(raw).map(Into::into)
+    parse_token_endpoint(raw.trim()).map(Into::into)
 }
 
 /// Resolve a GitHub App profile's token endpoint while preserving GHES path prefixes.
@@ -46,7 +46,7 @@ pub fn normalize_token_endpoint(raw: &str) -> Result<String, &'static str> {
 ///
 /// Rejects invalid installation path templates and disallowed token endpoints.
 pub fn github_app_installation_url(template: &str, id: u64) -> Result<url::Url, &'static str> {
-    parse_token_endpoint(&expand_github_app_template(template, id)?)
+    parse_token_endpoint(expand_github_app_template(template, id)?.trim())
 }
 
 /// Check a GitHub App profile template's structure while loading the catalog.
@@ -73,8 +73,13 @@ fn expand_github_app_template(template: &str, id: u64) -> Result<String, &'stati
     Ok(template.replace(PLACEHOLDER, &id.to_string()))
 }
 
-fn parse_token_endpoint(raw: &str) -> Result<url::Url, &'static str> {
-    let url = parse_auth_url(raw.trim())?;
+/// Parse the request destination when binding a workspace secret to a provider.
+///
+/// # Errors
+///
+/// Rejects endpoints with ambiguous paths or components disallowed for workspace secrets.
+pub fn parse_token_endpoint(raw: &str) -> Result<url::Url, &'static str> {
+    let url = parse_auth_url(raw)?;
     validate_token_endpoint(&url)?;
     Ok(url)
 }
