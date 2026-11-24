@@ -398,26 +398,31 @@ sending credentials. For example, `/a^b` and `/a%5Eb` can reach different
 handlers on the same server. A secret granted access to `/a^b` needs a new
 grant to reach `/a%5Eb`.
 
-1. Before upgrading, run `openshell secret list` in each workspace. Read every
-   page of refresh endpoints using `--page-token` when the CLI returns a next
-   page token. This command shows metadata without revealing secret values.
-   Check each affected provider with `openshell provider refresh status NAME`
-   and inspect its profile with `openshell profile export ID -o yaml`.
-2. Verify the replacement URL with the endpoint operator. Update the profile's
-   `token_url` with the exact path the secret owner approves. For GitHub
-   Enterprise Server, keep `{installation_id}` in the profile template.
-3. If the provider uses a workspace secret with an affected grant, create a
-   replacement under a new name with `--value-env` or `--value-file`. Set
-   `--allowed-endpoint` to the exact approved URL. For GitHub App, include the
-   numeric installation ID in this grant.
-4. Run `openshell provider refresh configure` for each affected credential with
-   its full material and updated secret references. Verify the mint with
-   `openshell provider refresh status NAME`. Restart workloads that hold the
-   previous credential handle.
+1. Before upgrading, check each workspace with `openshell secret list` and
+   follow any `--page-token`. This lists grants without revealing secret values.
+   Use `openshell profile list` and `openshell profile export ID` to check
+   refresh and dynamic token-grant URLs, including profiles that use inline
+   credentials. Add `--global` to inspect platform profiles. An existing refresh
+   record can still use the URL from an earlier profile revision.
+2. Confirm the intended destination with the endpoint operator. For refresh
+   credentials, update the profile's `token_url` or the material that supplies
+   the endpoint. Keep `{installation_id}` in a GitHub Enterprise Server
+   template. For a dynamic token grant, update `token_grant.token_endpoint`
+   in the profile and verify a new exchange.
+3. For an immutable workspace secret grant, create a replacement secret with a
+   new name, supply the value through `--value-env` or `--value-file`, and set
+   `--allowed-endpoint` to the exact URL the owner approved. A GitHub App
+   grant uses the numeric installation ID.
+4. For each affected refresh credential, run `openshell provider refresh
+   configure` with its complete material and any new secret references. Run
+   `openshell provider refresh rotate NAME --credential-key KEY` and verify a
+   new successful mint with `openshell provider refresh status NAME`. Restart
+   workloads that hold the previous credential handle.
 
-During upgrades and rollbacks, run only one gateway version against the same
-refresh records. An older gateway can still send credentials to a literal-caret
-path while its original grant is active.
+Apply the same steps to any old refresh record that reports a literal-caret
+error after the upgrade. During an upgrade or rollback, use one gateway version
+at a time against the same refresh records. Update supervisors that perform
+dynamic token exchanges as well. Older binaries can still use literal paths.
 
 ### AWS STS
 

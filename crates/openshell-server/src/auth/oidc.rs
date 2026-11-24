@@ -124,8 +124,8 @@ fn validate_oidc_url(
     description: &str,
     dangerously_allow_insecure_http: bool,
 ) -> Result<url::Url, String> {
-    let parsed = url::Url::parse(value)
-        .map_err(|error| format!("{description} must be an absolute URL: {error}"))?;
+    let parsed = openshell_core::token_endpoint::parse_auth_url(value)
+        .map_err(|reason| format!("{description} {reason}"))?;
 
     if parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!(
@@ -1135,6 +1135,20 @@ mod tests {
             error.contains("only with a numeric loopback"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn oidc_refuses_ambiguous_discovery_and_signing_key_paths() {
+        let config = transport_test_config("https://issuer.example/a^b");
+        let error = JwksCache::new(&config).await.unwrap_err();
+        assert!(error.contains("literal caret"), "{error}");
+
+        let issuer = url::Url::parse("https://issuer.example/a%5Eb").unwrap();
+        let config = transport_test_config(issuer.as_str());
+        assert!(validate_jwks_url("https://issuer.example/keys^old", &issuer, &config).is_err());
+        let jwks =
+            validate_jwks_url("https://issuer.example/keys%5Eold", &issuer, &config).unwrap();
+        assert_eq!(jwks.path(), "/keys%5Eold");
     }
 
     #[test]

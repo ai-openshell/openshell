@@ -604,7 +604,7 @@ async fn request_token(
     grant_kind: OAuthGrantKind,
     endpoint_allowlists: &[Vec<String>],
 ) -> Result<MintedCredential, RefreshFailure> {
-    let parsed = crate::endpoint::parse_token_url(token_url)
+    let parsed = crate::endpoint::parse_auth_url(token_url)
         .map_err(|reason| Status::invalid_argument(format!("token_url {reason}")))?;
     match parsed.scheme() {
         "https" => {}

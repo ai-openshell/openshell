@@ -7545,6 +7545,79 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_credential_endpoints_remain_visible_and_can_be_repaired() {
+        let state = test_server_state().await;
+        let id = "legacy-endpoints";
+        let profile = |prefix: &str| {
+            let mut profile = openshell_providers::example_profiles::load("github-app").to_proto();
+            profile.id = id.into();
+            let base = format!("https://auth.example.com/{prefix}");
+            profile.credentials[0].refresh.as_mut().unwrap().token_url =
+                format!("{base}/app/installations/{{installation_id}}/access_tokens");
+            let mut grant = token_grant_credential("dynamic");
+            grant.token_grant.as_mut().unwrap().token_endpoint = format!("{base}/exchange");
+            profile.credentials.push(grant);
+            let mut oauth = refreshable_credential("oauth", "OAUTH_TOKEN");
+            oauth.refresh.as_mut().unwrap().token_url = format!("{base}/oauth");
+            profile.credentials.push(oauth);
+            profile
+        };
+        let legacy = profile("a^b");
+        state
+            .store
+            .put_message(&stored_provider_profile(legacy.clone()))
+            .await
+            .unwrap();
+
+        let listed = handle_list_provider_profiles(
+            &state,
+            authed_request(ListProviderProfilesRequest {
+                page_size: 100,
+                workspace_scope: Some(default_workspace_selector()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profiles;
+        assert!(listed.iter().any(|profile| profile.id == "github"));
+        let fetched = listed.into_iter().find(|profile| profile.id == id).unwrap();
+        assert_eq!(fetched.credentials, legacy.credentials);
+
+        let update = |profile: ProviderProfile| {
+            authed_request(UpdateProviderProfilesRequest {
+                id: id.into(),
+                workspace_scope: Some(default_workspace_selector()),
+                expected_resource_version: fetched.resource_version,
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "repair.yaml".into(),
+                }),
+                ..Default::default()
+            })
+        };
+        let rejected = handle_update_provider_profiles(&state, update(legacy))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!rejected.updated);
+        assert_eq!(rejected.diagnostics.len(), 3, "{:?}", rejected.diagnostics);
+        assert!(
+            rejected
+                .diagnostics
+                .iter()
+                .all(|d| d.message.contains("literal caret"))
+        );
+
+        let repaired = handle_update_provider_profiles(&state, update(profile("a%5Eb")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(repaired.updated, "{:?}", repaired.diagnostics);
+    }
+
+    #[tokio::test]
     async fn update_provider_profile_replaces_custom_profile_and_preserves_metadata() {
         let state = test_server_state().await;
         let mut original = custom_profile("custom-api");

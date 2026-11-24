@@ -298,7 +298,7 @@ pub fn parse_token_endpoint_url(token_endpoint: &str) -> Result<reqwest::Url, To
         TokenGrantFailureKind::Configuration,
         TokenGrantStage::Configuration,
     );
-    let url = crate::token_endpoint::parse_token_url(token_endpoint).map_err(|_| invalid)?;
+    let url = crate::token_endpoint::parse_auth_url(token_endpoint).map_err(|_| invalid)?;
     if token_endpoint_transport_allowed(&url) {
         return Ok(url);
     }
