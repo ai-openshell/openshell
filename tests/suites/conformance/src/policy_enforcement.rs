@@ -2,23 +2,38 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Policy enforcement inside the sandbox: the filesystem rules Landlock
-//! applies to exec'd processes, the identity they run as, and connections
-//! the network policy doesn't allow.
+//! applies to exec'd processes, and connections the network policy doesn't
+//! allow.
 //!
 //! Ported from `e2e/python/test_sandbox_landlock.py`,
 //! `e2e/python/test_sandbox_policy.py` and the Landlock part of
-//! `e2e/python/test_sandbox_venv.py`.
+//! `e2e/python/test_sandbox_venv.py`. Which user exec'd processes run as
+//! isn't checked here: Docker and Podman take it from the policy, but
+//! Kubernetes and the VM driver choose it through driver configuration.
 
-use testkit::Context;
-use testkit::policy;
+use sandbox_clients_support::connect;
+use serde_json::Value;
+use testkit::{Context, Sandbox, policy};
 
-use crate::support::python_sandbox;
+/// Create a long-running sandbox from the Python image with `policy`.
+async fn python_sandbox(
+    cx: &Context,
+    suffix: &str,
+    policy: testkit::sdk::raw::proto::SandboxPolicy,
+) -> testkit::Result<Sandbox> {
+    cx.sandbox(suffix)
+        .image(testkit::python_image())
+        .command(["sleep", "infinity"])
+        .policy(policy)
+        .create_ready()
+        .await
+}
 
-/// Probes the filesystem from inside the sandbox and prints one
-/// `<probe> <result>` line each. `OK` means allowed; `EACCES`, `EPERM` and
-/// `ERROR:<errno>` mean refused.
+/// Probes the filesystem from inside the sandbox and prints one JSON object
+/// mapping each probe to its result. `OK` means allowed; `EACCES`, `EPERM`
+/// and `ERROR:<errno>` mean refused.
 const FILESYSTEM_PROBES: &str = r#"
-import errno, os, pwd
+import errno, json, os
 
 def outcome(action):
     try:
@@ -38,52 +53,37 @@ def rename_across_directories():
         f.write("probe")
     os.rename("/sandbox/refer-src/file", "/sandbox/refer-dst/file")
 
-print("user", pwd.getpwuid(os.getuid()).pw_name)
+results = {}
 for path in ["/usr", "/tmp", "/sandbox", "/home/sandbox"]:
-    print("write", path, outcome(lambda: write(path)))
+    results[f"write {path}"] = outcome(lambda: write(path))
 for path in ["/usr", "/etc", "/opt", "/root"]:
-    print("read", path, outcome(lambda: os.listdir(path)))
-print("rename /sandbox", outcome(rename_across_directories))
-home = os.stat("/home/sandbox").st_uid == os.getuid() if os.path.isdir("/home/sandbox") else False
-print("owns /home/sandbox", home)
+    results[f"read {path}"] = outcome(lambda: os.listdir(path))
+results["rename /sandbox"] = outcome(rename_across_directories)
+results["owns /home/sandbox"] = (
+    os.path.isdir("/home/sandbox") and os.stat("/home/sandbox").st_uid == os.getuid()
+)
+print(json.dumps(results))
 "#;
 
-/// Exec'd commands run as the policy's user. Landlock lets them read and
-/// write the policy's read-write paths, read but not write its read-only
-/// paths, and touch nothing outside the policy, even a directory the user
-/// owns. Renames between directories work, which uv and pip rely on
-/// (Landlock ABI v2's refer right).
+/// Landlock lets exec'd commands read and write the policy's read-write
+/// paths, read but not write its read-only paths, and touch nothing outside
+/// the policy, even a directory the user owns. Renames between directories
+/// work, which uv and pip rely on (Landlock ABI v2's refer right).
 #[testkit::test]
 async fn landlock_enforces_filesystem_policy(cx: &mut Context) -> testkit::Result {
-    let sandbox = python_sandbox(cx, "ll", policy::base(), &[]).await?;
+    let sandbox = python_sandbox(cx, "ll", policy::base()).await?;
     let output = sandbox
-        .exec(["python3", "-c", FILESYSTEM_PROBES])
+        .run_python(FILESYSTEM_PROBES, &[])
         .await?
         .success()?;
-    let probes: Vec<(String, String)> = output
-        .stdout
-        .lines()
-        .filter_map(|line| line.rsplit_once(' '))
-        .map(|(probe, result)| (probe.to_string(), result.to_string()))
-        .collect();
-    let result = |probe: &str| {
-        probes
-            .iter()
-            .find(|(name, _)| name == probe)
-            .map(|(_, result)| result.as_str())
-    };
+    let probes = output.last_json()?;
+    let result = |probe: &str| probes.get(probe).and_then(Value::as_str);
     let refused = |probe: &str| {
         result(probe).is_some_and(|result| {
             matches!(result, "EACCES" | "EPERM") || result.starts_with("ERROR:")
         })
     };
 
-    testkit::ensure!(
-        result("user") == Some("sandbox"),
-        "exec ran as {:?}; expected the policy's user sandbox\n{}",
-        result("user"),
-        output.stdout
-    );
     for allowed in [
         "write /tmp",
         "write /sandbox",
@@ -93,44 +93,28 @@ async fn landlock_enforces_filesystem_policy(cx: &mut Context) -> testkit::Resul
     ] {
         testkit::ensure!(
             result(allowed) == Some("OK"),
-            "{allowed} was {:?}; expected OK\n{}",
+            "{allowed} was {:?}; expected OK\n{probes}",
             result(allowed),
-            output.stdout
         );
     }
     for denied in ["write /usr", "read /opt", "read /root"] {
         testkit::ensure!(
             refused(denied),
-            "{denied} was {:?}; expected a refusal\n{}",
+            "{denied} was {:?}; expected a refusal\n{probes}",
             result(denied),
-            output.stdout
         );
     }
     // Not every image has a home directory for the sandbox user. When it
     // does, owning it doesn't get around Landlock.
-    if result("owns /home/sandbox") == Some("True") {
+    if probes.get("owns /home/sandbox") == Some(&Value::Bool(true)) {
         testkit::ensure!(
             refused("write /home/sandbox"),
-            "write /home/sandbox was {:?}; Landlock should refuse it although the user owns it\n{}",
+            "write /home/sandbox was {:?}; Landlock should refuse it although the user owns it\n{probes}",
             result("write /home/sandbox"),
-            output.stdout
         );
     }
     Ok(())
 }
-
-/// Prints the errno of a TCP connect to each `host:port` argument, or 0 if
-/// it connected.
-const CONNECT_ERRNO: &str = r"
-import socket, sys
-for target in sys.argv[1:]:
-    host, port = target.rsplit(':', 1)
-    try:
-        with socket.create_connection((host, int(port)), timeout=5):
-            print(target, 0)
-    except OSError as error:
-        print(target, error.errno or -1)
-";
 
 /// A workload's own socket fails fast with a permission error when it
 /// connects to a destination no rule allows, to an allowed host on a port
@@ -142,25 +126,16 @@ async fn transparent_tcp_denies_unauthorized_connections(cx: &mut Context) -> te
     let mut policy = policy::base();
     policy::allow(&mut policy, "wrong_port", "1.1.1.1", 80, &["/**"]);
     policy::allow(&mut policy, "wrong_binary", "1.0.0.1", 443, &["/bin/false"]);
-    let sandbox = python_sandbox(cx, "tcp", policy, &[]).await?;
+    let sandbox = python_sandbox(cx, "tcp", policy).await?;
 
     // 9.9.9.9 has no rule, 1.1.1.1 is allowed only on port 80, and 1.0.0.1
     // only for /bin/false.
-    let targets = ["9.9.9.9:443", "1.1.1.1:443", "1.0.0.1:443"];
-    let mut command = vec!["python3", "-c", CONNECT_ERRNO];
-    command.extend(targets);
-    let output = sandbox.exec(command).await?.success()?;
-    for target in targets {
-        let errno = output
-            .stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(target))
-            .map(str::trim);
-        // EPERM is 1 and EACCES is 13 on Linux.
+    for host in ["9.9.9.9", "1.1.1.1", "1.0.0.1"] {
+        let probe = connect(&sandbox, host, 443).await?;
         testkit::ensure!(
-            matches!(errno, Some("1" | "13")),
-            "connect to {target} ended with errno {errno:?}; expected EPERM or EACCES\n{}",
-            output.stdout
+            probe.outcome.is_permission_denied(),
+            "connect to {host}:443 ended with {:?}; expected EPERM or EACCES",
+            probe.outcome
         );
     }
     Ok(())

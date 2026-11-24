@@ -32,6 +32,5 @@ mod provider_credentials;
 mod settings;
 mod smoke;
 mod ssh;
-mod support;
 mod templates;
 mod workspaces;

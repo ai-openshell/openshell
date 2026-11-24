@@ -7,19 +7,16 @@
 //! unknown provider.
 //!
 //! Ported from `e2e/python/test_sandbox_providers.py`. Its other cases have
-//! Rust coverage already; `PLAN-kw23.md` on the porting branch maps them.
+//! Rust coverage already, in other suites or in server and core unit tests.
 //! The upstream server runs on the test host ([`host_server_support`]), so
-//! the placement tests require sandboxes to reach it as
-//! `host.openshell.internal`.
+//! the placement tests require sandboxes to reach it as [`TEST_HOST`].
 
-use host_server_support::{HttpRecorder, Request};
+use host_server_support::{HttpRecorder, Request as Upstream, TEST_HOST};
+use sandbox_clients_support::{Request, http};
 use testkit::policy::{self, Access, Endpoint as _};
 use testkit::sdk::raw::proto;
-use testkit::{Context, Error, GrpcCode, PYTHON_BINARIES, Result, ResultExt as _};
+use testkit::{Context, Error, GrpcCode, PYTHON_BINARIES, Result, ResultExt as _, Sandbox};
 
-use crate::support::python_sandbox;
-
-const TEST_HOST: &str = "host.openshell.internal";
 const TOKEN_ENV: &str = "E2E_PLACEMENT_TOKEN";
 const TEST_SECRET: &str = "synthetic-placement-secret";
 /// The built-in profiles these tests need. A gateway starts without profiles,
@@ -27,36 +24,6 @@ const TEST_SECRET: &str = "synthetic-placement-secret";
 const GOOGLE_CLOUD_PROFILE: &str = include_str!("../../../../providers/google-cloud.yaml");
 const CLAUDE_CODE_PROFILE: &str = include_str!("../../../../providers/claude-code.yaml");
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
-
-/// Sends the provider's token from `argv[2]`'s placement to `TEST_HOST` on
-/// the port in `argv[1]`: first in three places the profile doesn't name
-/// (a query parameter, another header, the path), then in a form body, then
-/// in the place the profile names. Prints one `<status> <body>` line each.
-const PLACEMENT_CLIENT: &str = r#"
-import os, sys, urllib.error, urllib.parse, urllib.request
-port, placement = sys.argv[1], sys.argv[2]
-token = os.environ["E2E_PLACEMENT_TOKEN"]
-root = f"http://host.openshell.internal:{port}"
-quoted = urllib.parse.quote(token, safe="")
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-requests = [
-    urllib.request.Request(root + "/search?" + urllib.parse.urlencode({"q": "rust", "probe": token})),
-    urllib.request.Request(root + "/search", headers={"X-Other-Credential": token}),
-    urllib.request.Request(root + f"/{quoted}/search"),
-    urllib.request.Request(root + "/search", data=urllib.parse.urlencode({"token": token}).encode(),
-                           headers={"Content-Type": "application/x-www-form-urlencoded"}),
-]
-if placement == "query":
-    requests.append(urllib.request.Request(root + "/search?" + urllib.parse.urlencode({"q": "rust", "api_key": token})))
-else:
-    requests.append(urllib.request.Request(root + "/search?q=rust", headers={"Authorization": f"token {token}"}))
-for request in requests:
-    try:
-        with opener.open(request, timeout=30) as response:
-            print(response.status, response.read().decode().replace("\n", " "))
-    except urllib.error.HTTPError as error:
-        print(error.code, error.read().decode().replace("\n", " "))
-"#;
 
 /// A credential the profile places in the Authorization header is refused,
 /// not substituted, when the workload puts it in a query parameter, another
@@ -96,11 +63,14 @@ async fn query_credential_is_refused_in_other_request_locations(
     Ok(())
 }
 
-/// Runs [`PLACEMENT_CLIENT`] for `placement` and checks what every placement
-/// shares: the three reflective requests get a 403 naming the mismatch,
-/// without the secret, and never reach upstream; the form body and the
-/// valid request do. Returns those two upstream requests.
-async fn expect_placement(cx: &Context, suffix: &str, placement: &str) -> Result<Vec<Request>> {
+/// Sends the provider's token from a sandbox to an upstream on the test host
+/// for `placement`: first in three places the profile doesn't name (a query
+/// parameter, another header, the path), then in a form body, then in the
+/// place the profile names. Checks what every placement shares: the three
+/// reflective requests get a 403 naming the mismatch, without the secret,
+/// and never reach upstream; the form body and the valid request do. Returns
+/// those two upstream requests.
+async fn expect_placement(cx: &Context, suffix: &str, placement: &str) -> Result<Vec<Upstream>> {
     let server = HttpRecorder::start("ok").await?;
     let credential = match placement {
         "query" => "    auth_style: query\n    query_param: api_key\n",
@@ -129,37 +99,59 @@ binaries:
     cx.install_provider(&provider, &profile, &[(TOKEN_ENV, TEST_SECRET)])
         .await?;
     let sandbox = python_sandbox(cx, suffix, policy::base(), &[&provider]).await?;
+    let token = provider_token(&sandbox).await?;
 
-    let output = sandbox
-        .exec([
-            "python3",
-            "-c",
-            PLACEMENT_CLIENT,
-            &server.port.to_string(),
-            placement,
-        ])
-        .await?
-        .success()
-        .context("run the placement client in the sandbox")?;
-    let responses: Vec<&str> = output.stdout.lines().collect();
-    testkit::ensure!(
-        responses.len() == 5,
-        "expected five responses; got:\n{}",
-        output.stdout
-    );
-    for (location, response) in ["query", "other header", "path"].iter().zip(&responses) {
+    let query = |pairs: &[(&str, &str)]| {
+        form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs)
+            .finish()
+    };
+    let quoted: String = form_urlencoded::byte_serialize(token.as_bytes()).collect();
+    let reflective = [
+        (
+            "query",
+            Request::get(format!(
+                "/search?{}",
+                query(&[("q", "rust"), ("probe", &token)])
+            )),
+        ),
+        (
+            "other header",
+            Request::get("/search").header("X-Other-Credential", &token),
+        ),
+        ("path", Request::get(format!("/{quoted}/search"))),
+    ];
+    for (location, request) in &reflective {
+        let reply = http(&sandbox, TEST_HOST, server.port, request).await?;
+        let body = reply
+            .response
+            .as_ref()
+            .map(|response| response.body_text())
+            .unwrap_or_default();
         testkit::ensure!(
-            response.starts_with("403 ")
-                && response.contains("credential_placement_mismatch")
-                && !response.contains(TEST_SECRET),
-            "the credential in the {location} got {response:?}; expected a 403 placement mismatch without the secret"
+            reply.status() == Some(403)
+                && body.contains("credential_placement_mismatch")
+                && !reply.received_text().contains(TEST_SECRET),
+            "the credential in the {location} got {reply:?}; expected a 403 placement mismatch without the secret"
         );
     }
-    for response in &responses[3..] {
+
+    let form = Request::new("POST", "/search")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(query(&[("token", &token)]));
+    let valid = if placement == "query" {
+        Request::get(format!(
+            "/search?{}",
+            query(&[("q", "rust"), ("api_key", &token)])
+        ))
+    } else {
+        Request::get("/search?q=rust").header("Authorization", format!("token {token}"))
+    };
+    for (what, request) in [("the body rewrite", form), ("the valid placement", valid)] {
+        let reply = http(&sandbox, TEST_HOST, server.port, &request).await?;
         testkit::ensure!(
-            response.starts_with("200 "),
-            "expected the body rewrite and the valid placement to succeed:\n{}",
-            output.stdout
+            reply.status() == Some(200),
+            "expected {what} to succeed; got {reply:?}"
         );
     }
 
@@ -270,15 +262,39 @@ async fn fetch_metadata(
     provider: &str,
 ) -> Result<serde_json::Value> {
     let sandbox = python_sandbox(cx, suffix, policy, &[provider]).await?;
-    let output = sandbox
-        .exec(["python3", "-c", METADATA_CLIENT])
+    sandbox
+        .run_python(METADATA_CLIENT, &[])
         .await?
         .success()
-        .context("query the metadata server in the sandbox")?;
-    serde_json::from_str(output.stdout.trim()).context(format!(
-        "parse the metadata client output: {}",
-        output.stdout
-    ))
+        .context("query the metadata server in the sandbox")?
+        .last_json()
+}
+
+/// Create a long-running sandbox from the Python image with `policy` and
+/// `providers`.
+async fn python_sandbox(
+    cx: &Context,
+    suffix: &str,
+    policy: proto::SandboxPolicy,
+    providers: &[&str],
+) -> Result<Sandbox> {
+    cx.sandbox(suffix)
+        .image(testkit::python_image())
+        .command(["sleep", "infinity"])
+        .policy(policy)
+        .providers(providers.iter().copied())
+        .create_ready()
+        .await
+}
+
+/// The provider token's placeholder, as the sandbox's environment holds it.
+async fn provider_token(sandbox: &Sandbox) -> Result<String> {
+    let output = sandbox
+        .exec(["printenv", TOKEN_ENV])
+        .await?
+        .success()
+        .context("read the provider token from the sandbox environment")?;
+    Ok(output.stdout.trim().to_string())
 }
 
 /// Create refuses a sandbox that names a provider that doesn't exist, and
@@ -288,7 +304,7 @@ async fn create_rejects_unknown_provider(cx: &mut Context) -> testkit::Result {
     let missing = cx.name("nope");
     let result = cx
         .sandbox("unk")
-        .spec(|spec| spec.providers = vec![missing.clone()])
+        .providers([missing.as_str()])
         .create()
         .await;
     match result {
@@ -321,11 +337,10 @@ async fn provider_credentials_are_not_stored_in_sandbox_spec(cx: &mut Context) -
     .await?;
     let sandbox = cx
         .sandbox("nop")
-        .spec(|spec| spec.providers = vec![provider.clone()])
+        .providers([provider.as_str()])
         .command(["sleep", "infinity"])
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
 
     let environment = sandbox
         .spec()
