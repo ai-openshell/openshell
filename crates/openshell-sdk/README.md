@@ -63,9 +63,9 @@ the `AlreadyExists` wait below.
 
 Each attempt waits the server's `RetryInfo` delay, or one second when the
 gateway supplies none, doubling that floor per retry up to 10 seconds (a server
-delay above that ceiling stays binding), plus jitter of at most half the delay,
-so a burst that times out together spreads its retries instead of retrying in
-lockstep. The jitter seed is drawn
+delay above that ceiling stays binding), plus jitter of at most half the delay
+(or half the failed attempt's wait, if longer), so a burst that times out
+together spreads its retries instead of retrying in lockstep. The jitter seed is drawn
 once per retrying call, so clients contending on one name spread their attempts.
 A retrying call makes at most five create attempts, including the first, so it
 cannot keep re-entering the gateway's lock wait on the budget alone. One

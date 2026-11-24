@@ -80,7 +80,8 @@ compensates the failed record and the next attempt resolves the name through
 the `ALREADY_EXISTS` wait below. Each attempt waits the server's `retry_delay`,
 or one second when the gateway supplies none, doubling that floor per retry up
 to 10 seconds (a server delay above that ceiling stays binding) and adding
-jitter of at most half the delay, so a burst that times out together spreads
+jitter of at most half the delay (or half the failed attempt's wait, if
+longer), so a burst that times out together spreads
 its retries instead of retrying in lockstep. The
 jitter seed is drawn once per retrying call, so clients contending on one
 sandbox name spread their attempts. A retrying call makes at

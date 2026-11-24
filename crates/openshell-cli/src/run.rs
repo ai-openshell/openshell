@@ -617,14 +617,21 @@ impl CreateRetry {
     /// Only `MUTATION_LOCK_TIMEOUT` retries: every other failure may have run
     /// after the gateway persisted the create, so repeating it can duplicate a
     /// sandbox. `attempts_made` counts the create sends so far, so the shared
-    /// decision layer can stop at its attempt cap.
-    fn plan_create(&self, status: &Status, attempts_made: u32) -> CreateAttemptPlan {
+    /// decision layer can stop at its attempt cap; `waited` is how long the
+    /// failed send took.
+    fn plan_create(
+        &self,
+        status: &Status,
+        attempts_made: u32,
+        waited: Duration,
+    ) -> CreateAttemptPlan {
         if !is_mutation_lock_timeout(status) {
             return CreateAttemptPlan::Stop;
         }
         match plan_retry(
             gateway_retry_delay(status),
             attempts_made,
+            waited,
             self.seed,
             self.remaining(),
         ) {
@@ -732,6 +739,7 @@ async fn create_sandbox_with_retry(
 
     loop {
         create_attempts += 1;
+        let sent = Instant::now();
         match client.create_sandbox(request.clone()).await {
             Ok(response) => return Ok(response.into_inner()),
             // A lock timeout means different things per gateway step. The
@@ -747,7 +755,7 @@ async fn create_sandbox_with_retry(
             // recorded failure instead of retrying.
             Err(status) if is_mutation_lock_timeout(&status) => {
                 let remaining = retry.remaining();
-                match retry.plan_create(&status, create_attempts) {
+                match retry.plan_create(&status, create_attempts, sent.elapsed()) {
                     CreateAttemptPlan::Sleep(delay) => {
                         eprintln!(
                             "gateway busy ({MUTATION_LOCK_TIMEOUT}); retrying in {} (attempt {}, budget {} left)",
@@ -7810,7 +7818,7 @@ mod tests {
         for attempts_made in 1..=4 {
             let floor = delay * (1 << (attempts_made - 1));
             let CreateAttemptPlan::Sleep(sleep) =
-                retry.plan_create(&mutation_lock_timeout(delay), attempts_made)
+                retry.plan_create(&mutation_lock_timeout(delay), attempts_made, Duration::ZERO)
             else {
                 panic!("a lock timeout inside the budget must retry");
             };
@@ -7829,12 +7837,17 @@ mod tests {
         assert!(matches!(
             retry.plan_create(
                 &status,
-                openshell_core::create_retry::MAX_CREATE_ATTEMPTS - 1
+                openshell_core::create_retry::MAX_CREATE_ATTEMPTS - 1,
+                Duration::ZERO
             ),
             CreateAttemptPlan::Sleep(_)
         ));
         assert_eq!(
-            retry.plan_create(&status, openshell_core::create_retry::MAX_CREATE_ATTEMPTS),
+            retry.plan_create(
+                &status,
+                openshell_core::create_retry::MAX_CREATE_ATTEMPTS,
+                Duration::ZERO
+            ),
             CreateAttemptPlan::Stop,
             "the attempt cap must stop the retry even with budget left"
         );
@@ -7844,7 +7857,11 @@ mod tests {
     fn create_retry_stops_when_the_budget_is_spent() {
         let retry = CreateRetry::new(Duration::ZERO, 7);
         assert_eq!(
-            retry.plan_create(&mutation_lock_timeout(Duration::from_millis(1)), 1),
+            retry.plan_create(
+                &mutation_lock_timeout(Duration::from_millis(1)),
+                1,
+                Duration::ZERO
+            ),
             CreateAttemptPlan::Stop
         );
     }
@@ -7859,13 +7876,20 @@ mod tests {
             "database is unavailable",
             Duration::from_millis(10),
         );
-        assert_eq!(retry.plan_create(&database, 1), CreateAttemptPlan::Stop);
         assert_eq!(
-            retry.plan_create(&Status::unavailable("gateway restarting"), 1),
+            retry.plan_create(&database, 1, Duration::ZERO),
             CreateAttemptPlan::Stop
         );
         assert_eq!(
-            retry.plan_create(&Status::invalid_argument("bad name"), 1),
+            retry.plan_create(
+                &Status::unavailable("gateway restarting"),
+                1,
+                Duration::ZERO
+            ),
+            CreateAttemptPlan::Stop
+        );
+        assert_eq!(
+            retry.plan_create(&Status::invalid_argument("bad name"), 1, Duration::ZERO),
             CreateAttemptPlan::Stop
         );
     }

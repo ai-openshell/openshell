@@ -1103,6 +1103,7 @@ impl OpenShellClient {
 
         loop {
             create_attempts += 1;
+            let sent = Instant::now();
             let result = self
                 .unary(|mut grpc| {
                     let request = request.clone();
@@ -1124,7 +1125,16 @@ impl OpenShellClient {
                 // future caller-supplied id must not enter this loop: replay
                 // admission would turn every retry into the recorded failure.
                 Err(err) if err.mutation_lock_timeout() => {
-                    if !sleep_before_retry(&sleep, &err, create_attempts, seed, deadline).await {
+                    if !sleep_before_retry(
+                        &sleep,
+                        &err,
+                        create_attempts,
+                        sent.elapsed(),
+                        seed,
+                        deadline,
+                    )
+                    .await
+                    {
                         return Err(annotate_create_retry(
                             err,
                             create_attempts,
@@ -1974,6 +1984,7 @@ async fn sleep_before_retry<F, Fut>(
     sleep: &F,
     err: &SdkError,
     attempts_made: u32,
+    waited: Duration,
     seed: u64,
     deadline: Instant,
 ) -> bool
@@ -1982,7 +1993,7 @@ where
     Fut: Future<Output = ()> + Send,
 {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    match plan_retry(err.retry_delay(), attempts_made, seed, remaining) {
+    match plan_retry(err.retry_delay(), attempts_made, waited, seed, remaining) {
         RetryPlan::Sleep(delay) => {
             sleep(delay).await;
             Instant::now() < deadline
@@ -2363,7 +2374,7 @@ mod tests {
                 *recorded.lock().unwrap() = Some(sleep_for);
             }
         };
-        let slept = sleep_before_retry(&sleep, err, attempt, seed, deadline).await;
+        let slept = sleep_before_retry(&sleep, err, attempt, Duration::ZERO, seed, deadline).await;
         assert_eq!(slept, recorded.lock().unwrap().is_some());
         *recorded.lock().unwrap()
     }

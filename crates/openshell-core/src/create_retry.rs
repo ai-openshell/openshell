@@ -56,9 +56,9 @@ pub enum RetryPlan {
 /// delay floor doubles per retry starting from the server delay, capped at
 /// [`MAX_RETRY_DELAY`]. `seed` decorrelates concurrent clients: callers derive
 /// one per client instance and keep it stable across attempts. The jitter is
-/// proportional to the delay, at most half of it, so a burst that times out
-/// together spreads its retries across the jitter window instead of retrying
-/// in lockstep.
+/// at most half the delay, or half of `waited` (how long the failed attempt
+/// took) when that is longer: a burst that timed out together on the gateway's
+/// lock wait spreads its retries over seconds instead of retrying in lockstep.
 ///
 /// The sleep includes the jitter. A sleep that does not fit in
 /// `remaining_budget` stops instead of overrunning the caller's deadline.
@@ -73,6 +73,7 @@ pub enum RetryPlan {
 pub fn plan_retry(
     server_delay: Option<Duration>,
     attempt: u32,
+    waited: Duration,
     seed: u64,
     remaining_budget: Duration,
 ) -> RetryPlan {
@@ -84,7 +85,7 @@ pub fn plan_retry(
         attempt.saturating_sub(1),
         MAX_RETRY_DELAY,
     );
-    let sleep = delay.saturating_add(jitter(seed, attempt, delay));
+    let sleep = delay.saturating_add(jitter(seed, attempt, delay.max(waited)));
     if sleep <= remaining_budget {
         RetryPlan::Sleep(sleep)
     } else {
@@ -271,7 +272,13 @@ mod tests {
 
     #[test]
     fn absent_delay_uses_the_one_second_floor() {
-        let sleep = sleep_of(plan_retry(None, 0, 7, Duration::from_mins(1)));
+        let sleep = sleep_of(plan_retry(
+            None,
+            0,
+            Duration::ZERO,
+            7,
+            Duration::from_mins(1),
+        ));
         assert!(sleep >= DEFAULT_RETRY_DELAY);
         assert!(sleep <= DEFAULT_RETRY_DELAY + DEFAULT_RETRY_DELAY / 2);
     }
@@ -281,6 +288,7 @@ mod tests {
         let sleep = sleep_of(plan_retry(
             Some(Duration::ZERO),
             0,
+            Duration::ZERO,
             7,
             Duration::from_mins(1),
         ));
@@ -290,7 +298,13 @@ mod tests {
     #[test]
     fn server_delay_is_the_floor_and_short_delays_cap_jitter_at_half() {
         let delay = Duration::from_millis(200);
-        let sleep = sleep_of(plan_retry(Some(delay), 0, 7, Duration::from_mins(1)));
+        let sleep = sleep_of(plan_retry(
+            Some(delay),
+            0,
+            Duration::ZERO,
+            7,
+            Duration::from_mins(1),
+        ));
         assert!(sleep >= delay);
         assert!(sleep <= delay + delay / 2);
     }
@@ -306,6 +320,7 @@ mod tests {
         let sleep = sleep_of(plan_retry(
             Some(delay),
             attempt,
+            Duration::ZERO,
             seed,
             Duration::from_mins(1),
         ));
@@ -319,16 +334,42 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_that_waited_on_the_lock_spreads_over_seconds() {
+        let waited = Duration::from_secs(10);
+        let sleeps: BTreeSet<Duration> = (0..64)
+            .map(|seed| sleep_of(plan_retry(None, 1, waited, seed, Duration::from_mins(1))))
+            .collect();
+        let spread = sleeps
+            .last()
+            .unwrap()
+            .saturating_sub(*sleeps.first().unwrap());
+        assert!(spread >= Duration::from_secs(3), "spread {spread:?}");
+        assert!(*sleeps.last().unwrap() < DEFAULT_RETRY_DELAY + waited / 2);
+    }
+
+    #[test]
     fn a_sleep_that_exceeds_the_remaining_budget_stops() {
         assert_eq!(
-            plan_retry(None, 0, 7, Duration::ZERO),
+            plan_retry(None, 0, Duration::ZERO, 7, Duration::ZERO),
             RetryPlan::Stop,
             "a zero budget cannot cover the delay floor"
         );
-        let sleep = sleep_of(plan_retry(None, 0, 7, Duration::from_mins(1)));
-        assert_eq!(plan_retry(None, 0, 7, sleep), RetryPlan::Sleep(sleep));
+        let sleep = sleep_of(plan_retry(
+            None,
+            0,
+            Duration::ZERO,
+            7,
+            Duration::from_mins(1),
+        ));
+        assert_eq!(
+            plan_retry(None, 0, Duration::ZERO, 7, sleep),
+            RetryPlan::Sleep(sleep)
+        );
         let just_short = sleep.checked_sub(Duration::from_nanos(1)).unwrap();
-        assert_eq!(plan_retry(None, 0, 7, just_short), RetryPlan::Stop);
+        assert_eq!(
+            plan_retry(None, 0, Duration::ZERO, 7, just_short),
+            RetryPlan::Stop
+        );
     }
 
     #[test]
@@ -340,7 +381,13 @@ mod tests {
             (3, Duration::from_millis(800)),
             (4, Duration::from_millis(1600)),
         ] {
-            let sleep = sleep_of(plan_retry(Some(delay), attempt, 7, Duration::from_mins(1)));
+            let sleep = sleep_of(plan_retry(
+                Some(delay),
+                attempt,
+                Duration::ZERO,
+                7,
+                Duration::from_mins(1),
+            ));
             assert!(sleep >= floor, "attempt {attempt}: {sleep:?} < {floor:?}");
             assert!(
                 sleep <= floor + floor / 2,
@@ -351,6 +398,7 @@ mod tests {
         let capped = sleep_of(plan_retry(
             Some(Duration::from_secs(4)),
             4,
+            Duration::ZERO,
             7,
             Duration::from_mins(1),
         ));
@@ -366,11 +414,23 @@ mod tests {
         // The documented contract is "retry after at least the supplied delay",
         // so the ten-second ceiling must never shorten a larger server minimum.
         assert_eq!(
-            plan_retry(Some(server_delay), 1, 7, Duration::from_secs(20)),
+            plan_retry(
+                Some(server_delay),
+                1,
+                Duration::ZERO,
+                7,
+                Duration::from_secs(20)
+            ),
             RetryPlan::Stop,
             "a twenty-second budget cannot cover a thirty-second server minimum"
         );
-        let sleep = sleep_of(plan_retry(Some(server_delay), 1, 7, Duration::from_mins(1)));
+        let sleep = sleep_of(plan_retry(
+            Some(server_delay),
+            1,
+            Duration::ZERO,
+            7,
+            Duration::from_mins(1),
+        ));
         assert!(
             sleep >= server_delay,
             "the floor must not drop below the server minimum: {sleep:?}"
@@ -401,11 +461,11 @@ mod tests {
     fn attempt_cap_stops_the_retry() {
         let budget = Duration::from_mins(1);
         assert!(matches!(
-            plan_retry(None, MAX_CREATE_ATTEMPTS - 1, 7, budget),
+            plan_retry(None, MAX_CREATE_ATTEMPTS - 1, Duration::ZERO, 7, budget),
             RetryPlan::Sleep(_)
         ));
         assert_eq!(
-            plan_retry(None, MAX_CREATE_ATTEMPTS, 7, budget),
+            plan_retry(None, MAX_CREATE_ATTEMPTS, Duration::ZERO, 7, budget),
             RetryPlan::Stop,
             "a create that already spent the attempt cap must not retry"
         );
