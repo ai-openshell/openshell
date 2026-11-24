@@ -25,7 +25,7 @@ never skips it. Add a row when you add a variable. The runner also sets
 | `OPENSHELL_TEST_KEYCLOAK_CLIENT_ID` | `<base>-keycloak` | `keycloak-support` | A client in that realm that allows password grants. |
 | `OPENSHELL_TEST_KEYCLOAK_USERNAME` | `<base>-keycloak` | `keycloak-support` | The realm user that tests sign in as. |
 | `OPENSHELL_TEST_KEYCLOAK_PASSWORD` | `<base>-keycloak` | `keycloak-support` | That user's password. |
-| `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | The additional-CA environment, which sets the driver's `additional_ca_bundle` (added by #5729) | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the supervisor trusts for sandbox egress. |
+| `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | The additional-CA environment, which sets `openshell.supervisor.network.additional_ca_bundle` (added by #5729) | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the supervisor trusts for sandbox egress. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_KEY` | The additional-CA environment | `host-server-support` (`TestCa::from_env`) | The path of that CA's private key, in PEM, readable by the test user. Tests sign server certificates with it. |
 | `OPENSHELL_TEST_BASE_IMAGE` | Optional; you, for example to use a mirror | `testkit::base_image()` | The default sandbox image. Unset, it is `nvcr.io/nvidia/base/ubuntu:24.04`. |
 | `OPENSHELL_TEST_PYTHON_IMAGE` | Optional; `e2e/rust/e2e-kubernetes.sh` and `e2e-vm.sh` set a pullable image | `testkit::python_image()` | The workload image for tests that run `python3`, curl, git or openssl. Unset, it is `openshell/e2e-python:dev`, which the tmachine installers load. |
@@ -41,7 +41,8 @@ hooks and crate test settings.
 
 When a test must listen on a port the environment picked, because the gateway
 or another service is configured to call it, the environment publishes it as
-`OPENSHELL_TEST_<SERVICE>_PORT` and the test binds that port on every host
-address, for example with `HttpRecorder::builder().port(port)` from
-`host-server-support`. The test never picks the port itself. Give each
-concurrent test a distinct port.
+`OPENSHELL_TEST_<SERVICE>_PORT` and the test binds that port on every IPv4
+host address, for example with `HttpRecorder::builder().port(port)` from
+`host-server-support`. The host servers don't listen on IPv6, so the
+environment must point the caller at an IPv4 address of the test host. The
+test never picks the port itself. Give each concurrent test a distinct port.

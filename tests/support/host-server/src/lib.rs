@@ -5,10 +5,12 @@
 //! `host.openshell.internal`, and that record what arrived, so a test can
 //! check what the supervisor forwarded upstream.
 //!
-//! The servers listen on every host address, since drivers map
+//! The servers listen on every IPv4 host address, since drivers map
 //! `host.openshell.internal` to different ones, and stop when dropped. They
-//! run where the tests run, so a gateway whose sandboxes can't reach the test
-//! host, such as one on a remote cluster, can't run tests that use them.
+//! don't listen on IPv6, so `host.openshell.internal` must resolve to an IPv4
+//! address of the test host. They run where the tests run, so a gateway whose
+//! sandboxes can't reach the test host, such as one on a remote cluster, can't
+//! run tests that use them.
 //!
 //! - [`HttpRecorder`] answers HTTP requests with a fixed body or a handler's
 //!   [`Response`], and records each parsed [`Request`]. It serves HTTPS with
@@ -58,7 +60,7 @@ const WAIT_INTERVAL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST: usize = 1024 * 1024;
 
-/// Listen on every host address at `port`, or at a random free port for 0.
+/// Listen on every IPv4 host address at `port`, or at a random free port for 0.
 async fn bind(port: u16) -> Result<(TcpListener, u16)> {
     let listener = TcpListener::bind(("0.0.0.0", port))
         .await

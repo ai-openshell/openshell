@@ -9,7 +9,8 @@
 //! - [`TestCa::new`] makes a CA that only the test knows, so nothing trusts it
 //!   unless the test hands over [`TestCa::cert_pem`].
 //! - [`TestCa::from_env`] loads the environment's additional CA, which the
-//!   supervisor trusts for sandbox egress (`additional_ca_bundle`). The environment
+//!   supervisor trusts for sandbox egress
+//!   (`openshell.supervisor.network.additional_ca_bundle`). The environment
 //!   publishes the paths of its PEM certificate and key in
 //!   `OPENSHELL_TEST_ADDITIONAL_CA_CERT` and `OPENSHELL_TEST_ADDITIONAL_CA_KEY`.
 
