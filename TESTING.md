@@ -29,6 +29,8 @@ The suites in `tests/suites/` run against a real OpenShell gateway. Tests use
 sandboxes. Testkit doesn't install the gateway or its dependencies.
 
 - **Conformance** checks public behavior that must work on every driver.
+  Tests [share a gateway](#what-a-conformance-test-may-assert) and run with
+  four nextest workers in CI, except on the VM host lane.
 - **Feature suites** check behavior that needs a service or gateway setting,
   such as Keycloak. Each feature is a package in the `features` workspace.
 - **Driver suites** check behavior specific to one compute driver. Each driver
@@ -79,7 +81,7 @@ for prerequisites and options.
 
 The **VM driver** doesn't run nested inside tmachine. Run `mise run e2e:vm`
 on a supported VM host; it starts the VM-backed gateway and runs conformance
-and the VM driver suite.
+and the VM driver suite with one worker each in CI.
 
 ## Rust Tests
 

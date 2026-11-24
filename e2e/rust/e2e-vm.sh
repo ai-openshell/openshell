@@ -463,12 +463,6 @@ e2e_export_gateway_restart_metadata \
 # preparation; allow 180s for slower CI runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
-# Both testkit suites use the VM lane's unsupported list.
-if [[ -z "${OPENSHELL_TEST_UNSUPPORTED:-}" ]]; then
-  OPENSHELL_TEST_UNSUPPORTED="$("${ROOT}/tasks/scripts/suite-unsupported.sh" vm)"
-  export OPENSHELL_TEST_UNSUPPORTED
-fi
-
 OPENSHELL_TEST_PYTHON_IMAGE="${OPENSHELL_TEST_PYTHON_IMAGE:-${E2E_PULLABLE_PYTHON_IMAGE}}" \
   e2e_run_openshell_conformance "VM"
 if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
@@ -478,6 +472,9 @@ fi
 
 if [ -z "${E2E_TEST_OVERRIDE}" ]; then
   echo "==> Running the VM driver suite"
+  # Conformance reads this list in its own subshell.
+  vm_unsupported="${OPENSHELL_TEST_UNSUPPORTED:-$("${ROOT}/tasks/scripts/suite-unsupported.sh" vm)}"
+  OPENSHELL_TEST_UNSUPPORTED="${vm_unsupported}" \
   OPENSHELL_TEST_PYTHON_IMAGE="${OPENSHELL_TEST_PYTHON_IMAGE:-${E2E_PULLABLE_PYTHON_IMAGE}}" \
     cargo nextest run --locked --manifest-path "${ROOT}/tests/suites/drivers/vm/Cargo.toml" \
     --test-threads 1 --no-tests fail
