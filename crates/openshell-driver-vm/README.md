@@ -29,7 +29,7 @@ flowchart LR
         gateway["openshell-gateway<br/>(launcher)"]
         driver["openshell-driver-vm<br/>libkrun"]
         supervisor["openshell-supervisor<br/>host policy supervisor"]
-        gateway <-->|"gRPC over UDS<br/>compute-driver.sock"| driver
+        gateway <-->|"gRPC over a<br/>private UDS"| driver
         supervisor <-->|"authenticated gRPC<br/>policy + relay"| gateway
     end
 
@@ -68,8 +68,8 @@ By default `mise run gateway:vm`:
   `~/.config/openshell/gateways/vm-dev/metadata.json`. It does not modify the
   workspace `.env`.
 - Persists the gateway SQLite DB under `.cache/gateway-vm/gateway.db`.
-- Places the VM driver state (per-sandbox `overlay.ext4`, image cache, and `run/compute-driver.sock`) under `/tmp/openshell-vm-driver-$USER-vm-dev/` so the AF_UNIX socket path stays under macOS `SUN_LEN`.
-- Writes `.cache/gateway-vm/gateway.toml` with `[openshell.drivers.vm].driver_dir = "$PWD/target/debug"` so the freshly built `openshell-driver-vm` is used instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
+- Places the VM driver state (per-sandbox `overlay.ext4`, image cache, and the private `run/` socket directories) under `/tmp/openshell-vm-driver-$USER-vm-dev/` so the AF_UNIX socket path stays under macOS `SUN_LEN`.
+- Writes `.cache/gateway-vm/gateway.toml` with `[openshell.gateway].driver_dir = "$PWD/target/debug"` so the freshly built `openshell-driver-vm` is used instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
 - Enables OTLP trace export, OCSF log export, and the agent trace relay only when `OPENSHELL_DEV_OTLP_ENDPOINT` names a collector, for example `http://127.0.0.1:4317`. Otherwise, it omits the OTLP configuration.
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
@@ -157,7 +157,7 @@ target/debug/openshell-gateway \
   --port 18081
 ```
 
-The gateway resolves `openshell-driver-vm` in this order: `[openshell.drivers.vm].driver_dir`, conventional install locations (`~/.local/libexec/openshell`, `/usr/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`), then a sibling of the gateway binary.
+The gateway resolves `openshell-driver-vm` in this order: `driver_dir` from `[openshell.gateway]` (the deprecated `[openshell.drivers.vm].driver_dir` is used only when that is unset), conventional install locations (`~/.local/libexec/openshell`, `/usr/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`), then a sibling of the gateway binary.
 
 ## Gateway And Driver Configuration
 
@@ -166,8 +166,8 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | Configuration key | Default | Purpose |
 |---|---|---|
 | `grpc_endpoint` | empty | Required. URL the native host supervisor uses to reach the gateway. Host loopback such as `http://127.0.0.1:<port>` is valid. Legacy guest aliases are normalized to host loopback. This endpoint is never sent into the VM. |
-| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. Relative paths are resolved to absolute paths at driver startup. |
-| `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
+| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and the private `run/<random>/driver.sock` UDS, one directory per launch. Relative paths are resolved to absolute paths at driver startup. |
+| `driver_dir` | unset | Deprecated in this table: set `driver_dir` in `[openshell.gateway]`. The directory is searched before the standard locations. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
 | `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Falls back only to the operator-configured `default_image`; the driver refuses to start when both are empty. |
 | `vcpus` | `2` | vCPUs per sandbox. |
@@ -283,8 +283,8 @@ RUST_LOG=openshell_server=debug,openshell_driver_vm=debug \
   mise run gateway:vm
 ```
 
-The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/compute-driver.sock`; OpenShell creates `run/` with owner-only permissions and removes same-owner stale sockets. On clean shutdown, the gateway sends the managed driver `SIGTERM`, waits up to five seconds for it to flush telemetry and exit, then force-kills it if necessary and removes the socket. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
-The VM serial console is appended to `<state-dir>/sandboxes/<sandbox-id>/rootfs-console.log`. Host-supervisor stdout and stderr are written beside it as `supervisor.log` and `supervisor.err.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/compute-driver.sock`; OpenShell creates `run/` with owner-only permissions, removes same-owner stale sockets, and the gateway removes the socket on clean shutdown via `ManagedDriverProcess::drop`. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
+The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/<random>/driver.sock`; each launch gets its own directory under `run/`, created with owner-only permissions and removed with the driver's handle. On clean shutdown, the gateway sends the managed driver `SIGTERM`, waits up to five seconds for it to flush telemetry and exit, then force-kills it if necessary and removes the socket. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
+The VM serial console is appended to `<state-dir>/sandboxes/<sandbox-id>/rootfs-console.log`. Host-supervisor stdout and stderr are written beside it as `supervisor.log` and `supervisor.err.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/<random>/driver.sock`; each launch gets its own directory under `run/`, created with owner-only permissions, and the gateway removes it on clean shutdown via `ManagedDriverProcess::drop`. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
 
 ## Network isolation
 
@@ -339,7 +339,6 @@ so driver choice remains automatic unless the user explicitly overrides it.
 
 ## TODOs
 
-- The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` note in `crates/openshell-gateway/src/vm.rs`.
 - macOS local builds are codesigned by `tasks/scripts/gateway-vm.sh`; the generated Homebrew formula signs the release tarball driver for local installs.
 
 ## Launched mode
