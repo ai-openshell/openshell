@@ -42,7 +42,7 @@ async fn provider_file_open_update_and_detach(cx: &mut Context) -> testkit::Resu
             &format!(
                 "set -eu; exec 3<{path}; test \"$(stat -Lc %a /proc/self/fd/3)\" = 600; \
                  test \"$(stat -Lc %F /proc/self/fd/3)\" = 'regular file'; \
-                 if (printf x >&3) 2>/dev/null; then exit 1; fi"
+                 if (printf x >>{path}) 2>/dev/null; then exit 1; fi"
             ),
         ])
         .await?
