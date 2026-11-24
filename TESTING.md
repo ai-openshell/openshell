@@ -832,7 +832,7 @@ branch CLI needs a newer feature, pin the SHA of your branch's base instead.
 Confirm a tag exists before relying on it (set `TAG` to the tag you plan to use):
 
 ```shell
-TAG=0.0.115
+TAG=0.1.10
 skopeo inspect "docker://quay.io/ai-openshell/gateway:${TAG}"
 ```
 
