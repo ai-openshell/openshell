@@ -7,6 +7,26 @@
 //! Creation and every mint compare endpoints in this normalized form, so the
 //! two checks cannot disagree about what a URL means.
 
+/// Parse a configured token URL without redirecting an existing credential grant
+/// from a literal caret to its percent-encoded spelling.
+///
+/// # Errors
+///
+/// Rejects invalid URLs and paths whose destination changes under caret encoding.
+/// Callers enforce the scheme and authority rules for their particular credential flow.
+pub fn parse_token_url(raw: &str) -> Result<url::Url, &'static str> {
+    let parse = |s: &str| url::Url::parse(s).map_err(|_| "must be an absolute URL");
+    let url = parse(raw)?;
+    // Ask the URL parser which carets survive in the path. A caret in the query
+    // or password, or in a removed dot segment, does not change the destination path.
+    if raw.contains('^') && parse(&raw.replace('^', "_"))?.path() != url.path() {
+        return Err(
+            "contains a literal caret (^) in its path. Confirm the intended destination and reconfigure the token endpoint",
+        );
+    }
+    Ok(url)
+}
+
 /// Normalize a token endpoint for exact comparison.
 ///
 /// Accepts absolute `https` URLs, or `http` URLs for loopback hosts (local
@@ -38,7 +58,7 @@ pub fn github_app_installation_url(template: &str, id: u64) -> Result<url::Url, 
 }
 
 fn parse_token_endpoint(raw: &str) -> Result<url::Url, &'static str> {
-    let url = url::Url::parse(raw.trim()).map_err(|_| "must be an absolute URL")?;
+    let url = parse_token_url(raw.trim())?;
     let Some(host) = url.host_str().filter(|host| !host.is_empty()) else {
         return Err("must include a host");
     };
@@ -76,6 +96,31 @@ mod tests {
             normalize_token_endpoint(" https://login.example.com:8443/oauth/token ").unwrap(),
             "https://login.example.com:8443/oauth/token"
         );
+    }
+
+    #[test]
+    fn checks_the_effective_path_before_losing_the_caret_spelling() {
+        for raw in [
+            "https://example.com/a^b",
+            "https://example.com/a^%5E",
+            r"https:\example.com\a^b",
+        ] {
+            assert!(
+                super::parse_token_url(raw)
+                    .unwrap_err()
+                    .contains("literal caret")
+            );
+        }
+        for raw in [
+            "https://example.com/%5E/%5e/%255E",
+            "https://example.com/a^b/../token",
+            "https://user:p^w@example.com/%5E?x=^#^",
+        ] {
+            assert_eq!(
+                super::parse_token_url(raw),
+                Ok(url::Url::parse(raw).unwrap())
+            );
+        }
     }
 
     #[test]

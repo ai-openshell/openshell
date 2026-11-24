@@ -391,6 +391,34 @@ to remove the reference without replacing the provider's current grant. Use
 If credential storage fails during deletion, `openshell secret list` shows the
 secret as `deleting`. Rerun `openshell secret delete` to finish the cleanup.
 
+### Replace a token endpoint with a literal caret
+
+The gateway refuses a refresh endpoint with a literal `^` in its path before
+sending credentials. For example, `/a^b` and `/a%5Eb` can reach different
+handlers on the same server. A secret granted access to `/a^b` needs a new
+grant to reach `/a%5Eb`.
+
+1. Before upgrading, run `openshell secret list` in each workspace. Read every
+   page of refresh endpoints using `--page-token` when the CLI returns a next
+   page token. This command shows metadata without revealing secret values.
+   Check each affected provider with `openshell provider refresh status NAME`
+   and inspect its profile with `openshell profile export ID -o yaml`.
+2. Verify the replacement URL with the endpoint operator. Update the profile's
+   `token_url` with the exact path the secret owner approves. For GitHub
+   Enterprise Server, keep `{installation_id}` in the profile template.
+3. If the provider uses a workspace secret with an affected grant, create a
+   replacement under a new name with `--value-env` or `--value-file`. Set
+   `--allowed-endpoint` to the exact approved URL. For GitHub App, include the
+   numeric installation ID in this grant.
+4. Run `openshell provider refresh configure` for each affected credential with
+   its full material and updated secret references. Verify the mint with
+   `openshell provider refresh status NAME`. Restart workloads that hold the
+   previous credential handle.
+
+During upgrades and rollbacks, run only one gateway version against the same
+refresh records. An older gateway can still send credentials to a literal-caret
+path while its original grant is active.
+
 ### AWS STS
 
 The gateway can mint short-lived AWS credentials with `sts:AssumeRole` for

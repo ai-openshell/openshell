@@ -3682,8 +3682,8 @@ fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
 }
 
 fn validate_token_grant_endpoint(token_endpoint: &str) -> Result<(), String> {
-    let url = url::Url::parse(token_endpoint)
-        .map_err(|_| "token_endpoint must be an absolute URL".to_string())?;
+    let url = openshell_core::token_endpoint::parse_token_url(token_endpoint)
+        .map_err(|reason| format!("token_endpoint {reason}"))?;
     if token_endpoint_transport_allowed(&url) {
         return Ok(());
     }
