@@ -1606,6 +1606,104 @@ impl IsolationSpecs {
     }
 }
 
+/// Build the OCI browser execution spec without inheriting workload or
+/// supervisor credentials, mounts, devices, environment, or network access.
+///
+/// `browser_image` must be resolved from an operator-controlled image and
+/// pinned to an immutable Podman image ID before calling this function.
+/// `entrypoint` must be selected by the trusted driver, never by the agent.
+/// This builder does not authorize access to the browser. The caller must
+/// provide an authenticated control channel and full lifecycle management
+/// before a browser container can be started.
+pub fn build_browser_container_spec(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    browser_image: &ResolvedPodmanImage,
+    entrypoint: &str,
+    command: &[String],
+) -> Result<ContainerSpec, ComputeDriverError> {
+    let digest = browser_image.id.strip_prefix("sha256:").ok_or_else(|| {
+        ComputeDriverError::Precondition("browser image must be pinned to a sha256 image ID".into())
+    })?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ComputeDriverError::Precondition(
+            "browser image has an invalid sha256 image ID".into(),
+        ));
+    }
+    if !entrypoint.starts_with('/')
+        || entrypoint
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || entrypoint.bytes().any(|byte| byte == 0)
+    {
+        return Err(ComputeDriverError::InvalidArgument(
+            "browser entrypoint must be an absolute, normalized path".into(),
+        ));
+    }
+    if config
+        .userns
+        .as_deref()
+        .is_some_and(|mode| mode.split(':').next() == Some("host"))
+    {
+        return Err(ComputeDriverError::Precondition(
+            "browser execution rejects host user namespaces".into(),
+        ));
+    }
+
+    // Reuse the driver-owned OCI fields and resource limits, but no runtime
+    // fields that could be influenced by an agent template may cross roles.
+    let mut browser = build_base_spec(sandbox, config, None, None, browser_image, None, None)?;
+    browser.name = format!("openshell-browser-{}", sandbox.id);
+    crate::client::validate_name(&browser.name)
+        .map_err(|error| ComputeDriverError::InvalidArgument(error.to_string()))?;
+    browser.labels = BTreeMap::from([
+        (LABEL_MANAGED.into(), "true".into()),
+        (LABEL_SANDBOX_ID.into(), sandbox.id.clone()),
+        (LABEL_SANDBOX_NAME.into(), sandbox.name.clone()),
+        (LABEL_SANDBOX_NAMESPACE.into(), sandbox.namespace.clone()),
+        (LABEL_SANDBOX_WORKSPACE.into(), sandbox.workspace.clone()),
+        (crate::isolation::LABEL_ROLE.into(), "browser".into()),
+    ]);
+    browser.hostname = format!("browser-{}", sandbox.id);
+    browser.env.clear();
+    browser.unsetenv = browser_image
+        .environment
+        .iter()
+        .filter_map(|value| value.split_once('=').map(|(key, _)| key.to_string()))
+        .collect();
+    browser.entrypoint = vec![entrypoint.to_string()];
+    browser.command = command.to_vec();
+    browser.user = "1000:1000".into();
+    browser.groups.clear();
+    browser.work_dir = "/sandbox".into();
+    browser.cap_drop = vec!["ALL".into()];
+    browser.cap_add = vec!["SYS_CHROOT".into()];
+    browser.no_new_privileges = true;
+    // Keep the runtime's default seccomp filter. Never use "unconfined".
+    browser.seccomp_profile_path.clear();
+    browser.sysctl.clear();
+    browser.volumes.clear();
+    browser.image_volumes.clear();
+    browser.mounts.clear();
+    browser.secret_env.clear();
+    browser.secrets.clear();
+    browser.hostadd.clear();
+    browser.dns_search.clear();
+    browser.dns_option.clear();
+    browser.use_image_resolve_conf = None;
+    browser.netns.nsmode = "none".into();
+    browser.networks.clear();
+    browser.portmappings.clear();
+    browser.devices = None;
+    browser.userns = None;
+    browser.idmappings = None;
+    browser.healthconfig.test = vec!["NONE".into()];
+    browser.restart_policy = "no".into();
+    browser.image_pull_policy = "never".into();
+    Ok(browser)
+}
+
 pub fn build_isolation_specs(
     input: IsolationSpecInput<'_>,
 ) -> Result<IsolationSpecs, ComputeDriverError> {
@@ -1933,6 +2031,102 @@ mod tests {
     use super::*;
     use crate::client::ImageConfig;
     use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
+
+    #[test]
+    fn browser_spec_isolated_from_agent_control_and_egress() {
+        let mut sandbox = test_sandbox("browser-test", "browser-test");
+        sandbox.namespace = "project".into();
+        let mut image = resolved_image(
+            "operator/browser",
+            &format!("sha256:{}", "a".repeat(64)),
+            "sandbox:sandbox",
+            "/sandbox",
+        );
+        image.environment = vec!["LD_PRELOAD=/tmp/attacker.so".into()];
+        let spec = build_browser_container_spec(
+            &sandbox,
+            &test_config(),
+            &image,
+            "/usr/local/bin/verify-sandbox",
+            &[],
+        )
+        .expect("build isolated browser spec");
+        let value = serde_json::to_value(spec).expect("encode browser Podman spec");
+
+        assert_eq!(value["name"], "openshell-browser-browser-test");
+        assert_eq!(value["labels"][crate::isolation::LABEL_ROLE], "browser");
+        assert_eq!(value["user"], "1000:1000");
+        assert_eq!(value["cap_drop"], serde_json::json!(["ALL"]));
+        assert_eq!(value["cap_add"], serde_json::json!(["SYS_CHROOT"]));
+        assert_eq!(value["no_new_privileges"], true);
+        assert_eq!(value["netns"]["nsmode"], "none");
+        assert_eq!(value["image_pull_policy"], "never");
+        assert_eq!(value["restart_policy"], "no");
+        assert!(value["networks"].as_object().unwrap().is_empty());
+        for field in [
+            "volumes",
+            "image_volumes",
+            "mounts",
+            "secrets",
+            "portmappings",
+            "hostadd",
+            "groups",
+            "devices",
+        ] {
+            assert!(
+                value[field].is_null() || value[field].as_array().is_some_and(Vec::is_empty),
+                "browser spec inherited forbidden {field}: {}",
+                value[field],
+            );
+        }
+        assert!(value["secret_env"].as_object().unwrap().is_empty());
+        assert!(value["env"].as_object().unwrap().is_empty());
+        assert!(
+            value["unsetenv"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("LD_PRELOAD"))
+        );
+        assert!(value["seccomp_profile_path"].is_null());
+    }
+
+    #[test]
+    fn browser_spec_rejects_unsafe_operator_inputs() {
+        let sandbox = test_sandbox("browser-test", "browser-test");
+        let image = resolved_image(
+            "operator/browser",
+            "mutable:latest",
+            "1000:1000",
+            "/sandbox",
+        );
+        assert!(
+            build_browser_container_spec(
+                &sandbox,
+                &test_config(),
+                &image,
+                "/usr/bin/chromium",
+                &[],
+            )
+            .is_err()
+        );
+
+        let pinned = resolved_image(
+            "operator/browser",
+            &format!("sha256:{}", "a".repeat(64)),
+            "1000:1000",
+            "/sandbox",
+        );
+        let mut config = test_config();
+        config.userns = Some("host".into());
+        assert!(
+            build_browser_container_spec(&sandbox, &config, &pinned, "/usr/bin/chromium", &[],)
+                .is_err()
+        );
+        assert!(
+            build_browser_container_spec(&sandbox, &test_config(), &pinned, "../../bin/sh", &[],)
+                .is_err()
+        );
+    }
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
