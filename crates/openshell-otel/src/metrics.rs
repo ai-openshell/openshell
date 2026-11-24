@@ -14,7 +14,7 @@ impl OtlpTarget {
         self.check_tls()?;
         let exporter = match self.protocol {
             Protocol::Grpc => self
-                .configure(MetricExporter::builder().with_tonic())
+                .configure(MetricExporter::builder().with_tonic())?
                 .build()?,
             Protocol::HttpProtobuf => self
                 .configure_http(

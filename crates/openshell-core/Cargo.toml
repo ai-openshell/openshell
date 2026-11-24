@@ -50,6 +50,8 @@ rustix = { workspace = true }
 libc = "0.2"
 
 [features]
+# Application opt-in; libraries remain backend-neutral by default.
+aws-lc = ["openshell-crypto/aws-lc"]
 default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with
 ## `--no-default-features` (plus any other features you need) for a build that

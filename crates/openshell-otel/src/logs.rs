@@ -14,7 +14,7 @@ impl OtlpTarget {
         self.check_tls()?;
         match self.protocol {
             Protocol::Grpc => Ok(self
-                .configure(LogExporter::builder().with_tonic())
+                .configure(LogExporter::builder().with_tonic())?
                 .build()?),
             Protocol::HttpProtobuf => Ok(self
                 .configure_http(

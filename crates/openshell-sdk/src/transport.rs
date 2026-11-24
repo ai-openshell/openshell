@@ -127,7 +127,8 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
     // `build_channel` only owns the TLS layer.
 
     // Tonic must use the host or facade provider, including backend-free builds.
-    openshell_crypto::tls::ensure_default_provider();
+    openshell_crypto::tls::try_ensure_default_provider()
+        .map_err(|e| SdkError::tls(e.to_string()))?;
     let mut tls_config = config.ca_cert.as_ref().map_or_else(
         || ClientTlsConfig::new().with_enabled_roots(),
         |ca_cert| ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_cert)),

@@ -51,7 +51,8 @@ not enable AWS-LC, including through core's optional telemetry and tracing featu
 Their development dependencies select AWS-LC only for standalone crate tests.
 
 Executable packages explicitly enable `openshell-crypto/aws-lc`, including builds
-with package defaults disabled. This preserves shipped behavior. Cargo features
+with package defaults disabled, except the VM guest init package mode, which
+does not use cryptography. This preserves shipped behavior. Cargo features
 apply to a whole package: the library targets in CLI, gateway, supervisor, sandbox,
 and standalone driver packages also carry that product choice. Embed through the
 backend-neutral core/SDK/policy crates when choosing your own implementation.
@@ -62,8 +63,14 @@ implement `CryptoBackend` and `ProtocolBackend`, and call
 `install_default_context(CryptoContext::new(Box::new(backend)))` before constructing
 clients or performing cryptography. Merely installing a Rustls provider does not
 supply primitive, PKI, or JWT operations. To retain OpenShell's AWS-LC behavior,
-add `openshell-crypto` with its default features enabled. Using facade operations
-without a selected backend fails closed with an initialization panic.
+enable the opt-in `aws-lc` feature on `openshell-core` or `openshell-sdk`, or add
+`openshell-crypto` with its default features enabled. SDK connections and fallible
+TLS builders return initialization errors when no provider is available. Legacy
+infallible helpers still panic; prefer `try_default_context`,
+`tls::try_ensure_default_provider`, and `openshell_sdk::oidc::try_http_client`.
+If a host has not installed a Rustls provider, the first dependency-owned TLS
+client installs the facade provider process-wide. Install a host provider first
+when it must own that global.
 
 Integration features (`tls-tonic`, `tls-kube`, `tls-sqlx`) activate
 dependencies. The `aws-lc` feature supplies their AWS-LC choices conditionally.

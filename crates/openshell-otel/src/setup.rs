@@ -155,6 +155,9 @@ impl std::fmt::Debug for CollectorTransport {
 /// Failure to set up OTLP export.
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
+    #[error("could not select OTLP TLS provider: {0}")]
+    Crypto(#[from] openshell_crypto::CryptoError),
+
     #[error("OTLP endpoint is empty")]
     EmptyEndpoint,
 
@@ -326,7 +329,7 @@ impl OtlpTarget {
     }
 
     /// Point an exporter builder at this target, over TLS for `https://`.
-    pub(crate) fn configure<B>(&self, builder: B) -> B
+    pub(crate) fn configure<B>(&self, builder: B) -> Result<B, SetupError>
     where
         B: WithExportConfig + WithTonicConfig,
     {
@@ -334,9 +337,10 @@ impl OtlpTarget {
             .with_endpoint(self.endpoint.clone())
             .with_metadata(MetadataMap::from_headers(self.headers.clone()));
         if self.tls {
-            builder.with_tls_config(self.tls_settings.grpc_config())
+            openshell_crypto::tls::try_ensure_default_provider()?;
+            Ok(builder.with_tls_config(self.tls_settings.grpc_config()))
         } else {
-            builder
+            Ok(builder)
         }
     }
 
@@ -395,7 +399,7 @@ impl OtlpTarget {
         self.check_tls()?;
         let exporter = match self.protocol {
             Protocol::Grpc => self
-                .configure(SpanExporter::builder().with_tonic())
+                .configure(SpanExporter::builder().with_tonic())?
                 .build()?,
             Protocol::HttpProtobuf => self
                 .configure_http(
