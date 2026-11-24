@@ -54,10 +54,15 @@ const WAIT_INTERVAL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST: usize = 1024 * 1024;
 
+/// Listens on every IPv6 and IPv4 address, or on IPv4 only where the host
+/// has no IPv6.
 async fn bind() -> Result<(TcpListener, u16)> {
-    let listener = TcpListener::bind(("0.0.0.0", 0))
-        .await
-        .context("bind a host server")?;
+    let listener = match TcpListener::bind(("::", 0)).await {
+        Ok(listener) => listener,
+        Err(_) => TcpListener::bind(("0.0.0.0", 0))
+            .await
+            .context("bind a host server")?,
+    };
     let port = listener
         .local_addr()
         .context("read the host server's address")?

@@ -247,7 +247,11 @@ pub(crate) async fn read_request(stream: &mut TcpStream, buffer: &mut Vec<u8>) -
     loop {
         if let Some((mut request, length)) = parse_request(buffer) {
             buffer.drain(..length);
-            request.local_addr = stream.local_addr().ok();
+            // An IPv4 client on the IPv6 socket arrives on a mapped address.
+            request.local_addr = stream
+                .local_addr()
+                .ok()
+                .map(|addr| SocketAddr::new(addr.ip().to_canonical(), addr.port()));
             return Some(request);
         }
         match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
