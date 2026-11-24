@@ -54,5 +54,5 @@ name = "host_tls_provider"
 required-features = ["runtime"]
 
 [[test]]
-name = "spiffe_jwt_svid"
+name = "jwt_svid_facade"
 required-features = ["integration"]

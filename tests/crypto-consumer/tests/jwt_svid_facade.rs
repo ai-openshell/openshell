@@ -1,12 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Validates that SPIFFE JWT-SVID signing, verification, and claim extraction
-//! work identically across crypto backends (aws-lc/Ring vs OpenSSL).
+//! Validates JWT-SVID-shaped signing, verification, and claim extraction
+//! through the openshell-crypto facade, across crypto backends
+//! (aws-lc/Ring vs OpenSSL).
+//!
+//! These tests cover the facade JWT path that library consumers use. The
+//! gateway's SPIFFE JWT-SVID verification goes through the `spiffe` crate's
+//! own JWT backend, which that crate's features select independently of the
+//! installed context; it is not exercised here.
 //!
 //! Run with either backend:
-//!   cargo test -p openshell-library-crypto-consumer --features runtime -- spiffe
-//!   cargo test -p openshell-library-crypto-consumer --features openssl-runtime -- spiffe
+//!   cargo test -p openshell-library-crypto-consumer --features runtime -- jwt_svid_facade
+//!   cargo test -p openshell-library-crypto-consumer --features openssl-runtime -- jwt_svid_facade
 
 use openshell_crypto::CryptoContext;
 use std::sync::Once;
@@ -38,7 +44,7 @@ struct RingConsumer;
 impl openshell_crypto::CryptoBackend for RingConsumer {
     fn capabilities(&self) -> openshell_crypto::Capabilities {
         openshell_crypto::Capabilities {
-            backend: "ring-spiffe-test",
+            backend: "ring-jwt-svid-test",
             provider_version: None,
             fips: openshell_crypto::FipsState::NotVerified,
             primitives: &[],
@@ -110,12 +116,12 @@ fn generate_ed25519_keypair() -> (String, String) {
     }
 }
 
-/// Sign and verify an EdDSA JWT-SVID with SPIFFE standard claims.
-/// This is the core operation in the gateway SPIFFE token exchange flow:
-/// SPIRE mints a JWT-SVID, the gateway verifies it, extracts the SPIFFE ID,
-/// then exchanges it with Keycloak for a scoped access token.
+/// Sign and verify an EdDSA JWT-SVID with SPIFFE standard claims through the
+/// facade. Mirrors the claim shape of the gateway's SPIFFE token exchange
+/// flow (SPIRE mints a JWT-SVID, the gateway verifies it and extracts the
+/// SPIFFE ID) using the facade JWT path a library consumer would call.
 #[test]
-fn spiffe_eddsa_jwt_sign_and_verify() {
+fn facade_eddsa_jwt_svid_sign_and_verify() {
     install_backend();
 
     let (private_pem, public_pem) = generate_ed25519_keypair();
@@ -153,7 +159,7 @@ fn spiffe_eddsa_jwt_sign_and_verify() {
 
 /// Wrong audience must be rejected — the gateway checks `aud` before exchange.
 #[test]
-fn spiffe_jwt_wrong_audience_rejected() {
+fn facade_jwt_svid_wrong_audience_rejected() {
     install_backend();
 
     let (private_pem, public_pem) = generate_ed25519_keypair();
@@ -184,7 +190,7 @@ fn spiffe_jwt_wrong_audience_rejected() {
 
 /// Tampered signature must be rejected — protects against SVID forgery.
 #[test]
-fn spiffe_jwt_tampered_signature_rejected() {
+fn facade_jwt_svid_tampered_signature_rejected() {
     install_backend();
 
     let (private_pem, public_pem) = generate_ed25519_keypair();
@@ -222,7 +228,7 @@ fn spiffe_jwt_tampered_signature_rejected() {
 
 /// Expired JWT-SVID must be rejected — SPIRE SVIDs have short TTLs.
 #[test]
-fn spiffe_jwt_expired_rejected() {
+fn facade_jwt_svid_expired_rejected() {
     install_backend();
 
     let (private_pem, public_pem) = generate_ed25519_keypair();
@@ -254,7 +260,7 @@ fn spiffe_jwt_expired_rejected() {
 /// Cross-key verification must fail — a JWT-SVID signed by one SPIRE server
 /// must not verify with another server's key.
 #[test]
-fn spiffe_jwt_cross_key_rejected() {
+fn facade_jwt_svid_cross_key_rejected() {
     install_backend();
 
     let (private_pem, _) = generate_ed25519_keypair();
