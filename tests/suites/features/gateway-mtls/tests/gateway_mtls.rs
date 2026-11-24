@@ -181,6 +181,18 @@ async fn expect_refused(gateway: &Gateway, dir: &Path, config: ClientConfig, wha
         Ok(_) => Err(Error::msg(format!(
             "the gateway answered Health over {what}"
         ))),
+        // On loopback, a TLS gateway also serves plaintext HTTP for sandbox
+        // services only. It answers anything else, gRPC included, with a
+        // bare 404, which tonic maps to Unimplemented without a grpc-status.
+        // No RPC ran, so that is a refusal too.
+        Err(status)
+            if status.code() == GrpcCode::Unimplemented
+                && status
+                    .message()
+                    .contains("grpc-status header missing, mapped from HTTP status code 404") =>
+        {
+            Ok(())
+        }
         Err(status) => expect_transport_error(&format!("{status:?}"), what),
     }
 }
