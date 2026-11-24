@@ -111,18 +111,12 @@ report `SKIP` when the executor or backend is absent; E2E returns nonzero
 when required runtime coverage is missing. Report passed, failed, and
 skipped/ignored executions separately, including why any probe gated coverage.
 Passing E2E does not qualify the [known Windows enforcement gaps](WINDOWS.md#runtime-and-current-limits).
-See the [Windows test task definitions](https://github.com/NVIDIA/OpenShell/blob/windows/tasks/windows.toml)
+See the [Windows test task definitions](https://github.com/ai-openshell/openshell/blob/windows/tasks/windows.toml)
 for boundary, loopback, network, and audit suites.
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
 Windows now checks tracked Cargo lockfiles through PowerShell rather than
 skipping them.
-
-`mise run --skip-tools sdk:ts:ci` selects the x64 Biome executable on Windows
-(including ARM64 hosts running it under emulation), resolves the protobuf
-plugin through its Windows `.cmd` launcher, and installs the matching locked
-ARM64 Rolldown binding when Node itself is ARM64. The helper preserves lockfile
-resolution; it must not upgrade unrelated test dependencies.
 
 Windows token-file tests explicitly skip POSIX
 mode-bit assertions; those skips do not establish Windows ACL protection.
@@ -209,6 +203,12 @@ re-locks a workspace from the root lockfile. Add new testkit workspaces to
 
 #### What a conformance test may assert
 
+Conformance tests must work concurrently on a shared gateway. Use
+`Context::name` (or testkit's sandbox builder) for gateway resource names,
+use test-unique selector values and host fixtures, and scope assertions and
+cleanup to resources the test owns. Do not change gateway-wide settings or
+routes.
+
 Conformance tests run on every compute driver, so they check the public
 contract and nothing a driver is free to change.
 
@@ -224,7 +224,7 @@ contract and nothing a driver is free to change.
 - The only way to skip a test is `#[ignore = "<issue link>"]`, for a broken or
   flaky test.
 
-Adapted from the handover notes in NVIDIA/OpenShell#4629 by Evan Lezar.
+Adapted from the handover notes in ai-openshell/openshell#4629 by Evan Lezar.
 
 ### Running suites in a tmachine environment (`tests/runner/`)
 
@@ -257,10 +257,13 @@ prebuilt testkit program, such as a static `openshell-conformance` for the
 guest's architecture, instead of building the family's tests; it can't be
 combined with `--package`. With it, `--filter` (repeatable) takes parts of test
 names, as the program does, such as `--filter policy_advisor::`, rather than a
-nextest filterset. The runner runs the program's `ready`
-and `run` commands in the guest and still writes `junit.xml` and `nextest.log`
-(the program's output) to the results directory. Branch E2E builds
+nextest filterset. The runner runs the program's `ready` command in the
+guest, then uses nextest to run the prebuilt binary. It writes `junit.xml`
+and `nextest.log` to the results directory. Branch E2E builds
 `openshell-conformance` once and passes it to every conformance row this way.
+`--test-threads N` runs up to N tests concurrently in the guest, whether
+the runner builds the suite or uses `--bundle` or `--program`. The default
+is one. CI rows can opt in with `test_threads`.
 
 `openshell-test-runner build --family <family> --out <dir>` builds a family's
 test bundle for the guest without booting a VM, and `run --bundle <dir>` runs
@@ -289,7 +292,9 @@ suite, with a name that says what the suite tests.
 1. Add a crate under `tests/suites/features/<name>` that depends on
    `openshell-testkit`, and add it to `members` in
    `tests/suites/features/Cargo.toml`.
-2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
+2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions and use
+   [testkit's harness](tests/testkit/README.md#unsupported-tests) so the suite
+   can skip unsupported tests per environment.
 3. Re-lock the workspace: `cargo metadata --manifest-path
    tests/suites/features/Cargo.toml`, then
    `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`. `cargo fmt`
@@ -518,6 +523,9 @@ feature variable (`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURE
 `e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
 it skips them. Unset or empty values select the driver's default Rust
 features. The selector is handled by the runner; it is not a Cargo feature.
+The wrappers use nextest, which runs one test per CPU by default. Set
+`NEXTEST_TEST_THREADS` to change the worker count. For a standalone run without nextest,
+invoke `openshell-conformance run` directly.
 
 ```shell
 OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes
@@ -690,6 +698,15 @@ rootful and rootless, and the `k3s` and `k3s-ha` installers. The tests run on
 the K3s node, so the K3s installers set the chart's `server.hostGatewayIP` to
 the node's address.
 
+The `routable-host-ip` feature suite (`tests/suites/features/routable-host-ip`)
+checks that a policy endpoint whose host is an IP literal reaches that address,
+with or without `allowed_ips`. The test reaches a host server by
+`host.openshell.internal`, then uses the address that request arrived at, or
+the host's outbound address when it arrived on loopback from a host-network
+supervisor. The address must be one the supervisor lets an IP literal reach.
+Rootless Podman's is link-local and always blocked, so CI runs the suite on
+Docker rootful, Podman rootful, and the `k3s` and `k3s-ha` installers.
+
 The `connect-ssh-supervision` feature suite
 (`tests/suites/features/connect-ssh-supervision`) checks how `sandbox connect`
 supervises its `ssh` process: it reconnects after losing the SSH transport and
@@ -714,7 +731,7 @@ mise run e2e:kubernetes:credential-drivers
 
 The `e2e-kubernetes` nextest profile temporarily excludes only
 `canonical_main_connect_recovers_its_ssh_transport` while
-[#4445](https://github.com/NVIDIA/OpenShell/issues/4445) investigates delayed SSH
+[#4445](https://github.com/ai-openshell/openshell/issues/4445) investigates delayed SSH
 input-owner release through port-forwarding. The test remains available to other
 driver profiles; the remaining Kubernetes tests stay enabled.
 
@@ -753,7 +770,7 @@ failure or interrupt.
 
 Sandbox pods use the namespace-assigned UID/GID and run under `restricted-v2`
 without a privileged SCC grant to `openshell-sandbox`. Earlier versions required
-that grant for in-container isolation setup. [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation)
+that grant for in-container isolation setup. [RFC 0012](https://github.com/ai-openshell/openshell/blob/main/rfc/0012-isolation-backend/README.md#motivation)
 explains the isolation backend separation behind the capability-free runtime.
 
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
@@ -761,7 +778,7 @@ on the sandbox-side `host.openshell.internal` alias reaching the machine running
 the tests, which is unreachable from pods on a remote cluster, so they fail.
 The conformance suite's `credential_gating` tests need the alias to reach that
 machine too, and the feature selection doesn't skip them, so they fail on a
-remote cluster. [#5409](https://github.com/NVIDIA/OpenShell/issues/5409)
+remote cluster. [#5409](https://github.com/ai-openshell/openshell/issues/5409)
 tracks handling that.
 Left enabled, the `host_gateway_alias` suite fails because
 `host.openshell.internal` does not resolve inside the pod, so the gateway

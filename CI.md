@@ -12,6 +12,10 @@ PR CI runs on standard GitHub-hosted runners. `Branch Checks` and `Helm Lint` tr
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
+### TypeScript SDK freeze
+
+The TypeScript SDK moved to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript), and the `TypeScript SDK Freeze` job rejects changes to `sdk/typescript/` other than the `@nvidia/openshell-sdk` re-export stub.
+
 ### Monitoring dashboards
 
 `Monitoring Mixin` runs in Branch Checks when files under
@@ -75,12 +79,12 @@ visible; do not disable the job or add a broad Buf ignore rule.
 ### Windows validation
 
 Native Windows implementation and releases use the
-[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows), independently
+[`windows` branch](https://github.com/ai-openshell/openshell/tree/windows), independently
 of the `main` release train described in this document. Shared documentation on
 `main` must retain that branch placement. See [WINDOWS.md](WINDOWS.md) for the
 native MSVC build and MXC runtime requirements.
 
-The [Windows MSVC workflow on `windows`](https://github.com/NVIDIA/OpenShell/blob/windows/.github/workflows/windows-msvc.yml)
+The [Windows MSVC workflow on `windows`](https://github.com/ai-openshell/openshell/blob/windows/.github/workflows/windows-msvc.yml)
 runs native x64 and ARM64 lanes. Windows PR checks are opt-in: adding
 `test:windows` starts them, and later commits to the PR run them automatically.
 Windows checks are not required for merging and do not run in merge queues.
@@ -89,7 +93,7 @@ release binary builds. Those jobs use `continue-on-error: true`, so inspect
 their individual results rather than treating a green workflow as qualification.
 The jobs do not upload or publish the binaries. Native Windows packages are
 not supplied through the `main` installer or release train. Real MXC runtime qualification requires a
-capable host and the [Windows runtime tests](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation).
+capable host and the [Windows runtime tests](https://github.com/ai-openshell/openshell/blob/windows/TESTING.md#native-windows-validation).
 
 ### Advisory compatibility review
 
@@ -98,9 +102,9 @@ qualification. Branch checks compare the prospective merge tree with its target,
 using workflow-revision review tooling and the target's tag-derived train policy.
 Release qualification reviews the cumulative diff from the previous reachable
 stable release to the exact candidate commit, using the same tag-derived
-patch/minor policy as the protobuf check. It reviews public Rust, Python, and
-TypeScript SDKs, API behavior, CLI contracts, configuration, policy, Helm,
-and persisted state.
+patch/minor policy as the protobuf check. It reviews the public Rust and Python
+SDKs, API behavior, CLI contracts, configuration, policy, Helm, and persisted
+state.
 Both Codex workflows share the `codex-release-review` concurrency group with
 `queue: max`, so only one review runs at a time and up to 100 pending reviews
 are retained across branch, release, and manual runs. The release compatibility
@@ -243,6 +247,26 @@ nix run .#openshell-test-runner -- run \
 
 A local run does not replace the required PR E2E gate.
 
+### Run only the GitHub App provider regression
+
+The GitHub App sandbox regression runs in the curated `e2e:podman:ci` suite
+used by the branch Podman E2E job. It is also independently selectable:
+
+```shell
+OPENSHELL_E2E_PODMAN_TEST=provider_github_app mise run e2e:podman
+```
+
+It builds a tool image with `gh` and Git, then uses a local installation-token
+issuer and authenticated HTTPS API/Git fixture. It checks both clients across
+12 rotations, revocation after reconfiguration, and a fresh process using the
+replacement handle. No live GitHub app or installation is required. It needs
+the wrapper-managed gateway so it can temporarily trust the fixture CA; the
+original gateway configuration is restored afterward. The OAuth counterpart
+remains separately selectable as `provider_refresh_handles`. It uses an HTTP
+fixture and the standard workload image, and supports both wrapper-managed
+gateways and existing gateways selected with `OPENSHELL_GATEWAY_ENDPOINT`.
+It does not install CA trust or restart the gateway.
+
 ## Informational security reports
 
 Security workflows run on GitHub-hosted runners. The PR-oriented workflows receive no secrets and run
@@ -366,7 +390,10 @@ Pre-release builds, then publishes and calls `release-qualification.yml` in
 parallel within the same run, using native job dependencies.
 Its platform package artifacts are uploaded after versioned images and the chart,
 so the installer can use them while qualification runs or after it fails.
-The pre-release snap artifact is published to the `latest/beta` channel.
+Automatic snap publishing to `latest/edge`, `latest/beta`, and `latest/stable`
+is disabled pending migration to the upcoming packages repository under `ai-openshell`.
+Snap artifacts remain available in the GitHub Releases; manual snap publishing
+remains enabled.
 Stable release publication pushes the public `proto/` module to
 `buf.build/openshell/core`, labeled with the release tag (for example,
 `v0.1.7`) and linked to the release source commit. Prereleases do not publish
@@ -457,18 +484,19 @@ Release rebuilds all stable artifacts with the stable version and publishes
 without rerunning qualification. These artifacts have different embedded versions
 from the qualified prerelease. Existing stable tags are never moved; a retry must
 resolve to the same qualified candidate. A retry rebuilds, then publishes only what
-is missing: it keeps published GHCR version tags, Helm charts, GitHub Release assets,
-and npm versions. Snap uploads are not skipped.
+is missing: it keeps published Quay version tags, Helm charts, GitHub Release assets,
+and npm versions. Automatic snap publishing is disabled pending migration to
+the upcoming packages repository under `ai-openshell`.
 
 Stable image builds save multi-platform OCI archives as workflow artifacts without
-pushing to GHCR. Publication copies those archives, including their attestations,
-to the stable version tags and verifies their SBOMs before updating `latest`.
+pushing them. Publication copies those archives, including their attestations,
+to the stable version tags on Quay and verifies their SBOMs before updating `latest`.
 The qualified prerelease's commit-SHA image tags remain unchanged.
 
 Release is manually dispatched; pushing a stable tag does not trigger publication.
 Stable runs serialize across branches. A version older than the highest stable
 Git tag publishes versioned artifacts while preserving shared latest channels:
-GHCR `latest`, GitHub's latest release, npm `latest`, and snap `latest/stable`.
+Quay `latest`, GitHub's latest release, and npm `latest`.
 Each publisher rechecks the current remote stable tags immediately before
 updating its shared channel, including when a past publishing job is rerun.
 This protection applies to runs created with these workflow definitions.
@@ -520,9 +548,9 @@ gpg --output private-reports.tar.gz --decrypt codex-security-private.tar.gz.gpg
 ```
 
 Trivy accepts optional `images` and `charts`, one reference per line. Images can
-use tags or digests, such as `ghcr.io/nvidia/openshell/gateway:0.1.1-pre.1` or
-`ghcr.io/nvidia/openshell/gateway@sha256:<digest>`. Charts use versioned OCI
-references, such as `oci://ghcr.io/nvidia/openshell/helm-chart:0.1.1-pre.1`.
+use tags or digests, such as `quay.io/ai-openshell/gateway:0.1.1-pre.1` or
+`quay.io/ai-openshell/gateway@sha256:<digest>`. Charts use versioned OCI
+references, such as `oci://quay.io/ai-openshell/charts/openshell:0.1.1-pre.1`.
 Artifacts must already be published and accessible to the workflow. The caller
 selects artifacts matching the candidate; the workflow does not verify that
 association. Without artifact inputs, Trivy scans only the candidate's deployment
@@ -567,7 +595,7 @@ Run the scanner locally with:
 
 ```shell
 nix develop --command tasks/scripts/trivy-scan.sh config
-nix develop --command tasks/scripts/trivy-scan.sh images ghcr.io/nvidia/openshell/gateway:dev
+nix develop --command tasks/scripts/trivy-scan.sh images quay.io/ai-openshell/gateway:dev
 nix develop --command tasks/scripts/trivy-scan.sh gate
 nix develop --command tasks/scripts/trivy-scan.sh prepare-sarif
 ```
@@ -600,7 +628,7 @@ operating-system CVEs remain the responsibility of the standalone scan.
 
 Org members and collaborators sign their commits cryptographically.
 
-DCO sign-off (`-s` / `Signed-off-by`) is a separate requirement and does not count as commit signing. Dependabot-authored dependency update PRs are allowlisted in DCO Assistant because the bot cannot sign commits.
+DCO sign-off (`-s` / `Signed-off-by`) is a separate requirement and does not count as commit signing.
 
 ### One-time setup with an SSH key
 
@@ -674,9 +702,9 @@ Maintainers should add ready PRs to the queue rather than pressing a direct merg
 
 | File | Role |
 |---|---|
-| `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `pull_request` and on `merge_group` for queued merges. |
+| `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `pull_request` and on `merge_group` for queued merges. Rust lint and tests run once with the development configuration (`--features experimental`). |
 | `.github/workflows/branch-e2e.yml` | Standard, Kubernetes HA, Kubernetes credential-driver, and continuity E2E. PRs use the `test:e2e`, `test:e2e-kubernetes`, and `test:e2e:continuity` labels; merge groups do not run E2E. Jobs load the images this run builds from workflow artifacts, so fork PRs need no registry write access. |
-| `.github/workflows/build-binaries-{linux,macos}.yml`, `build-vm-driver-{linux,macos}.yml` | Shared per-platform binary matrices used by branch and release workflows. Each platform is its own workflow, so a consumer depends only on the platforms it needs. The VM driver remains separate because its build consumes the runtime binaries. Its build steps stay inline rather than in a local action because release builds check out the release tag, which may predate the action. |
+| `.github/workflows/build-binaries-{linux,macos}.yml`, `build-vm-driver-{linux,macos}.yml` | Shared per-platform binary matrices used by branch and release workflows. Each platform is its own workflow, so a consumer depends only on the platforms it needs. The VM driver remains separate because its build consumes the runtime binaries. Its build steps stay inline rather than in a local action because release builds check out the release tag, which may predate the action. `experimental: true` selects `--features experimental` for the gateway and supervisor; Release Dev and branch E2E enable it, while prerelease and stable builds use the default of `false`. |
 | `.github/workflows/build-images.yml` | Builds multi-platform images and uploads them as OCI archives plus per-platform Docker archives for E2E. Release callers also push them; Branch E2E Checks does not. |
 | `.github/actions/load-e2e-images` | Downloads the per-platform Docker archives and loads them into Docker, Podman, or kind, so E2E jobs never pull OpenShell images from a registry. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
@@ -702,19 +730,21 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 
 Each step that publishes to an external registry, store, or site lives in its own workflow with both `workflow_call` and `workflow_dispatch`. Release calls it, and a maintainer can dispatch it to finish one missing publication for an existing release without rerunning Release. Dispatch inputs identify an already-published release, such as its tag and source commit; the workflow verifies them before publishing and should skip what is already published. Keep the manual trigger when changing or moving a publisher.
 
+CI builds push SHA-tagged images to the private CI registry, `ghcr.io/<owner>/openshell/<component>:<sha>`. Releases promote them to the public release registry: images to `quay.io/ai-openshell/{gateway,sandbox,supervisor}` and charts to `oci://quay.io/ai-openshell/charts/{openshell,openshell-workspace}`. Jobs that write to Quay run in the `release` environment and log in as the robot `ai-openshell+openshell_release` with the job's OIDC token through `ai-openshell/workflows/quay-login`; there is no stored registry secret. `ghcr.io/nvidia/openshell` is frozen and receives no new releases.
+
 | File | Role |
 |---|---|
-| `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries and packages, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
+| `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries and packages, promotes the images to `quay.io/ai-openshell/<component>` as `:dev` and `:<sha>`, and pushes the Helm chart as `oci://quay.io/ai-openshell/charts/openshell:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
 | `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. Publishes the prerelease's notes preview, retagged, or generates notes when it is unavailable. The notes-only mode generates a release notes preview artifact. Published artifacts are never overwritten: a rerun fills in what is missing, and a bad published artifact is fixed by releasing a new patch version. |
-| `.github/workflows/release-auto-tag.yml` | Dispatched manually; its schedule is paused. Tags the next `-pre.N` on `main` when commits landed since the latest one, then dispatches Pre-release. It skips when the train has no `-pre.1` or its version is already stable, so push each train's `-pre.1` tag by hand. |
+| `.github/workflows/release-auto-tag.yml` | Weekdays at 14:00 Europe/Zurich, tags the next `-pre.N` on `main` when commits landed since the latest one, then dispatches Pre-release. It skips when the train has no `-pre.1` or its version is already stable, so push each train's `-pre.1` tag by hand. |
 | `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually. A tagless dispatch creates the next candidate on its branch; explicit tags select existing candidates. Builds, then publishes and qualifies in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
-| `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish release-labeled public schemas to Buf (`BUF_TOKEN` required) and GitHub Releases, and call the snap and npm publishers. The Python SDK is released from [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), so no GitHub Release carries a wheel. |
+| `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish release-labeled public schemas to Buf (`BUF_TOKEN` required) and GitHub Releases, and call the npm publisher. The Python SDK is released from [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), so no GitHub Release carries a wheel. |
 | `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable releases. Stable releases reuse the promoted prerelease's preview when available. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance, continuity, and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
-| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |
-| `.github/workflows/sdk-typescript-publish.yml` | Publishes the TypeScript SDK to GitHub Packages. Called by stable Release; manual dispatch publishes a given tag and npm version. |
+| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Automatic publishing to `latest/edge`, `latest/beta`, and `latest/stable` is disabled pending migration to the upcoming packages repository under `ai-openshell`. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |
+| `.github/workflows/sdk-typescript-publish.yml` | Publishes the deprecated `@nvidia/openshell-sdk` stub to GitHub Packages. Manual dispatch only: run it for a stable tag after ai-openshell/sdk-typescript publishes the matching `@ai-openshell/sdk` release. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts
