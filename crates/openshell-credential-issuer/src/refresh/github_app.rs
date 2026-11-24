@@ -697,14 +697,13 @@ mod tests {
         assert!(failure.status.message().contains("timed out"));
         assert!(!failure.status.message().contains("secret"));
 
-        let port = openshell_core::test_support::RefusingTcpPort::bind().unwrap();
-        let url = format!("http://{}/secret-path?secret-query=value", port.address());
+        let url = "http://127.0.0.1:0/secret-path?secret-query=value";
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
-        let failure = transport_failure(client.get(&url).send().await.unwrap_err());
+        let failure = transport_failure(client.get(url).send().await.unwrap_err());
         assert_eq!(failure.failure_code, "github_token_endpoint_unavailable");
         assert_eq!(failure.recovery_action, Recovery::Retry);
         assert!(failure.status.message().contains("connection failed"));

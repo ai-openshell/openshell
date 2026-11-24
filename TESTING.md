@@ -58,11 +58,11 @@ Let test servers bind port `0` and keep the resulting listener alive. Binding a
 temporary listener, reading its port, and dropping it lets a parallel test claim
 the port before the test uses it.
 
-For tests that need connection refusal, enable `openshell-core`'s `test-support`
-feature in dev-dependencies and keep a `test_support::RefusingTcpPort` guard alive
-through the request or child process. This fixture is not for handing a port to a
-server later. When a separate process must bind a selected port, retry only bind
-collisions with a fresh port and a bounded attempt count.
+For a generic connection failure, use destination `127.0.0.1:0`: port zero cannot
+host a TCP listener. The error kind differs by OS, so do not assert a specific
+refusal error. For handshake or acquisition timeouts, keep a listener bound and
+never serve its connections. When a separate process must bind a selected port,
+retry only bind collisions with a fresh port and a bounded attempt count.
 
 ### PostgreSQL-backed tests
 

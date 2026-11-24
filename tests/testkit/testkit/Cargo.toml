@@ -42,6 +42,3 @@ libc = "0.2"
 [[test]]
 name = "program"
 harness = false
-
-[dev-dependencies]
-openshell-core = { path = "../../../crates/openshell-core", default-features = false, features = ["test-support"] }

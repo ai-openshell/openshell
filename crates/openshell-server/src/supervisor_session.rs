@@ -5606,12 +5606,11 @@ mod tests {
         let metrics = MetricsCapture::install();
         let state = crate::grpc::test_support::test_server_state().await;
         seed_peer_token(&state);
-        let port = openshell_core::test_support::RefusingTcpPort::bind().unwrap();
-        let endpoint = format!("http://{}", port.address());
+        let endpoint = "http://127.0.0.1:0";
 
         let err = forward_provider_status_query_to_owner(
             &state,
-            &owner_at(&endpoint),
+            &owner_at(endpoint),
             "sbx-peer",
             GetSandboxProviderStatusRequest::default(),
         )

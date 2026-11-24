@@ -41,7 +41,6 @@ url = { workspace = true }
 test-support = []
 
 [dev-dependencies]
-openshell-core = { path = "../openshell-core", features = ["test-support"] }
 axum = { workspace = true }
 rcgen = { workspace = true }
 tokio-rustls = { workspace = true }

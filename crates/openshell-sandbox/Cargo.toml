@@ -78,7 +78,6 @@ socket2 = { workspace = true, features = ["all"] }
 tempfile = "3"
 
 [dev-dependencies]
-openshell-core = { path = "../openshell-core", features = ["test-support"] }
 hyper-util = { workspace = true }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 rcgen = { workspace = true }

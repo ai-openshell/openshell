@@ -34,7 +34,6 @@ tracing-subscriber = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-openshell-core = { path = "../openshell-core", features = ["test-support"] }
 rcgen = { workspace = true }
 tempfile = "3"
 tokio-rustls = { workspace = true }

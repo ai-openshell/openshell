@@ -68,8 +68,6 @@ pub mod secrets;
 pub mod settings;
 pub mod shell;
 pub mod telemetry;
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
 pub mod time;
 pub mod token_endpoint;
 pub mod token_grant_failure;

@@ -418,11 +418,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_export_to_a_closed_port_fails_promptly() {
-        let port = openshell_core::test_support::RefusingTcpPort::bind().unwrap();
-        let endpoint = format!("http://{}", port.address());
+    async fn http_export_to_port_zero_fails_promptly() {
+        let endpoint = "http://127.0.0.1:0";
         let exporter = Exporter::new(
-            &endpoint,
+            endpoint,
             OtlpProtocol::HttpProtobuf,
             http::HeaderMap::new(),
             None,
@@ -433,7 +432,7 @@ mod tests {
         let error = exporter
             .export(Bytes::from(encoded_request("s", &[])))
             .await
-            .expect_err("closed port fails");
+            .expect_err("port zero fails");
         assert!(matches!(error, ExportError::Http(_)), "{error}");
         assert!(started.elapsed() < EXPORT_TIMEOUT);
     }
@@ -612,17 +611,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_to_a_closed_port_returns_status_promptly() {
-        let port = openshell_core::test_support::RefusingTcpPort::bind().unwrap();
-        let endpoint = format!("http://{}", port.address());
+    async fn export_to_port_zero_returns_status_promptly() {
+        let endpoint = "http://127.0.0.1:0";
         let exporter =
-            Exporter::new(&endpoint, OtlpProtocol::Grpc, http::HeaderMap::new(), None).unwrap();
+            Exporter::new(endpoint, OtlpProtocol::Grpc, http::HeaderMap::new(), None).unwrap();
 
         let started = Instant::now();
         let error = exporter
             .export(Bytes::from(encoded_request("s", &[])))
             .await
-            .expect_err("closed port fails");
+            .expect_err("port zero fails");
         assert!(matches!(error, ExportError::Status(_)), "{error}");
         assert!(started.elapsed() < EXPORT_TIMEOUT);
     }

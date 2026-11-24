@@ -51,8 +51,6 @@ libc = "0.2"
 
 [features]
 default = ["telemetry"]
-## Socket fixtures for tests in downstream crates.
-test-support = []
 ## Compile in anonymous telemetry emission support. On by default; disable with
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.

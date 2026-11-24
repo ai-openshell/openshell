@@ -2759,13 +2759,16 @@ impl PostgresStore {
         }
     }
 
-    /// Keep the guard alive while using the URL so every connection is refused.
-    pub(crate) fn refusing_url_for_tests() -> (openshell_core::test_support::RefusingTcpPort, String)
-    {
-        let port = openshell_core::test_support::RefusingTcpPort::bind()
-            .expect("reserve a refusing loopback port");
-        let url = format!("postgres://openshell@{}/openshell", port.address());
-        (port, url)
+    /// Hold a listener that never answers the `PostgreSQL` handshake.
+    pub(crate) async fn unresponsive_url_for_tests() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a silent database endpoint");
+        let url = format!(
+            "postgres://openshell@{}/openshell",
+            listener.local_addr().unwrap()
+        );
+        (listener, url)
     }
 }
 
@@ -2774,14 +2777,43 @@ mod tests {
     use super::super::mutation_lock::SSH_IDENTITY_LOCK_KEY;
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn connect_to_a_refusing_server_fails_unavailable_within_the_acquire_timeout() {
-        let (_port, url) = PostgresStore::refusing_url_for_tests();
+        // Linux refuses connections to a bound, non-listening socket. Keeping
+        // it bound also excludes listeners with SO_REUSEADDR enabled.
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let address = socket.local_addr().unwrap().as_socket().unwrap();
+        assert!(tokio::net::TcpListener::bind(address).await.is_err());
+        assert_eq!(
+            openshell_core::net::connect_tcp_nodelay_best_effort(address)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+        let url = format!("postgres://openshell@{address}/openshell");
+        let started = std::time::Instant::now();
+        let error = PostgresStore::connect(&url, None, None).await.unwrap_err();
+        assert!(
+            matches!(error, PersistenceError::Unavailable(_)),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < DATA_POOL_ACQUIRE_TIMEOUT + Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn connect_to_an_unresponsive_server_fails_unavailable_within_the_acquire_timeout() {
+        let (_listener, url) = PostgresStore::unresponsive_url_for_tests().await;
         let started = std::time::Instant::now();
 
         let error = PostgresStore::connect(&url, None, None)
             .await
-            .expect_err("nothing listens on the port");
+            .expect_err("the database never answers");
 
         assert!(
             matches!(error, PersistenceError::Unavailable(_)),
@@ -2825,7 +2857,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_connection_timeout_is_contention_only_if_the_pool_filled_during_the_wait() {
-        let (_port, url) = PostgresStore::refusing_url_for_tests();
+        let (_listener, url) = PostgresStore::unresponsive_url_for_tests().await;
         let store = PostgresStore::connect_lazy_for_tests(&url, 2);
         let usage = &store.lock_usage;
         let is_contention = |error: PersistenceError| match error {
@@ -2869,7 +2901,7 @@ mod tests {
     async fn lock_connection_checkout_tracks_the_in_use_gauge() {
         const IN_USE: &str = "openshell_server_mutation_lock_connections_in_use";
         let metrics = crate::gateway_metrics::MetricsCapture::install();
-        let (_port, url) = PostgresStore::refusing_url_for_tests();
+        let (_listener, url) = PostgresStore::unresponsive_url_for_tests().await;
         let store = PostgresStore::connect_lazy_for_tests(&url, 2);
         let usage = &store.lock_usage;
 
@@ -2894,7 +2926,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_connection_timeout_without_time_to_connect_is_a_lock_timeout() {
-        let (_port, url) = PostgresStore::refusing_url_for_tests();
+        let (_listener, url) = PostgresStore::unresponsive_url_for_tests().await;
         let store = PostgresStore::connect_lazy_for_tests(&url, 1);
         // The pool never fills, but an earlier wait left too little time to
         // open a connection.
@@ -2905,7 +2937,7 @@ mod tests {
             PersistenceError::LockTimeout(_)
         ));
 
-        // SQLx retries the refused connection until the deadline.
+        // The handshake stays pending until the acquisition deadline.
         let deadline = tokio::time::Instant::now() + LOCK_CONNECTION_MIN_BUDGET / 4;
         match store
             .acquire_mutation_locks(&MutationLockSet::default(), deadline)
@@ -2915,17 +2947,17 @@ mod tests {
                 assert_eq!(detail, "waiting for a mutation lock connection");
             }
             Err(error) => panic!("expected a lock timeout, got {error:?}"),
-            Ok(_) => panic!("nothing listens, yet a lock connection opened"),
+            Ok(_) => panic!("the database never answers, yet a lock connection opened"),
         }
         assert_eq!(store.lock_usage.in_use.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
-    async fn refused_lock_connection_is_a_database_error_not_a_lock_timeout() {
-        let (_port, url) = PostgresStore::refusing_url_for_tests();
+    async fn unresponsive_lock_connection_is_a_database_error_not_a_lock_timeout() {
+        let (_listener, url) = PostgresStore::unresponsive_url_for_tests().await;
         let store = PostgresStore::connect_lazy_for_tests(&url, 1);
-        // SQLx retries a refused connection until the deadline, which leaves
-        // ample time to open one.
+        // Give acquisition enough budget to classify an unanswered handshake
+        // as a database error rather than lock contention.
         let deadline =
             tokio::time::Instant::now() + LOCK_CONNECTION_MIN_BUDGET + Duration::from_millis(300);
         match store
@@ -2937,7 +2969,7 @@ mod tests {
                 "{detail}"
             ),
             Err(error) => panic!("expected a database error, got {error:?}"),
-            Ok(_) => panic!("nothing listens, yet a lock connection opened"),
+            Ok(_) => panic!("the database never answers, yet a lock connection opened"),
         }
         assert_eq!(store.lock_usage.in_use.load(Ordering::Acquire), 0);
     }
@@ -2973,7 +3005,7 @@ mod tests {
                 .with_writer(move || LogWriter(writer.clone()))
                 .finish(),
         );
-        let (_port, url) = PostgresStore::refusing_url_for_tests();
+        let (_listener, url) = PostgresStore::unresponsive_url_for_tests().await;
         let store = PostgresStore::connect_lazy_for_tests(&url, 1);
         let available = u32::try_from(store.data_lock_slots.available_permits())
             .expect("the slot count fits in u32");
@@ -2983,7 +3015,7 @@ mod tests {
 
         // The outer timeout turns a missing bound into a failure instead of a
         // hang. It also fails a data connection acquired before the slot:
-        // SQLx retries the refused connection until its 30-second acquire
+        // The handshake waits for the 30-second acquire
         // timeout, past this one.
         match tokio::time::timeout(
             MUTATION_LOCK_TIMEOUT * 2,
@@ -3010,10 +3042,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_data_pool_lock_acquisition_returns_its_slot() {
-        let (_port, url) = PostgresStore::refusing_url_for_tests();
+        let (_listener, url) = PostgresStore::unresponsive_url_for_tests().await;
         let store = PostgresStore::connect_lazy_for_tests(&url, 1);
         let slots = store.data_lock_slots.available_permits();
-        // SQLx retries the refused connection until its 30-second acquire
+        // The handshake waits for the 30-second acquire
         // timeout, so the acquisition's own deadline ends the wait first.
         match tokio::time::timeout(
             MUTATION_LOCK_TIMEOUT * 2,
@@ -3026,7 +3058,7 @@ mod tests {
                 assert_eq!(detail, "waiting for a data-pool lock connection");
             }
             Err(error) => panic!("expected a lock timeout, got {error:?}"),
-            Ok(_) => panic!("nothing listens, yet a data-pool lock was acquired"),
+            Ok(_) => panic!("the database never answers, yet a data-pool lock was acquired"),
         }
         assert_eq!(
             store.data_lock_slots.available_permits(),
