@@ -9,12 +9,11 @@ use std::time::{Duration, Instant};
 use openshell_sdk::raw::proto;
 use openshell_sdk::{DeleteOptions, OpenShellClient};
 
-use serde::Deserialize;
-
 use crate::cleanup::Cleanup;
 use crate::cli::Cli;
 use crate::context::{Context, track_sandbox};
 use crate::error::{Error, Result, ResultExt as _};
+use crate::provider::profile_id;
 use crate::yaml_file::YamlFile;
 
 /// The longest workspace name the gateway accepts.
@@ -107,13 +106,7 @@ impl Workspace {
     /// Import `profile`, a provider profile in YAML, into the workspace and
     /// return its `id`. Cleanup deletes it after the workspace's providers.
     pub async fn import_profile(&self, profile: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Profile {
-            id: String,
-        }
-        let id = serde_yml::from_str::<Profile>(profile)
-            .context("read the provider profile's id")?
-            .id;
+        let id = profile_id(profile)?;
         // Deleting a missing profile succeeds, so register the delete before
         // the import.
         let cli = self.cli.clone();

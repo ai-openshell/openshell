@@ -10,18 +10,24 @@ use crate::context::Context;
 use crate::error::{Result, ResultExt as _};
 use crate::yaml_file::YamlFile;
 
+/// The `id` of `profile`, a provider profile in YAML: the provider type it
+/// defines.
+pub(crate) fn profile_id(profile: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Profile {
+        id: String,
+    }
+    Ok(serde_yml::from_str::<Profile>(profile)
+        .context("read the provider profile's id")?
+        .id)
+}
+
 impl Context {
     /// Import `profile`, a provider profile in YAML, and return its `id`, the
     /// provider type it defines. Cleanup deletes the profile after the test's
     /// sandboxes and the providers created after it.
     pub async fn import_profile(&self, profile: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Profile {
-            id: String,
-        }
-        let id = serde_yml::from_str::<Profile>(profile)
-            .context("read the provider profile's id")?
-            .id;
+        let id = profile_id(profile)?;
         // Deleting a missing profile succeeds, so register the delete before
         // the import.
         self.on_cleanup_delete("profile", &id);
