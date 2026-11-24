@@ -23,8 +23,9 @@
 //! cx.import_profile(&profile.to_yaml()?).await?;
 //! ```
 //!
-//! Profile endpoints are policy endpoints, so [`policy::Endpoint`] configures
-//! them. Setters are named after the YAML fields they set.
+//! [`policy::Endpoint`] configures profile endpoints. Setters are named after
+//! the YAML fields they set, but explicit credential bindings belong in
+//! sandbox policy, not reusable profiles.
 //!
 //! [`policy::Endpoint`]: crate::policy::Endpoint
 
@@ -127,7 +128,17 @@ impl Profile {
     }
 
     /// The profile as YAML, as `profile export` writes it.
+    /// Returns an error if an endpoint specifies `credential_binding`.
     pub fn to_yaml(&self) -> Result<String> {
+        for endpoint in &self.profile.endpoints {
+            if endpoint.credential_binding.is_some() {
+                return Err(Error::msg(format!(
+                    "provider profile {} endpoint {}:{} cannot set credential_binding; \
+                     set it in sandbox policy to bind a concrete provider",
+                    self.profile.id, endpoint.host, endpoint.port
+                )));
+            }
+        }
         profile_to_yaml(&ProviderTypeProfile::from_proto(&self.profile))
             .map_err(Error::from_display)
             .context(format!("render provider profile {}", self.profile.id))
@@ -246,6 +257,20 @@ binaries: [/usr/bin/curl, /usr/bin/python*]
         );
         let yaml = profile.to_yaml().expect("renders");
         assert_eq!(parsed(&yaml), expected, "rendered:\n{yaml}");
+    }
+
+    #[test]
+    fn rejects_explicit_credential_binding() {
+        let error = Profile::new("example")
+            .endpoint("api.example.test", 443, |ep| {
+                ep.credential_binding("provider");
+            })
+            .to_yaml()
+            .expect_err("a profile must not silently drop an explicit binding")
+            .to_string();
+        assert!(error.contains("api.example.test:443"), "{error}");
+        assert!(error.contains("credential_binding"), "{error}");
+        assert!(error.contains("sandbox policy"), "{error}");
     }
 
     /// A profile with only an id has the display name and category the
