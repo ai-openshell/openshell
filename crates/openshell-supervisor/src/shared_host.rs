@@ -1578,7 +1578,8 @@ async fn run_stream(
                         accepted = true;
                         host.gateway_connected.send_replace(true);
                         host.gateway_home.send_replace(Some(accepted_message.peer_endpoint.clone()));
-                        host.route_lookups.connect(Some(tx.clone()));
+                        host.route_lookups
+                            .connect(accepted_message.route_lookups.then(|| tx.clone()));
                         tracing::info!(session = %accepted_message.session_id, "gateway accepted the supervisor host");
                         // A pool gateway detects failed members by silence,
                         // so it asks for more frequent heartbeats.
@@ -2286,6 +2287,7 @@ mod tests {
                     nanos: 0,
                 }),
                 peer_endpoint: peer_endpoint.to_string(),
+                route_lookups: true,
             },
         ))
     }
@@ -2415,6 +2417,47 @@ mod tests {
             }
         });
         (reported, gateway)
+    }
+
+    /// A replica that predates lookups ends the stream on one, so the host
+    /// asks only replicas that accept with `route_lookups`.
+    #[tokio::test(start_paused = true)]
+    async fn route_lookups_go_only_to_a_gateway_that_answers_them() {
+        for answers in [false, true] {
+            let (host, _gateway, mut streams, _root) = attach_pool_host(vec![Attempt::Now]);
+            let mut stream = streams.recv().await.unwrap();
+            assert!(is_hello(stream.outbound.recv().await));
+            let mut accepted = accepted();
+            if let Some(host_gateway_message::Payload::Accepted(message)) = &mut accepted.payload {
+                message.route_lookups = answers;
+            }
+            stream.inbound.send(Ok(accepted)).await.unwrap();
+            assert!(next_status(&mut stream.outbound).await.is_some());
+
+            let lookup = tokio::spawn({
+                let host = host.clone();
+                async move { host.route_lookups.owner("rt-elsewhere-0123456789").await }
+            });
+            if answers {
+                loop {
+                    match stream.outbound.recv().await.and_then(|m| m.payload) {
+                        Some(host_message::Payload::RouteLookup(_)) => break,
+                        Some(_) => {}
+                        None => panic!("the stream ended before a lookup was sent"),
+                    }
+                }
+                lookup.abort();
+            } else {
+                assert_eq!(lookup.await.unwrap(), None);
+                while let Ok(message) = stream.outbound.try_recv() {
+                    assert!(!matches!(
+                        message.payload,
+                        Some(host_message::Payload::RouteLookup(_))
+                    ));
+                }
+            }
+            host.shut_down().await;
+        }
     }
 
     /// The part of the reconnect budget the host itself spends: everything

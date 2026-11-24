@@ -96,6 +96,9 @@ message HostAccepted {
   // instances' sessions here so they run on the replica serving this stream.
   // Empty when the replica has no peer endpoint.
   string peer_endpoint = 3;
+  // The replica answers RouteLookup. A host sends no lookup on a stream
+  // without it, since a replica that predates lookups ends the stream on one.
+  bool route_lookups = 4;
 }
 
 // Another gateway replica should serve the host, which dials it at once. The
@@ -113,9 +116,6 @@ message HostRejected {
 // previous one; an instance absent from a snapshot must stop, except on a
 // pool host, which releases it without stopping its workload.
 message AssignmentSnapshot {
-  reserved 5;
-  reserved "route_directory";
-
   // Monotonic within the session, starting at 1.
   uint64 revision = 1;
   repeated SandboxInstanceAssignment instances = 2;
@@ -125,6 +125,9 @@ message AssignmentSnapshot {
   // Pool hosts only: routes whose sandbox is stopping or deleted; the host
   // stops their workloads if it still hosts them.
   repeated string stop_routes = 4;
+  // Deprecated and no longer sent: a pool host asks for the owner of a route
+  // it does not own with RouteLookup instead.
+  repeated RouteOwner route_directory = 5;
   // Pool hosts only: routes this host's process owns whose launch material
   // this gateway replica has not loaded yet. The host keeps supervising them
   // unchanged; it neither releases nor stops them, and starts nothing for

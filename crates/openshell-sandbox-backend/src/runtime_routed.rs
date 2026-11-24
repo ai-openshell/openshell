@@ -64,9 +64,13 @@ const MAX_PENDING_HANDSHAKES: usize = 64;
 const MAX_PENDING_HANDSHAKES_PER_ROUTE: usize = 4;
 /// Bound on reading the preface and completing TLS for one socket.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Bound on resolving the owner of a route this listener does not own, so
-/// the handshake that may follow keeps most of its budget.
-const ROUTE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a runtime waits on one supervisor address to connect, send its
+/// preface, and read the reply.
+pub const ROUTE_HOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound on resolving the owner of a route this listener does not own. Half
+/// the runtime's hop budget, so a stalled lookup still leaves time to fall
+/// back and reply before the runtime gives up on this address.
+const ROUTE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
 /// Authenticated connections queued for a sandbox instance but not yet claimed.
 const MAX_QUEUED_CONNECTIONS: usize = 2;
 
@@ -891,6 +895,48 @@ mod tests {
         );
         assert_eq!(
             negotiate(address, &new_route_handle()).await.1,
+            RouteReply::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_lookup_answers_within_the_runtime_hop_budget() {
+        struct Stalled;
+        #[async_trait]
+        impl ResolveRoute for Stalled {
+            async fn owner(&self, _route: &str) -> Option<SocketAddr> {
+                std::future::pending().await
+            }
+        }
+
+        let router = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = router.local_addr();
+        let identity =
+            generate_sandbox_tls_material(openshell_core::SandboxSessionId::new()).unwrap();
+        let tls = client_tls(&identity);
+        let registered = new_route_handle();
+        let _registration = router.register(&registered, &tls).unwrap();
+        router.set_resolver(Arc::new(Stalled));
+        router.set_owned(Some(address), HashSet::new());
+
+        // Connecting, sending the preface, and reading the reply all fit in
+        // the runtime's per-hop budget even though the gateway never answers.
+        let hop = |route: String| {
+            tokio::time::timeout(ROUTE_HOP_TIMEOUT, async move {
+                let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+                    .await
+                    .unwrap();
+                negotiate_route(&mut stream, &route).await.unwrap()
+            })
+        };
+        assert_eq!(
+            hop(registered).await.expect("reply within the hop budget"),
+            RouteReply::Accept(Some(address))
+        );
+        assert_eq!(
+            hop(new_route_handle())
+                .await
+                .expect("reply within the hop budget"),
             RouteReply::Unknown
         );
     }

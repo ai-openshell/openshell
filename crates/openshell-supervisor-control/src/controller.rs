@@ -907,6 +907,7 @@ impl SupervisorHostController {
                     nanos: 0,
                 }),
                 peer_endpoint,
+                route_lookups: true,
             })),
         }))
         .await
@@ -1194,6 +1195,7 @@ impl SupervisorHostController {
                 seconds: i64::from(pool.recovery_timeout_secs),
                 nanos: 0,
             }),
+            ..AssignmentSnapshot::default()
         })
     }
 
