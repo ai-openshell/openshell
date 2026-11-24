@@ -922,15 +922,17 @@ middleware alone keeps Cedar's generation so it does not close tunnels.
 
 ## Implementation plan
 
-The proposal is implemented as a stack of pull requests.
-[#5005](https://github.com/NVIDIA/OpenShell/pull/5005) adds the
-`experimental` feature bundle for development builds.
-[#5006](https://github.com/NVIDIA/OpenShell/pull/5006) adds Cedar on top of
-it, refactoring the original implementation branch (`vishwa/cedar-openshell`,
+The proposal is implemented on `main` in development builds.
+[#5005](https://github.com/NVIDIA/OpenShell/pull/5005), merged as
+`0d495be49`, adds the `experimental` feature bundle for development builds.
+[#5006](https://github.com/NVIDIA/OpenShell/pull/5006), merged as
+`152c59d31`, adds Cedar on top of it, refactoring the original implementation
+branch (`vishwa/cedar-openshell`,
 [#4565](https://github.com/NVIDIA/OpenShell/pull/4565)) along the boundary
-described under [Rollout](#rollout).
-[#4991](https://github.com/NVIDIA/OpenShell/pull/4991) carries the Cedar
-versions of the examples. Together they contain the schema and engine crates
+described under [Rollout](#rollout); #4565 is superseded by it.
+[#4991](https://github.com/NVIDIA/OpenShell/pull/4991), which carried the
+Cedar versions of the examples against #4565, was closed without merging.
+The merged change contains the schema and engine crates
 (`openshell-policy-cedar-schema`, `openshell-policy-cedar`), the message
 adapter shared by the gateway and runtime (`openshell-policy-cedar-adapter`),
 the engine-neutral runtime contracts (`openshell-policy-runtime-interface`)
@@ -951,11 +953,12 @@ sandbox-wide WebSocket budget; staged policies that could change an enforced
 decision through the query budget or an evaluation error; Cedar MCP endpoints
 missing from endpoint status; and public skills that round-tripped every
 policy through YAML. The review also recommended splitting the change; the
-stack above does that, separating build configuration, the Cedar
+pull requests above do that, separating build configuration, the Cedar
 integration, and the examples.
 
 Remaining steps:
 
+- Bring the Cedar versions of the examples from #4991 to `main`.
 - Keep `ai-openshell/cedar` moving with the Cedar team: track delimited
   `like` upstream (cedar-policy/rfcs#115) and bump the pin as features land.
 - Let the CLI set middleware, endpoint settings, and `process` for Cedar
@@ -972,7 +975,11 @@ Remaining steps:
 
 Verification of #5006: the conformance suite passes on macOS (151 tests,
 with the 3 symlink tests that need Linux ignored), and the Cedar runtime's 76
-tests pass. Default builds of the gateway, supervisor, CLI, sandbox, and TUI
+tests pass. An offline RPM-style build of the merged tree resolves: the
+vendor archive from `deploy/rpm/create-vendor-archive.sh` carries the
+`ai-openshell/cedar` source mapping, and default and `experimental` gateway
+builds resolve with an empty Cargo home, while the same build without that
+mapping fails. Default builds of the gateway, supervisor, CLI, sandbox, and TUI
 contain no `cedar-policy`, and `experimental` builds of the gateway and
 supervisor resolve `ai-openshell/cedar`. The pull request also reports strict
 Clippy across the affected crates, the TypeScript SDK checks, protobuf
@@ -990,7 +997,7 @@ symlinked binaries beyond what the conformance suite covers.
 ### Rollout
 
 Cedar ships as an opt-in, development-only feature. A review of #4565 asked
-for this, and #5005 and #5006 implement it:
+for this, and #5005 and #5006 implemented it:
 
 - One `experimental` feature bundle gates Cedar; there is no Cedar-specific
   feature. `openshell-gateway`, `openshell-server`, `openshell-supervisor`,
@@ -998,10 +1005,10 @@ for this, and #5005 and #5006 implement it:
   and forward it. The CLI, TUI, SDKs, compute drivers, providers, and sandbox
   runtime never link the engine, in any build.
 - Release Dev and branch end-to-end builds set the binary build's
-  `dev-build` input, which enables `experimental` for the gateway and
+  `experimental` input, which enables the bundle for the gateway and
   supervisor. Pre-release and stable builds do not. Branch checks lint and
   test with the bundle enabled. Stable binary graphs exclude `cedar-policy`
-  today; whether CI should assert that is an
+  today, verified by per-package checks; whether CI should assert that is an
   [open question](#open-questions).
 - Only a supervisor built with the bundle advertises
   `openshell.policy.cedar.v1`, so a stable supervisor never claims support
@@ -1063,8 +1070,10 @@ maintainers to confirm.
   explicitly; the boundary digest already does. Linking Cedar also grew
   `SandboxPolicy` enough that some gateway futures needed boxing. The
   `ai-openshell/cedar` git source is in `Cargo.lock` for every build,
-  including builds that do not compile Cedar, so offline packaging such as
-  the RPM build must map that source to vendored crates.
+  including builds that do not compile Cedar, so offline packaging must map
+  that source to vendored crates. The RPM build does this through
+  `deploy/rpm/create-vendor-archive.sh`; other offline packaging needs the
+  same mapping.
 
 ## Alternatives
 
