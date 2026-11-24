@@ -1021,11 +1021,9 @@ where
         upstream,
         observer,
         correlation,
-        request_span: None,
+        request_span: RequestSpanState::new(live_body.is_none()),
         started_forwarding: false,
-        track_request_span: live_body.is_none(),
-        transport_failed: false,
-        read_eof: false,
+        upstream_state: UpstreamState::Open,
     };
     let mut client = ResponseProgress {
         client,
@@ -1050,8 +1048,8 @@ where
             if let Some(error) = report.downcast_mut::<UpstreamHttpError>() {
                 error.response_started = client.response_started;
                 Err(report)
-            } else if observed_upstream.transport_failed
-                || (observed_upstream.read_eof
+            } else if matches!(observed_upstream.upstream_state, UpstreamState::Failed)
+                || (matches!(observed_upstream.upstream_state, UpstreamState::ReadEof)
                     && report.downcast_ref::<IncompleteHttpBody>().is_some())
             {
                 Err(miette::Report::new(UpstreamHttpError {
@@ -1537,7 +1535,7 @@ where
         }
     }
     upstream.flush().await.into_diagnostic()?;
-    upstream.request_span.take();
+    upstream.request_span.disable();
 
     let response = relay_response(
         &req.action,
@@ -1646,20 +1644,60 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for ResponseProgress<'_, C> {
 ///
 /// Once a valid response status consumes the observation token, later stream
 /// failures are ignored and cannot overwrite the endpoint's first network result.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpstreamState {
+    Open,
+    ReadEof,
+    Failed,
+}
+
+enum RequestSpanState {
+    Disabled,
+    Pending,
+    Active(tracing::Span),
+}
+
+impl RequestSpanState {
+    fn new(enabled: bool) -> Self {
+        if enabled {
+            Self::Pending
+        } else {
+            Self::Disabled
+        }
+    }
+
+    fn start_if_pending(&mut self, correlation: Option<&RequestCorrelation>) {
+        if matches!(self, Self::Pending) {
+            *self = Self::Active(correlation.map_or_else(tracing::Span::none, |correlation| {
+                correlation.stage(RequestStage::UpstreamSend)
+            }));
+        }
+    }
+
+    fn active(&self) -> Option<&tracing::Span> {
+        match self {
+            Self::Active(span) => Some(span),
+            Self::Disabled | Self::Pending => None,
+        }
+    }
+
+    fn disable(&mut self) {
+        *self = Self::Disabled;
+    }
+}
+
 struct ObservedUpstream<'a, U> {
     upstream: &'a mut U,
     observer: Option<&'a EndpointObserver>,
-    transport_failed: bool,
-    read_eof: bool,
     correlation: Option<&'a RequestCorrelation>,
-    request_span: Option<tracing::Span>,
+    request_span: RequestSpanState,
     started_forwarding: bool,
-    track_request_span: bool,
+    upstream_state: UpstreamState,
 }
 
 impl<U> ObservedUpstream<'_, U> {
     fn record_write_failure(&self) {
-        if let Some(span) = &self.request_span {
+        if let Some(span) = self.request_span.active() {
             span.record("otel.status_code", "ERROR");
             span.record("openshell.request.failure_reason", "upstream_send_failed");
         }
@@ -1669,7 +1707,7 @@ impl<U> ObservedUpstream<'_, U> {
     }
 
     fn transport_error(&mut self, error: std::io::Error) -> std::io::Error {
-        self.transport_failed = true;
+        self.upstream_state = UpstreamState::Failed;
         if let Some(observer) = self.observer {
             observer.observe(EndpointResult::TransportFailed);
         }
@@ -1687,9 +1725,13 @@ impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
         let before = buf.filled().len();
         let can_read = buf.remaining() > 0;
         let result = std::pin::Pin::new(&mut *this.upstream).poll_read(cx, buf);
-        this.read_eof |= matches!(result, std::task::Poll::Ready(Ok(())))
+        if matches!(this.upstream_state, UpstreamState::Open)
+            && matches!(result, std::task::Poll::Ready(Ok(())))
             && can_read
-            && buf.filled().len() == before;
+            && buf.filled().len() == before
+        {
+            this.upstream_state = UpstreamState::ReadEof;
+        }
         match result {
             std::task::Poll::Ready(Err(error)) => {
                 std::task::Poll::Ready(Err(this.transport_error(error)))
@@ -1712,13 +1754,8 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
                 correlation.finish_inspection(crate::metrics::ResultLabel::Success);
             }
         }
-        let result = if this.track_request_span {
-            let span = this.request_span.get_or_insert_with(|| {
-                this.correlation
-                    .map_or_else(tracing::Span::none, |correlation| {
-                        correlation.stage(RequestStage::UpstreamSend)
-                    })
-            });
+        this.request_span.start_if_pending(this.correlation);
+        let result = if let Some(span) = this.request_span.active() {
             span.in_scope(|| std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf))
         } else {
             std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf)
@@ -1743,7 +1780,7 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let result = if let Some(span) = &this.request_span {
+        let result = if let Some(span) = this.request_span.active() {
             span.in_scope(|| std::pin::Pin::new(&mut *this.upstream).poll_flush(cx))
         } else {
             std::pin::Pin::new(&mut *this.upstream).poll_flush(cx)
@@ -1755,7 +1792,7 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
             }
             result => {
                 if matches!(result, std::task::Poll::Ready(Ok(())))
-                    && let Some(span) = &this.request_span
+                    && let Some(span) = this.request_span.active()
                 {
                     span.record("otel.status_code", "OK");
                 }
@@ -2871,7 +2908,7 @@ fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
     let split = headers
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .map_or(headers.len(), |pos| pos);
+        .unwrap_or(headers.len());
     let mut out = Vec::with_capacity(headers.len() + name.len() + value.len() + 4);
     out.extend_from_slice(&headers[..split]);
     out.extend_from_slice(b"\r\n");
@@ -7295,11 +7332,9 @@ mod tests {
                 upstream: &mut response,
                 observer: Some(&observer),
                 correlation: None,
-                request_span: None,
+                request_span: RequestSpanState::Pending,
                 started_forwarding: false,
-                track_request_span: true,
-                transport_failed: false,
-                read_eof: false,
+                upstream_state: UpstreamState::Open,
             };
             let mut client = Vec::new();
             relay_response(

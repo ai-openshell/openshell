@@ -1115,7 +1115,10 @@ mod tests {
                 opentelemetry::KeyValue::new("openshell.gateway.name", "prod-west"),
             ]
         );
-        assert!(supervisor_resource_attributes(None, None).is_empty());
+        assert_eq!(
+            supervisor_resource_attributes(None, None),
+            Vec::<opentelemetry::KeyValue>::new()
+        );
     }
 
     #[test]

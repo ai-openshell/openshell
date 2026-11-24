@@ -607,7 +607,7 @@ network_policies:
         "local sampler/export configuration controls request span export"
     );
     if roots.is_empty() {
-        assert!(spans.is_empty());
+        assert_eq!(spans, Vec::new());
         assert!(records.iter().all(|record| record.get("trace").is_none()));
     } else {
         assert_eq!(roots.len(), 1);
@@ -623,13 +623,7 @@ network_policies:
             root.links.links[0].span_context.span_id().to_string(),
             WORKLOAD_SPAN_ID
         );
-        assert!(
-            root.links.links[0]
-                .span_context
-                .trace_state()
-                .header()
-                .is_empty()
-        );
+        assert_eq!(root.links.links[0].span_context.trace_state().header(), "");
         for record in &records {
             assert_eq!(
                 record["trace"]["uid"],

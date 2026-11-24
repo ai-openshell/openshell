@@ -405,7 +405,7 @@ mod tests {
         let records = exporter.get_finished_metrics().unwrap();
         let instruments = records[0]
             .scope_metrics()
-            .flat_map(|scope| scope.metrics())
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
             .collect::<Vec<_>>();
         for (name, result) in [
             (
@@ -471,7 +471,7 @@ mod tests {
                     .last()
                     .unwrap()
                     .scope_metrics()
-                    .flat_map(|scope| scope.metrics())
+                    .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
                     .find(|metric| metric.name() == "openshell_supervisor_connections_active")
                     .unwrap();
                 let AggregatedMetrics::U64(MetricData::Gauge(gauge)) = gauge.data() else {
