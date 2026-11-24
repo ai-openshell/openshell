@@ -157,6 +157,9 @@ message GetCapabilitiesResponse {
   // Gateways require an exact policy match before activating the driver.
   // Empty denotes a legacy driver and requires explicit admission opt-out.
   string resource_admission_policy = 13;
+  // Whether this driver supports `DriverSandboxSpec.privileged` (true guest
+  // root inside a hardened VM boundary). False by default.
+  bool supports_privileged = 14;
 }
 
 message AuthenticateSandboxRequest {
@@ -263,6 +266,9 @@ message DriverSandboxSpec {
   // public sandbox spec or workload environment. Omitted for the built-in
   // runtime. Requires openshell.compute.isolation-backend.
   IsolationBackendRegistration isolation_backend = 17;
+  // Provision the sandbox in privileged (true guest root) mode. Drivers that
+  // do not support privileged mode must reject creation.
+  bool privileged = 18;
 }
 
 // Trusted operator registration delivered to the compute driver on every

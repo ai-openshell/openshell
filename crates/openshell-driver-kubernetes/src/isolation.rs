@@ -408,6 +408,7 @@ pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub host_gateway_ip: Option<IpAddr>,
     pub workload_identity: ResolvedWorkloadIdentity,
     pub child_env: HashMap<String, String>,
+    pub privileged: bool,
 }
 
 /// Protected workload-pod config and matching sandbox-runtime descriptor.
@@ -548,6 +549,9 @@ impl KubernetesSandboxRuntimeBoundarySpec {
             }),
         }
         .project(&self.generation)?;
+        let privileged = self
+            .privileged
+            .then_some(openshell_sandbox_backend::privileged::PrivilegedGuestProfile::vm_bpf_lsm());
         Ok(KubernetesSandboxRuntimeBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
@@ -566,6 +570,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 workload_identity: self.workload_identity.clone(),
                 provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
+                privileged,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,
@@ -577,6 +582,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 host_gateway_ip: self.host_gateway_ip,
                 resource_claims,
                 provisioning_evidence,
+                privileged,
             },
         })
     }
@@ -676,6 +682,7 @@ mod tests {
             )
             .unwrap(),
             child_env: HashMap::new(),
+            privileged: false,
         }
     }
 

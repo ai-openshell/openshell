@@ -5,6 +5,8 @@
 
 use openshell_isolation_interface::contract::BackendError;
 
+use crate::privileged::{PrivilegedGuestProfile, PrivilegedSandboxAuditEvidence};
+
 /// Validate the built-in Linux backend's measured enforcement state.
 pub fn validate_native_linux_audit(evidence: &serde_json::Value) -> Result<(), BackendError> {
     let audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
@@ -12,6 +14,29 @@ pub fn validate_native_linux_audit(evidence: &serde_json::Value) -> Result<(), B
             BackendError::Confirm(format!("decode Linux sandbox audit evidence: {error}"))
         })?;
     audit.validate()
+}
+
+/// Validate a privileged guest runtime's evidence against the admitted profile.
+pub fn validate_privileged_audit(
+    evidence: &serde_json::Value,
+    admitted: PrivilegedGuestProfile,
+) -> Result<(), BackendError> {
+    let audit: PrivilegedSandboxAuditEvidence =
+        serde_json::from_value(evidence.clone()).map_err(|error| {
+            BackendError::Confirm(format!("decode privileged sandbox audit evidence: {error}"))
+        })?;
+    audit.validate(admitted)
+}
+
+/// Validate built-in runtime evidence for the boundary's admitted mode.
+pub fn validate_builtin_audit(
+    evidence: &serde_json::Value,
+    admitted: Option<PrivilegedGuestProfile>,
+) -> Result<(), BackendError> {
+    admitted.map_or_else(
+        || validate_native_linux_audit(evidence),
+        |profile| validate_privileged_audit(evidence, profile),
+    )
 }
 
 #[cfg(test)]

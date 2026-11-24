@@ -62,6 +62,14 @@ struct BoundaryArgs {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
+
+    /// Run as privileged (true guest root) VM boundary sealed by boot-once BPF LSM.
+    #[arg(long, visible_alias = "priv")]
+    privileged: bool,
+
+    /// Separate mounted workload rootfs used in `--privileged` mode.
+    #[arg(long, default_value = "/newroot")]
+    workload_root: std::path::PathBuf,
 }
 
 /// Run the active Phase 0 probe inside the exact workload runtime profile.
@@ -1812,6 +1820,70 @@ fn run_boundary(_bootstrap: &Path, _log_level: &str) -> Result<()> {
     Err(miette::miette!("openshell-sandbox requires Linux"))
 }
 
+#[cfg(target_os = "linux")]
+fn run_privileged_boundary(bootstrap: &Path, workload_root: &Path, log_level: &str) -> Result<()> {
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+    let _ = tracing_subscriber::registry()
+        .with(
+            OcsfShorthandLayer::new(
+                openshell_sandbox::container_log::ContainerLog::process().launcher_writer(),
+            )
+            .with_non_ocsf(true)
+            .with_filter(console_filter),
+        )
+        .try_init();
+    openshell_sandbox::run_privileged(bootstrap, workload_root)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_privileged_boundary(
+    _bootstrap: &Path,
+    _workload_root: &Path,
+    _log_level: &str,
+) -> Result<()> {
+    Err(miette::miette!(
+        "openshell-sandbox --privileged requires Linux"
+    ))
+}
+
+fn run_privileged_role(role: &str, args: &[String]) -> Option<Result<()>> {
+    #[cfg(target_os = "linux")]
+    {
+        use openshell_sandbox::privileged::{FREEZE_CANARY_ROLE, SFTP_ROLE, WORKLOAD_HOLD_ROLE};
+        match role {
+            WORKLOAD_HOLD_ROLE => {
+                return Some(match args {
+                    [flag, root] if flag == "--root" => {
+                        openshell_sandbox::privileged::placement::run_workload_hold(Path::new(root))
+                            .into_diagnostic()
+                    }
+                    _ => Err(miette::miette!(
+                        "usage: openshell-sandbox {WORKLOAD_HOLD_ROLE} --root <DIR>"
+                    )),
+                });
+            }
+            FREEZE_CANARY_ROLE => {
+                return Some(openshell_sandbox::privileged::run_freeze_canary().into_diagnostic());
+            }
+            SFTP_ROLE => {
+                return Some(match args {
+                    [flag, root] if flag == "--root" => {
+                        openshell_sandbox::privileged::run_sftp_helper(root.into())
+                    }
+                    _ => Err(miette::miette!(
+                        "usage: openshell-sandbox {SFTP_ROLE} --root <DIR>"
+                    )),
+                });
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (role, args);
+    None
+}
+
 fn main() -> Result<()> {
     let raw_args = std::env::args().collect::<Vec<_>>();
     if raw_args.get(1).map(String::as_str) == Some(COPY_SELF_SUBCOMMAND) {
@@ -1851,9 +1923,18 @@ fn main() -> Result<()> {
     if raw_args.get(1).map(String::as_str) == Some(CAPABILITY_FREE_LAUNCH_SUBCOMMAND) {
         return launch_capability_free(&raw_args[2..]);
     }
+    if let Some(role) = raw_args.get(1)
+        && let Some(result) = run_privileged_role(role, &raw_args[2..])
+    {
+        return result;
+    }
 
     let args = BoundaryArgs::parse();
-    run_boundary(&args.bootstrap, &args.log_level)
+    if args.privileged {
+        run_privileged_boundary(&args.bootstrap, &args.workload_root, &args.log_level)
+    } else {
+        run_boundary(&args.bootstrap, &args.log_level)
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

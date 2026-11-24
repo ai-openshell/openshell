@@ -342,6 +342,30 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
     install_notification_filter(syscalls)
 }
 
+/// INET networking syscalls mediated by the network broker in privileged mode.
+pub const NETWORK_NOTIFIED_SYSCALLS: [i64; 8] = [
+    libc::SYS_socket,
+    libc::SYS_connect,
+    libc::SYS_bind,
+    libc::SYS_listen,
+    libc::SYS_sendto,
+    libc::SYS_sendmsg,
+    libc::SYS_sendmmsg,
+    libc::SYS_setsockopt,
+];
+
+/// Install a networking-only notification listener on a guest-root launcher
+/// thread without setting `PR_SET_NO_NEW_PRIVS`.
+///
+/// Requires `CAP_SYS_ADMIN` (guest PID 1 root). Leaving `no_new_privs` unset
+/// lets setuid helpers inside the privileged workload continue working while
+/// keeping every INET socket mediated irreversibly (even guest `UID 0` cannot
+/// remove an installed seccomp filter).
+pub fn install_network_listener_privileged() -> io::Result<NotificationListener> {
+    verify_notification_sizes()?;
+    install_notification_filter(&NETWORK_NOTIFIED_SYSCALLS)
+}
+
 /// Install the capability-free workload networking listener on the calling
 /// launcher thread.
 ///

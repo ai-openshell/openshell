@@ -463,8 +463,10 @@ e2e_export_gateway_restart_metadata \
 # preparation; allow 180s for slower CI runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
-OPENSHELL_TEST_PYTHON_IMAGE="${OPENSHELL_TEST_PYTHON_IMAGE:-${E2E_PULLABLE_PYTHON_IMAGE}}" \
-  e2e_run_openshell_conformance "VM"
+if [ "${OPENSHELL_E2E_SKIP_CONFORMANCE:-0}" != "1" ]; then
+  OPENSHELL_TEST_PYTHON_IMAGE="${OPENSHELL_TEST_PYTHON_IMAGE:-${E2E_PULLABLE_PYTHON_IMAGE}}" \
+    e2e_run_openshell_conformance "VM"
+fi
 if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
   echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
   exit 0
@@ -496,6 +498,7 @@ else
   run_e2e_test ephemeral_cleanup
   run_e2e_test host_gateway_alias
   run_e2e_test vm_overlay
+  run_e2e_test vm_privileged
   run_e2e_test vm_bind_mount
   run_e2e_test vm_gateway_start
   run_e2e_test vm_corporate_proxy

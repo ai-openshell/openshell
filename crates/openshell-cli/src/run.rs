@@ -435,6 +435,7 @@ async fn finalize_sandbox_create_session(
 /// on the function signature, following the `provider_refresh_config(server, input, tls)`
 /// precedent. This struct captures sandbox-specific options.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
     pub template: Option<&'a str>,
@@ -463,6 +464,7 @@ pub struct SandboxCreateConfig<'a> {
     pub suppress_credential_warnings: bool,
     pub restart_policy: &'a str,
     pub provision_timeout_secs: Option<u32>,
+    pub privileged: bool,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -495,6 +497,7 @@ impl Default for SandboxCreateConfig<'_> {
             suppress_credential_warnings: false,
             restart_policy: "never",
             provision_timeout_secs: None,
+            privileged: false,
         }
     }
 }
@@ -535,6 +538,7 @@ pub async fn sandbox_create(
         suppress_credential_warnings,
         restart_policy,
         provision_timeout_secs,
+        privileged,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -699,6 +703,7 @@ pub async fn sandbox_create(
                 "always" => SandboxRestartPolicy::Always as i32,
                 value => return Err(miette::miette!("invalid restart policy '{value}'")),
             },
+            privileged,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),

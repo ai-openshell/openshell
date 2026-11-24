@@ -258,6 +258,20 @@ setup_overlay_root() {
         fi
     fi
 
+    # Privileged mode uses an ephemeral root overlay across boots: wipe any
+    # mutated non-workspace entries in /overlay/upper while preserving /sandbox
+    # and the driver-injected /.openshell bootstrap staging directory.
+    if [ "${OPENSHELL_VM_PRIVILEGED:-0}" = "1" ]; then
+        for entry in /overlay/upper/* /overlay/upper/.[!.]* /overlay/upper/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            base="$(basename "$entry")"
+            case "$base" in
+                sandbox|.openshell) ;;
+                *) rm -rf "$entry" ;;
+            esac
+        done
+    fi
+
     # The host makes upper under the gateway's umask and uid, and it becomes /.
     chown 0:0 /overlay/upper
     chmod 0755 /overlay/upper
@@ -274,11 +288,13 @@ setup_overlay_root() {
         setup_gpu || ts "WARNING: GPU init failed; continuing without GPU"
     fi
 
-    bind_mount_into_newroot /proc
-    bind_mount_into_newroot /sys
-    bind_mount_into_newroot /tmp
-    bind_mount_into_newroot /dev
-    bind_mount_into_newroot /run
+    if [ "${OPENSHELL_VM_PRIVILEGED:-0}" != "1" ]; then
+        bind_mount_into_newroot /proc
+        bind_mount_into_newroot /sys
+        bind_mount_into_newroot /tmp
+        bind_mount_into_newroot /dev
+        bind_mount_into_newroot /run
+    fi
 
     ROOT_PREFIX="/newroot"
     run_post_overlay_setup
@@ -648,6 +664,10 @@ run_post_overlay_setup() {
         wait
     fi
 
+    if [ "${OPENSHELL_VM_PRIVILEGED:-0}" = "1" ]; then
+        mkdir -p /sys/fs/cgroup
+        mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || true
+    fi
     mkdir -p "$(root_path /dev/pts)" "$(root_path /dev/shm)" "$(root_path /sys/fs/cgroup)"
     mount -t devpts devpts "$(root_path /dev/pts)" 2>/dev/null &
     mount -t tmpfs tmpfs "$(root_path /dev/shm)" 2>/dev/null &
@@ -710,16 +730,42 @@ if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
 fi
 
 ts "starting OpenShell VM sandbox"
-_sandbox_owner="$(sandbox_owner)"
-_sandbox_uid="${_sandbox_owner%%:*}"
-_sandbox_gid="${_sandbox_owner##*:}"
 _sandbox_bootstrap_guest="${OPENSHELL_VM_SANDBOX_BOOTSTRAP:-/.openshell/state/bootstrap.json}"
 _sandbox_bootstrap="$(root_path "$_sandbox_bootstrap_guest")"
 _sandbox_state_dir="${_sandbox_bootstrap%/*}"
 if [ ! -f "$_sandbox_bootstrap" ]; then
-    ts "FATAL: capability-free sandbox bootstrap is missing"
+    ts "FATAL: sandbox bootstrap is missing"
     exit 1
 fi
+
+if [ "${OPENSHELL_VM_PRIVILEGED:-0}" = "1" ]; then
+    # Stage bootstrap and TLS material into runtime-private tmpfs on the
+    # read-only runtime root and remove them from the workload overlay so
+    # guest-root workloads never see bootstrap secrets.
+    mkdir -p /run/openshell/bootstrap /run/openshell/tls
+    chmod 0700 /run/openshell /run/openshell/bootstrap
+    chmod 0755 /run/openshell/tls
+    for _sandbox_private_file in "$_sandbox_state_dir"/*; do
+        [ -f "$_sandbox_private_file" ] || continue
+        _dst="/run/openshell/bootstrap/$(basename "$_sandbox_private_file")"
+        cp "$_sandbox_private_file" "$_dst"
+        chmod 0600 "$_dst"
+    done
+    rm -rf "$_sandbox_state_dir"
+    # Ensure the workload root has no bootstrap mount exposing the runtime root.
+    umount /newroot/.openshell-bootstrap 2>/dev/null || true
+    rmdir /newroot/.openshell-bootstrap 2>/dev/null || true
+    _priv_bootstrap="/run/openshell/bootstrap/$(basename "$_sandbox_bootstrap")"
+    ts "exec openshell-sandbox --privileged (workload root: ${ROOT_PREFIX:-/newroot})"
+    exec /opt/openshell/bin/openshell-sandbox \
+        --bootstrap "$_priv_bootstrap" \
+        --privileged \
+        --workload-root "${ROOT_PREFIX:-/newroot}"
+fi
+
+_sandbox_owner="$(sandbox_owner)"
+_sandbox_uid="${_sandbox_owner%%:*}"
+_sandbox_gid="${_sandbox_owner##*:}"
 chown "${_sandbox_uid}:${_sandbox_gid}" "$_sandbox_state_dir"
 chmod 0700 "$_sandbox_state_dir"
 for _sandbox_private_file in "$_sandbox_state_dir"/*; do

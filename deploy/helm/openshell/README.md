@@ -781,6 +781,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | server.otlp.endpoint | string | `""` | OTLP/gRPC collector endpoint, conventionally port 4317. For an `http/protobuf` collector, also set protocol under gatewayConfig."openshell.gateway.otlp". |
 | server.otlp.serviceName | string | `""` | Gateway OpenTelemetry service name. Empty uses openshell-gateway. |
 | server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |
+| server.privilegedRuntimeClassName | string | `""` | Kubernetes runtimeClassName for `--privileged` (true guest root + boot-once BPF LSM) sandbox pods, such as a hardened Kata Containers class. Empty (default) disables privileged sandboxes on Kubernetes. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants. |
 | server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into gateway and sandbox pods. |
 | server.sandboxGid | string | `""` | GID for sandbox pods (`sandbox_gid`). Empty (default) = same as sandboxUid. Must be an integer between 1 and 4294967294. |

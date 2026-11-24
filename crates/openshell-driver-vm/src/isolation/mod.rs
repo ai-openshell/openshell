@@ -60,6 +60,7 @@ pub struct VmBoundarySpec {
     pub agent_gid: u32,
     pub child_env: HashMap<String, String>,
     pub gpu_requested: bool,
+    pub privileged: bool,
 }
 
 /// The protected guest config and matching host descriptor for one VM.
@@ -91,6 +92,9 @@ impl VmBoundarySpec {
             network_device_count: 0,
         }
         .project()?;
+        let privileged = self
+            .privileged
+            .then_some(openshell_sandbox_backend::privileged::PrivilegedGuestProfile::vm_bpf_lsm());
         Ok(VmBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
@@ -123,6 +127,7 @@ impl VmBoundarySpec {
                 workload_identity: workload_identity.clone(),
                 provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
+                privileged,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,
@@ -137,6 +142,7 @@ impl VmBoundarySpec {
                 host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
                 resource_claims,
                 provisioning_evidence,
+                privileged,
             },
         })
     }
@@ -209,6 +215,7 @@ mod tests {
             agent_gid: 1000,
             child_env: HashMap::new(),
             gpu_requested,
+            privileged: false,
         }
         .provision()
         .unwrap();

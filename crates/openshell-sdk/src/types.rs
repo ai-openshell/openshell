@@ -299,6 +299,8 @@ pub struct SandboxSpec {
     pub service_exposures: Vec<ServiceExposure>,
     /// Restart behavior after the canonical main process exits.
     pub restart_policy: SandboxRestartPolicy,
+    /// Request privileged (true guest root) mode on supported VM drivers.
+    pub privileged: bool,
 }
 
 /// A loopback HTTP service to expose during sandbox creation.

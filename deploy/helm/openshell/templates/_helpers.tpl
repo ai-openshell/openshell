@@ -809,7 +809,7 @@ absent fields so every chart consumer observes the same configuration.
 {{- $imagePullSecrets := list -}}{{- range (get $legacyServer "sandboxImagePullSecrets" | default list) }}{{- if .name }}{{- $imagePullSecrets = append $imagePullSecrets .name }}{{- end }}{{- end -}}
 {{- if $imagePullSecrets }}{{- $_ := set $kubernetes "image_pull_secrets" $imagePullSecrets -}}{{- end -}}
 {{- end -}}
-{{- range $legacyKey, $runtimeKey := dict "workspaceDefaultStorageSize" "workspace_default_storage_size" "workspaceStorageClass" "workspace_storage_class" "defaultRuntimeClassName" "default_runtime_class_name" -}}
+{{- range $legacyKey, $runtimeKey := dict "workspaceDefaultStorageSize" "workspace_default_storage_size" "workspaceStorageClass" "workspace_storage_class" "defaultRuntimeClassName" "default_runtime_class_name" "privilegedRuntimeClassName" "privileged_runtime_class_name" -}}
 {{- if and (get $legacyServer $legacyKey) (not (hasKey $kubernetes $runtimeKey)) -}}{{- $_ := set $kubernetes $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
 {{- end -}}
 {{- if not (hasKey $kubernetes "sandbox_uid") -}}

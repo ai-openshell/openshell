@@ -436,15 +436,25 @@ fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
     }
 }
 
+/// Default `PATH` for privileged guest workloads when the driver's user
+/// environment sets none.
+pub(crate) const GUEST_WORKLOAD_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 #[cfg(target_os = "linux")]
 pub fn spawn_command_with_workload_launcher(
     launcher: &crate::linux::workload_launcher::WorkloadLauncher,
     mut cmd: Command,
 ) -> std::io::Result<Child> {
     let runtime = tokio::runtime::Handle::current();
+    let placement = launcher.privileged_placement().cloned();
     launcher.execute(move || {
         let _guard = runtime.enter();
-        cmd.spawn()
+        if let Some(placement) = placement {
+            placement.with_workload_pid_ns(|| cmd.spawn())
+        } else {
+            cmd.spawn()
+        }
     })?
 }
 
@@ -453,7 +463,14 @@ pub fn spawn_std_command_with_workload_launcher(
     launcher: &crate::linux::workload_launcher::WorkloadLauncher,
     mut cmd: std::process::Command,
 ) -> std::io::Result<std::process::Child> {
-    launcher.execute(move || cmd.spawn())?
+    let placement = launcher.privileged_placement().cloned();
+    launcher.execute(move || {
+        if let Some(placement) = placement {
+            placement.with_workload_pid_ns(|| cmd.spawn())
+        } else {
+            cmd.spawn()
+        }
+    })?
 }
 
 /// Handle to a running process.
@@ -601,6 +618,59 @@ impl ProcessHandle {
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(placement) = launcher.privileged_placement().cloned() {
+            let user_environment = configured_user_environment();
+            if !user_environment.contains_key("SHELL") {
+                cmd.env(
+                    "SHELL",
+                    crate::privileged::detect_workload_login_shell(placement.workload_root()),
+                );
+            }
+            if !user_environment.contains_key("PATH") {
+                cmd.env("PATH", GUEST_WORKLOAD_PATH);
+            }
+            if !user_environment.contains_key("USER") {
+                cmd.env("USER", "root");
+            }
+            let session = if terminal_slave_fd.is_some() {
+                crate::privileged::placement::ChildSession::Terminal
+            } else {
+                crate::privileged::placement::ChildSession::Pipes
+            };
+            placement
+                .install(cmd.as_std_mut(), workspace.root().unwrap_or("/"), session)
+                .into_diagnostic()
+                .wrap_err("prepare privileged workload placement")?;
+            let mut child_registry = managed_children::lock();
+            let mut child = spawn_command_with_workload_launcher(launcher, cmd)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to spawn privileged sandbox entrypoint '{program}'")
+                })?;
+            let pid = child.id().unwrap_or(0);
+            let managed_child = child_registry.register(pid);
+            drop(child_registry);
+            let io = if let Some(master) = pty_master {
+                ProcessIo::Pty(master)
+            } else {
+                ProcessIo::Pipes {
+                    stdin: child.stdin.take().expect("canonical stdin must be piped"),
+                    stdout: child.stdout.take().expect("canonical stdout must be piped"),
+                    stderr: child.stderr.take().expect("canonical stderr must be piped"),
+                }
+            };
+            debug!(pid, program, "Privileged workload process spawned");
+            return Ok(Self {
+                child,
+                pid,
+                io: Some(io),
+                terminal: Arc::new(AtomicBool::new(false)),
+                signal_lock: Arc::new(std::sync::Mutex::new(())),
+                managed_child,
+            });
         }
 
         // Probe Landlock availability and emit OCSF logs from the parent

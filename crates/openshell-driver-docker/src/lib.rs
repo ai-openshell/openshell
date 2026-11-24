@@ -1132,6 +1132,7 @@ impl DockerComputeDriver {
                     Vec::new()
                 },
             )),
+            supports_privileged: false,
         }
     }
 
@@ -1156,6 +1157,11 @@ impl DockerComputeDriver {
             .spec
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("sandbox.spec is required"))?;
+        if spec.privileged {
+            return Err(Status::failed_precondition(
+                "privileged sandboxes are not supported by the docker compute driver",
+            ));
+        }
         let template = spec
             .template
             .as_ref()

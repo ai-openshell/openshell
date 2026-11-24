@@ -32,6 +32,8 @@ mod network_broker;
 #[cfg(all(target_os = "linux", feature = "perf-harness"))]
 pub mod perf;
 #[cfg(target_os = "linux")]
+pub mod privileged;
+#[cfg(target_os = "linux")]
 pub mod process;
 #[cfg(target_os = "linux")]
 mod provider_files;
@@ -81,6 +83,15 @@ pub fn run(
     qualification: RuntimeQualification,
 ) -> miette::Result<()> {
     boundary_server::run_boundary(config_path, qualification)
+        .map_err(|error| miette::miette!(error))
+}
+
+/// Run the privileged (true guest root) VM sandbox sealed by boot-once BPF LSM.
+pub fn run_privileged(
+    config_path: &std::path::Path,
+    workload_root: &std::path::Path,
+) -> miette::Result<()> {
+    boundary_server::run_privileged_boundary(config_path, workload_root)
         .map_err(|error| miette::miette!(error))
 }
 

@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::linux::seccomp_notify::{NotificationListener, install_workload_listener};
+use crate::linux::seccomp_notify::{
+    NotificationListener, install_network_listener_privileged, install_workload_listener,
+};
 
 type LaunchJob = Box<dyn FnOnce() + Send + 'static>;
 
@@ -26,9 +28,27 @@ type LaunchJob = Box<dyn FnOnce() + Send + 'static>;
 pub struct WorkloadLauncher {
     jobs: mpsc::SyncSender<LaunchJob>,
     alive: Arc<AtomicBool>,
+    privileged_placement: Option<Arc<crate::privileged::placement::PrivilegedPlacement>>,
 }
 
 impl WorkloadLauncher {
+    /// Bind a privileged guest placement to every launch through this launcher.
+    #[must_use]
+    pub fn with_privileged_placement(
+        mut self,
+        placement: Arc<crate::privileged::placement::PrivilegedPlacement>,
+    ) -> Self {
+        self.privileged_placement = Some(placement);
+        self
+    }
+
+    /// The privileged placement, when this launcher serves `--privileged` mode.
+    #[must_use]
+    pub fn privileged_placement(
+        &self,
+    ) -> Option<&Arc<crate::privileged::placement::PrivilegedPlacement>> {
+        self.privileged_placement.as_ref()
+    }
     /// Execute one prebuilt spawn operation on the filtered launcher thread.
     ///
     /// The closure must only perform audited launch work. It must not open an
@@ -68,6 +88,18 @@ impl WorkloadLauncher {
 /// Start the only workload launcher and return its listener to an unfiltered
 /// sandbox thread.
 pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
+    start_with(install_workload_listener)
+}
+
+/// Start a launcher whose inherited listener mediates only INET networking
+/// without `PR_SET_NO_NEW_PRIVS` (for `--privileged` guest PID 1 root).
+pub fn start_privileged_networking() -> io::Result<(WorkloadLauncher, NotificationListener)> {
+    start_with(install_network_listener_privileged)
+}
+
+fn start_with(
+    install: fn() -> io::Result<NotificationListener>,
+) -> io::Result<(WorkloadLauncher, NotificationListener)> {
     let (jobs_tx, jobs_rx) = mpsc::sync_channel::<LaunchJob>(64);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let alive = Arc::new(AtomicBool::new(true));
@@ -75,7 +107,7 @@ pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
     thread::Builder::new()
         .name("openshell-workload-launcher".to_string())
         .spawn(move || {
-            match install_workload_listener() {
+            match install() {
                 Ok(listener) => {
                     if ready_tx.send(Ok(listener)).is_err() {
                         thread_alive.store(false, Ordering::Release);
@@ -108,6 +140,7 @@ pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
         WorkloadLauncher {
             jobs: jobs_tx,
             alive,
+            privileged_placement: None,
         },
         listener,
     ))

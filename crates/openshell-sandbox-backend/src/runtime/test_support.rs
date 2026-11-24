@@ -748,6 +748,7 @@ fn client(peer: Peer) -> Arc<BoundaryClient> {
         resource_claims: std::collections::BTreeMap::default(),
         provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence("test", b"test")
             .unwrap(),
+        privileged: None,
     };
     let bearer = SessionBearerTokenSlot::new(
         SecretJwt::parse("a".repeat(32)).unwrap(),

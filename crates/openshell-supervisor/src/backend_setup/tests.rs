@@ -724,6 +724,7 @@ fn standard_setup_decodes_native_descriptor_and_preserves_vm_identity() {
             b"test-evidence",
         )
         .unwrap(),
+        privileged: None,
     };
     for is_vm in [false, true] {
         if is_vm {
