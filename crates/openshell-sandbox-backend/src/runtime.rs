@@ -571,6 +571,10 @@ impl OpenShellRuntimeBackend {
         let generation = runtime_descriptor.generation.clone();
         let session_id = runtime_descriptor.session_id;
         let provisioning_evidence = runtime_descriptor.provisioning_evidence.clone();
+        let privileged = runtime_descriptor.privileged;
+        if let Some(profile) = privileged {
+            profile.validate()?;
+        }
         let mut client = BoundaryClient::with_backend(
             runtime_descriptor,
             self.sandbox_bearer.clone(),
@@ -625,6 +629,7 @@ impl OpenShellRuntimeBackend {
             session_id,
             resource_claims,
             provisioning_evidence,
+            privileged,
             takeover,
         }))
     }
@@ -772,6 +777,7 @@ pub struct BoundBoundary {
     session_id: openshell_core::SandboxSessionId,
     resource_claims: std::collections::BTreeMap<String, String>,
     provisioning_evidence: openshell_isolation_interface::contract::ProvisioningEvidence,
+    privileged: Option<crate::privileged::PrivilegedGuestProfile>,
     takeover: Option<RecoveredSession>,
 }
 
@@ -840,7 +846,7 @@ impl BoundBoundary {
             ));
         }
         if self.client.backend_name == crate::BACKEND_NAME {
-            crate::audit::validate_native_linux_audit(&confirmation.backend_audit)?;
+            crate::audit::validate_builtin_audit(&confirmation.backend_audit, self.privileged)?;
         }
         let client = self.client.clone();
         // Adopt from a snapshot taken after the promotion: the replaced owner
@@ -4635,6 +4641,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence: test_provisioning_evidence(),
+            privileged: None,
         }
     }
 
@@ -4859,6 +4866,7 @@ mod tests {
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence,
             takeover: None,
+            privileged: None,
         };
 
         assert!(matches!(
@@ -4912,6 +4920,7 @@ mod tests {
             host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence: test_provisioning_evidence(),
+            privileged: None,
         };
         let debug = format!("{runtime_descriptor:?}");
         assert!(debug.contains("<redacted>"));
@@ -4932,6 +4941,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence: test_provisioning_evidence(),
+            privileged: None,
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -4954,6 +4964,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence: test_provisioning_evidence(),
+            privileged: None,
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -4976,6 +4987,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence: test_provisioning_evidence(),
+            privileged: None,
         };
         validate_runtime_descriptor(&runtime_descriptor, &sandbox())
             .expect("TCP runtime descriptor should be valid");
@@ -5291,6 +5303,7 @@ mod tests {
                 host_gateway_ip: None,
                 resource_claims: std::collections::BTreeMap::new(),
                 provisioning_evidence: test_provisioning_evidence(),
+                privileged: None,
             },
             test_bearer(&"a".repeat(32)),
         ));
@@ -5796,6 +5809,7 @@ mod tests {
                 host_gateway_ip: None,
                 resource_claims: std::collections::BTreeMap::new(),
                 provisioning_evidence: test_provisioning_evidence(),
+                privileged: None,
             },
             test_bearer(&"a".repeat(32)),
         );

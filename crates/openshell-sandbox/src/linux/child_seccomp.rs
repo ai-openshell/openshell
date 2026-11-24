@@ -86,6 +86,37 @@ impl ChildHardeningProgram {
         }
     }
 
+    /// Install this filter on the calling thread without setting
+    /// `PR_SET_NO_NEW_PRIVS` (requires `CAP_SYS_ADMIN` in the caller).
+    pub fn install_privileged(&mut self) -> io::Result<()> {
+        mark_inherited_descriptors_close_on_exec()?;
+        let len = u16::try_from(self.instructions.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child seccomp filter is too large",
+            )
+        })?;
+        let mut program = libc::sock_fprog {
+            len,
+            filter: self.instructions.as_mut_ptr(),
+        };
+        // SAFETY: `program` references the prebuilt cBPF instruction vector
+        // for the complete syscall. No TSYNC flag is used.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER,
+                0,
+                std::ptr::addr_of_mut!(program),
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Number of cBPF instructions, exposed for admission diagnostics.
     #[must_use]
     pub fn instruction_count(&self) -> usize {
@@ -142,6 +173,49 @@ pub fn mark_inherited_descriptors_close_on_exec() -> io::Result<()> {
 /// [`install_workload_listener`]: crate::linux::seccomp_notify::install_workload_listener
 pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     build(sandbox_tgid, Mediation::Brokered)
+}
+
+/// Build the minimal hardening filter for privileged (true guest root) VM
+/// workloads.
+///
+/// The boot-once BPF LSM protects the shim, runtime mounts, freezer cgroup,
+/// `bpf()`, and `AF_VSOCK`/`init_net`. This child filter closes only the
+/// seccomp-level network mediation bypasses: `io_uring` (async socket connect
+/// outside `seccomp_notify`) and nested `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
+/// Ordinary seccomp filters (used by Chrome and `bwrap`), namespaces, mounts,
+/// `ptrace`/`strace`/`gdb`, and `clone3` stay allowed.
+pub fn prepare_privileged() -> io::Result<ChildHardeningProgram> {
+    const SECCOMP_FILTER_FLAG_NEW_LISTENER: u32 = 1 << 3;
+    let mut instructions = vec![
+        stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
+        jump(BPF_JMP_JEQ_K, native_audit_arch(), 1, 0),
+        stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    instructions.extend([
+        jump(BPF_JMP_JSET_K, X32_SYSCALL_BIT, 0, 1),
+        stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+    ]);
+
+    for syscall in [
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+    ] {
+        append_unconditional_deny(&mut instructions, syscall)?;
+    }
+    // Block nested seccomp user-notification listeners while keeping ordinary
+    // seccomp filters (used by Chrome and bubblewrap) allowed.
+    append_argument_masked_deny(
+        &mut instructions,
+        libc::SYS_seccomp,
+        1,
+        SECCOMP_FILTER_FLAG_NEW_LISTENER,
+    )?;
+
+    instructions.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+    Ok(ChildHardeningProgram { instructions })
 }
 
 /// Build the self-protection program for a child no broker mediates.

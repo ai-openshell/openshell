@@ -509,6 +509,10 @@ pub struct SandboxRuntimeDescriptor {
     pub resource_claims: std::collections::BTreeMap<String, String>,
     /// Backend-neutral projection of the validated outer network fence.
     pub provisioning_evidence: ProvisioningEvidence,
+    /// Optional driver-admitted privileged VM guest profile. Absent for the
+    /// default capability-free runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privileged: Option<crate::privileged::PrivilegedGuestProfile>,
 }
 
 impl fmt::Debug for SandboxRuntimeDescriptor {
@@ -523,6 +527,7 @@ impl fmt::Debug for SandboxRuntimeDescriptor {
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("resource_claims", &self.resource_claims)
             .field("provisioning_evidence", &self.provisioning_evidence)
+            .field("privileged", &self.privileged)
             .finish()
     }
 }
@@ -580,6 +585,10 @@ pub struct BoundaryConfig {
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
+    /// Optional driver-admitted privileged VM guest profile. Absent for the
+    /// default capability-free runtime, which refuses a config that sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privileged: Option<crate::privileged::PrivilegedGuestProfile>,
 }
 
 /// Default time a runtime keeps a workload frozen, after losing its

@@ -1328,6 +1328,7 @@ impl KubernetesComputeDriver {
                         .to_string(),
                 ],
             )),
+            supports_privileged: !self.config.privileged_runtime_class_name.is_empty(),
         })
     }
 
@@ -2154,6 +2155,8 @@ impl KubernetesComputeDriver {
             default_image: &self.config.default_image,
             image_pull_secrets: &self.config.image_pull_secrets,
             default_runtime_class_name: &self.config.default_runtime_class_name,
+            privileged_runtime_class_name: &self.config.privileged_runtime_class_name,
+            privileged: sandbox.spec.as_ref().is_some_and(|spec| spec.privileged),
             service_account_name: &self.config.service_account_name,
             ..Default::default()
         };
@@ -2570,6 +2573,13 @@ impl KubernetesComputeDriver {
             sandbox,
         )
         .map_err(admission_error)?;
+        let is_privileged = sandbox.spec.as_ref().is_some_and(|spec| spec.privileged);
+        if is_privileged && self.config.privileged_runtime_class_name.is_empty() {
+            return Err(KubernetesDriverError::InvalidArgument(
+                "privileged sandboxes require a configured kubernetes privileged_runtime_class_name (for example a hardened Kata Containers RuntimeClass)"
+                    .to_string(),
+            ));
+        }
         self.validate_pod_metadata_for_sandbox(sandbox)
             .map_err(KubernetesDriverError::InvalidArgument)?;
         let gpu_requirements = sandbox
@@ -2653,6 +2663,8 @@ impl KubernetesComputeDriver {
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             workspace_storage_class: &self.config.workspace_storage_class,
             default_runtime_class_name: &self.config.default_runtime_class_name,
+            privileged_runtime_class_name: &self.config.privileged_runtime_class_name,
+            privileged: is_privileged,
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
             boundary_port: self.config.sandbox_runtime.boundary_port,
@@ -2673,6 +2685,9 @@ impl KubernetesComputeDriver {
         }
         let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
         let mut annotations = sandbox_annotations(sandbox);
+        if is_privileged {
+            annotations.insert(ANNOTATION_SANDBOX_PRIVILEGED.into(), "true".into());
+        }
         annotations.insert(
             crate::resource_admission::IDENTITIES.into(),
             serde_json::to_string(&resource_identities)
@@ -3113,6 +3128,7 @@ impl KubernetesComputeDriver {
         uid: u32,
         gid: u32,
         sandbox_secret_name: &str,
+        privileged_runtime_class: Option<&str>,
     ) -> Result<(), KubernetesDriverError> {
         let fail = |message: &str| {
             KubernetesDriverError::Precondition(format!(
@@ -3191,7 +3207,13 @@ impl KubernetesComputeDriver {
             .security_context
             .as_ref()
             .ok_or_else(|| fail("missing Pod security context"))?;
-        if security.run_as_user != Some(i64::from(uid))
+        if let Some(expected_rc) = privileged_runtime_class {
+            if spec.runtime_class_name.as_deref() != Some(expected_rc) {
+                return Err(fail(
+                    "privileged Pod runtimeClassName does not match configured privileged_runtime_class_name",
+                ));
+            }
+        } else if security.run_as_user != Some(i64::from(uid))
             || security.run_as_group != Some(i64::from(gid))
             || security.run_as_non_root != Some(true)
             || security.fs_group != Some(i64::from(gid))
@@ -3208,19 +3230,21 @@ impl KubernetesComputeDriver {
         }
         let pod_json = serde_json::to_value(pod)
             .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        if let Some(policy) = pod_json.pointer("/spec/securityContext/supplementalGroupsPolicy")
-            && policy != &serde_json::json!("Strict")
-        {
-            return Err(fail("supplementalGroupsPolicy is not Strict"));
-        }
-        if pod_json
-            .pointer("/spec/securityContext/supplementalGroupsPolicy")
-            .is_none()
-        {
-            tracing::warn!(
-                pod = pod.metadata.name.as_deref().unwrap_or("<unknown>"),
-                "Kubernetes omitted supplementalGroupsPolicy; exact runtime groups remain enforced by boundary confirmation"
-            );
+        if privileged_runtime_class.is_none() {
+            if let Some(policy) = pod_json.pointer("/spec/securityContext/supplementalGroupsPolicy")
+                && policy != &serde_json::json!("Strict")
+            {
+                return Err(fail("supplementalGroupsPolicy is not Strict"));
+            }
+            if pod_json
+                .pointer("/spec/securityContext/supplementalGroupsPolicy")
+                .is_none()
+            {
+                tracing::warn!(
+                    pod = pod.metadata.name.as_deref().unwrap_or("<unknown>"),
+                    "Kubernetes omitted supplementalGroupsPolicy; exact runtime groups remain enforced by boundary confirmation"
+                );
+            }
         }
         let unprivileged_port_sysctl = pod_json
             .pointer("/spec/securityContext/sysctls")
@@ -3268,7 +3292,20 @@ impl KubernetesComputeDriver {
             .iter()
             .find(|container| container.name == "agent")
             .ok_or_else(|| fail("agent container missing"))?;
-        check_container(agent, "agent")?;
+        if privileged_runtime_class.is_some() {
+            let context = agent
+                .security_context
+                .as_ref()
+                .ok_or_else(|| fail("privileged agent container has no security context"))?;
+            if context.privileged != Some(true)
+                || context.run_as_user != Some(0)
+                || context.run_as_group != Some(0)
+            {
+                return Err(fail("privileged agent security context changed"));
+            }
+        } else {
+            check_container(agent, "agent")?;
+        }
         let bootstrap = spec
             .init_containers
             .as_deref()
@@ -3835,6 +3872,23 @@ impl KubernetesComputeDriver {
         self.admit_stored_resources(&admission_object)
             .await
             .map_err(admission_error)?;
+        let is_privileged = admission_object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_PRIVILEGED))
+            .is_some_and(|value| value == "true");
+        let privileged_runtime_class = if is_privileged {
+            if self.config.privileged_runtime_class_name.is_empty() {
+                return Err(KubernetesDriverError::Precondition(
+                    "privileged Sandbox cannot launch without a configured privileged_runtime_class_name"
+                        .to_string(),
+                ));
+            }
+            Some(self.config.privileged_runtime_class_name.as_str())
+        } else {
+            None
+        };
         Self::validate_capability_free_workload_pod(
             &workload_pod,
             cr_uid,
@@ -3842,6 +3896,7 @@ impl KubernetesComputeDriver {
             agent_uid,
             agent_gid,
             &names.sandbox_secret,
+            privileged_runtime_class,
         )?;
         let workload_pod_uid =
             workload_pod.metadata.uid.clone().ok_or_else(|| {
@@ -3945,6 +4000,7 @@ impl KubernetesComputeDriver {
             host_gateway_ip: self.config.host_gateway_ip.parse().ok(),
             workload_identity,
             child_env,
+            privileged: is_privileged,
         }
         .provision()
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
@@ -7378,6 +7434,8 @@ fn extract_image_size(message: &str) -> Option<u64> {
 
 const SANDBOX_RUNTIME_VOLUME_NAME: &str = "openshell-runtime";
 const SANDBOX_STATE_VOLUME_NAME: &str = "openshell-runtime-state";
+const ANNOTATION_SANDBOX_PRIVILEGED: &str = "openshell.ai/privileged";
+
 const SANDBOX_BOOTSTRAP_VOLUME_NAME: &str = "openshell-sandbox-bootstrap";
 const SANDBOX_BOOTSTRAP_CONTAINER_NAME: &str = "openshell-sandbox-bootstrap";
 const SANDBOX_POD_IDENTITY_VOLUME_NAME: &str = "openshell-pod-identity";
@@ -7492,20 +7550,31 @@ fn apply_supervisor_sandbox_runtime_boundary(
             ]
         }),
     );
-    spec.insert(
-        "securityContext".to_string(),
-        serde_json::json!({
-            "runAsUser": params.sandbox_uid,
-            "runAsGroup": params.sandbox_gid,
-            "runAsNonRoot": true,
-            "fsGroup": params.sandbox_gid,
-            "fsGroupChangePolicy": "OnRootMismatch",
-            "supplementalGroups": [],
-            "supplementalGroupsPolicy": "Strict",
-            "seccompProfile": {"type": "RuntimeDefault"},
-            "sysctls": [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "0"}]
-        }),
-    );
+    if params.privileged {
+        spec.insert(
+            "securityContext".to_string(),
+            serde_json::json!({
+                "fsGroup": params.sandbox_gid,
+                "fsGroupChangePolicy": "OnRootMismatch",
+                "sysctls": [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "0"}]
+            }),
+        );
+    } else {
+        spec.insert(
+            "securityContext".to_string(),
+            serde_json::json!({
+                "runAsUser": params.sandbox_uid,
+                "runAsGroup": params.sandbox_gid,
+                "runAsNonRoot": true,
+                "fsGroup": params.sandbox_gid,
+                "fsGroupChangePolicy": "OnRootMismatch",
+                "supplementalGroups": [],
+                "supplementalGroupsPolicy": "Strict",
+                "seccompProfile": {"type": "RuntimeDefault"},
+                "sysctls": [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "0"}]
+            }),
+        );
+    }
     let volumes = spec
         .entry("volumes")
         .or_insert_with(|| serde_json::json!([]))
@@ -7570,24 +7639,48 @@ fn apply_supervisor_sandbox_runtime_boundary(
     let container = containers[index]
         .as_object_mut()
         .expect("agent container must be an object");
-    container.insert(
-        "command".to_string(),
-        serde_json::json!([
-            format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
-            "--bootstrap",
-            BOUNDARY_CONFIG_PATH,
-        ]),
-    );
-    container.insert(
-        "securityContext".to_string(),
-        serde_json::json!({
-            "runAsUser": params.sandbox_uid,
-            "runAsGroup": params.sandbox_gid,
-            "runAsNonRoot": true,
-            "allowPrivilegeEscalation": false,
-            "capabilities": {"drop": ["ALL"]}
-        }),
-    );
+    if params.privileged {
+        container.insert(
+            "command".to_string(),
+            serde_json::json!([
+                format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
+                "--bootstrap",
+                BOUNDARY_CONFIG_PATH,
+                "--privileged",
+                "--workload-root",
+                "/",
+            ]),
+        );
+        container.insert(
+            "securityContext".to_string(),
+            serde_json::json!({
+                "privileged": true,
+                "runAsUser": 0,
+                "runAsGroup": 0,
+                "allowPrivilegeEscalation": true,
+                "seccompProfile": {"type": "Unconfined"}
+            }),
+        );
+    } else {
+        container.insert(
+            "command".to_string(),
+            serde_json::json!([
+                format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
+                "--bootstrap",
+                BOUNDARY_CONFIG_PATH,
+            ]),
+        );
+        container.insert(
+            "securityContext".to_string(),
+            serde_json::json!({
+                "runAsUser": params.sandbox_uid,
+                "runAsGroup": params.sandbox_gid,
+                "runAsNonRoot": true,
+                "allowPrivilegeEscalation": false,
+                "capabilities": {"drop": ["ALL"]}
+            }),
+        );
+    }
     container.insert(
         "ports".to_string(),
         serde_json::json!([{
@@ -7828,6 +7921,8 @@ struct SandboxPodParams<'a> {
     workspace_default_storage_size: &'a str,
     workspace_storage_class: &'a str,
     default_runtime_class_name: &'a str,
+    privileged_runtime_class_name: &'a str,
+    privileged: bool,
     /// Resolved sandbox UID for supervisor `runAsUser` and env var.
     sandbox_uid: u32,
     /// Resolved sandbox GID for PVC init container operations.
@@ -7852,6 +7947,8 @@ impl Default for SandboxPodParams<'_> {
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             workspace_storage_class: "",
             default_runtime_class_name: "",
+            privileged_runtime_class_name: "",
+            privileged: false,
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
             boundary_port: 5500,
@@ -8039,15 +8136,20 @@ fn sandbox_template_to_k8s_with_validated_config(
     }
 
     let mut spec = serde_json::Map::new();
-    let runtime_class_name = platform_config_string(template, "runtime_class_name")
-        .or_else(|| {
-            (!driver_config.pod.runtime_class_name.is_empty())
-                .then(|| driver_config.pod.runtime_class_name.clone())
-        })
-        .or_else(|| {
-            (!params.default_runtime_class_name.is_empty())
-                .then(|| params.default_runtime_class_name.to_string())
-        });
+    let runtime_class_name = if params.privileged {
+        (!params.privileged_runtime_class_name.is_empty())
+            .then(|| params.privileged_runtime_class_name.to_string())
+    } else {
+        platform_config_string(template, "runtime_class_name")
+            .or_else(|| {
+                (!driver_config.pod.runtime_class_name.is_empty())
+                    .then(|| driver_config.pod.runtime_class_name.clone())
+            })
+            .or_else(|| {
+                (!params.default_runtime_class_name.is_empty())
+                    .then(|| params.default_runtime_class_name.to_string())
+            })
+    };
     if let Some(runtime_class) = runtime_class_name {
         spec.insert(
             "runtimeClassName".to_string(),
@@ -8064,9 +8166,11 @@ fn sandbox_template_to_k8s_with_validated_config(
 
     // Per-sandbox portable intent overrides the cluster-wide default. This
     // driver owns the Kubernetes-specific `hostUsers` translation.
-    let use_user_namespaces = template
-        .user_namespaces
-        .unwrap_or(params.enable_user_namespaces);
+    // Privileged Kata Pods use VM isolation instead of host user namespaces.
+    let use_user_namespaces = !params.privileged
+        && template
+            .user_namespaces
+            .unwrap_or(params.enable_user_namespaces);
 
     if use_user_namespaces {
         spec.insert("hostUsers".to_string(), serde_json::json!(false));

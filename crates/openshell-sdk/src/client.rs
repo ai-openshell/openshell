@@ -1499,6 +1499,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         tty,
         service_exposures,
         restart_policy,
+        privileged,
     } = spec;
     let template = image.map(|image| proto::SandboxTemplate {
         image,
@@ -1517,6 +1518,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
             command,
             tty,
             restart_policy: proto::SandboxRestartPolicy::from(restart_policy) as i32,
+            privileged,
             ..proto::SandboxSpec::default()
         }),
         name: name.unwrap_or_default(),

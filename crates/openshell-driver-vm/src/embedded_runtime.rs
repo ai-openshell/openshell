@@ -66,10 +66,6 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, String> {
 
     cleanup_old_versions(&cache_dir)?;
 
-    if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir)
-            .map_err(|e| format!("remove old runtime cache {}: {e}", cache_dir.display()))?;
-    }
     fs::create_dir_all(&cache_dir)
         .map_err(|e| format!("create runtime cache {}: {e}", cache_dir.display()))?;
 
@@ -83,13 +79,15 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, String> {
     {
         let unversioned = cache_dir.join("libkrunfw.dylib");
         if !unversioned.exists() {
-            std::os::unix::fs::symlink(resources::LIBKRUNFW_NAME, &unversioned)
-                .map_err(|e| format!("symlink {}: {e}", unversioned.display()))?;
+            let _ = std::os::unix::fs::symlink(resources::LIBKRUNFW_NAME, &unversioned);
         }
     }
 
-    fs::write(&version_marker, cache_key)
-        .map_err(|e| format!("write runtime marker {}: {e}", version_marker.display()))?;
+    let marker_tmp = cache_dir.join(format!(".version.tmp.{}", std::process::id()));
+    fs::write(&marker_tmp, &cache_key)
+        .map_err(|e| format!("write runtime marker {}: {e}", marker_tmp.display()))?;
+    fs::rename(&marker_tmp, &version_marker)
+        .map_err(|e| format!("publish runtime marker {}: {e}", version_marker.display()))?;
 
     Ok(cache_dir)
 }
@@ -163,5 +161,16 @@ fn extract_resource(compressed: &[u8], dest: &Path) -> Result<(), String> {
 
     let decompressed =
         zstd::decode_all(compressed).map_err(|e| format!("decompress {}: {e}", dest.display()))?;
-    fs::write(dest, decompressed).map_err(|e| format!("write {}: {e}", dest.display()))
+    // Stage into a per-process temporary file and rename atomically so
+    // concurrent VM launchers never truncate a mapped shared library in place.
+    let tmp_name = format!(
+        ".{}.tmp.{}",
+        dest.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("runtime"),
+        std::process::id()
+    );
+    let tmp_path = dest.with_file_name(tmp_name);
+    fs::write(&tmp_path, decompressed).map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
+    fs::rename(&tmp_path, dest).map_err(|e| format!("publish {}: {e}", dest.display()))
 }

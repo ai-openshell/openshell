@@ -522,6 +522,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub rootfs_tar_staging_dir: String,
     /// Maximum rootfs tar file size in bytes.
     pub rootfs_tar_max_bytes: u64,
+    /// Whether this driver supports `DriverSandboxSpec.privileged`.
+    pub supports_privileged: bool,
 }
 
 // Startup recovery owns persisted desired state before normal observations
@@ -1040,6 +1042,7 @@ impl ComputeRuntime {
             resource_capabilities: capabilities.resource_capabilities,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
+            supports_privileged: capabilities.supports_privileged,
         };
         let default_image = capabilities.default_image;
         let rootfs_tar_staging = Arc::new(rootfs_tar::RootfsTarStagingRegistry::new(
@@ -1409,6 +1412,11 @@ impl ComputeRuntime {
         self.driver_info.supports_sandbox_authentication
     }
 
+    #[must_use]
+    pub fn supports_privileged(&self) -> bool {
+        self.driver_info.supports_privileged
+    }
+
     pub(crate) async fn authenticate_sandbox(
         &self,
         credential: &str,
@@ -1673,6 +1681,13 @@ impl ComputeRuntime {
                 .as_ref()
                 .and_then(|spec| spec.template.as_ref()),
         )?;
+        if sandbox.spec.as_ref().is_some_and(|spec| spec.privileged) && !self.supports_privileged()
+        {
+            return Err(Status::failed_precondition(format!(
+                "privileged sandboxes are not supported by the '{}' compute driver",
+                self.driver_info.driver_name
+            )));
+        }
         let sandbox_id = sandbox.object_id().to_string();
         let mut sandbox = sandbox;
         let metadata = sandbox
@@ -7321,6 +7336,7 @@ fn driver_sandbox_spec_from_public(
         }),
         launch_authentication: Vec::new(),
         isolation_backend: None,
+        privileged: spec.privileged,
     })
 }
 
@@ -8597,6 +8613,7 @@ impl ComputeDriver for NoopTestDriver {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_privileged: false,
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
                     ExtensionFamily::Compute,
                     "openshell/noop-test-driver",
@@ -8812,6 +8829,7 @@ pub fn new_test_runtime_with_driver(
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            supports_privileged: false,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -9293,6 +9311,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_privileged: false,
                 extension: (!self.omit_protocol_metadata).then(|| {
                     let mut metadata = openshell_core::extension_protocol::extension_metadata(
                         ExtensionFamily::Compute,
@@ -9849,6 +9868,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_privileged: false,
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
                     ExtensionFamily::Compute,
                     "openshell/controlled-test-driver",
@@ -10150,6 +10170,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_privileged: false,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,

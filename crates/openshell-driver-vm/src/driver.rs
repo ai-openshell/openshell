@@ -1582,6 +1582,7 @@ impl VmDriver {
                 .into_owned(),
             rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
             extension: Some(extension),
+            supports_privileged: true,
         }
     }
 
@@ -2106,6 +2107,12 @@ impl VmDriver {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let is_privileged = sandbox.spec.as_ref().is_some_and(|spec| spec.privileged);
+        let sandbox_tls = if is_privileged {
+            privileged_guest_boundary_tls_paths(&boundary_generation)
+        } else {
+            guest_boundary_tls_paths(&boundary_generation)
+        };
         let provisioning = VmBoundarySpec {
             boundary_id: sandbox.id.clone(),
             generation: launch_authentication
@@ -2120,12 +2127,13 @@ impl VmDriver {
             image_identity,
             transport,
             supervisor_tls,
-            sandbox_tls: guest_boundary_tls_paths(&boundary_generation),
+            sandbox_tls,
             control_port: VM_CONTROL_PORT,
             agent_uid: sandbox_owner_state.uid,
             agent_gid: sandbox_owner_state.gid,
             child_env: merged_environment(&sandbox),
             gpu_requested: is_gpu,
+            privileged: is_privileged,
         }
         .provision()
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -6763,6 +6771,9 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
+    if sandbox.spec.as_ref().is_some_and(|spec| spec.privileged) {
+        environment.insert("OPENSHELL_VM_PRIVILEGED".to_string(), "1".to_string());
+    }
     let mut pairs = environment.into_iter().collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
     pairs
@@ -7635,7 +7646,17 @@ fn inject_guest_boundary_bundle(
         ),
         (tls.private_key_path, material.private_key_pem.as_bytes()),
     ] {
-        let path = overlay_upper_path(guest_path.to_string_lossy().as_ref());
+        // Privileged mode stages TLS material from `GUEST_BOUNDARY_CONFIG_DIR`
+        // into runtime-private `/run/openshell/bootstrap` before removing the
+        // staging directory from the workload overlay.
+        let staged_guest_path = if config.privileged.is_some()
+            && let Some(file_name) = guest_path.file_name().and_then(|n| n.to_str())
+        {
+            format!("{GUEST_BOUNDARY_CONFIG_DIR}/{file_name}")
+        } else {
+            guest_path.to_string_lossy().into_owned()
+        };
+        let path = overlay_upper_path(&staged_guest_path);
         write_rootfs_image_file(overlay_disk, &path, contents)?;
         set_rootfs_image_file_mode(overlay_disk, &path, 0o600)?;
     }
@@ -7664,6 +7685,17 @@ fn guest_boundary_tls_paths(generation: &str) -> SandboxTlsServerConfig {
         )),
         private_key_path: PathBuf::from(format!(
             "{GUEST_BOUNDARY_CONFIG_DIR}/sandbox-{generation}.key"
+        )),
+    }
+}
+
+fn privileged_guest_boundary_tls_paths(generation: &str) -> SandboxTlsServerConfig {
+    SandboxTlsServerConfig {
+        certificate_chain_path: PathBuf::from(format!(
+            "/run/openshell/bootstrap/sandbox-{generation}.crt"
+        )),
+        private_key_path: PathBuf::from(format!(
+            "/run/openshell/bootstrap/sandbox-{generation}.key"
         )),
     }
 }

@@ -531,6 +531,10 @@ server:
   # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
   # to all sandboxes that don't explicitly override it.
   defaultRuntimeClassName: ""
+  # -- Kubernetes runtimeClassName for `--privileged` (true guest root +
+  # boot-once BPF LSM) sandbox pods, such as a hardened Kata Containers class.
+  # Empty (default) disables privileged sandboxes on Kubernetes.
+  privilegedRuntimeClassName: ""
   # -- UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift
   # SCC namespace annotation if present, otherwise the driver default. Must be
   # an integer between 1 and 4294967294.

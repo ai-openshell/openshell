@@ -595,6 +595,7 @@ fn grpc_create_request(
         tty,
         service_exposures: _,
         restart_policy,
+        privileged,
     } = spec;
     proto::CreateSandboxRequest {
         name: name.unwrap_or_default(),
@@ -614,6 +615,7 @@ fn grpc_create_request(
             tty,
             policy,
             restart_policy: proto::SandboxRestartPolicy::from(restart_policy) as i32,
+            privileged,
             ..proto::SandboxSpec::default()
         }),
         ..proto::CreateSandboxRequest::default()

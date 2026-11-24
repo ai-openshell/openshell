@@ -127,9 +127,17 @@ impl LocalBoundaryExec {
         })
     }
 
+    fn login_shell(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        if let Some(placement) = self.launcher.privileged_placement() {
+            return crate::privileged::find_workload_login_shell(placement.workload_root());
+        }
+        openshell_core::shell::find_login_shell()
+    }
+
     fn command(&self, spec: &ExecSpec) -> Result<Command, BackendError> {
         let (program, args) = if let Some(shell_spec) = &spec.shell {
-            let shell = openshell_core::shell::find_login_shell().ok_or_else(|| {
+            let shell = self.login_shell().ok_or_else(|| {
                 BackendError::Process(
                     "sandbox image does not provide an executable shell at /bin/bash, /usr/bin/bash, or /bin/sh"
                         .to_string(),
@@ -162,15 +170,28 @@ impl LocalBoundaryExec {
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         let (session_user, session_home) =
             crate::process::session_user_and_home(&self.policy, effective_workdir);
-        let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+        #[cfg(target_os = "linux")]
+        let is_privileged = self.launcher.privileged_placement().is_some();
+        #[cfg(not(target_os = "linux"))]
+        let is_privileged = false;
+        let path = if is_privileged {
+            crate::process::GUEST_WORKLOAD_PATH.to_string()
+        } else {
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into())
+        };
+        let effective_user = if is_privileged {
+            "root".to_string()
+        } else {
+            session_user
+        };
         command
             .env_clear()
             .env(openshell_core::sandbox_env::SANDBOX, "1")
             .env("HOME", session_home)
-            .env("USER", session_user)
+            .env("USER", effective_user)
             .env("PATH", path)
             .env("TERM", if spec.pty { "xterm-256color" } else { "dumb" });
-        if let Some(shell) = openshell_core::shell::find_login_shell() {
+        if let Some(shell) = self.login_shell() {
             command.env("SHELL", shell);
         }
         for (key, value) in &self.user_environment {
@@ -235,21 +256,40 @@ impl LocalBoundaryExec {
             .stderr(Stdio::piped());
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
-        let prepared = self.prepare_sandbox(effective_workdir)?;
-        #[cfg(target_os = "linux")]
-        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+        if let Some(placement) = self.launcher.privileged_placement() {
+            placement
+                .install(
+                    &mut command,
+                    effective_workdir.unwrap_or("/"),
+                    crate::privileged::placement::ChildSession::Pipes,
+                )
+                .map_err(|error| {
+                    BackendError::Process(format!("prepare privileged exec placement: {error}"))
+                })?;
+        } else {
+            let prepared = self.prepare_sandbox(effective_workdir)?;
+            let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+                .map_err(|error| BackendError::Process(error.to_string()))?;
+            crate::pty::install_dedicated_process_group(&mut command);
+            crate::pty::install_pre_exec_no_pty(
+                &mut command,
+                self.policy.clone(),
+                effective_workdir.map(str::to_string),
+                prepared,
+                child_hardening,
+            )
             .map_err(|error| BackendError::Process(error.to_string()))?;
-        crate::pty::install_dedicated_process_group(&mut command);
-        crate::pty::install_pre_exec_no_pty(
-            &mut command,
-            self.policy.clone(),
-            effective_workdir.map(str::to_string),
-            #[cfg(target_os = "linux")]
-            prepared,
-            #[cfg(target_os = "linux")]
-            child_hardening,
-        )
-        .map_err(|error| BackendError::Process(error.to_string()))?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            crate::pty::install_dedicated_process_group(&mut command);
+            crate::pty::install_pre_exec_no_pty(
+                &mut command,
+                self.policy.clone(),
+                effective_workdir.map(str::to_string),
+            )
+            .map_err(|error| BackendError::Process(error.to_string()))?;
+        }
         #[cfg(target_os = "linux")]
         let mut child_registry = crate::managed_children::lock();
         #[cfg(target_os = "linux")]
@@ -373,19 +413,36 @@ impl LocalBoundaryExec {
         command.stdin(stdin).stdout(stdout).stderr(slave);
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
-        let prepared = self.prepare_sandbox(effective_workdir)?;
-        #[cfg(target_os = "linux")]
-        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+        if let Some(placement) = self.launcher.privileged_placement() {
+            placement
+                .install(
+                    &mut command,
+                    effective_workdir.unwrap_or("/"),
+                    crate::privileged::placement::ChildSession::Terminal,
+                )
+                .map_err(|error| {
+                    BackendError::Process(format!("prepare privileged PTY placement: {error}"))
+                })?;
+        } else {
+            let prepared = self.prepare_sandbox(effective_workdir)?;
+            let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+                .map_err(|error| BackendError::Process(error.to_string()))?;
+            crate::pty::install_pre_exec(
+                &mut command,
+                self.policy.clone(),
+                effective_workdir.map(str::to_string),
+                slave_fd,
+                prepared,
+                child_hardening,
+            )
             .map_err(|error| BackendError::Process(error.to_string()))?;
+        }
+        #[cfg(not(target_os = "linux"))]
         crate::pty::install_pre_exec(
             &mut command,
             self.policy.clone(),
             effective_workdir.map(str::to_string),
             slave_fd,
-            #[cfg(target_os = "linux")]
-            prepared,
-            #[cfg(target_os = "linux")]
-            child_hardening,
         )
         .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]
@@ -466,6 +523,41 @@ impl BoundaryExec for LocalBoundaryExec {
     async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError> {
         #[cfg(target_os = "linux")]
         if spec.runtime_helper.is_some() {
+            if self.launcher.privileged_placement().is_some() {
+                let root = spec
+                    .workdir
+                    .as_deref()
+                    .or(self.base_workdir.as_deref())
+                    .ok_or_else(|| {
+                        BackendError::Process("SFTP requires a workload directory".to_string())
+                    })?
+                    .to_string();
+                let helper_spec = ExecSpec {
+                    program: "/opt/openshell/bin/openshell-sandbox".to_string(),
+                    args: vec![
+                        crate::privileged::SFTP_ROLE.to_string(),
+                        "--root".to_string(),
+                        root.clone(),
+                    ],
+                    workdir: Some(root),
+                    pty: false,
+                    shell: None,
+                    env: Vec::new(),
+                    runtime_helper: None,
+                };
+                let executor = self.clone();
+                let (send, receive) = tokio::sync::oneshot::channel();
+                tokio::task::spawn_blocking(move || {
+                    let _ = send.send(executor.spawn_piped(&helper_spec));
+                });
+                let mut spawned = receive.await.map_err(|_| {
+                    BackendError::Process("privileged SFTP helper spawn cancelled".to_string())
+                })??;
+                spawned.armed = false;
+                return spawned.session.take().ok_or_else(|| {
+                    BackendError::Process("privileged SFTP helper session missing".to_string())
+                });
+            }
             return self.runtime_helper(spec);
         }
         let executor = self.clone();

@@ -1675,6 +1675,12 @@ enum SandboxCommands {
         #[arg(long, value_parser = ["manual", "auto"], default_value = "manual")]
         approval_mode: String,
 
+        /// Run the sandbox workload as true guest root inside a hardened VM
+        /// boundary sealed by boot-once BPF LSM. Requires a compute driver that
+        /// supports privileged mode.
+        #[arg(long, visible_alias = "priv")]
+        privileged: bool,
+
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "no_keep", "forward"])]
         output: OutputFormat,
@@ -3586,6 +3592,7 @@ async fn run_async() -> Result<()> {
                     env_from,
                     no_credential_warnings,
                     approval_mode,
+                    privileged,
                     output,
                     command,
                 } => {
@@ -3674,6 +3681,7 @@ async fn run_async() -> Result<()> {
                             suppress_credential_warnings: no_credential_warnings,
                             restart_policy: &restart_policy,
                             provision_timeout_secs: timeout.map(std::num::NonZeroU32::get),
+                            privileged,
                         },
                         &cli.workspace,
                         &tls,

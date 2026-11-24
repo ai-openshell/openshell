@@ -67,7 +67,7 @@ install_deps() {
   
   if command -v apt-get &>/dev/null; then
     # Debian/Ubuntu
-    DEPS="build-essential git python3 python3-pip python3-pyelftools flex bison libelf-dev libssl-dev libcap-ng-dev bc curl libclang-dev cpio zstd jq"
+    DEPS="build-essential git python3 python3-pip python3-pyelftools flex bison libelf-dev libssl-dev libcap-ng-dev bc curl libclang-dev cpio zstd jq dwarves"
     MISSING=""
     for dep in $DEPS; do
       if ! dpkg -s "$dep" &>/dev/null; then
@@ -214,6 +214,11 @@ if [ -f openshell.kconfig ]; then
   for opt in \
     CONFIG_SECURITY \
     CONFIG_SECURITY_LANDLOCK \
+    CONFIG_SECURITY_LOCKDOWN_LSM \
+    CONFIG_BPF_SYSCALL \
+    CONFIG_BPF_JIT \
+    CONFIG_BPF_LSM \
+    CONFIG_DEBUG_INFO_BTF \
     CONFIG_SECCOMP \
     CONFIG_SECCOMP_FILTER \
     CONFIG_HARDENED_USERCOPY \
@@ -228,17 +233,29 @@ if [ -f openshell.kconfig ]; then
       all_ok=false
     fi
   done
-  if grep -qx '# CONFIG_INIT_ON_FREE_DEFAULT_ON is not set' "${KERNEL_SOURCES}/.config"; then
-    echo "    CONFIG_INIT_ON_FREE_DEFAULT_ON: disabled"
-  else
-    echo "    WARNING: CONFIG_INIT_ON_FREE_DEFAULT_ON is not explicitly disabled after merge!" >&2
-    all_ok=false
-  fi
+  for opt in \
+    CONFIG_INIT_ON_FREE_DEFAULT_ON \
+    CONFIG_MODULES \
+    CONFIG_KEXEC \
+    CONFIG_KEXEC_FILE \
+    CONFIG_HIBERNATION \
+    CONFIG_DEVMEM \
+    CONFIG_DEVKMEM \
+    CONFIG_PROC_KCORE \
+    CONFIG_BLK_DEV_WRITE_MOUNTED \
+    CONFIG_UPROBES; do
+    if grep -qx "# ${opt} is not set" "${KERNEL_SOURCES}/.config" || ! grep -q "^${opt}=" "${KERNEL_SOURCES}/.config"; then
+      echo "    ${opt}: disabled"
+    else
+      echo "    WARNING: ${opt} is enabled after merge!" >&2
+      all_ok=false
+    fi
+  done
   lsm_order="$(grep '^CONFIG_LSM=' "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
-  if [[ "$lsm_order" == *landlock* ]]; then
+  if [[ "$lsm_order" == *landlock* ]] && [[ "$lsm_order" == *bpf* ]]; then
     echo "    CONFIG_LSM: ${lsm_order#*=}"
   else
-    echo "    WARNING: CONFIG_LSM does not activate Landlock: ${lsm_order:-unset}" >&2
+    echo "    WARNING: CONFIG_LSM does not activate Landlock and BPF: ${lsm_order:-unset}" >&2
     all_ok=false
   fi
   if [ "$all_ok" = false ]; then

@@ -746,6 +746,7 @@ impl PodmanComputeDriver {
                 openshell_core::VERSION,
                 [],
             )),
+            supports_privileged: false,
         })
     }
 
@@ -1089,6 +1090,11 @@ impl PodmanComputeDriver {
         // any workload/supervisor pair is admitted. Do not turn a tampered
         // artifact into a runtime-only supervisor failure.
         self.verify_network_trust()?;
+        if sandbox.spec.as_ref().is_some_and(|spec| spec.privileged) {
+            return Err(ComputeDriverError::Precondition(
+                "privileged sandboxes are not supported by the podman compute driver".into(),
+            ));
+        }
         if sandbox.name.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "sandbox name is required".into(),

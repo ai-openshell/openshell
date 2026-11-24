@@ -98,6 +98,7 @@ pub fn validate_open(
         || descriptor.workload_identity != config.workload_identity
         || descriptor.resource_claims != config.resource_claims
         || descriptor.provisioning_evidence != config.provisioning_evidence
+        || descriptor.privileged != config.privileged
     {
         return Err(tonic::Status::permission_denied(
             "driver descriptor does not match provisioned boundary",

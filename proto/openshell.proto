@@ -1248,6 +1248,10 @@ message SandboxSpec {
   // Gateway-owned policy for replacing the sandbox runtime after the canonical
   // main process exits. Unspecified is normalized to Never before persistence.
   SandboxRestartPolicy restart_policy = 15;
+  // Run workload processes as true guest root inside a hardened VM sandbox
+  // sealed by boot-once BPF LSM. Requires a compute driver that advertises
+  // privileged support; unsupported drivers reject creation.
+  bool privileged = 16;
 }
 
 message ResourceRequirements {

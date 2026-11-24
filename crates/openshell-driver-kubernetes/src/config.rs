@@ -430,6 +430,11 @@ pub struct KubernetesComputeConfig {
     /// by the gateway administrator; sandbox creators cannot change it, and
     /// it never inherits the workload class. Empty (default) = omit the field.
     pub supervisor_runtime_class_name: String,
+    /// Kubernetes `runtimeClassName` used for `--privileged` (true guest root +
+    /// boot-once BPF LSM) sandbox pods, such as a hardened Kata Containers class.
+    /// Empty (default) disables privileged sandboxes on Kubernetes.
+    #[serde(default)]
+    pub privileged_runtime_class_name: String,
     /// Pod annotation keys that sandbox templates may set. Each entry is an
     /// exact key (`example.com/team`) or a prefix wildcard (`example.com/*`).
     /// Empty (default) rejects every caller-supplied pod annotation.
@@ -552,6 +557,7 @@ impl Default for KubernetesComputeConfig {
             workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
             supervisor_runtime_class_name: String::new(),
+            privileged_runtime_class_name: String::new(),
             allowed_pod_annotations: Vec::new(),
             allowed_pod_labels: Vec::new(),
             sa_token_ttl_secs: 3600,

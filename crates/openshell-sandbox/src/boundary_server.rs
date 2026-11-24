@@ -255,6 +255,12 @@ mod linux {
             format!("decode boundary config {}: {error}", config_path.display())
         })?;
         validate_config(&config)?;
+        if config.privileged.is_some() {
+            return Err(
+                "boundary config selects privileged mode; launch openshell-sandbox with --privileged"
+                    .to_string(),
+            );
+        }
         validate_runtime_resource_claims(&config)?;
         validate_running_identity(
             &config.workload_identity,
@@ -301,6 +307,90 @@ mod linux {
             launcher,
             qualification,
         )?);
+        serve_then_stop(process_runtime, &config.listener, runtime)
+    }
+
+    pub fn run_privileged_boundary(config_path: &Path, workload_root: &Path) -> Result<(), String> {
+        install_boundary_signal_handlers()?;
+        make_boundary_nondumpable()?;
+        disable_core_dumps()?;
+        let bytes = std::fs::read(config_path)
+            .map_err(|error| format!("read boundary config {}: {error}", config_path.display()))?;
+        let config: BoundaryConfig = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("decode boundary config {}: {error}", config_path.display())
+        })?;
+        validate_config(&config)?;
+        let Some(profile) = config.privileged else {
+            return Err(
+                "openshell-sandbox --privileged requires a privileged boundary bootstrap"
+                    .to_string(),
+            );
+        };
+        profile
+            .validate()
+            .map_err(|error| format!("invalid privileged profile: {error}"))?;
+        validate_runtime_resource_claims(&config)?;
+        std::fs::remove_file(config_path).map_err(|error| {
+            format!("consume boundary config {}: {error}", config_path.display())
+        })?;
+        crate::process::install_boundary_user_environment(config.child_env.clone())?;
+        if nix::unistd::getpid().as_raw() != 1 {
+            rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
+                .map_err(|error| format!("become child subreaper: {error}"))?;
+        }
+        crate::managed_children::start_orphan_reaper()
+            .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
+        let protected_control_port = match &config.listener {
+            BoundaryListenerConfig::TlsTcp { address, .. } => Some(address.port()),
+            BoundaryListenerConfig::RuntimeInitiatedTlsTcp { addresses, .. } => {
+                addresses.first().map(std::net::SocketAddr::port)
+            }
+            BoundaryListenerConfig::Unix { .. }
+            | BoundaryListenerConfig::Vsock { .. }
+            | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
+            | BoundaryListenerConfig::RuntimeInitiatedVsock { .. } => None,
+        };
+        let process_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("create boundary process runtime: {error}"))?;
+        let runtime_guard = process_runtime.enter();
+        let (privileged_runtime, launcher, network_broker) =
+            crate::privileged::PrivilegedRuntime::start(
+                profile,
+                workload_root.to_path_buf(),
+                protected_control_port,
+            )
+            .map_err(|error| format!("start privileged sandbox runtime: {error}"))?;
+        drop(runtime_guard);
+        let dummy_qualification = crate::RuntimeQualification {
+            seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
+                new_listener: true,
+                notification_round_trip: true,
+                id_validation: true,
+                addfd_send: true,
+                retained_socket_operation: true,
+                proc_fd_identity: true,
+                task_memory_read: true,
+            },
+            landlock_abi: 0,
+            landlock_allow_deny: false,
+            udp_dns_round_trip: true,
+            tcp_dns_round_trip: true,
+            tcp_allow_round_trip: true,
+            tcp_deny_round_trip: true,
+            socket_loopback_confinement: true,
+        };
+        let runtime = Arc::new(
+            BoundaryRuntime::new(
+                config.clone(),
+                process_runtime.handle().clone(),
+                network_broker,
+                launcher,
+                dummy_qualification,
+            )?
+            .with_privileged(privileged_runtime),
+        );
         serve_then_stop(process_runtime, &config.listener, runtime)
     }
 
@@ -2569,6 +2659,7 @@ mod linux {
         network_broker: NetworkBroker,
         workload_launcher: crate::linux::workload_launcher::WorkloadLauncher,
         qualification: crate::RuntimeQualification,
+        privileged: Option<Arc<crate::privileged::PrivilegedRuntime>>,
     }
 
     #[derive(Clone)]
@@ -2879,7 +2970,16 @@ mod linux {
                 network_broker,
                 workload_launcher,
                 qualification,
+                privileged: None,
             })
+        }
+
+        fn with_privileged(
+            mut self,
+            privileged: Arc<crate::privileged::PrivilegedRuntime>,
+        ) -> Self {
+            self.privileged = Some(privileged);
+            self
         }
 
         #[cfg(test)]
@@ -2904,7 +3004,15 @@ mod linux {
             Ok(principal)
         }
 
-        fn discover_image_policy() -> Response {
+        fn discover_image_policy(&self) -> Response {
+            if let Some(priv_rt) = &self.privileged {
+                return Response::ImagePolicy {
+                    yaml: crate::privileged::discover_workload_image_policy(
+                        priv_rt.workload_root(),
+                    ),
+                    invalid: false,
+                };
+            }
             Self::discover_image_policy_from_paths(&[
                 openshell_policy::CONTAINER_POLICY_PATH,
                 openshell_policy::LEGACY_CONTAINER_POLICY_PATH,
@@ -3128,6 +3236,9 @@ mod linux {
             if let SupervisorConnectionState::Frozen { recovery_id } = *connection
                 && let Some(process) = process
             {
+                if let Some(priv_rt) = &self.privileged {
+                    priv_rt.thaw_workload();
+                }
                 if !process.boundary_runtime.resume(recovery_id) {
                     return Err((
                         BoundaryErrorKind::Process,
@@ -3229,13 +3340,20 @@ mod linux {
                 // The recovery identity is allocated before the freeze so a
                 // failed deferred sweep can name it.
                 let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
+                let mut freeze_failed = false;
                 if let Some(process) = &process {
                     self.network_broker.set_workload_frozen(true);
+                    if let Some(priv_rt) = &self.privileged
+                        && !priv_rt.freeze_workload()
+                    {
+                        freeze_failed = true;
+                    }
                     let _ = process.boundary_runtime.freeze(recovery_id);
                 }
                 *connection = SupervisorConnectionState::Frozen { recovery_id };
-                recovery_id
+                (recovery_id, freeze_failed)
             };
+            let (recovery_id, freeze_failed) = recovery_id;
             tracing::warn!(
                 recovery_id,
                 "Sandbox Protocol connection lost; workload frozen pending authenticated recovery"
@@ -3254,8 +3372,13 @@ mod linux {
                     .build()
             );
             // The supervisor whose connection was in force chose how long its
-            // replacement may take.
-            let recovery_timeout = recovery_offer.unwrap_or(self.default_recovery_timeout);
+            // replacement may take. If cgroup freeze failed in privileged mode,
+            // expire immediately instead of leaving the workload running unsupervised.
+            let recovery_timeout = if freeze_failed {
+                Duration::ZERO
+            } else {
+                recovery_offer.unwrap_or(self.default_recovery_timeout)
+            };
             #[cfg(test)]
             lock(&self.scheduled_recoveries).push(recovery_timeout);
             let runtime = Arc::downgrade(self);
@@ -3333,6 +3456,9 @@ mod linux {
                 Some(process) => Self::terminate_process_tree(&process, false).await,
                 None => Ok(()),
             };
+            if let Some(priv_rt) = &self.privileged {
+                priv_rt.kill_workload();
+            }
             // The host may end the VM on acknowledgement. Flush dirty writes
             // first, even if process termination failed.
             self.flush_filesystem().await;
@@ -3440,7 +3566,7 @@ mod linux {
             let request_id = envelope.request_id;
             let payload_digest = envelope.payload_digest;
             let response = match envelope.request {
-                Request::DiscoverPolicy => Self::discover_image_policy(),
+                Request::DiscoverPolicy => self.discover_image_policy(),
                 Request::Attach {
                     policy,
                     supervisor_takeover,
@@ -3748,6 +3874,33 @@ mod linux {
             {
                 return guest_error(BoundaryErrorKind::Denied, error);
             }
+            if let Some(priv_rt) = &self.privileged {
+                let sandbox_policy: openshell_core::policy::SandboxPolicy = policy.clone().into();
+                if matches!(
+                    sandbox_policy.landlock.compatibility,
+                    openshell_core::policy::LandlockCompatibility::HardRequirement
+                ) {
+                    return guest_error(
+                        BoundaryErrorKind::Denied,
+                        "privileged mode enforces filesystem policy via BPF LSM and does not support landlock.compatibility: hard_requirement",
+                    );
+                }
+                if matches!(
+                    sandbox_policy.network.mode,
+                    openshell_core::policy::NetworkMode::Allow
+                ) {
+                    return guest_error(
+                        BoundaryErrorKind::Denied,
+                        "privileged mode does not permit unrestricted network mode",
+                    );
+                }
+                if let Err(error) = priv_rt.apply_policy(&sandbox_policy, "/sandbox") {
+                    return guest_error(
+                        BoundaryErrorKind::Process,
+                        format!("apply BPF LSM policy: {error}"),
+                    );
+                }
+            }
             let accepted = match &*state {
                 RuntimeState::AwaitingAttach => {
                     let prepared = match PreparedBoundary::establish(self.network_broker.clone()) {
@@ -3859,6 +4012,26 @@ mod linux {
         }
 
         fn measure_confirmation(&self) -> Result<BoundaryConfirmation, String> {
+            if let Some(priv_rt) = &self.privileged {
+                self.network_broker
+                    .confirm_healthy()
+                    .map_err(|error| format!("verify sandbox network broker: {error}"))?;
+                if !self.workload_launcher.is_alive() {
+                    return Err("sandbox workload launcher is not running".to_string());
+                }
+                let audit = priv_rt.audit_evidence(true);
+                let backend_audit = serde_json::to_value(audit).map_err(|error| {
+                    format!("encode privileged sandbox audit evidence: {error}")
+                })?;
+                return Ok(BoundaryConfirmation {
+                    generation: self.config.generation.clone(),
+                    identity: self.config.workload_identity.clone(),
+                    session_id: self.config.session_id,
+                    provisioning_evidence_digest: self.config.provisioning_evidence.evidence_digest,
+                    resource_claims: self.config.resource_claims.clone(),
+                    backend_audit,
+                });
+            }
             validate_running_identity(
                 &self.config.workload_identity,
                 allows_runtime_supplementary_groups(&self.config),
@@ -3980,6 +4153,71 @@ mod linux {
                     BoundaryErrorKind::Invalid,
                     format!("invalid provider files: {error}"),
                 );
+            }
+            if let Some(priv_rt) = &self.privileged {
+                if !provider_files.is_empty() {
+                    return guest_error(
+                        BoundaryErrorKind::Denied,
+                        "in-guest provider files are refused by default in privileged mode; use supervisor L7 credential injection",
+                    );
+                }
+                let ca_file_paths = match (ca_cert.as_deref(), ca_bundle.as_deref()) {
+                    (Some(cert), Some(bundle)) => {
+                        match priv_rt.install_ca_material(cert.as_bytes(), bundle.as_bytes()) {
+                            Ok(paths) => Some(paths),
+                            Err(error) => {
+                                return guest_error(
+                                    BoundaryErrorKind::Process,
+                                    format!("install privileged CA material: {error}"),
+                                );
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let mut policy: openshell_core::policy::SandboxPolicy = policy.into();
+                if let Err(error) =
+                    priv_rt.apply_policy(&policy, spec.workdir.as_deref().unwrap_or("/sandbox"))
+                {
+                    return guest_error(
+                        BoundaryErrorKind::Process,
+                        format!("apply BPF LSM policy: {error}"),
+                    );
+                }
+                policy.process.run_as_user = Some("0".to_string());
+                policy.process.run_as_group = Some("0".to_string());
+                let launch = ManagedProcessLaunch {
+                    process_id: format!("{}:main:0", self.config.generation),
+                    spec,
+                    policy,
+                    provider_env_revision,
+                    provider_env,
+                    ca_file_paths,
+                };
+                let provider_file_count = provider_files.len();
+                let process = match ManagedProcess::spawn(
+                    &self.process_runtime,
+                    &self.workload_launcher,
+                    launch,
+                    prepared.clone(),
+                ) {
+                    Ok(process) => Arc::new(process),
+                    Err(error) => return guest_error(BoundaryErrorKind::Process, error),
+                };
+                *lock(&self.started_agent) = Some(requested);
+                let process_id = process.process_id();
+                let revision = process.provider_credentials.snapshot().revision;
+                let generation = *lock(&process.provider_environment_generation);
+                *state = RuntimeState::Running(process);
+                tracing::info!(
+                    provider_file_count,
+                    "Privileged workload canonical process started"
+                );
+                return Response::Started {
+                    process_id,
+                    provider_env_revision: revision,
+                    provider_env_generation: generation,
+                };
             }
             let ca_file_paths = match install_ca_material(ca_cert, ca_bundle) {
                 Ok(paths) => paths,
@@ -5597,6 +5835,7 @@ mod linux {
                     host_gateway_ip: None,
                     resource_claims: config.resource_claims.clone(),
                     provisioning_evidence: config.provisioning_evidence.clone(),
+                    privileged: None,
                 };
             OpenBoundaryRequest {
                 session_id: config.session_id.to_string(),
@@ -5700,6 +5939,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
+                privileged: None,
             };
             let debug = format!("{config:?}");
             assert!(debug.contains("test-key"));
@@ -5814,6 +6054,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
+                privileged: None,
             };
             assert!(allows_runtime_supplementary_groups(&config));
         }
@@ -5898,6 +6139,7 @@ mod linux {
                     workload_identity: test_workload_identity(),
                     provisioning_evidence: test_provisioning_evidence(),
                     child_env: std::collections::HashMap::new(),
+                    privileged: None,
                 },
                 tokio::runtime::Handle::current(),
                 broker,
@@ -6371,6 +6613,7 @@ mod linux {
                             workload_identity: test_workload_identity(),
                             provisioning_evidence: test_provisioning_evidence(),
                             child_env: std::collections::HashMap::new(),
+                            privileged: None,
                         },
                         process_runtime.handle().clone(),
                         network_broker,
@@ -6891,6 +7134,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
+                privileged: None,
             };
 
             validate_config(&config).unwrap();
@@ -7071,6 +7315,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
+                privileged: None,
             };
             for address in [
                 "127.0.0.1:5500",
@@ -7727,6 +7972,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
+                privileged: None,
             };
 
             validate_config(&config).expect("valid runtime claim configuration");
@@ -8024,6 +8270,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
+                        privileged: None,
                     },
                     tokio::runtime::Handle::current(),
                     network_broker,
@@ -8333,6 +8580,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
+                        privileged: None,
                     },
                     process_runtime.handle().clone(),
                     network_broker,
@@ -8751,6 +8999,7 @@ mod linux {
                     workload_identity: test_workload_identity(),
                     provisioning_evidence: test_provisioning_evidence(),
                     child_env: std::collections::HashMap::new(),
+                    privileged: None,
                 },
                 process_runtime.handle().clone(),
                 network_broker,
@@ -8971,6 +9220,7 @@ mod linux {
                     workload_identity: test_workload_identity(),
                     provisioning_evidence: test_provisioning_evidence(),
                     child_env: std::collections::HashMap::new(),
+                    privileged: None,
                 },
                 process_runtime.handle().clone(),
                 network_broker,
@@ -10391,6 +10641,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
+                        privileged: None,
                     },
                     process_runtime.handle().clone(),
                     network_broker,
@@ -10821,6 +11072,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
+                        privileged: None,
                     },
                     process_runtime.handle().clone(),
                     broker,
@@ -10963,4 +11215,14 @@ pub fn run_boundary(
     _qualification: crate::RuntimeQualification,
 ) -> Result<(), String> {
     Err("boundary mode is supported only on Linux".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_privileged_boundary(config_path: &Path, workload_root: &Path) -> Result<(), String> {
+    linux::run_privileged_boundary(config_path, workload_root)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run_privileged_boundary(_config_path: &Path, _workload_root: &Path) -> Result<(), String> {
+    Err("privileged boundary mode is supported only on Linux".to_string())
 }
