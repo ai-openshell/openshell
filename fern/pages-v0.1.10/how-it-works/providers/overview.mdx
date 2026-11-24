@@ -1,0 +1,430 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Providers"
+sidebar-title: "Overview"
+description: "Create and manage credential providers that inject API keys and tokens into OpenShell sandboxes."
+keywords: "Generative AI, Cybersecurity, Providers, Credentials, API Keys, Sandbox, Security"
+position: 4
+---
+
+AI agents typically need credentials to access external services: an API key for the AI model provider, a token for GitHub or GitLab, and so on. OpenShell manages these credentials as first-class entities called *providers*.
+
+Create and manage providers that supply credentials to sandboxes.
+
+<Info>
+Provider profiles define provider credentials, policy, and refresh behavior. See
+[Profiles](/how-it-works/providers/profiles) for the profile format and custom
+profile workflow.
+</Info>
+
+This walkthrough uses a GitHub token to make a read-only request to the GitHub
+REST API.
+
+## Import a Profile
+
+A provider profile defines a provider type. It specifies which credentials the
+provider accepts, which service endpoints and sandbox binaries can use them,
+and how to refresh them when applicable. The profile does not contain the
+credential values. A provider instance stores those values separately.
+
+A new gateway starts with an empty profile catalog. Import a profile before
+creating a provider of that type. For this walkthrough, save the following
+profile as `github.yaml`.
+
+```yaml showLineNumbers={false}
+id: github
+display_name: GitHub REST
+credentials:
+  - name: api_token
+    env_vars: [GITHUB_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: Authorization
+discovery:
+  credentials: [api_token]
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries: [/usr/bin/curl]
+```
+
+- `credentials` declares the required `GITHUB_TOKEN` and its placement as a bearer token in the `Authorization` header.
+- `discovery` lets the CLI read `api_token` from your local `GITHUB_TOKEN` when you create a provider with `--from-existing`.
+- `endpoints` limits where the credential can be used and enforces read-only REST access to `api.github.com` on port `443`.
+- `binaries` lists the executables allowed to access those endpoints. Use absolute paths that match the sandbox image. If `curl` is installed elsewhere in your image, replace `/usr/bin/curl` with its path before importing.
+
+Lint and import the profile into your current workspace, then view the available
+profiles:
+
+```shell
+openshell profile lint -f github.yaml
+openshell profile import -f github.yaml
+openshell profile list
+openshell profile describe github
+```
+
+### Provider Examples
+
+For other services, download a YAML file from the repository's
+[`providers/`](https://github.com/ai-openshell/openshell/tree/main/providers) directory.
+For a released version of OpenShell, use the
+[matching release tag](https://github.com/ai-openshell/openshell/tags) instead of `main`.
+Review the credentials and endpoints, adjust `binaries` for your sandbox image,
+and run the same lint and import commands with the downloaded filename.
+
+## Create a Provider
+
+After importing `github.yaml`, create a provider named `my-github` with `--type github`,
+the profile's `id`. First, export `GITHUB_TOKEN` in your local shell with a GitHub
+token that has only read permissions. Passing `--credential GITHUB_TOKEN` without
+a value reads the token from the environment.
+
+```shell
+openshell provider create --name my-github --type github --credential GITHUB_TOKEN
+```
+
+Because the profile declares `discovery`, `--from-existing` does the same
+lookup for every discoverable credential:
+
+```shell
+openshell provider create --name my-github --type github --from-existing
+```
+
+`--credential GITHUB_TOKEN=<value>` stores an explicit value instead, but
+exposes it in shell history and the host process table.
+
+Provider creation rejects a `--type` that does not name an imported profile.
+Existing providers created without a profile remain usable, but OpenShell does
+not create new ones.
+
+## Attach Providers to Sandboxes
+
+Set `SANDBOX_IMAGE` to an image with `sh` and `curl`. Make sure the `curl` path
+matches your imported profile. Attach `my-github` and make an authenticated
+request inside the sandbox:
+
+```shell
+openshell sandbox create --no-keep --from "$SANDBOX_IMAGE" --provider my-github -- \
+  sh -c 'curl --fail --silent --show-error -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/user'
+```
+
+GitHub returns the authenticated user's account information. `--no-keep`
+removes the sandbox when the command exits. Repeat `--provider` to attach more
+than one provider to a sandbox.
+
+An attached provider supplies eligible credentials as placeholders and can
+contribute network policy entries. Each static credential resolves only for
+endpoints in its profile, or for sandbox policy endpoints explicitly bound to
+an endpointless profile.
+
+To change the providers on an existing sandbox, use `openshell sandbox provider attach`
+or `openshell sandbox provider detach`. See
+[Attach and Detach Providers](/how-it-works/providers/profiles#attach-and-detach-providers).
+
+Provider attachment checks credential inspection against the latest saved sandbox
+policy, falling back to the creation policy only when no revision exists. If a
+current rule permits uninspected traffic to a credentialed endpoint, configure
+L7 inspection or remove the rule before attaching the provider. Use
+`allow_uninspected_credentials: true` only for an intentional exception.
+
+### Auto-Discovery Shortcut
+
+For profiles with a `discovery` section, pass the imported profile ID to
+`--provider`. If no provider by that name exists, the CLI can create it from local
+credentials before attaching it:
+
+```shell
+openshell sandbox create --no-keep --from "$SANDBOX_IMAGE" --provider github -- \
+  sh -c 'curl --fail --silent --show-error -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/user'
+```
+
+This creates a provider named `github` from your local `GITHUB_TOKEN`. Pass
+`--auto-providers` to skip the confirmation prompt or `--no-auto-providers` to
+skip creation.
+
+OpenShell attaches only the providers you name. It does not infer a provider
+from the command or from the profile's `binaries` list.
+
+## Manage Providers
+
+List providers in the current workspace and inspect `my-github`:
+
+```shell
+openshell provider list
+openshell provider get my-github
+```
+
+Use `-o json` or `-o yaml` for machine-readable output. The list envelope contains
+`providers` and `next_page_token`. Each provider includes its metadata,
+credential and config key names, and credential expirations. The output does
+not include credential or config values. Pass the next token to `--page-token`
+to continue.
+
+To replace the GitHub token, export the replacement as `GITHUB_TOKEN` and run:
+
+```shell
+openshell provider update my-github --credential GITHUB_TOKEN
+```
+
+Add `--wait` to wait for currently attached sandboxes to apply the update:
+
+```shell
+openshell provider update my-github --credential GITHUB_TOKEN --wait --timeout 30 --output json
+```
+
+The result includes a change ID and an outcome for each selected sandbox.
+Sandboxes attached after the update are outside this wait. The timeout applies
+to the entire group. A failure or timeout returns a nonzero exit code and still
+reports all outcomes. If no sandbox is attached, the result reports the saved
+change and an empty target list.
+
+[Provider readiness](/how-it-works/providers/profiles#inspect-provider-readiness)
+reports whether the sandbox applied the update for new processes, not whether a
+backend accepts the token. After an ordinary static credential update, launch a
+new process to use the new credential reference. For long-running clients, see
+[Stable Placeholders](/how-it-works/providers/profiles#keep-an-externally-updated-placeholder-stable).
+
+To record when a token expires, pass an RFC3339 timestamp or Unix epoch
+milliseconds:
+
+```shell
+openshell provider update my-github \
+  --credential GITHUB_TOKEN \
+  --credential-expires-at GITHUB_TOKEN=2027-01-01T00:00:00Z
+```
+
+Use `0` as the timestamp to clear the expiry.
+
+## Label a Provider
+
+Attach labels when you create a provider to track environment or team ownership.
+Repeat `--label` for each key-value pair. This example uses a profile that
+declares no credentials, so the provider needs no credential source. Save it as
+`pypi.yaml`, adjusting `binaries` for your image:
+
+```yaml showLineNumbers={false}
+id: pypi
+display_name: PyPI
+endpoints:
+  - host: pypi.org
+    port: 443
+  - host: files.pythonhosted.org
+    port: 443
+binaries: [/usr/bin/python3]
+```
+
+Import it, create a labeled provider, and filter by its labels:
+
+```shell
+openshell profile import -f pypi.yaml
+openshell provider create --name public-pypi --type pypi --label env=dev --label team=ml
+openshell provider list --label-selector env=dev,team=ml
+openshell provider get public-pypi
+```
+
+A comma-separated selector matches providers with every listed key-value pair.
+Filtering applies before pagination. Platform Admins can pass `--all-workspaces`.
+Keep the selector and workspace scope unchanged when continuing with `--page-token`.
+
+API clients set `CreateProviderRequest.provider.metadata.labels` and filter with
+`ListProvidersRequest.label_selector`. The gateway returns labels in
+`provider.metadata.labels`. Provider updates preserve existing labels and do not
+change them, so set labels during creation.
+
+## Retrieve Runtime Credentials
+
+An [mTLS operator](/how-it-works/gateways/authentication#mtls-operators) can call
+`openshell.v1.OpenShell/GetProviderCredentials` through the
+[Python SDK](/sdk/python#retrieve-provider-credentials),
+[TypeScript SDK](/sdk/typescript#retrieve-provider-credentials), or a generated/raw
+gRPC client. Select one explicit workspace, one provider by canonical name, and
+between 1 and 32 runtime environment keys. If you created `my-github` in the
+`default` workspace, use this request body:
+
+```json
+{
+  "workspace_scope": { "workspace": "default" },
+  "name": "my-github",
+  "credential_keys": ["GITHUB_TOKEN"]
+}
+```
+
+The response maps each key to its value and optional expiry. The gateway returns
+all selected values or an error. `minimum_remaining_lifetime` accepts a protobuf
+duration up to 24 hours and defaults to five minutes when omitted or zero.
+Non-expiring static credentials satisfy the requirement. A credential that
+cannot meet the requested lifetime causes the call to fail. Gateway-managed
+credentials refresh when necessary; refresh effects can persist even if another
+requested key causes the call to fail.
+
+For OAuth refresh, the RPC returns access tokens, never gateway-only refresh
+tokens, client secrets, or signing material. Supervisor-side, endpoint-specific,
+and SPIFFE-bound dynamic grants return `FAILED_PRECONDITION`. If the outcome of
+a rotating-token exchange is uncertain, reauthorize or reconfigure refresh rather
+than retrying automatically.
+
+<Warning>
+Retrieval exports real credential values outside sandbox endpoint enforcement.
+Keep them out of logs, command history, and shared output. Ordinary users and
+OIDC admins cannot call this RPC. No dedicated CLI command is provided.
+</Warning>
+
+## How Credential Injection Works
+
+OpenShell supplies eligible credentials to sandbox processes as opaque
+placeholders. The proxy resolves a placeholder immediately before forwarding a
+request if all of the following are true:
+
+1. Network policy allows the calling binary and destination.
+2. The request host, port, and path match a credential binding. The provider profile sets this boundary unless the profile is endpointless, in which case the sandbox policy endpoint must explicitly bind the provider with `credential_binding.provider`.
+3. The request uses the credential's declared location, such as an HTTP header, query parameter, or path slot. Without placement metadata, static credentials resolve only in `Authorization` or explicitly enabled body or WebSocket rewrite policies.
+
+### Fail-closed behavior
+
+For `my-github`, the profile allows `curl` to use `GITHUB_TOKEN` in the
+`Authorization` header at `api.github.com:443`. If sandbox policy permits a
+request to another host, the proxy still rejects sending the GitHub placeholder
+there with HTTP 403 and `credential_endpoint_mismatch`. The proxy logs the
+reason without logging the secret or placeholder. Unknown, malformed, expired,
+or otherwise unresolved placeholders also fail closed.
+
+### Supported injection locations
+
+Credential resolution requires HTTP inspection. Raw `tls: skip` and non-HTTP
+tunnels remain opaque. The proxy does not rewrite cookies, responses,
+unsupported bodies, or binary WebSocket frames. Only send credentialed requests
+to trusted endpoints. See [Static Credential Endpoint Binding](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding)
+for supported placement and upgrade behavior.
+
+### Clients that parse JWT claims
+
+A trusted launcher can wrap an issued placeholder in a JWT-shaped alias when a
+client needs local account metadata. Keep the original placeholder suffix in
+the signature segment:
+
+```text
+base64url(header).base64url(claims).OPENSHELL-RESOLVE-ENV-<issued-placeholder-suffix>
+```
+
+For example, a placeholder beginning `openshell:resolve:env:s` becomes a JWT
+whose signature begins `OPENSHELL-RESOLVE-ENV-s`, retaining the entire handle and
+environment key. Use the placeholder supplied to the running workload, not the
+environment key or a fabricated handle. The proxy replaces the alias with the
+resolved credential and preserves its endpoint, authorization-epoch, and expiry
+checks. The claims supply local metadata only; the alias is not a signed
+identity assertion or an upstream credential.
+
+### Inspect an Endpoint Binding
+
+Export the profile to inspect its credential boundary:
+
+```shell
+openshell profile export github -o yaml
+```
+
+## Update or Remove a Profile
+
+To edit the GitHub profile, export it, change the metadata or policy, and keep
+its `id` and exported `resource_version`:
+
+```shell
+openshell profile export github -o yaml > github-profile.yaml
+openshell profile update github -f github-profile.yaml
+```
+
+Import fails if the profile ID already exists. Use `profile update` for
+existing custom profiles. Interceptor-managed profiles are read-only. Updated
+policy applies to provider instances of that type on their next sandbox config
+sync.
+
+To clean up, first detach the providers from any sandboxes that still use them.
+Then delete the providers and profiles, adding `github` to the provider list if
+you used the auto-discovery shortcut:
+
+```shell
+openshell provider delete my-github public-pypi
+openshell profile delete github pypi
+```
+
+Both delete commands accept multiple names or IDs. If one deletion fails,
+OpenShell attempts the remaining deletions and returns a nonzero exit code.
+
+## Available Provider Types
+
+Run `openshell profile list` to see which profile IDs you can use with `--type`.
+Write your own profile using the [profile schema](/how-it-works/providers/profiles#profile-schema).
+
+## Credential Refresh
+
+The GitHub walkthrough uses a static token. For profiles that declare refresh
+metadata, the gateway can mint new credentials without injecting refresh secrets
+into sandboxes. See [Configure Credential Refresh](/how-it-works/providers/profiles#configure-credential-refresh)
+and [Dynamic Token Grants](/how-it-works/providers/profiles#dynamic-token-grants).
+
+### Shared Secret Material
+
+A [workspace secret](/how-it-works/gateways/configuration#workspace-secrets) can
+hold a client secret for multiple providers. Create it with `openshell secret create`,
+passing `--value-env` for the secret's environment variable and `--allowed-endpoint`
+for each permitted token endpoint. Reference it from `openshell provider refresh configure`
+with `--material-secret KEY=SECRET`. The gateway reads the current value at each
+mint. Refresh tokens must remain separate for each provider. The gateway
+operator must enable workspace secrets with `enable_workspace_secrets`.
+
+Rotate the shared value with `openshell secret update <name> --value-file <path>`.
+The file is stored exactly as read, including any trailing newline, so write it
+with `printf '%s'`. Each provider uses the new value at its next refresh;
+`openshell provider refresh rotate` applies it immediately.
+
+Set the allowed endpoints at creation. A secret without one cannot be used for
+refresh. The gateway does not follow token endpoint redirects when a workspace
+secret is in use. Workspace secrets work with the OAuth2, Google service account, and GitHub App
+installation strategies, not `aws_sts_assume_role`.
+
+Before deleting a referenced secret, use `openshell provider refresh inline-secrets`
+to remove the reference without replacing the provider's current grant. Use
+`openshell provider refresh status` to find which secrets a provider references.
+If credential storage fails during deletion, `openshell secret list` shows the
+secret as `deleting`. Rerun `openshell secret delete` to finish the cleanup.
+
+### AWS STS
+
+The gateway can mint short-lived AWS credentials with `sts:AssumeRole` for
+profiles that declare `aws_sts_assume_role` refresh. See
+[Gateway-Managed STS Credentials](/how-it-works/providers/aws#gateway-managed-sts-credentials)
+for the create, configure, and rotate sequence.
+
+## Inference Provider Access
+
+Attach an inference provider to each sandbox that needs it and configure the
+workload to call the provider's native endpoint. The workload, not OpenShell,
+selects the model and request timeout. Import the example profile from
+[Provider Examples](#provider-examples) before creating the provider.
+
+| Provider | Example profile | Native base URL | Credential variable |
+|---|---|---|---|
+| OpenAI | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| Anthropic | `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
+| NVIDIA API Catalog | `nvidia` | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` |
+| DeepInfra | `deepinfra` | `https://api.deepinfra.com/v1/openai` | `DEEPINFRA_API_KEY` |
+| Google Vertex AI | `google-vertex-ai` | Region and model dependent | `GOOGLE_VERTEX_AI_TOKEN` or `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN` |
+
+<Note>
+`ANTHROPIC_API_KEY` is an API key from [console.anthropic.com](https://console.anthropic.com), not a subscription token. Subscription users must generate a separate API key from the Anthropic Console.
+</Note>
+
+An OpenAI-compatible protocol does not make the `openai` profile safe for an
+arbitrary host. Baseten, Bitdeer, Groq, Ollama, LM Studio, self-hosted NIM, and
+other alternate endpoints need their own profile declaring the actual host,
+port, credential, and allowed binaries. See [Inference](/how-it-works/inference)
+for complete examples.
+
+## Next Steps
+
+- Manage provider access with [Workspaces](/how-it-works/workspaces).
+- Control workload access with [Policies](/how-it-works/policies/overview).
+- Choose a sandbox image using [Default Workload Image](/how-it-works/sandboxes/overview#default-workload-image).

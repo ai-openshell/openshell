@@ -71,6 +71,9 @@ navigation:
     - page: Schema Reference
       path: ../pages-latest/how-it-works/policies/schema.mdx
       slug: schema
+    - page: Cedar Policies
+      path: ../pages-latest/how-it-works/policies/cedar.mdx
+      slug: cedar
   - page: Inference
     path: ../pages-latest/how-it-works/inference.mdx
 - section: Extensibility
@@ -132,5 +135,7 @@ navigation:
   contents:
   - page: 0.1.0
     path: ../pages-latest/upgrade/0-1-0.mdx
+  - page: Registry Move
+    path: ../pages-latest/upgrade/registry-move.mdx
 - folder: ../pages-latest/resources
   title: Resources
