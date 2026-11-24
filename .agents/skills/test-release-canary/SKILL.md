@@ -133,26 +133,6 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 
 ## Diagnosing failures
 
-For snap installation failures during `systemctl --user daemon-reload`, use
-`Snap Install Diagnostic` (`.github/workflows/snap-install-diagnostic.yml`). It
-tests the same amd64 snap revision on Ubuntu 24.04 and 26.04, each with and
-without the extra user manager started by the snap canary. Jobs run independently
-and retain failed install status, snap task details, and systemd journals.
-Draft and ready PRs that change the diagnostic workflow run the matrix on
-`pull_request`, using revision `2730`, without merging it first.
-
-```shell
-gh workflow run snap-install-diagnostic.yml --ref <branch> -f revision=2730
-```
-
-The workflow must first exist on the default branch for manual dispatch; `--ref`
-then selects the branch's definition.
-It installs the revision directly to isolate snap service registration; it does
-not exercise `install.sh` or assert gateway health. Compare the four install
-outcomes before attributing the failure to the OS or the extra user manager.
-Each OS uses its own snapd/systemd packages, so OS-dependent failures need
-further investigation to identify the responsible component.
-
 | Symptom | Likely cause | Where to look |
 |---|---|---|
 | `macos`/`ubuntu-deb`/`fedora` job fails on `install.sh` | Dev release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
