@@ -707,6 +707,12 @@ supervisor. The address must be one the supervisor lets an IP literal reach.
 Rootless Podman's is link-local and always blocked, so CI runs the suite on
 Docker rootful, Podman rootful, and the `k3s` and `k3s-ha` installers.
 
+The `policy-dns-ipv6` feature suite (`tests/suites/features/policy-dns-ipv6`)
+checks that policy DNS answers AAAA queries with a synthetic address that
+reaches only the policy endpoint's server. CI runs it on `ubuntu-k3s-ipv6`,
+where the K3s installers enable `policy_dns_ipv6_egress` and set
+`server.hostGatewayIP` to the node's IPv6 address.
+
 The `connect-ssh-supervision` feature suite
 (`tests/suites/features/connect-ssh-supervision`) checks how `sandbox connect`
 supervises its `ssh` process: it reconnects after losing the SSH transport and
