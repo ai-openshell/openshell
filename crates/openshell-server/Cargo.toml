@@ -135,6 +135,7 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+openshell-core = { path = "../openshell-core", features = ["test-support"] }
 openshell-credential-issuer = { path = "../openshell-credential-issuer", features = ["test-support"] }
 tracing-core = "0.1"
 rustls-pki-types = "1.9"

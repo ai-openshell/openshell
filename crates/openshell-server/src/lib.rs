@@ -4225,7 +4225,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_store_serves_probes_while_the_database_is_unreachable() {
-        let url = crate::persistence::PostgresStore::refusing_url_for_tests().await;
+        let (_port, url) = crate::persistence::PostgresStore::refusing_url_for_tests();
         let health_address = reserved_loopback_address().await;
         let mut health = super::HealthListener::new(Some(health_address));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

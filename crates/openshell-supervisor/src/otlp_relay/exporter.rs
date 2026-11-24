@@ -419,9 +419,8 @@ mod tests {
 
     #[tokio::test]
     async fn http_export_to_a_closed_port_fails_promptly() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        let port = openshell_core::test_support::RefusingTcpPort::bind().unwrap();
+        let endpoint = format!("http://{}", port.address());
         let exporter = Exporter::new(
             &endpoint,
             OtlpProtocol::HttpProtobuf,
@@ -614,9 +613,8 @@ mod tests {
 
     #[tokio::test]
     async fn export_to_a_closed_port_returns_status_promptly() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        let port = openshell_core::test_support::RefusingTcpPort::bind().unwrap();
+        let endpoint = format!("http://{}", port.address());
         let exporter =
             Exporter::new(&endpoint, OtlpProtocol::Grpc, http::HeaderMap::new(), None).unwrap();
 

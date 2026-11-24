@@ -605,25 +605,24 @@ mod unix {
 
     /// Point the gateway lookup at a closed port, away from any registered
     /// gateways.
-    fn without_gateway(mut command: Command, config: &Path) -> Command {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let endpoint = format!("http://{}", closed.local_addr().expect("address"));
-        drop(closed);
+    fn output_without_gateway(mut command: Command, config: &Path) -> Output {
+        let port = openshell_core::test_support::RefusingTcpPort::bind().expect("reserve port");
+        let endpoint = format!("http://{}", port.address());
         command
             .env("XDG_CONFIG_HOME", config)
             .env("OPENSHELL_GATEWAY_ENDPOINT", endpoint)
             .env_remove("OPENSHELL_GATEWAY")
             .env("OPENSHELL_BIN", config.join("no-openshell"));
-        command
+        output(command)
     }
 
     fn registered_tests_run_through_testkit() {
         let dir = tempfile::tempdir().expect("temp dir");
         let (path, junit_arg) = junit(dir.path());
-        let run = output(without_gateway(
+        let run = output_without_gateway(
             program("registered", &["run", "--junit", &junit_arg]),
             dir.path(),
-        ));
+        );
         assert_eq!(run.status.code(), Some(1));
         // `testkit::run` logs the description and the gateway.
         assert!(stderr(&run).contains("[registered_needs_a_gateway] Needs a gateway."));
@@ -642,10 +641,10 @@ mod unix {
     fn ready_fails_without_a_gateway() {
         let dir = tempfile::tempdir().expect("temp dir");
         let started = Instant::now();
-        let ready = output(without_gateway(
+        let ready = output_without_gateway(
             program("registered", &["ready", "--timeout", "1"]),
             dir.path(),
-        ));
+        );
         assert_eq!(ready.status.code(), Some(2));
         assert!(stderr(&ready).contains("not ready after 1s"));
         assert!(started.elapsed() < Duration::from_secs(10));

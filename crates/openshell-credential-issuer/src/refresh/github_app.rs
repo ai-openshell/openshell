@@ -697,7 +697,8 @@ mod tests {
         assert!(failure.status.message().contains("timed out"));
         assert!(!failure.status.message().contains("secret"));
 
-        drop(listener);
+        let port = openshell_core::test_support::RefusingTcpPort::bind().unwrap();
+        let url = format!("http://{}/secret-path?secret-query=value", port.address());
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))

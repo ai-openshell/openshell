@@ -5140,13 +5140,6 @@ mod tests {
         owner
     }
 
-    fn closed_local_endpoint() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        format!("http://{addr}")
-    }
-
     fn peer_relay_open(channel_id: &str) -> RelayOpen {
         RelayOpen {
             channel_id: channel_id.to_string(),
@@ -5613,7 +5606,8 @@ mod tests {
         let metrics = MetricsCapture::install();
         let state = crate::grpc::test_support::test_server_state().await;
         seed_peer_token(&state);
-        let endpoint = closed_local_endpoint();
+        let port = openshell_core::test_support::RefusingTcpPort::bind().unwrap();
+        let endpoint = format!("http://{}", port.address());
 
         let err = forward_provider_status_query_to_owner(
             &state,

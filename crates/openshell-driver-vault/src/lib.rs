@@ -1374,9 +1374,8 @@ mod tests {
 
     #[test]
     fn loopback_http_bypasses_system_proxy() {
-        let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let proxy_address = proxy_listener.local_addr().unwrap();
-        drop(proxy_listener);
+        let proxy_port = openshell_core::test_support::RefusingTcpPort::bind().unwrap();
+        let proxy_address = proxy_port.address();
 
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
