@@ -1219,6 +1219,7 @@ async fn proxy_http2(
         return error(StatusCode::BAD_GATEWAY);
     };
     strip_hop_headers(response.headers_mut(), false);
+    strip_gateway_response_cookies(response.headers_mut());
     response.map(|body| relay_body(body, active))
 }
 
@@ -1622,6 +1623,14 @@ mod tests {
                             .header("x-upstream-only", "private")
                             .header("keep-alive", "timeout=1")
                             .header(header::CONTENT_TYPE, "text/plain")
+                            .header(
+                                header::SET_COOKIE,
+                                "__Host-openshell-service-login=untrusted; Secure; Path=/",
+                            )
+                            .header(
+                                header::SET_COOKIE,
+                                "__Host-openshell-service-session=untrusted; Secure; Path=/",
+                            )
                             .header(header::SET_COOKIE, "app=session; HttpOnly")
                             .body(Body::from("upstream closed"))
                             .unwrap());
