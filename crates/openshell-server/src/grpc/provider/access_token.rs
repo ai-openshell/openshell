@@ -261,13 +261,22 @@ async fn obtain(
     }
     let grant_type = ProviderCredentialTokenGrantType::try_from(grant.grant_type)
         .map_err(|_| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
+    let flow = oauth::TokenGrantFlow::resolve(
+        grant_type,
+        grant
+            .subject_token
+            .as_ref()
+            .map_or("", |subject| subject.source.as_str()),
+        grant.client_authentication.as_ref(),
+    )
+    .map_err(|_| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     // Resolve the subject before any cache lookup, so its revocation or
     // expiry also denies cached tokens.
-    let subject = if grant_type == ProviderCredentialTokenGrantType::TokenExchange {
+    let subject = if flow == oauth::TokenGrantFlow::ProviderCredentialSubjectExchange {
         let subject = grant
             .subject_token
             .as_ref()
-            .filter(|subject| subject.source == "provider_credential")
+            .filter(|subject| subject.source == oauth::SUBJECT_TOKEN_SOURCE_PROVIDER_CREDENTIAL)
             .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
         Some(Subject {
             expires_at_ms: provider_credential_expiration_ms(
@@ -322,6 +331,7 @@ async fn obtain(
                     identity,
                     gateway_id,
                     grant,
+                    flow,
                     subject.as_ref(),
                     ttl_override,
                     request_id,
@@ -385,6 +395,7 @@ async fn acquire(
     identity: &dyn SandboxIdentityProvider<Error = TokenGrantFailure>,
     gateway_id: &str,
     grant: &ProviderCredentialTokenGrant,
+    flow: oauth::TokenGrantFlow,
     subject: Option<&Subject>,
     ttl_override: Option<Duration>,
     request_id: Option<&str>,
@@ -431,7 +442,7 @@ async fn acquire(
         let intermediate = perform_intermediate_token_exchange(
             &grant.token_endpoint,
             &TokenExchangeParams {
-                client_assertion: &component_svid,
+                client_assertion: Some(&component_svid),
                 client_assertion_type: &grant.client_assertion_type,
                 subject_token: &subject.value,
                 subject_token_type: &subject.token_type,
@@ -447,10 +458,35 @@ async fn acquire(
             client,
             &grant.token_endpoint,
             &TokenExchangeParams {
-                client_assertion: &svid.token,
+                client_assertion: Some(&svid.token),
                 client_assertion_type: &grant.client_assertion_type,
                 subject_token: &intermediate.access_token,
                 subject_token_type: oauth::ACCESS_TOKEN_TYPE,
+                audience: &grant.audience,
+                scopes: &grant.scopes,
+                requested_token_type: &grant.requested_token_type,
+            },
+            request_id,
+        )
+        .await
+        .map_err(TokenGrantFailure::to_status)?
+    } else if let oauth::TokenGrantFlow::JwtSvidSubjectExchange { client_assertion } = flow {
+        // The sandbox's stable SVID is the subject; the endpoint trusts its
+        // issuer directly, so there is no intermediate exchange.
+        let subject_token_type = grant
+            .subject_token
+            .as_ref()
+            .map_or("", |subject| subject.subject_token_type.as_str());
+        oauth::post_oauth_token_exchange(
+            client,
+            &grant.token_endpoint,
+            &TokenExchangeParams {
+                client_assertion: client_assertion.then_some(svid.token.as_str()),
+                client_assertion_type: &grant.client_assertion_type,
+                subject_token: &svid.token,
+                subject_token_type: oauth::effective_jwt_svid_subject_token_type(
+                    subject_token_type,
+                ),
                 audience: &grant.audience,
                 scopes: &grant.scopes,
                 requested_token_type: &grant.requested_token_type,

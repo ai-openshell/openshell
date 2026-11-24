@@ -11,9 +11,11 @@ use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
-    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantSubjectToken,
-    ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
-    ProviderProfileCredential, ProviderProfileDiscovery, ProviderProfileFile,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantClientAuthentication,
+    ProviderCredentialTokenGrantClientAuthenticationMechanism,
+    ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType, ProviderProfile,
+    ProviderProfileCategory, ProviderProfileCredential, ProviderProfileDiscovery,
+    ProviderProfileFile,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
 use openshell_policy::{
@@ -27,6 +29,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
+/// Token exchange subject token stored as a provider credential and exchanged by the gateway.
+pub const SUBJECT_TOKEN_SOURCE_PROVIDER_CREDENTIAL: &str = "provider_credential";
+/// Token exchange subject token that is the sandbox's own SPIFFE JWT-SVID.
+pub const SUBJECT_TOKEN_SOURCE_JWT_SVID: &str = "jwt_svid";
 const MCP_VERSION_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision; use an exact supported revision; or omit protocol and mcp for deliberate uninspected L4 passthrough only when that weaker boundary is acceptable";
 
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +115,10 @@ pub struct CredentialProfile {
     pub path_template: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_grant: Option<TokenGrantProfile>,
+    /// Serve a placeholder access token for this token-grant credential from
+    /// the sandbox GCE metadata emulator. The grant replaces it on its endpoints.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gce_metadata_token: bool,
 }
 
 /// Origin-aware protobuf duration presence retained across profile conversion.
@@ -204,6 +214,8 @@ pub struct TokenGrantProfile {
     pub subject_token: Option<TokenGrantSubjectTokenProfile>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub requested_token_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_authentication: Option<TokenGrantClientAuthenticationProfile>,
 }
 
 impl PartialEq for TokenGrantProfile {
@@ -218,14 +230,41 @@ impl PartialEq for TokenGrantProfile {
             && self.audience_overrides == other.audience_overrides
             && self.subject_token == other.subject_token
             && self.requested_token_type == other.requested_token_type
+            && effective_client_authentication(self.client_authentication.as_ref())
+                == effective_client_authentication(other.client_authentication.as_ref())
     }
 }
 
 impl Eq for TokenGrantProfile {}
 
+/// How the token endpoint authenticates the client. The mechanism and the
+/// credential it uses are chosen independently.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TokenGrantClientAuthenticationProfile {
+    #[serde(
+        default = "default_client_authentication_mechanism",
+        deserialize_with = "deserialize_client_authentication_mechanism",
+        serialize_with = "serialize_client_authentication_mechanism"
+    )]
+    pub mechanism: ProviderCredentialTokenGrantClientAuthenticationMechanism,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<TokenGrantClientCredentialProfile>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TokenGrantClientCredentialProfile {
+    /// Only `jwt_svid` is supported; empty selects it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenGrantSubjectTokenProfile {
     pub source: String,
+    /// Required for `provider_credential`; must be empty for `jwt_svid`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credential: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub subject_token_type: String,
@@ -827,6 +866,7 @@ impl ProviderTypeProfile {
                         .map(credential_refresh_from_proto),
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_from_proto),
+                    gce_metadata_token: credential.gce_metadata_token,
                 })
                 .collect(),
             files: profile
@@ -1015,6 +1055,7 @@ impl ProviderTypeProfile {
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_to_proto),
                     token_grant_owners: Vec::new(),
+                    gce_metadata_token: credential.gce_metadata_token,
                 })
                 .collect(),
             files: self
@@ -1316,6 +1357,40 @@ fn is_client_credentials_grant(value: &ProviderCredentialTokenGrantType) -> bool
     effective_token_grant_type(*value) == ProviderCredentialTokenGrantType::ClientCredentials
 }
 
+fn default_client_authentication_mechanism()
+-> ProviderCredentialTokenGrantClientAuthenticationMechanism {
+    ProviderCredentialTokenGrantClientAuthenticationMechanism::Unspecified
+}
+
+/// Mechanism and credential source with defaults applied, for comparison.
+fn effective_client_authentication(
+    authentication: Option<&TokenGrantClientAuthenticationProfile>,
+) -> (
+    ProviderCredentialTokenGrantClientAuthenticationMechanism,
+    String,
+) {
+    use ProviderCredentialTokenGrantClientAuthenticationMechanism as Mechanism;
+    let Some(authentication) = authentication else {
+        return (Mechanism::ClientAssertion, "jwt_svid".to_string());
+    };
+    let source = authentication
+        .credential
+        .as_ref()
+        .map_or("", |credential| credential.source.trim());
+    match authentication.mechanism {
+        Mechanism::None => (Mechanism::None, source.to_string()),
+        Mechanism::Unspecified | Mechanism::ClientAssertion => (
+            Mechanism::ClientAssertion,
+            if source.is_empty() {
+                "jwt_svid"
+            } else {
+                source
+            }
+            .to_string(),
+        ),
+    }
+}
+
 fn deserialize_category<'de, D>(deserializer: D) -> Result<ProviderProfileCategory, D::Error>
 where
     D: Deserializer<'de>,
@@ -1378,6 +1453,60 @@ where
     S: Serializer,
 {
     serializer.serialize_str(provider_token_grant_type_to_yaml(*grant_type))
+}
+
+fn deserialize_client_authentication_mechanism<'de, D>(
+    deserializer: D,
+) -> Result<ProviderCredentialTokenGrantClientAuthenticationMechanism, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    provider_token_grant_client_authentication_mechanism_from_yaml(&raw).ok_or_else(|| {
+        de::Error::custom(format!(
+            "unsupported provider token grant client_authentication mechanism: {raw}"
+        ))
+    })
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_client_authentication_mechanism<S>(
+    mechanism: &ProviderCredentialTokenGrantClientAuthenticationMechanism,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer
+        .serialize_str(provider_token_grant_client_authentication_mechanism_to_yaml(*mechanism))
+}
+
+/// Parse the YAML `client_authentication.mechanism` value. Unknown values
+/// return `None`.
+#[must_use]
+pub fn provider_token_grant_client_authentication_mechanism_from_yaml(
+    raw: &str,
+) -> Option<ProviderCredentialTokenGrantClientAuthenticationMechanism> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "" | "client_assertion" => {
+            Some(ProviderCredentialTokenGrantClientAuthenticationMechanism::ClientAssertion)
+        }
+        "none" => Some(ProviderCredentialTokenGrantClientAuthenticationMechanism::None),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn provider_token_grant_client_authentication_mechanism_to_yaml(
+    mechanism: ProviderCredentialTokenGrantClientAuthenticationMechanism,
+) -> &'static str {
+    match mechanism {
+        ProviderCredentialTokenGrantClientAuthenticationMechanism::None => "none",
+        ProviderCredentialTokenGrantClientAuthenticationMechanism::ClientAssertion
+        | ProviderCredentialTokenGrantClientAuthenticationMechanism::Unspecified => {
+            "client_assertion"
+        }
+    }
 }
 
 #[must_use]
@@ -1565,6 +1694,10 @@ fn token_grant_from_proto(
             .as_ref()
             .map(token_grant_subject_token_from_proto),
         requested_token_type: token_grant.requested_token_type.clone(),
+        client_authentication: token_grant
+            .client_authentication
+            .as_ref()
+            .map(token_grant_client_authentication_from_proto),
     }
 }
 
@@ -1592,6 +1725,41 @@ fn token_grant_to_proto(
             .as_ref()
             .map(token_grant_subject_token_to_proto),
         requested_token_type: token_grant.requested_token_type.clone(),
+        client_authentication: token_grant
+            .client_authentication
+            .as_ref()
+            .map(token_grant_client_authentication_to_proto),
+    }
+}
+
+// An unknown wire mechanism falls back to unspecified; the supervisor and
+// gateway reject unknown values they receive directly.
+fn token_grant_client_authentication_from_proto(
+    authentication: &ProviderCredentialTokenGrantClientAuthentication,
+) -> TokenGrantClientAuthenticationProfile {
+    TokenGrantClientAuthenticationProfile {
+        mechanism: ProviderCredentialTokenGrantClientAuthenticationMechanism::try_from(
+            authentication.mechanism,
+        )
+        .unwrap_or(ProviderCredentialTokenGrantClientAuthenticationMechanism::Unspecified),
+        credential: authentication.credential.as_ref().map(|credential| {
+            TokenGrantClientCredentialProfile {
+                source: credential.source.clone(),
+            }
+        }),
+    }
+}
+
+fn token_grant_client_authentication_to_proto(
+    authentication: &TokenGrantClientAuthenticationProfile,
+) -> ProviderCredentialTokenGrantClientAuthentication {
+    ProviderCredentialTokenGrantClientAuthentication {
+        mechanism: authentication.mechanism as i32,
+        credential: authentication.credential.as_ref().map(|credential| {
+            openshell_core::proto::ProviderCredentialTokenGrantClientCredential {
+                source: credential.source.clone(),
+            }
+        }),
     }
 }
 
@@ -2777,6 +2945,10 @@ pub fn validate_catalog_profiles(
                 credential,
                 &credential_names,
             ));
+            diagnostics.extend(validate_token_grant_client_authentication(
+                source, profile_id, credential,
+            ));
+            diagnostics.extend(validate_gce_metadata_token(source, profile_id, credential));
             diagnostics.extend(validate_token_grant_audience_overrides(
                 source,
                 profile_id,
@@ -3394,31 +3566,41 @@ fn validate_token_grant_subject_token(
                 return diagnostics;
             };
 
-            let source_value = subject_token.source.trim();
-            if source_value != "provider_credential" {
-                diagnostics.push(ProfileValidationDiagnostic::error(
+            let subject_credential = subject_token.credential.trim();
+            match subject_token.source.trim() {
+                SUBJECT_TOKEN_SOURCE_PROVIDER_CREDENTIAL => {
+                    if subject_credential.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            "subject_token.credential is required",
+                        ));
+                    } else if !credential_names.contains(subject_credential) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            format!("unknown subject token credential: {subject_credential}"),
+                        ));
+                    }
+                }
+                SUBJECT_TOKEN_SOURCE_JWT_SVID => {
+                    if !subject_credential.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            "subject_token.credential must be empty when subject_token.source is jwt_svid",
+                        ));
+                    }
+                }
+                _ => diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
                     profile_id,
                     "credentials.token_grant.subject_token.source",
-                    "subject_token.source must be provider_credential",
-                ));
-            }
-
-            let subject_credential = subject_token.credential.trim();
-            if subject_credential.is_empty() {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.credential",
-                    "subject_token.credential is required",
-                ));
-            } else if !credential_names.contains(subject_credential) {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.credential",
-                    format!("unknown subject token credential: {subject_credential}"),
-                ));
+                    "subject_token.source must be provider_credential or jwt_svid",
+                )),
             }
         }
         ProviderCredentialTokenGrantType::Unspecified => {
@@ -3426,6 +3608,109 @@ fn validate_token_grant_subject_token(
         }
     }
 
+    diagnostics
+}
+
+/// Validate the client authentication sent to the token endpoint.
+///
+/// Omitting client authentication is only safe when the subject token is the
+/// sandbox's own JWT-SVID: that token alone proves the workload identity.
+fn validate_token_grant_client_authentication(
+    source: &str,
+    profile_id: &str,
+    credential: &CredentialProfile,
+) -> Vec<ProfileValidationDiagnostic> {
+    let Some(token_grant) = credential.token_grant.as_ref() else {
+        return Vec::new();
+    };
+    let Some(authentication) = token_grant.client_authentication.as_ref() else {
+        return Vec::new();
+    };
+    let error = |field: &str, message: &str| {
+        ProfileValidationDiagnostic::error(source, profile_id, field, message)
+    };
+    let credential_source = authentication
+        .credential
+        .as_ref()
+        .map(|credential| credential.source.trim());
+    let mut diagnostics = Vec::new();
+    match effective_client_authentication(Some(authentication)).0 {
+        ProviderCredentialTokenGrantClientAuthenticationMechanism::None => {
+            if !token_grant_subject_is_jwt_svid(token_grant) {
+                diagnostics.push(error(
+                    "credentials.token_grant.client_authentication.mechanism",
+                    "client_authentication mechanism none requires a token_exchange grant with subject_token.source jwt_svid",
+                ));
+            }
+            if credential_source.is_some() {
+                diagnostics.push(error(
+                    "credentials.token_grant.client_authentication.credential",
+                    "client_authentication credential cannot be set when mechanism is none",
+                ));
+            }
+            if !token_grant.client_assertion_type.trim().is_empty() {
+                diagnostics.push(error(
+                    "credentials.token_grant.client_assertion_type",
+                    "client_assertion_type cannot be set when client_authentication mechanism is none",
+                ));
+            }
+        }
+        _ => {
+            if credential_source.is_some_and(|source| !source.is_empty() && source != "jwt_svid") {
+                diagnostics.push(error(
+                    "credentials.token_grant.client_authentication.credential.source",
+                    "client_authentication credential source must be jwt_svid",
+                ));
+            }
+        }
+    }
+    diagnostics
+}
+
+fn token_grant_subject_is_jwt_svid(token_grant: &TokenGrantProfile) -> bool {
+    effective_token_grant_type(token_grant.grant_type)
+        == ProviderCredentialTokenGrantType::TokenExchange
+        && token_grant
+            .subject_token
+            .as_ref()
+            .is_some_and(|subject| subject.source.trim() == SUBJECT_TOKEN_SOURCE_JWT_SVID)
+}
+
+/// Validate `gce_metadata_token`.
+///
+/// The placeholder served by the metadata emulator is sent by Google SDKs as
+/// `Authorization: Bearer`. Only a token grant that replaces that header can
+/// turn it into a credential, so the opt-in requires one.
+fn validate_gce_metadata_token(
+    source: &str,
+    profile_id: &str,
+    credential: &CredentialProfile,
+) -> Vec<ProfileValidationDiagnostic> {
+    if !credential.gce_metadata_token {
+        return Vec::new();
+    }
+    let mut diagnostics = Vec::new();
+    if credential.token_grant.is_none() {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            "credentials.gce_metadata_token",
+            "gce_metadata_token is only valid on token_grant credentials",
+        ));
+    }
+    let bearer = matches!(
+        credential.auth_style.trim().to_ascii_lowercase().as_str(),
+        "" | "bearer"
+    );
+    let header = credential.header_name.trim();
+    if !bearer || !(header.is_empty() || header.eq_ignore_ascii_case("authorization")) {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            "credentials.gce_metadata_token",
+            "gce_metadata_token requires auth_style bearer on the Authorization header",
+        ));
+    }
     diagnostics
 }
 
@@ -3469,7 +3754,9 @@ fn token_exchange_subject_credential_names(profile: &ProviderTypeProfile) -> Has
                 == ProviderCredentialTokenGrantType::TokenExchange
         })
         .filter_map(|token_grant| token_grant.subject_token.as_ref())
-        .filter(|subject_token| subject_token.source.trim() == "provider_credential")
+        .filter(|subject_token| {
+            subject_token.source.trim() == SUBJECT_TOKEN_SOURCE_PROVIDER_CREDENTIAL
+        })
         .filter_map(|subject_token| {
             let credential = subject_token.credential.trim();
             (!credential.is_empty()).then_some(credential)
@@ -3818,12 +4105,16 @@ mod tests {
     use std::collections::HashMap;
 
     use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
-    use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
+    use openshell_core::proto::{
+        ProviderCredentialTokenGrantClientAuthenticationMechanism,
+        ProviderCredentialTokenGrantType, ProviderProfileCategory,
+    };
 
     use super::{
         DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
-        ProfileDurationWkt, ProfileError, ProviderTypeProfile, is_mcp_diagnostic_field,
-        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
+        ProfileDurationWkt, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
+        SUBJECT_TOKEN_SOURCE_JWT_SVID, is_mcp_diagnostic_field, normalize_profile_id,
+        parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
         profile_duration_to_proto, profile_to_json, profile_to_yaml, profiles_to_json,
         profiles_to_yaml, token_grant_from_proto, token_grant_to_proto, validate_profile_duration,
         validate_profile_set,
@@ -5568,6 +5859,245 @@ credentials:
         assert_eq!(
             reparsed.credentials[1].token_grant,
             profile.credentials[1].token_grant
+        );
+    }
+
+    // The design target plus display_name and header_name, which every
+    // profile YAML and bearer credential require.
+    const SPIFFE_STS_PROFILE: &str = r#"
+id: google-cloud
+display_name: Google Cloud (SPIFFE)
+credentials:
+  - name: wif_token
+    auth_style: bearer
+    header_name: Authorization
+    gce_metadata_token: true
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://sts.googleapis.com/v1/token
+      jwt_svid_audience: //iam.googleapis.com/projects/N/locations/global/workloadIdentityPools/onix-spire/providers/spire
+      audience: //iam.googleapis.com/projects/N/locations/global/workloadIdentityPools/onix-spire/providers/spire
+      scopes: [https://www.googleapis.com/auth/cloud-platform]
+      requested_token_type: urn:ietf:params:oauth:token-type:access_token
+      client_authentication:
+        mechanism: none
+      subject_token:
+        source: jwt_svid
+        subject_token_type: urn:ietf:params:oauth:token-type:jwt
+endpoints:
+  - { host: "*.googleapis.com", port: 443, protocol: rest, access: full }
+"#;
+
+    fn spiffe_sts_diagnostics(yaml: &str) -> Vec<ProfileValidationDiagnostic> {
+        let profile = parse_profile_yaml(yaml).expect("profile should parse");
+        validate_profile_set(&[("google-cloud.yaml".to_string(), profile)])
+    }
+
+    #[test]
+    fn jwt_svid_sts_profile_validates_and_round_trips() {
+        let profile = parse_profile_yaml(SPIFFE_STS_PROFILE).expect("profile should parse");
+        let diagnostics =
+            validate_profile_set(&[("google-cloud.yaml".to_string(), profile.clone())]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+
+        let credential = &profile.credentials[0];
+        assert!(credential.gce_metadata_token);
+        let token_grant = credential.token_grant.as_ref().unwrap();
+        let authentication = token_grant.client_authentication.as_ref().unwrap();
+        assert_eq!(
+            authentication.mechanism,
+            ProviderCredentialTokenGrantClientAuthenticationMechanism::None
+        );
+        assert!(authentication.credential.is_none());
+        let subject = token_grant.subject_token.as_ref().unwrap();
+        assert_eq!(subject.source, SUBJECT_TOKEN_SOURCE_JWT_SVID);
+        assert!(subject.credential.is_empty());
+
+        let proto = profile.to_proto();
+        assert!(proto.credentials[0].gce_metadata_token);
+        assert_eq!(
+            proto.credentials[0]
+                .token_grant
+                .as_ref()
+                .unwrap()
+                .client_authentication
+                .as_ref()
+                .unwrap()
+                .mechanism,
+            ProviderCredentialTokenGrantClientAuthenticationMechanism::None as i32
+        );
+        let from_proto = ProviderTypeProfile::from_proto(&proto);
+        assert_eq!(from_proto.credentials, profile.credentials);
+
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        assert!(exported.contains("mechanism: none"));
+        assert!(exported.contains("gce_metadata_token: true"));
+        assert!(!exported.contains("credential: ''"));
+        let reparsed = parse_profile_yaml(&exported).expect("re-parse");
+        assert_eq!(reparsed.credentials, profile.credentials);
+    }
+
+    #[test]
+    fn client_authentication_mechanism_and_credential_are_independent() {
+        let explicit = SPIFFE_STS_PROFILE.replace(
+            "mechanism: none",
+            "mechanism: client_assertion\n        credential:\n          source: jwt_svid",
+        );
+        let diagnostics = spiffe_sts_diagnostics(&explicit);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let profile = parse_profile_yaml(&explicit).expect("profile should parse");
+        let exported =
+            profile_to_yaml(&ProviderTypeProfile::from_proto(&profile.to_proto())).expect("yaml");
+        assert!(
+            exported.contains("mechanism: client_assertion"),
+            "{exported}"
+        );
+        assert!(exported.contains("source: jwt_svid"), "{exported}");
+        assert_eq!(
+            parse_profile_yaml(&exported).expect("re-parse").credentials,
+            profile.credentials
+        );
+
+        // Omitting the field, an empty object, and the explicit default all
+        // mean the same thing.
+        let omitted = SPIFFE_STS_PROFILE.replace(
+            "      client_authentication:\n        mechanism: none\n",
+            "",
+        );
+        let omitted = parse_profile_yaml(&omitted).expect("profile should parse");
+        let explicit_default = parse_profile_yaml(&explicit).expect("profile should parse");
+        assert_eq!(
+            omitted.credentials[0].token_grant,
+            explicit_default.credentials[0].token_grant
+        );
+        assert!(
+            !profile_to_yaml(&omitted)
+                .expect("yaml")
+                .contains("client_authentication")
+        );
+    }
+
+    #[test]
+    fn spiffe_gcp_sts_example_profile_validates() {
+        let yaml = include_str!("../../../examples/spiffe-gcp-sts-demo/provider-profile.yaml");
+        let diagnostics = spiffe_sts_diagnostics(yaml);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn unknown_client_authentication_fails_to_parse() {
+        let yaml = SPIFFE_STS_PROFILE.replace("mechanism: none", "mechanism: private_key_jwt");
+        let error = parse_profile_yaml(&yaml).expect_err("unknown value must not be ignored");
+        assert!(
+            error.to_string().contains("client_authentication"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn jwt_svid_sts_profile_rejects_invalid_combinations() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            // Unknown sources fail closed.
+            (
+                "source: jwt_svid",
+                "source: kubernetes_token",
+                "credentials.token_grant.subject_token.source",
+                "must be provider_credential or jwt_svid",
+            ),
+            // The SVID is the subject; no stored credential may be named.
+            (
+                "source: jwt_svid\n",
+                "source: jwt_svid\n        credential: wif_token\n",
+                "credentials.token_grant.subject_token.credential",
+                "must be empty when subject_token.source is jwt_svid",
+            ),
+            // jwt_svid is only a token_exchange subject.
+            (
+                "grant_type: token_exchange",
+                "grant_type: client_credentials",
+                "credentials.token_grant.subject_token",
+                "only valid for token_exchange grants",
+            ),
+            (
+                "grant_type: token_exchange",
+                "grant_type: client_credentials",
+                "credentials.token_grant.client_authentication.mechanism",
+                "requires a token_exchange grant with subject_token.source jwt_svid",
+            ),
+            // No client authentication without a self-proving subject.
+            (
+                "source: jwt_svid\n",
+                "source: provider_credential\n        credential: wif_token\n",
+                "credentials.token_grant.client_authentication.mechanism",
+                "requires a token_exchange grant with subject_token.source jwt_svid",
+            ),
+            (
+                "mechanism: none",
+                "mechanism: none\n      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "credentials.token_grant.client_assertion_type",
+                "cannot be set when client_authentication mechanism is none",
+            ),
+            // The mechanism and its credential are independent choices; none
+            // takes no credential and client_assertion only the JWT-SVID.
+            (
+                "mechanism: none",
+                "mechanism: none\n        credential:\n          source: jwt_svid",
+                "credentials.token_grant.client_authentication.credential",
+                "cannot be set when mechanism is none",
+            ),
+            (
+                "mechanism: none",
+                "mechanism: client_assertion\n        credential:\n          source: static",
+                "credentials.token_grant.client_authentication.credential.source",
+                "must be jwt_svid",
+            ),
+            // The placeholder needs a grant replacing the Authorization header.
+            (
+                "    header_name: Authorization\n",
+                "    header_name: X-Goog-Token\n",
+                "credentials.gce_metadata_token",
+                "requires auth_style bearer on the Authorization header",
+            ),
+        ];
+        for (from, to, field, message) in cases {
+            let yaml = SPIFFE_STS_PROFILE.replace(from, to);
+            assert_ne!(yaml, SPIFFE_STS_PROFILE, "fixture did not change: {to}");
+            let diagnostics = spiffe_sts_diagnostics(&yaml);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.field == *field
+                        && diagnostic.message.contains(message)),
+                "expected {field}: {message}; got {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gce_metadata_token_requires_token_grant() {
+        let diagnostics = spiffe_sts_diagnostics(
+            r"
+id: plain
+display_name: Plain
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: Authorization
+    gce_metadata_token: true
+endpoints:
+  - { host: api.example.com, port: 443, protocol: rest, access: full }
+",
+        );
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.field
+                == "credentials.gce_metadata_token"
+                && diagnostic.message
+                    == "gce_metadata_token is only valid on token_grant credentials"),
+            "{diagnostics:?}"
         );
     }
 

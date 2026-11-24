@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Exchange the sandbox SPIFFE JWT-SVID at Google STS (Workload Identity
+# Federation) and inject the federated access token on Google APIs.
+# Replace PROJECT_NUMBER, the pool ID and the provider ID with your own, and
+# list the binaries in your sandbox image that call Google APIs.
+id: google-cloud-spiffe
+display_name: Google Cloud (SPIFFE Workload Identity Federation)
+category: data
+credentials:
+  - name: wif_token
+    auth_style: bearer
+    header_name: Authorization
+    gce_metadata_token: true
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://sts.googleapis.com/v1/token
+      jwt_svid_audience: //iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/onix-spire/providers/spire
+      audience: //iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/onix-spire/providers/spire
+      scopes: [https://www.googleapis.com/auth/cloud-platform]
+      requested_token_type: urn:ietf:params:oauth:token-type:access_token
+      client_authentication:
+        mechanism: none
+      subject_token:
+        source: jwt_svid
+        subject_token_type: urn:ietf:params:oauth:token-type:jwt
+endpoints:
+  - { host: "*.googleapis.com", port: 443, protocol: rest, access: full }
+binaries:
+  - /usr/bin/curl
+  - /usr/bin/python3
+  - /usr/bin/node
+  - /usr/local/bin/node

@@ -31,6 +31,7 @@ use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
 
 /// Borrowed grant configuration for one endpoint-bound provider credential.
+#[derive(Clone, Copy)]
 pub struct TokenGrantRequest<'a> {
     pub provider_key: &'a str,
     pub token_endpoint: &'a str,
@@ -41,6 +42,13 @@ pub struct TokenGrantRequest<'a> {
     pub cache_ttl: Option<std::time::Duration>,
     pub grant_type: i32,
     pub requested_token_type: &'a str,
+    /// `subject_token.source`; empty for grants without a subject token.
+    pub subject_token_source: &'a str,
+    /// `subject_token.subject_token_type`; empty selects the source default.
+    pub subject_token_type: &'a str,
+    /// `client_authentication`; absent sends the JWT-SVID as `client_assertion`.
+    pub client_authentication:
+        Option<&'a openshell_core::proto::ProviderCredentialTokenGrantClientAuthentication>,
     /// Supervisor-minted ID of the HTTP exchange that needs the token.
     pub request_id: &'a str,
 }
@@ -594,6 +602,15 @@ fn token_grant_request<'a>(
         cache_ttl,
         grant_type: token_grant.grant_type,
         requested_token_type: &token_grant.requested_token_type,
+        subject_token_source: token_grant
+            .subject_token
+            .as_ref()
+            .map_or("", |subject| subject.source.as_str()),
+        subject_token_type: token_grant
+            .subject_token
+            .as_ref()
+            .map_or("", |subject| subject.subject_token_type.as_str()),
+        client_authentication: token_grant.client_authentication.as_ref(),
         request_id,
     })
 }
@@ -1063,6 +1080,7 @@ pub mod test_support {
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
             subject_token: None,
             requested_token_type: String::new(),
+            client_authentication: None,
         }
     }
 
@@ -1079,6 +1097,53 @@ pub mod test_support {
             requested_token_type: "urn:ietf:params:oauth:token-type:access_token".to_string(),
             ..token_grant()
         }
+    }
+
+    #[test]
+    fn token_grant_request_carries_subject_source_and_client_authentication() {
+        use openshell_core::proto::ProviderCredentialTokenGrantClientAuthentication;
+        let none = ProviderCredentialTokenGrantClientAuthentication {
+            mechanism: 2,
+            credential: None,
+        };
+        let grant = ProviderCredentialTokenGrant {
+            client_assertion_type: String::new(),
+            subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                source: "jwt_svid".to_string(),
+                credential: String::new(),
+                subject_token_type: "urn:ietf:params:oauth:token-type:jwt".to_string(),
+            }),
+            client_authentication: Some(none.clone()),
+            ..token_exchange_grant()
+        };
+        let request = token_grant_request("key", &grant, "request-1").expect("request");
+        assert_eq!(request.subject_token_source, "jwt_svid");
+        assert_eq!(
+            request.subject_token_type,
+            "urn:ietf:params:oauth:token-type:jwt"
+        );
+        assert_eq!(request.client_authentication, Some(&none));
+
+        let plain = token_grant();
+        let request = token_grant_request("key", &plain, "request-1").expect("request");
+        assert_eq!(request.subject_token_source, "");
+        assert_eq!(request.subject_token_type, "");
+        assert_eq!(request.client_authentication, None);
+    }
+
+    #[test]
+    fn grant_header_replaces_gce_metadata_placeholder() {
+        let placeholder = openshell_core::secrets::placeholder_for_env_key(
+            openshell_core::google_cloud::TOKEN_GRANT_PLACEHOLDER_ENV_KEY,
+        );
+        let raw = format!(
+            "GET /storage/v1/b HTTP/1.1\r\nHost: storage.googleapis.com\r\nAuthorization: Bearer {placeholder}\r\n\r\n"
+        );
+        let rewritten = inject_header(raw.as_bytes(), "Authorization", "Bearer ya29.real")
+            .expect("header injection");
+        let rewritten = String::from_utf8(rewritten).unwrap();
+        assert!(rewritten.contains("Authorization: Bearer ya29.real\r\n"));
+        assert!(!openshell_core::secrets::contains_reserved_credential_marker(&rewritten));
     }
 
     impl TokenGrantResolver for FakeTokenGrantResolver {

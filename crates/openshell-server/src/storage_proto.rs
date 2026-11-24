@@ -251,14 +251,17 @@ mod tests {
     // and the public/durable overlap remain unchanged.
     // The service backend HTTP version is part of both schemas. Legacy
     // endpoint records omit it and continue to use HTTP/1.1.
+    // Provider token grants add a client_authentication message and credentials
+    // add gce_metadata_token. Both are new tags whose zero values keep the
+    // prior behavior, so earlier profile payloads decode unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "edfc80ad192e77e1a9d1e1d6e3342280e4438f8bf7cb49969f580060df9a056a";
+        "4f53df10e5c598d5f4e91c87c2d786fb13c9d8257c3d14855d207e5c2eeab869";
     // The storage.v2 refresh root adds retired handles and the first mint's
     // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
-        "ca31950286327bc385fae933bbb9e34d3c9191214f9b549c558bba40957fcc65";
+        "81d76dfb2a9d637365eb2d36cb42d5fcb1ab4fcdbb3234695fc0c37c9e67266c";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "d0eead2cd403f6f52ecd9b7df73ca7db15e84dd847e11bc9d50469970204e589";
+        "4de4791abe05b422c68c4517f6e58a4175f1949d6354f0c3367c9bb1ad0e96a7";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -802,9 +805,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (369, 32),
-                (104, 23),
-                (88, 23),
+                (371, 33),
+                (106, 24),
+                (90, 24),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

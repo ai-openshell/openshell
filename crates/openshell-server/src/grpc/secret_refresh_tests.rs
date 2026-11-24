@@ -81,6 +81,7 @@ async fn import_profile_with_material(
         env_vars: vec![KEY.to_string()],
         required: true,
         stable_placeholder: false,
+        gce_metadata_token: false,
         auth_style: "bearer".to_string(),
         header_name: "authorization".to_string(),
         query_param: String::new(),

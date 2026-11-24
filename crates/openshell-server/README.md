@@ -292,11 +292,13 @@ verified, currently authorized session JWT. The key must equal one of the
 gateway's configured keys, including its endpoint owner, once the supervisor's
 revision and installation are removed. Provider attachment and profile
 configuration determine the endpoint, audience, and scopes. The gateway performs
-RFC 7523 or both RFC 8693 exchanges and returns only the final access token.
+an RFC 7523 grant, both RFC 8693 exchanges for a stored subject token, or a
+single RFC 8693 exchange whose `jwt_svid` subject is the sandbox JWT-SVID, and
+returns only the final access token.
 Its bounded cache is isolated by sandbox generation, credential epoch, provider
-revision, the matched configured key and grant, and the subject token, which is
-resolved before every lookup so its revocation or rotation also applies to
-cached tokens. Concurrent misses for one cache key wait for a single
+revision, the matched configured key and grant, and any stored subject token,
+which is resolved before every lookup so its revocation or rotation also applies
+to cached tokens. Concurrent misses for one cache key wait for a single
 acquisition, then use its cached token. A token is served until the usual skew
 before the earliest of its `expires_in`, its JWT `exp`, and the session, SVID,
 and subject expiries, and no longer than the default cache lifetime; a
