@@ -18,7 +18,9 @@ PORT = int(sys.argv[2])
 result = {"addresses": [], "error": None}
 try:
     answers = socket.getaddrinfo(HOST, PORT, type=socket.SOCK_STREAM)
-except OSError as error:
+# A malformed name, such as an empty or overlong label, fails IDNA encoding
+# with UnicodeError before any lookup.
+except (OSError, UnicodeError) as error:
     result["error"] = repr(error)
 else:
     result["addresses"] = sorted({answer[4][0] for answer in answers})
