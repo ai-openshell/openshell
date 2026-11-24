@@ -38,9 +38,6 @@ tonic = "0.14"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[dev-dependencies]
-prost-types = "0.14"
-
 # A test program, run by `cargo test` and nextest through `testkit::main`'s
 # libtest interface, that checks the program's own subcommands.
 [[test]]
