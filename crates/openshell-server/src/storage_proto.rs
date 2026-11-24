@@ -250,7 +250,7 @@ mod tests {
     // public-only messages alongside main's public APIs; durable schemas
     // and the public/durable overlap remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "dc96b55350209d252c8eb22a697fede2abf26d6bcb80223774c5fa093dca885b";
+        "e61e46eea1d3730bcdd04a345b7cf8e8ba5bac9f420fd188fa2021b7c31e29d6";
     // The storage.v2 refresh root adds retired handles and the first mint's
     // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
