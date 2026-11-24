@@ -1668,12 +1668,12 @@ async fn create_sandbox_with_retry_bounds_a_stuck_holder_poll_by_the_budget() {
 
     let err = tokio::time::timeout(
         Duration::from_secs(5),
-        client.create_sandbox_with_retry(
+        Box::pin(client.create_sandbox_with_retry(
             named_sandbox("my-box"),
             CreateRetryOptions {
                 budget: Duration::from_millis(20),
             },
-        ),
+        )),
     )
     .await
     .expect("a stuck holder poll must not outlive the retry budget")
@@ -2134,17 +2134,16 @@ async fn create_sandbox_from_template_with_retry_retries_a_lock_timeout() {
     let endpoint = start_mock(state.clone()).await;
     let client = connect(&endpoint).await;
 
-    let sandbox = client
-        .create_sandbox_from_template_with_retry(
-            SandboxTemplateCreateSpec {
-                name: Some("from-template".to_string()),
-                template_name: "python".to_string(),
-                ..Default::default()
-            },
-            retry_options(),
-        )
-        .await
-        .unwrap();
+    let sandbox = Box::pin(client.create_sandbox_from_template_with_retry(
+        SandboxTemplateCreateSpec {
+            name: Some("from-template".to_string()),
+            template_name: "python".to_string(),
+            ..Default::default()
+        },
+        retry_options(),
+    ))
+    .await
+    .unwrap();
     assert_eq!(sandbox.name, "from-template");
 
     let requests = state.create_requests.lock().await;
@@ -2174,10 +2173,10 @@ async fn workspace_scoped_create_with_retry_reuses_the_create_workspace() {
     let client = connect(&endpoint).await;
     let scoped = client.workspace("production");
 
-    let sandbox = scoped
-        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
-        .await
-        .unwrap();
+    let sandbox =
+        Box::pin(scoped.create_sandbox_with_retry(named_sandbox("my-box"), retry_options()))
+            .await
+            .unwrap();
     assert_eq!(sandbox.name, "my-box");
 
     let requests = state.create_requests.lock().await;
@@ -2205,16 +2204,15 @@ async fn workspace_scoped_template_create_with_retry_reuses_the_create_workspace
     let client = connect(&endpoint).await;
     let scoped = client.workspace("production");
 
-    let sandbox = scoped
-        .create_sandbox_from_template_with_retry(
-            SandboxTemplateCreateSpec {
-                template_name: "python".to_string(),
-                ..Default::default()
-            },
-            retry_options(),
-        )
-        .await
-        .unwrap();
+    let sandbox = Box::pin(scoped.create_sandbox_from_template_with_retry(
+        SandboxTemplateCreateSpec {
+            template_name: "python".to_string(),
+            ..Default::default()
+        },
+        retry_options(),
+    ))
+    .await
+    .unwrap();
     assert_eq!(sandbox.name, "generated");
 
     let requests = state.create_requests.lock().await;
