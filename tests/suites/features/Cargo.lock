@@ -2749,6 +2749,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "otlp-relay-inactive"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+]
+
+[[package]]
 name = "otlp-support"
 version = "0.0.0"
 dependencies = [

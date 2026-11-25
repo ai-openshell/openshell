@@ -6,7 +6,7 @@
 //! The tests need a gateway whose OTLP export and agent trace relay point at
 //! the environment's collector ([`otlp_support`]). Each names its spans with
 //! [`Context::name`] and checks only those, so the tests share the collector
-//! with each other and with the gateway's own traces. `conformance::otlp`
+//! with each other and with the gateway's own traces. `features/otlp-relay-inactive`
 //! tests the relay without a collector.
 
 use std::collections::HashMap;
