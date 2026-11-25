@@ -20,7 +20,9 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
-use openshell_core::proto::{GpuResourceRequirements, ServiceAuthorizationMode};
+use openshell_core::proto::{
+    GpuResourceRequirements, ServiceAuthorizationMode, ServiceBackendHttpVersion,
+};
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -802,6 +804,24 @@ impl From<CliServiceAuthorizationMode> for ServiceAuthorizationMode {
         match value {
             CliServiceAuthorizationMode::Strip => Self::Strip,
             CliServiceAuthorizationMode::BearerPassthrough => Self::BearerPassthrough,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum CliServiceBackendHttpVersion {
+    #[default]
+    #[value(name = "1.1")]
+    Http1,
+    #[value(name = "2")]
+    Http2,
+}
+
+impl From<CliServiceBackendHttpVersion> for ServiceBackendHttpVersion {
+    fn from(value: CliServiceBackendHttpVersion) -> Self {
+        match value {
+            CliServiceBackendHttpVersion::Http1 => Self::Http1,
+            CliServiceBackendHttpVersion::Http2 => Self::Http2,
         }
     }
 }
@@ -1624,6 +1644,19 @@ enum SandboxCommands {
         /// (default: 300, or `OPENSHELL_PROVISION_TIMEOUT`).
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<std::num::NonZeroU32>,
+
+        /// Seconds to keep retrying while the gateway mutation lock is busy
+        /// (default: 60, or `OPENSHELL_CREATE_RETRY_TIMEOUT`). The budget
+        /// bounds the waits between attempts; the attempt in flight when it
+        /// runs out can still wait the gateway's lock budget (10s) before the
+        /// final answer.
+        #[arg(long, value_name = "SECONDS", overrides_with = "no_create_retry")]
+        create_retry_timeout: Option<std::num::NonZeroU32>,
+
+        /// Fail immediately when the gateway mutation lock is busy instead of
+        /// retrying.
+        #[arg(long, overrides_with = "create_retry_timeout")]
+        no_create_retry: bool,
 
         /// Auto-create missing providers from local credentials.
         ///
@@ -2505,6 +2538,10 @@ enum ServiceCommands {
         /// Handling for an incoming application Authorization header.
         #[arg(long, value_enum, default_value_t)]
         authorization_mode: CliServiceAuthorizationMode,
+
+        /// HTTP version on the sandbox loopback port. HTTP/2 requires the supervisor application listener.
+        #[arg(long, value_enum, default_value_t)]
+        backend_http_version: CliServiceBackendHttpVersion,
     },
 
     /// List exposed sandbox service endpoints.
@@ -3157,6 +3194,7 @@ async fn run_async() -> Result<()> {
                     service,
                     target_port,
                     authorization_mode,
+                    backend_http_version,
                 } => {
                     let service = service.unwrap_or_default();
                     run::service_expose(
@@ -3165,6 +3203,7 @@ async fn run_async() -> Result<()> {
                         &service,
                         target_port,
                         authorization_mode.into(),
+                        backend_http_version.into(),
                         &cli.workspace,
                         &tls,
                     )
@@ -3578,6 +3617,8 @@ async fn run_async() -> Result<()> {
                     detach,
                     restart_policy,
                     timeout,
+                    create_retry_timeout,
+                    no_create_retry,
                     auto_providers,
                     no_auto_providers,
                     labels,
@@ -3605,6 +3646,15 @@ async fn run_async() -> Result<()> {
                         Some(true)
                     } else {
                         None // prompt or auto-detect
+                    };
+
+                    // Resolve --create-retry-timeout / --no-create-retry.
+                    // A zero budget disables retries; the environment and the
+                    // 60s default are applied in `run::sandbox_create`.
+                    let create_retry_timeout_secs = if no_create_retry {
+                        Some(0)
+                    } else {
+                        create_retry_timeout.map(std::num::NonZeroU32::get)
                     };
 
                     // Parse --label and --annotation flags into maps.
@@ -3674,6 +3724,7 @@ async fn run_async() -> Result<()> {
                             suppress_credential_warnings: no_credential_warnings,
                             restart_policy: &restart_policy,
                             provision_timeout_secs: timeout.map(std::num::NonZeroU32::get),
+                            create_retry_timeout_secs,
                         },
                         &cli.workspace,
                         &tls,
@@ -6690,6 +6741,59 @@ mod tests {
         assert!(Cli::try_parse_from(["openshell", "sandbox", "create", "--timeout", "0"]).is_err());
     }
 
+    fn create_retry_flags(args: &[&str]) -> (Option<std::num::NonZeroU32>, bool) {
+        let cli = Cli::try_parse_from(
+            ["openshell", "sandbox", "create"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        create_retry_timeout,
+                        no_create_retry,
+                        ..
+                    }),
+                ..
+            }) => (create_retry_timeout, no_create_retry),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_retry_flags_parse() {
+        assert_eq!(
+            create_retry_flags(&["--create-retry-timeout", "30"]),
+            (std::num::NonZeroU32::new(30), false)
+        );
+        assert_eq!(create_retry_flags(&["--no-create-retry"]), (None, true));
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--create-retry-timeout",
+                "0"
+            ])
+            .is_err(),
+            "a zero retry budget must be rejected; --no-create-retry disables retries"
+        );
+    }
+
+    #[test]
+    fn sandbox_create_retry_flags_use_the_last_one_given() {
+        assert_eq!(
+            create_retry_flags(&["--no-create-retry", "--create-retry-timeout", "30"]),
+            (std::num::NonZeroU32::new(30), false)
+        );
+        assert_eq!(
+            create_retry_flags(&["--create-retry-timeout", "30", "--no-create-retry"]),
+            (None, true)
+        );
+    }
+
     #[test]
     fn sandbox_create_restart_policy_rejects_unknown_value() {
         assert!(
@@ -7394,12 +7498,14 @@ mod tests {
                         target_port,
                         service,
                         authorization_mode,
+                        backend_http_version,
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
                 assert_eq!(target_port, 8080);
                 assert_eq!(service.as_deref(), Some("api"));
                 assert_eq!(authorization_mode, CliServiceAuthorizationMode::Strip);
+                assert_eq!(backend_http_version, CliServiceBackendHttpVersion::Http1);
             }
             other => panic!("expected service expose command, got: {other:?}"),
         }
@@ -7418,6 +7524,7 @@ mod tests {
                         target_port,
                         service,
                         authorization_mode,
+                        ..
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
@@ -7430,7 +7537,7 @@ mod tests {
     }
 
     #[test]
-    fn service_expose_parses_bearer_passthrough() {
+    fn service_expose_parses_bearer_passthrough_and_http2_backend() {
         let cli = Cli::try_parse_from([
             "openshell",
             "service",
@@ -7439,19 +7546,26 @@ mod tests {
             "4500",
             "--authorization-mode",
             "bearer-passthrough",
+            "--backend-http-version",
+            "2",
         ])
-        .expect("service authorization mode should parse");
+        .expect("service authorization mode and backend HTTP version should parse");
 
         match cli.command {
             Some(Commands::Service {
                 command:
                     Some(ServiceCommands::Expose {
-                        authorization_mode, ..
+                        authorization_mode,
+                        backend_http_version,
+                        ..
                     }),
-            }) => assert_eq!(
-                authorization_mode,
-                CliServiceAuthorizationMode::BearerPassthrough
-            ),
+            }) => {
+                assert_eq!(
+                    authorization_mode,
+                    CliServiceAuthorizationMode::BearerPassthrough
+                );
+                assert_eq!(backend_http_version, CliServiceBackendHttpVersion::Http2);
+            }
             other => panic!("expected service expose command, got: {other:?}"),
         }
     }

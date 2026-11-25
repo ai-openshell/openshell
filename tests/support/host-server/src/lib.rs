@@ -5,13 +5,16 @@
 //! `host.openshell.internal`, and that record what arrived, so a test can
 //! check what the supervisor forwarded upstream.
 //!
-//! The servers listen on every host address, since drivers map
+//! The servers listen on every host address, IPv6 and IPv4, since drivers map
 //! `host.openshell.internal` to different ones, and stop when dropped. They
-//! run where the tests run, so a gateway whose sandboxes can't reach the test
-//! host, such as one on a remote cluster, can't run tests that use them.
+//! listen on IPv4 only where the host has no IPv6. They run where the tests
+//! run, so a gateway whose sandboxes can't reach the test host, such as one
+//! on a remote cluster, can't run tests that use them.
 //!
 //! - [`HttpRecorder`] answers HTTP requests with a fixed body or a handler's
-//!   [`Response`], and records each parsed [`Request`].
+//!   [`Response`], and records each parsed [`Request`]. It serves HTTPS with
+//!   a certificate from a [`TestCa`], and listens on a random free port unless
+//!   [`HttpRecorder::builder`] names one.
 //! - [`WebSocketRecorder`] completes the WebSocket handshake and records the
 //!   frames that arrive.
 //! - [`TcpServer`] records raw bytes, and echoes them or answers once the
@@ -21,6 +24,7 @@
 
 mod http;
 mod tcp;
+mod tls;
 mod websocket;
 
 use std::sync::Arc;
@@ -32,8 +36,9 @@ use testkit::{PYTHON_BINARIES, Result, ResultExt as _, policy};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-pub use http::{HttpRecorder, Request, Response};
+pub use http::{HttpRecorder, HttpRecorderBuilder, Request, Response};
 pub use tcp::{TcpServer, exchange};
+pub use tls::{ADDITIONAL_CA_CERT_ENV, ADDITIONAL_CA_KEY_ENV, Identity, TestCa};
 pub use websocket::{TEXT_REPLY, WebSocketRecorder};
 
 /// The name a sandbox reaches these servers by.
@@ -54,14 +59,18 @@ const WAIT_INTERVAL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST: usize = 1024 * 1024;
 
-/// Listens on every IPv6 and IPv4 address, or on IPv4 only where the host
-/// has no IPv6.
-async fn bind() -> Result<(TcpListener, u16)> {
-    let listener = match TcpListener::bind(("::", 0)).await {
+/// Listen on every IPv6 and IPv4 host address at `port`, or on IPv4 only
+/// where the host has no IPv6. Port 0 picks a random free port.
+async fn bind(port: u16) -> Result<(TcpListener, u16)> {
+    let listener = match TcpListener::bind(("::", port)).await {
         Ok(listener) => listener,
-        Err(_) => TcpListener::bind(("0.0.0.0", 0))
+        Err(_) => TcpListener::bind(("0.0.0.0", port))
             .await
-            .context("bind a host server")?,
+            .context(if port == 0 {
+                "bind a host server".to_string()
+            } else {
+                format!("bind a host server on port {port}")
+            })?,
     };
     let port = listener
         .local_addr()
@@ -79,12 +88,12 @@ struct Server {
 }
 
 impl Server {
-    async fn start<F, Fut>(serve: F) -> Result<Self>
+    async fn start<F, Fut>(port: u16, serve: F) -> Result<Self>
     where
         F: Fn(TcpStream) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let (listener, port) = bind().await?;
+        let (listener, port) = bind(port).await?;
         let connections = Arc::new(AtomicUsize::new(0));
         let task_connections = Arc::clone(&connections);
         let task = tokio::spawn(async move {
@@ -113,7 +122,7 @@ impl Drop for Server {
 
 /// A port that nothing on the test host listened on when this returned.
 pub async fn free_port() -> Result<u16> {
-    let (_listener, port) = bind().await?;
+    let (_listener, port) = bind(0).await?;
     Ok(port)
 }
 
