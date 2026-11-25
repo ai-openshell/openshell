@@ -26,3 +26,19 @@
   issue: https://github.com/ai-openshell/openshell/issues/5752
   environments:
     - ubuntu-k3s/k3s-ha
+
+# Importing or deleting any provider profile supersedes other sandboxes'
+# in-flight `provider update --wait`. Rows that run conformance with more than
+# one worker import profiles in other tests at the same time; vm runs one.
+- test: conformance::providers::provider_file_open_update_and_detach
+  issue: https://github.com/ai-openshell/openshell/issues/5927
+  environments:
+    - ubuntu-docker-rootful/deb
+    - ubuntu-docker-rootful/deb-external-docker-driver
+    - fedora-podman-rootful/rpm
+    - fedora-podman-rootless/rpm
+    - ubuntu-k3s/k3s
+    - ubuntu-k3s/k3s-ha
+    - docker
+    - podman
+    - kubernetes

@@ -127,6 +127,18 @@ impl Profile {
         self
     }
 
+    /// Add a file to `files`: `content`, a template that may use
+    /// `{{config.KEY}}`, served at `path` under the provider's directory,
+    /// with `env_var` naming its absolute path.
+    pub fn file(mut self, path: &str, env_var: &str, content: &str) -> Self {
+        self.profile.files.push(proto::ProviderProfileFile {
+            path: path.to_string(),
+            content: content.to_string(),
+            env_var: env_var.to_string(),
+        });
+        self
+    }
+
     /// The profile as YAML, as `profile export` writes it.
     /// Returns an error if an endpoint specifies `credential_binding`.
     pub fn to_yaml(&self) -> Result<String> {
@@ -227,7 +239,12 @@ mod tests {
             .endpoint("ws.example.test", 8443, |ep| {
                 ep.websocket(Access::ReadOnly);
             })
-            .binaries(["/usr/bin/curl", "/usr/bin/python*"]);
+            .binaries(["/usr/bin/curl", "/usr/bin/python*"])
+            .file(
+                "client.toml",
+                "CLIENT_CONFIG",
+                "project = \"{{config.project}}\"\n",
+            );
 
         let expected = parsed(
             "id: example
@@ -253,6 +270,11 @@ endpoints:
     protocol: websocket
     access: read-only
 binaries: [/usr/bin/curl, /usr/bin/python*]
+files:
+  - path: client.toml
+    env_var: CLIENT_CONFIG
+    content: |
+      project = \"{{config.project}}\"
 ",
         );
         let yaml = profile.to_yaml().expect("renders");
