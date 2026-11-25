@@ -17,8 +17,9 @@ path = "tests/token_exchange.rs"
 harness = false
 
 [dependencies]
+host-server-support = { path = "../../../support/host-server" }
 openshell-testkit = { path = "../../../testkit/testkit" }
 serde_json = "1"
 spiffe-support = { path = "../../../support/spiffe" }
-tokio = { version = "1.43", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1.43", features = ["macros"] }
 url = "2"

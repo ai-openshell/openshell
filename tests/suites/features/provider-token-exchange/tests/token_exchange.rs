@@ -6,30 +6,30 @@
 //! results into requests to a protected target.
 //!
 //! The gateway and supervisors fetch JWT-SVIDs from the environment's
-//! Workload APIs ([`spiffe_support`]). The token endpoints listen on loopback, which
-//! both the gateway and Podman's host-network supervisors reach and which the
-//! token endpoint transport policy allows over plain HTTP. The targets listen
-//! on every address, for sandboxes to reach through `host.openshell.internal`.
-//! Tests never print the fixture tokens, though none are real.
+//! Workload APIs ([`spiffe_support`]). The token endpoints and targets are
+//! [`HttpRecorder`]s on the test host. The gateway and Podman's host-network
+//! supervisors reach the token endpoints on loopback, which the token
+//! endpoint transport policy allows over plain HTTP. Sandboxes reach the
+//! targets through [`TEST_HOST`]. Tests never print the fixture tokens,
+//! though none are real.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use host_server_support::{HttpRecorder, Request, Response, TEST_HOST};
 use serde_json::json;
 use spiffe_support::{Bundle, ISSUER, SUPERVISOR_SUBJECT};
 use testkit::{Context, Error, Poll, Result, ResultExt as _, Sandbox, poll_until};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{TcpListener, TcpStream};
 
 fn main() -> std::process::ExitCode {
     testkit::main()
 }
 
-const TEST_HOST: &str = "host.openshell.internal";
+/// How long the route servers wait for a request before closing the
+/// connection.
+const ROUTE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_SUBJECT_TOKEN: &str = "stored-user-token";
 const INTERMEDIATE_TOKEN: &str = "intermediate-token";
 const FINAL_ACCESS_TOKEN: &str = "final-access-token";
@@ -51,28 +51,29 @@ const SUBJECT_TOKEN_ENV: &str = "subject_token";
 async fn independent_grants_across_sandboxes(cx: &mut Context) -> testkit::Result {
     let bundle = Arc::new(Bundle::from_env()?);
     let observations = Arc::new(GrantObservations::default());
-    let (token_listener, token_port) = listen(Ipv4Addr::LOCALHOST).await?;
-    let (identity_listener, identity_port) = listen(Ipv4Addr::LOCALHOST).await?;
-    let (target_listener, target_port) = listen(Ipv4Addr::UNSPECIFIED).await?;
-    let _token = serve(token_listener, {
+    let token = HttpRecorder::serve({
         let observations = Arc::clone(&observations);
-        move |stream| exchange_token(stream, Arc::clone(&observations))
-    });
-    let _identity = serve(identity_listener, {
+        move |request| exchange_token(request, &observations)
+    })
+    .await?;
+    let identity = HttpRecorder::serve({
         let observations = Arc::clone(&observations);
         let bundle = Arc::clone(&bundle);
-        move |stream| issue_identity(stream, Arc::clone(&observations), Arc::clone(&bundle))
-    });
-    let _target = serve(target_listener, {
+        move |request| issue_identity(request, &observations, &bundle)
+    })
+    .await?;
+    let target = HttpRecorder::serve({
         let observations = Arc::clone(&observations);
         let bundle = Arc::clone(&bundle);
-        move |stream| protected_target(stream, Arc::clone(&observations), Arc::clone(&bundle))
-    });
+        move |request| protected_target(request, &observations, &bundle)
+    })
+    .await?;
+    let target_port = target.port;
 
     let mut sandboxes = Vec::new();
     for instance in ["a", "b"] {
         let provider = cx.name(&format!("grants-{instance}"));
-        let profile = grants_profile(&provider, token_port, identity_port, target_port, instance);
+        let profile = grants_profile(&provider, token.port, identity.port, target_port, instance);
         let subject = format!("{USER_SUBJECT_TOKEN}-{instance}");
         cx.install_provider(&provider, &profile, &[(SUBJECT_TOKEN_ENV, &subject)])
             .await?;
@@ -117,7 +118,7 @@ async fn independent_grants_across_sandboxes(cx: &mut Context) -> testkit::Resul
         "repeat requests acquired credentials again instead of using the caches: {after_first:?} after the first round, {issued:?} after the cached round"
     );
 
-    let target_requests = observations.target_requests.load(Ordering::SeqCst);
+    let target_bytes = target.received();
     // An audience override forces acquisition of only the failing credential;
     // the other stays cached from the successful requests.
     let (from_a, from_b) = tokio::join!(
@@ -135,7 +136,7 @@ async fn independent_grants_across_sandboxes(cx: &mut Context) -> testkit::Resul
         "the identity endpoint saw no request for the denied identity audience"
     );
     testkit::ensure!(
-        observations.target_requests.load(Ordering::SeqCst) == target_requests,
+        target.received() == target_bytes,
         "a failed grant forwarded request bytes to the target"
     );
     Ok(())
@@ -151,24 +152,23 @@ async fn independent_grants_across_sandboxes(cx: &mut Context) -> testkit::Resul
 #[testkit::test]
 async fn routes_recover_and_select_a_b_a_on_one_connection(cx: &mut Context) -> testkit::Result {
     let grants = Arc::new(RouteGrantState::default());
-    let observed = Arc::new(Mutex::new(Vec::new()));
-    let observed_bytes = Arc::new(AtomicUsize::new(0));
-    let (token_listener, token_port) = listen(Ipv4Addr::LOCALHOST).await?;
-    let (target_listener, target_port) = listen(Ipv4Addr::UNSPECIFIED).await?;
-    let _token = serve(token_listener, {
-        let grants = Arc::clone(&grants);
-        move |stream| route_token(stream, Arc::clone(&grants))
-    });
-    let target = RouteTarget::start(
-        target_listener,
-        Arc::clone(&observed),
-        Arc::clone(&observed_bytes),
-    );
+    let token = HttpRecorder::builder()
+        .read_timeout(ROUTE_READ_TIMEOUT)
+        .serve({
+            let grants = Arc::clone(&grants);
+            move |request| route_token(request, &grants)
+        })
+        .await?;
+    let target = HttpRecorder::builder()
+        .read_timeout(ROUTE_READ_TIMEOUT)
+        .serve(route_target)
+        .await?;
+    let target_port = target.port;
 
     let mut providers = Vec::new();
     for route in ["a", "b"] {
         let provider = cx.name(&format!("route-{route}"));
-        let profile = route_profile(&provider, token_port, target_port, route);
+        let profile = route_profile(&provider, token.port, target_port, route);
         let stored = format!("stored-{route}");
         cx.install_provider(&provider, &profile, &[(SUBJECT_TOKEN_ENV, &stored)])
             .await?;
@@ -235,8 +235,10 @@ print('route-recovery-a-b-a-ok')
     wait_for_grant_failure(&sandbox, false).await?;
     sandbox.delete().await?;
     sandbox.wait_absent(Duration::from_secs(60)).await?;
+    // Only EOF on every connection proves the byte count includes all that
+    // reached the target.
     target
-        .drain()
+        .wait_closed(Duration::from_secs(35))
         .await
         .context("the route target saw EOF on every accepted connection")?;
 
@@ -266,18 +268,17 @@ print('route-recovery-a-b-a-ok')
         );
     }
 
-    let requests = observed.lock().expect("lock");
+    let requests = target.requests();
     let summary: Vec<(usize, &str)> = requests
         .iter()
-        .map(|request| (request.connection, request.path.as_str()))
+        .map(|request| (request.connection, request.path()))
         .collect();
     testkit::ensure!(
         requests.len() == 3,
         "the target saw {summary:?}; the failed grant must not reach it"
     );
     testkit::ensure!(
-        observed_bytes.load(Ordering::Relaxed)
-            == requests.iter().map(|request| request.bytes).sum::<usize>(),
+        target.received() == requests.iter().map(|request| request.size).sum::<usize>(),
         "part of the failed request reached the target"
     );
     for ((request, path), token) in requests
@@ -286,11 +287,11 @@ print('route-recovery-a-b-a-ok')
         .zip(["Bearer final-a", "Bearer final-b", "Bearer final-a"])
     {
         testkit::ensure!(
-            request.path == path && request.connection == requests[0].connection,
+            request.path() == path && request.connection == requests[0].connection,
             "the target saw {summary:?}; expected the A/B/A paths on one upstream connection"
         );
         testkit::ensure!(
-            request.authorization.len() == 1 && request.authorization[0] == token,
+            request.headers("authorization") == [token],
             "{path} did not carry exactly its own route's token"
         );
     }
@@ -308,7 +309,6 @@ struct GrantObservations {
     identity_issued: [AtomicUsize; 2],
     service_denied: AtomicUsize,
     identity_denied: AtomicUsize,
-    target_requests: AtomicUsize,
     target_rejected: AtomicUsize,
 }
 
@@ -326,13 +326,10 @@ impl GrantObservations {
 /// The gateway's and the supervisor's token exchanges. The gateway trades
 /// the stored subject token for an intermediate token addressed to the
 /// supervisor's SPIFFE ID; the supervisor trades that for the final token.
-async fn exchange_token(mut stream: TcpStream, observations: Arc<GrantObservations>) {
-    let Some(request) = read_http_request(&mut stream).await else {
-        return;
-    };
-    let form = token_form(&request);
+fn exchange_token(request: &Request, observations: &GrantObservations) -> Response {
+    let form = token_form(request);
     let field = |name: &str| form.get(name).map_or("", String::as_str);
-    let valid = request.starts_with("POST /token ")
+    let valid = is_post(request, "/token")
         && field("grant_type") == "urn:ietf:params:oauth:grant-type:token-exchange"
         && field("client_assertion_type") == CLIENT_ASSERTION_TYPE
         && field("subject_token_type") == TOKEN_TYPE_ACCESS_TOKEN
@@ -359,25 +356,22 @@ async fn exchange_token(mut stream: TcpStream, observations: Arc<GrantObservatio
             }
         }
     }
-    write_token_response(&mut stream, access_token.as_deref(), 600).await;
+    token_response(access_token.as_deref(), 600)
 }
 
 /// A client-credentials grant that checks the supervisor's JWT-SVID and
 /// returns it as the access token. No new grant type or sandbox-visible
 /// credential is needed to exercise custom-header injection.
-async fn issue_identity(
-    mut stream: TcpStream,
-    observations: Arc<GrantObservations>,
-    bundle: Arc<Bundle>,
-) {
-    let Some(request) = read_http_request(&mut stream).await else {
-        return;
-    };
-    let form = token_form(&request);
+fn issue_identity(
+    request: &Request,
+    observations: &GrantObservations,
+    bundle: &Bundle,
+) -> Response {
+    let form = token_form(request);
     let field = |name: &str| form.get(name).map_or("", String::as_str);
     let mut access_token = None;
     for (index, instance) in ["a", "b"].into_iter().enumerate() {
-        let valid = request.starts_with("POST /identity-token ")
+        let valid = is_post(request, "/identity-token")
             && field("grant_type") == "client_credentials"
             && field("client_assertion_type") == IDENTITY_ASSERTION_TYPE
             && field("scope") == "identity.read"
@@ -392,63 +386,33 @@ async fn issue_identity(
             observations.identity_denied.fetch_add(1, Ordering::SeqCst);
         }
     }
-    write_token_response(&mut stream, access_token, 900).await;
+    token_response(access_token, 900)
 }
 
 /// Accepts `GET /resource/<instance>` only with exactly one bearer token and
 /// one JWT-SVID, both for that instance.
-async fn protected_target(
-    mut stream: TcpStream,
-    observations: Arc<GrantObservations>,
-    bundle: Arc<Bundle>,
-) {
-    // Count any request bytes, including an incomplete header. A failed
-    // grant may open a TCP stream but must send no request.
-    let mut byte = [0_u8; 1];
-    if !matches!(
-        tokio::time::timeout(Duration::from_secs(5), stream.peek(&mut byte)).await,
-        Ok(Ok(1))
-    ) {
-        return;
-    }
-    observations.target_requests.fetch_add(1, Ordering::SeqCst);
-    let Some(request) = read_http_request(&mut stream).await else {
-        return;
-    };
-    let headers = request.split("\r\n\r\n").next().unwrap_or_default();
-    let header_values = |name: &str| {
-        headers
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.trim())
-            .collect::<Vec<_>>()
-    };
-    let bearer = header_values("authorization");
-    let identity = header_values("x-workload-jwt");
+fn protected_target(
+    request: &Request,
+    observations: &GrantObservations,
+    bundle: &Bundle,
+) -> Response {
+    let bearer = request.headers("authorization");
+    let identity = request.headers("x-workload-jwt");
     let ok = ["a", "b"].into_iter().any(|instance| {
-        request.starts_with(&format!("GET /resource/{instance} "))
-            && bearer.len() == 1
-            && bearer[0] == format!("Bearer {FINAL_ACCESS_TOKEN}-{instance}")
+        request.method() == "GET"
+            && request.path() == format!("/resource/{instance}")
+            && bearer == [format!("Bearer {FINAL_ACCESS_TOKEN}-{instance}")]
             && identity.len() == 1
-            && bundle.verify_supervisor_svid(identity[0], &identity_jwt_audience(instance))
+            && bundle.verify_supervisor_svid(&identity[0], &identity_jwt_audience(instance))
     });
-    let (status, body) = if ok {
-        ("HTTP/1.1 200 OK", "independent-grants-ok")
+    if ok {
+        Response::text("independent-grants-ok")
     } else {
         // Keep the rejection even if the workload retries and a later
         // request gets the right credentials.
         observations.target_rejected.fetch_add(1, Ordering::SeqCst);
-        (
-            "HTTP/1.1 401 Unauthorized",
-            "credential-verification-failed",
-        )
-    };
-    let response = format!(
-        "{status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
+        Response::text("credential-verification-failed").status(401)
+    }
 }
 
 fn identity_jwt_audience(instance: &str) -> String {
@@ -683,11 +647,8 @@ struct RouteGrantState {
 
 /// The route grants' token endpoint. It records each supervisor exchange's
 /// route, and fails the next one for B with a 503 when `fail_next_b` is set.
-async fn route_token(mut stream: TcpStream, state: Arc<RouteGrantState>) {
-    let Ok(Some(request)) = read_route_request(&mut stream, None).await else {
-        return;
-    };
-    let form = token_form(&request);
+fn route_token(request: &Request, state: &RouteGrantState) -> Response {
+    let form = token_form(request);
     let field = |name: &str| form.get(name).map_or("", String::as_str);
     let subject = field("subject_token");
     let route = match subject {
@@ -699,7 +660,7 @@ async fn route_token(mut stream: TcpStream, state: Arc<RouteGrantState>) {
     // The gateway's exchange targets the supervisor's SPIFFE ID; the
     // supervisor's targets the route's audience.
     let valid = !route.is_empty()
-        && request.starts_with("POST /token ")
+        && is_post(request, "/token")
         && !field("client_assertion").is_empty()
         && !field("audience").is_empty()
         && (!supervisor || field("audience") == format!("audience-{route}"));
@@ -713,324 +674,50 @@ async fn route_token(mut stream: TcpStream, state: Arc<RouteGrantState>) {
     } else {
         false
     };
-    let (status, body) = if fail {
-        let request_id = request
-            .split_once("\r\n\r\n")
-            .map(|(headers, _)| headers)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-openshell-request-id"))
-            .map(|(_, value)| value.trim().to_owned());
-        *state.failed_request_id.lock().expect("lock") = request_id;
-        (
-            "HTTP/1.1 503 Service Unavailable",
-            json!({"error": "temporary_failure"}).to_string(),
-        )
+    if fail {
+        *state.failed_request_id.lock().expect("lock") = request.header("x-openshell-request-id");
+        Response::json(&json!({"error": "temporary_failure"})).status(503)
     } else if valid {
         let stage = if supervisor { "final" } else { "intermediate" };
-        (
-            "HTTP/1.1 200 OK",
-            json!({"access_token": format!("{stage}-{route}"), "token_type": "Bearer", "expires_in": 300})
-                .to_string(),
+        Response::json(
+            &json!({"access_token": format!("{stage}-{route}"), "token_type": "Bearer", "expires_in": 300}),
         )
     } else {
-        (
-            "HTTP/1.1 400 Bad Request",
-            json!({"error": "unexpected_route_exchange"}).to_string(),
-        )
+        Response::json(&json!({"error": "unexpected_route_exchange"})).status(400)
+    }
+}
+
+/// The route grants' target. It keeps each connection open across requests,
+/// and accepts a request only with exactly its route's token.
+fn route_target(request: &Request) -> Response {
+    let expected = if request.path().starts_with("/a/") {
+        "Bearer final-a"
+    } else {
+        "Bearer final-b"
     };
-    let response = format!(
-        "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        stream.write_all(response.as_bytes()),
-    )
-    .await;
+    let status = if request.headers("authorization") == [expected] {
+        200
+    } else {
+        401
+    };
+    Response::new(status).keep_alive()
 }
 
-struct RouteTargetRequest {
-    connection: usize,
-    path: String,
-    authorization: Vec<String>,
-    bytes: usize,
+fn is_post(request: &Request, path: &str) -> bool {
+    request.method() == "POST" && request.path() == path
 }
 
-/// The route grants' target. It keeps each connection open across requests
-/// and records every byte it reads, so draining it proves that nothing else
-/// arrived.
-struct RouteTarget {
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<std::result::Result<(), String>>,
-}
-
-impl RouteTarget {
-    fn start(
-        listener: TcpListener,
-        observed: Arc<Mutex<Vec<RouteTargetRequest>>>,
-        observed_bytes: Arc<AtomicUsize>,
-    ) -> Self {
-        let (stop, mut stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let next_connection = AtomicUsize::new(1);
-            let mut connections = tokio::task::JoinSet::new();
-            let mut completed = Vec::new();
-            loop {
-                tokio::select! {
-                    // Once the workload has closed, accept queued connections
-                    // before stopping so their buffered bytes are observed too.
-                    biased;
-                    accepted = listener.accept() => {
-                        let (stream, _) = accepted
-                            .map_err(|error| format!("route target accept failed: {error}"))?;
-                        let connection = next_connection.fetch_add(1, Ordering::Relaxed);
-                        connections.spawn(route_connection(
-                            stream,
-                            connection,
-                            Arc::clone(&observed),
-                            Arc::clone(&observed_bytes),
-                        ));
-                    }
-                    _ = &mut stopped => break,
-                    Some(result) = connections.join_next(), if !connections.is_empty() => {
-                        completed.push(result);
-                    }
-                }
-            }
-            drop(listener);
-            // Only EOF proves that the byte count includes everything sent on
-            // each accepted connection, so wait for every reader.
-            while let Some(result) = connections.join_next().await {
-                completed.push(result);
-            }
-            for result in completed {
-                result.map_err(|error| format!("route target reader task failed: {error}"))??;
-            }
-            Ok(())
-        });
-        Self {
-            stop: Some(stop),
-            task,
-        }
-    }
-
-    /// Stop accepting, then wait for every connection to reach EOF.
-    async fn drain(mut self) -> Result {
-        if let Some(stop) = self.stop.take() {
-            // A closed receiver means the task already stopped; joining still
-            // reports its error.
-            let _ = stop.send(());
-        }
-        tokio::time::timeout(Duration::from_secs(35), &mut self.task)
-            .await
-            .map_err(|_| Error::msg("the route target did not drain its connections"))?
-            .map_err(|error| Error::msg(format!("the route target task failed: {error}")))?
-            .map_err(Error::msg)
-    }
-}
-
-impl Drop for RouteTarget {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn route_connection(
-    mut stream: TcpStream,
-    connection: usize,
-    observed: Arc<Mutex<Vec<RouteTargetRequest>>>,
-    observed_bytes: Arc<AtomicUsize>,
-) -> std::result::Result<(), String> {
-    while let Some(request) = read_route_request(&mut stream, Some(&observed_bytes)).await? {
-        let path = request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or_default()
-            .to_owned();
-        let authorization = request
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-            .map(|(_, value)| value.trim().to_owned())
-            .collect::<Vec<_>>();
-        let expected = if path.starts_with("/a/") {
-            "Bearer final-a"
-        } else {
-            "Bearer final-b"
-        };
-        let valid = authorization.len() == 1 && authorization[0] == expected;
-        observed.lock().expect("lock").push(RouteTargetRequest {
-            connection,
-            path,
-            authorization,
-            bytes: request.len(),
-        });
-        let status = if valid {
-            "HTTP/1.1 200 OK"
-        } else {
-            "HTTP/1.1 401 Unauthorized"
-        };
-        let response = format!("{status}\r\nContent-Length: 0\r\n\r\n");
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            stream.write_all(response.as_bytes()),
-        )
-        .await
-        .map_err(|_| "route target response write timed out".to_owned())?
-        .map_err(|error| format!("route target response write failed: {error}"))?;
-    }
-    Ok(())
-}
-
-async fn listen(ip: Ipv4Addr) -> Result<(TcpListener, u16)> {
-    let listener = TcpListener::bind(SocketAddr::from((ip, 0)))
-        .await
-        .context(format!("listen on {ip}"))?;
-    let port = listener
-        .local_addr()
-        .context("read the listener's port")?
-        .port();
-    Ok((listener, port))
-}
-
-/// Handle each connection `listener` accepts with `handle`, until dropped.
-struct Served(tokio::task::JoinHandle<()>);
-
-impl Drop for Served {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-fn serve<F, Fut>(listener: TcpListener, handle: F) -> Served
-where
-    F: Fn(TcpStream) -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    Served(tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let _ = stream.set_nodelay(true);
-            tokio::spawn(handle(stream));
-        }
-    }))
-}
-
-/// Read one bounded request framed by Content-Length. Forms and JWT headers
-/// can span TCP reads.
-async fn read_http_request(stream: &mut TcpStream) -> Option<String> {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let length = stream.read(&mut buffer).await.ok()?;
-            if length == 0 || request.len() + length > 32 * 1024 {
-                return None;
-            }
-            request.extend_from_slice(&buffer[..length]);
-            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                let headers = std::str::from_utf8(&request[..end]).ok()?;
-                let content_length = headers
-                    .lines()
-                    .filter_map(|line| line.split_once(':'))
-                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                    .map_or(Some(0), |(_, value)| value.trim().parse::<usize>().ok())?;
-                if request.len() >= end.checked_add(4)?.checked_add(content_length)? {
-                    return String::from_utf8(request).ok();
-                }
-            }
-        }
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Read one whole request without consuming the next one on a keepalive
-/// connection, counting the bytes read in `observed_bytes`. `None` is a
-/// clean EOF.
-async fn read_route_request(
-    stream: &mut TcpStream,
-    observed_bytes: Option<&AtomicUsize>,
-) -> std::result::Result<Option<String>, String> {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let mut bytes = Vec::new();
-        while !bytes.ends_with(b"\r\n\r\n") {
-            let mut byte = [0];
-            if stream
-                .read(&mut byte)
-                .await
-                .map_err(|error| error.to_string())?
-                == 0
-            {
-                return if bytes.is_empty() {
-                    Ok(None)
-                } else {
-                    Err("partial fixture header".into())
-                };
-            }
-            bytes.push(byte[0]);
-            if let Some(observed) = observed_bytes {
-                observed.fetch_add(1, Ordering::Relaxed);
-            }
-            if bytes.len() > 16 * 1024 {
-                return Err("fixture header exceeds limit".into());
-            }
-        }
-        let header = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
-        let length = header
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .map(|(_, value)| value.trim().parse::<usize>())
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .unwrap_or(0);
-        if length > 64 * 1024 {
-            return Err("fixture body exceeds limit".into());
-        }
-        let header_len = bytes.len();
-        bytes.resize(header_len + length, 0);
-        stream
-            .read_exact(&mut bytes[header_len..])
-            .await
-            .map_err(|error| error.to_string())?;
-        if let Some(observed) = observed_bytes {
-            observed.fetch_add(length, Ordering::Relaxed);
-        }
-        String::from_utf8(bytes)
-            .map(Some)
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|_| "fixture request timed out".to_owned())?
-}
-
-fn token_form(request: &str) -> HashMap<String, String> {
-    let (_, body) = request.split_once("\r\n\r\n").unwrap_or_default();
-    url::form_urlencoded::parse(body.as_bytes())
+fn token_form(request: &Request) -> HashMap<String, String> {
+    url::form_urlencoded::parse(request.body.as_bytes())
         .into_owned()
         .collect()
 }
 
-async fn write_token_response(stream: &mut TcpStream, access_token: Option<&str>, ttl: u64) {
-    let (status, body) = if let Some(access_token) = access_token {
-        (
-            "HTTP/1.1 200 OK",
-            json!({"access_token": access_token, "token_type": "Bearer", "expires_in": ttl})
-                .to_string(),
-        )
-    } else {
-        (
-            "HTTP/1.1 400 Bad Request",
-            json!({"error": "invalid_grant"}).to_string(),
-        )
-    };
-    let response = format!(
-        "{status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
+fn token_response(access_token: Option<&str>, ttl: u64) -> Response {
+    match access_token {
+        Some(access_token) => Response::json(
+            &json!({"access_token": access_token, "token_type": "Bearer", "expires_in": ttl}),
+        ),
+        None => Response::json(&json!({"error": "invalid_grant"})).status(400),
+    }
 }
