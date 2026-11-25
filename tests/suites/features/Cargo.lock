@@ -2702,7 +2702,6 @@ dependencies = [
  "host-server-support",
  "openshell-testkit",
  "sandbox-clients-support",
- "serde_json",
 ]
 
 [[package]]

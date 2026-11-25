@@ -97,8 +97,6 @@
         k3s_node_ip: "{{ k3s_node_address.stdout.split()[0] }}"
         k3s_ipv6: "{{ ':' in k3s_node_address.stdout.split()[0] }}"
 
-    # On an IPv6-first cluster the gateway and supervisor listen on IPv6, and
-    # policy DNS answers AAAA queries, so sandboxes reach the node over IPv6.
     - name: Write OpenShell Helm values
       ansible.builtin.copy:
         dest: /var/lib/openshell/artifacts/values.yaml
@@ -212,7 +210,6 @@
       changed_when: false
 
     # Rejects headless Services (ClusterIP "None") and a missing grpc port.
-    # The ClusterIP is IPv6 on a cluster whose primary family is IPv6.
     - name: Require a gateway Service address
       ansible.builtin.assert:
         that:
