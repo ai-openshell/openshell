@@ -14,7 +14,7 @@ mise run ci            # Everything: lint, compile checks, and tests
 crates/*/src/          # Inline #[cfg(test)] modules
 crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
-e2e/workload/          # Workload image the E2E sandboxes run python3, curl, and git from
+e2e/workload/          # E2E Python image the sandboxes run python3, curl, and git from
 e2e/rust/              # Rust CLI E2E tests
 tests/testkit/         # Support library for SDK-driven E2E suites
 tests/suites/          # E2E suites, grouped by test family
@@ -391,14 +391,15 @@ nix run .#openshell-test-runner -- run \
   --family continuity --disruption upgrade
 ```
 
-### E2E workload image (`e2e/workload/`)
+### E2E Python image (`e2e/workload/`)
 
-`mise run e2e:workload:build` builds `openshell/e2e-python:dev` from
+`mise run e2e:python-image:build` builds `openshell/e2e-python:dev` from
 `e2e/workload/Dockerfile`; `testkit::python_image()` and the Rust Docker
 harness select it for tests that need Python, Git, curl, openssl, or the
 `sandbox` user. This Noble-based fixture also has a writable `/sandbox/.venv`.
 Its Python version comes from `.python-version`. The production workload
-default remains the unmodified NVIDIA Ubuntu image.
+default remains the unmodified NVIDIA Ubuntu image. The GPU workload images
+in `e2e/gpu/` are separate; `mise run e2e:workloads:build` builds them.
 
 Explicit `--from` or `--template` arguments and the default-image tests retain
 their own image selection. Docker sandbox and support-container fixtures use

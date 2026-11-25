@@ -16,7 +16,7 @@ const PYTHON_IMAGE_ENV: &str = "OPENSHELL_TEST_PYTHON_IMAGE";
 /// The workload image for tests that run `python3`, curl, git or openssl in a
 /// sandbox, built from `e2e/workload/Dockerfile`. It isn't published:
 /// the tmachine installers load it into every environment, and
-/// `mise run e2e:workload:build` builds it locally.
+/// `mise run e2e:python-image:build` builds it locally.
 const DEFAULT_PYTHON_IMAGE: &str = "openshell/e2e-python:dev";
 
 /// The paths `python3` runs from in [`python_image`] images, as network
