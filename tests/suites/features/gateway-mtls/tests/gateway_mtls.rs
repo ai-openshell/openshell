@@ -16,6 +16,10 @@ use testkit::sdk::raw::proto;
 use testkit::sdk::{AuthConfig, ClientConfig, ClientIdentity, OpenShellClient, ServiceStatus};
 use testkit::{Context, Error, Gateway, GrpcCode, Result, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 /// A client with the CLI's certificate calls Health and a user RPC.
 #[testkit::test]
 async fn client_certificate_authenticates_user(_cx: &mut Context) -> testkit::Result {
