@@ -74,8 +74,9 @@ print(json.dumps({"udp": udp_answer, "tcp": tcp_answer}))
 
 /// A native client gets the same synthetic AAAA answer over UDP and TCP, and
 /// reaches the policy endpoint's server through it. The sandbox denies the
-/// server's real address, the synthetic address on another port, and the
-/// synthetic address once a policy change made its mapping stale.
+/// server's real address and the synthetic address on another port. After a
+/// policy change moves the endpoint to another port, the same synthetic
+/// address reaches the new port and is denied on the old one.
 #[testkit::test]
 async fn aaaa_answer_reaches_only_the_pinned_upstream(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::start("pinned").await?;
@@ -149,10 +150,17 @@ async fn aaaa_answer_reaches_only_the_pinned_upstream(cx: &mut Context) -> testk
     policy::set(&sandbox, &changed)
         .await
         .context("move the endpoint to another port")?;
+    let moved_header = format!("{TEST_HOST}:{}", moved.port);
+    let after_reload = Request::get("/after-reload").header("Host", moved_header.as_str());
+    let reply = http(&sandbox, &synthetic, moved.port, &after_reload).await?;
+    testkit::ensure!(
+        reply.status() == Some(200),
+        "request to the synthetic address {synthetic} on the new port failed: {reply:?}"
+    );
     let attempt = connect(&sandbox, &synthetic, server.port).await?;
     testkit::ensure!(
         attempt.outcome.is_permission_denied(),
-        "expected a denial for the stale synthetic address [{synthetic}]:{}; got {attempt:?}",
+        "expected a denial for the old port [{synthetic}]:{}; got {attempt:?}",
         server.port
     );
     Ok(())
