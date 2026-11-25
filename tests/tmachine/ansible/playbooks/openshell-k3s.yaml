@@ -66,8 +66,8 @@
     # address must be the one of the node the tests run on. QEMU user
     # networking gives every boot the same guest address (10.0.2.15), so the
     # value stays valid when the disk is reused.
-    # A dual-stack node lists both addresses, the IPv6 one first on an
-    # IPv6-first cluster (playbooks/k3s-ipv6.yaml). Take the first.
+    # The first address is IPv4, or IPv6 on an IPv6-only cluster
+    # (playbooks/k3s-ipv6.yaml).
     - name: Discover the K3s node address
       ansible.builtin.command:
         argv:
@@ -81,7 +81,7 @@
       changed_when: false
       until: >-
         k3s_node_address.rc == 0
-        and k3s_node_address.stdout.split() | select('match', '^[0-9.]+$') | list | length > 0
+        and k3s_node_address.stdout.split() | length > 0
       retries: 30
       delay: 2
 
@@ -130,11 +130,6 @@
             disableTls: true
             hostGatewayIP: "{{ k3s_node_ip }}"
             telemetryEnabled: false
-          {% if k3s_ipv6 %}
-          gatewayConfig:
-            openshell.drivers.kubernetes:
-              policy_dns_ipv6_egress: enabled
-          {% endif %}
 
     - name: Write OpenShell Helm values overlay
       ansible.builtin.copy:

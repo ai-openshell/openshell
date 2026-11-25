@@ -227,7 +227,7 @@ fn command(
         .arg("virtio-rng-pci")
         // A unique local IPv6 prefix instead of user networking's default
         // site-local fec0::/64. Linux ranks a site-local source below any
-        // global address, so on a dual-stack K3s guest it picks flannel's
+        // global address, so on an IPv6 K3s guest it picks flannel's
         // address to reach an IPv6 Service and never gets the reply.
         .arg("-netdev")
         .arg(format!(

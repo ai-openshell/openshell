@@ -727,9 +727,10 @@ Docker rootful, Podman rootful, and the `k3s` and `k3s-ha` installers.
 
 The `policy-dns-ipv6` feature suite (`tests/suites/features/policy-dns-ipv6`)
 checks that policy DNS answers AAAA queries with a synthetic address that
-reaches only the policy endpoint's server. CI runs it on `ubuntu-k3s-ipv6`,
-where the K3s installers enable `policy_dns_ipv6_egress` and set
-`server.hostGatewayIP` to the node's IPv6 address.
+reaches only the policy endpoint's server. CI runs it on `ubuntu-k3s-ipv6`, an
+IPv6-only cluster where sandboxes have no IPv4 route, so the default
+`policy_dns_ipv6_egress = "auto"` turns on. The K3s installers set
+`server.hostGatewayIP` to the node's IPv6 address there.
 
 The `connect-ssh-supervision` feature suite
 (`tests/suites/features/connect-ssh-supervision`) checks how `sandbox connect`

@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! With `policy_dns_ipv6_egress` enabled, policy DNS answers AAAA queries for
-//! a policy endpoint's host with a synthetic IPv6 address, and a connection to
-//! that address reaches only the endpoint's upstream.
+//! On an IPv6-only network, policy DNS answers AAAA queries for a policy
+//! endpoint's host with a synthetic IPv6 address, and a connection to that
+//! address reaches only the endpoint's upstream.
 //!
-//! The environment must enable it and set `host.openshell.internal` to the
-//! test host's IPv6 address, as the `k3s` installers do on `ubuntu-k3s-ipv6`.
+//! The environment must give sandboxes no IPv4 default route, so the default
+//! `policy_dns_ipv6_egress = "auto"` turns on, and set
+//! `host.openshell.internal` to the test host's IPv6 address, as the `k3s`
+//! installers do on `ubuntu-k3s-ipv6`.
 
 use std::net::IpAddr;
 
