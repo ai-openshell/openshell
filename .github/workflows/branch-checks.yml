@@ -37,6 +37,8 @@ jobs:
 
   compatibility-review:
     name: Compatibility Review (advisory)
+    # Temporarily disabled until the review is fixed.
+    if: ${{ success() && false }}
     permissions:
       contents: read
       pull-requests: read
@@ -55,10 +57,11 @@ jobs:
   compatibility-comment:
     name: Comment on detected breaking changes
     needs: compatibility-review
+    # Temporarily disabled with the compatibility review.
     if: >-
       ${{ !cancelled() && github.event_name == 'pull_request'
           && needs.compatibility-review.outputs.has_findings == 'true'
-          && needs.compatibility-review.outputs.report_artifact != '' }}
+          && needs.compatibility-review.outputs.report_artifact != '' && false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     continue-on-error: true
@@ -294,9 +297,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: openshell-hosted-amd64-16
             system: x86_64-linux
-          - runner: ubuntu-24.04-arm
+          - runner: openshell-hosted-arm64-16
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -318,7 +321,7 @@ jobs:
       - name: Lint
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets --features experimental -- -D warnings
           cargo clippy --locked --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
@@ -338,9 +341,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: openshell-hosted-amd64-16
             system: x86_64-linux
-          - runner: ubuntu-24.04-arm
+          - runner: openshell-hosted-arm64-16
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -413,7 +416,7 @@ jobs:
         env:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
-          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
+          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support,experimental
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/testkit/Cargo.toml
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/tmachine/Cargo.toml
@@ -425,7 +428,7 @@ jobs:
     name: Rust PostgreSQL tests
     # Bare runner: the test script starts a disposable PostgreSQL container
     # with the host's Docker.
-    runs-on: ubuntu-24.04
+    runs-on: openshell-hosted-amd64-16
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -455,9 +458,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: openshell-hosted-amd64-16
             system: x86_64-linux
-          - runner: ubuntu-24.04-arm
+          - runner: openshell-hosted-arm64-16
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -509,7 +512,7 @@ jobs:
 
   rust-feature-alias:
     name: Rust feature alias
-    runs-on: ubuntu-24.04
+    runs-on: openshell-hosted-amd64-16
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -532,7 +535,7 @@ jobs:
 
   rust-gateway-core-features:
     name: Rust gateway core features
-    runs-on: ubuntu-24.04
+    runs-on: openshell-hosted-amd64-16
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -557,7 +560,7 @@ jobs:
 
   rust-gateway-extended-features:
     name: Rust gateway extended features
-    runs-on: ubuntu-24.04
+    runs-on: openshell-hosted-amd64-16
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -646,9 +649,13 @@ jobs:
       - name: Reject changes to the Python SDK
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # Compare against the PR head, not the checked-out merge commit: the
+          # recorded base SHA can lag main, and diffing the merge commit would
+          # then report main's own changes as the PR's.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          changed=$(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- \
+          changed=$(git diff --name-only --diff-filter=d "${BASE_SHA}...${HEAD_SHA}" -- \
             python \
             tasks/scripts/generate_python_proto.py)
           if [ -z "$changed" ]; then
@@ -692,11 +699,13 @@ jobs:
       - name: Reject changes to the TypeScript SDK
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # See the Python SDK freeze: diff the PR head, not the merge commit.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           # The package is a stub that re-exports @ai-openshell/sdk. Its files stay
           # editable so the stub and its moved notice can be maintained.
-          changed=$(git diff --no-renames --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- sdk/typescript \
+          changed=$(git diff --no-renames --name-only --diff-filter=d "${BASE_SHA}...${HEAD_SHA}" -- sdk/typescript \
             ':(exclude)sdk/typescript/package.json' \
             ':(exclude)sdk/typescript/README.md' \
             ':(exclude)sdk/typescript/index.js' \

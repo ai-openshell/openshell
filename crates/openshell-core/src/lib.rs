@@ -16,6 +16,7 @@ pub mod color;
 pub mod compute;
 pub mod config;
 pub mod container_paths;
+pub mod create_retry;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;
@@ -48,6 +49,7 @@ pub mod network_trust;
 pub mod oauth;
 pub mod paths;
 pub mod policy;
+pub mod policy_l7;
 pub use openshell_policy_schema::yaml;
 pub mod policy_identity;
 pub mod progress;
@@ -77,7 +79,8 @@ pub use config::{
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig, MtlsAuthConfig,
-    OidcConfig, PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
+    OidcConfig, PolicyDnsIpv6Egress, PolicyValidationFailureMode, SupervisorIpv6EgressConfig,
+    TlsConfig, UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};

@@ -3956,10 +3956,9 @@ async fn bind_material_secrets(
         token_url: token_url.to_string(),
         ..Default::default()
     })?;
-    let endpoint = openshell_credential_issuer::endpoint::normalize_token_endpoint(&endpoint)
-        .map_err(|reason| {
-            Status::failed_precondition(format!("refresh token endpoint {reason}"))
-        })?;
+    let endpoint = openshell_credential_issuer::endpoint::parse_token_endpoint(&endpoint)
+        .map_err(|reason| Status::failed_precondition(format!("refresh token endpoint {reason}")))?
+        .to_string();
     for (material_key, name) in material_secrets {
         let secret = super::secret::get_live_secret(&state.store, workspace, name)
             .await?
@@ -4368,6 +4367,9 @@ async fn profile_attached_sandbox_diagnostics(
     let validate_policy_composition =
         super::policy::provider_policy_composition_enabled(store).await?;
     for sandbox in sandboxes {
+        if super::policy::skip_sandbox_with_unsupported_cedar_policy(&sandbox) {
+            continue;
+        }
         let sandbox_name = sandbox.object_name().to_string();
         let sandbox_workspace = sandbox.object_workspace().to_string();
         let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
@@ -7407,6 +7409,57 @@ pub(super) mod tests {
         }));
     }
 
+    /// A sandbox a Cedar-enabled gateway created must not fail profile imports
+    /// for its whole workspace on a gateway built without Cedar.
+    #[cfg(not(feature = "experimental"))]
+    #[tokio::test]
+    async fn import_provider_profile_skips_attached_cedar_sandbox_without_cedar_support() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_values("provider-cedar", "cedar-attached"),
+        )
+        .await
+        .unwrap();
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-cedar-id".to_string(),
+                    name: "sandbox-cedar".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["provider-cedar".to_string()],
+                    policy: Some(crate::grpc::test_support::cedar_policy()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("cedar-attached")),
+                    source: "cedar-attached.yaml".to_string(),
+                }],
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .expect("a stored Cedar sandbox must not fail the import")
+        .into_inner();
+        assert!(response.imported, "{:?}", response.diagnostics);
+    }
+
     #[tokio::test]
     async fn import_provider_profile_waits_for_sandbox_mutation_in_workspace() {
         let state = test_server_state().await;
@@ -7489,6 +7542,79 @@ pub(super) mod tests {
             .expect("import should succeed")
             .into_inner();
         assert!(response.imported, "{:?}", response.diagnostics);
+    }
+
+    #[tokio::test]
+    async fn legacy_credential_endpoints_remain_visible_and_can_be_repaired() {
+        let state = test_server_state().await;
+        let id = "legacy-endpoints";
+        let profile = |prefix: &str| {
+            let mut profile = openshell_providers::example_profiles::load("github-app").to_proto();
+            profile.id = id.into();
+            let base = format!("https://auth.example.com/{prefix}");
+            profile.credentials[0].refresh.as_mut().unwrap().token_url =
+                format!("{base}/app/installations/{{installation_id}}/access_tokens");
+            let mut grant = token_grant_credential("dynamic");
+            grant.token_grant.as_mut().unwrap().token_endpoint = format!("{base}/exchange");
+            profile.credentials.push(grant);
+            let mut oauth = refreshable_credential("oauth", "OAUTH_TOKEN");
+            oauth.refresh.as_mut().unwrap().token_url = format!("{base}/oauth");
+            profile.credentials.push(oauth);
+            profile
+        };
+        let legacy = profile("a^b");
+        state
+            .store
+            .put_message(&stored_provider_profile(legacy.clone()))
+            .await
+            .unwrap();
+
+        let listed = handle_list_provider_profiles(
+            &state,
+            authed_request(ListProviderProfilesRequest {
+                page_size: 100,
+                workspace_scope: Some(default_workspace_selector()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profiles;
+        assert!(listed.iter().any(|profile| profile.id == "github"));
+        let fetched = listed.into_iter().find(|profile| profile.id == id).unwrap();
+        assert_eq!(fetched.credentials, legacy.credentials);
+
+        let update = |profile: ProviderProfile| {
+            authed_request(UpdateProviderProfilesRequest {
+                id: id.into(),
+                workspace_scope: Some(default_workspace_selector()),
+                expected_resource_version: fetched.resource_version,
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "repair.yaml".into(),
+                }),
+                ..Default::default()
+            })
+        };
+        let rejected = handle_update_provider_profiles(&state, update(legacy))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!rejected.updated);
+        assert_eq!(rejected.diagnostics.len(), 3, "{:?}", rejected.diagnostics);
+        assert!(
+            rejected
+                .diagnostics
+                .iter()
+                .all(|d| d.message.contains("literal caret"))
+        );
+
+        let repaired = handle_update_provider_profiles(&state, update(profile("a%5Eb")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(repaired.updated, "{:?}", repaired.diagnostics);
     }
 
     #[tokio::test]

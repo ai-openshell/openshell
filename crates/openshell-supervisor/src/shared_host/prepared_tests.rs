@@ -60,6 +60,8 @@ fn host(root: &Path) -> Arc<SharedHost> {
             member_id: "member-1".into(),
             runtime_address: "127.0.0.1:5500".parse().unwrap(),
         },
+        policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+        nat64_prefixes: Vec::new(),
     })
     .unwrap()
 }
