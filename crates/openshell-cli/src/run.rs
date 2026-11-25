@@ -67,11 +67,12 @@ use openshell_core::proto::{
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
     ResumeSandboxRequest, RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase,
     SandboxPolicy, SandboxResources, SandboxResponse, SandboxRestartPolicy, SandboxServiceExposure,
-    SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig,
-    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
-    ServiceBackendHttpVersion, ServiceEndpointResponse, SettingScope, StartSandboxRequest,
-    StopSandboxRequest, SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
+    SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate,
+    SandboxTemplateWarmPoolStatus, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceBackendHttpVersion,
+    ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
+    SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::rpc_error::{MUTATION_LOCK_TIMEOUT, decode_details, is_mutation_lock_timeout};
 use openshell_core::settings;
@@ -4051,18 +4052,57 @@ pub async fn sandbox_template_get(
             )),
         })
         .await
-        .into_diagnostic()?;
+        .into_diagnostic()?
+        .into_inner();
     let template = response
-        .into_inner()
         .template
         .ok_or_else(|| miette!("sandbox template missing from response"))?;
+    let warm_pool = response.warm_pool;
 
-    if crate::output::print_output_single(output, &template, sandbox_template_to_json)? {
+    if crate::output::print_output_single(output, &template, |template| {
+        let mut value = sandbox_template_to_json(template);
+        if let Some(pool) = &warm_pool {
+            value["warm_pool"] = warm_pool_status_to_json(pool);
+        }
+        value
+    })? {
         return Ok(());
     }
 
     print_sandbox_template_detail(&template);
+    if let Some(pool) = &warm_pool {
+        print_warm_pool_status(pool);
+    }
     Ok(())
+}
+
+fn warm_pool_status_to_json(pool: &SandboxTemplateWarmPoolStatus) -> serde_json::Value {
+    serde_json::json!({
+        "target": pool.target,
+        "ready": pool.ready,
+        "pending": pool.pending,
+        "retiring": pool.retiring,
+        "revision": pool.revision,
+        "suspended": pool.suspended,
+    })
+}
+
+fn print_warm_pool_status(pool: &SandboxTemplateWarmPoolStatus) {
+    println!();
+    println!("  {}", "Warm pool:".cyan().bold());
+    println!("    {} {}", "Target:".dimmed(), pool.target);
+    println!("    {} {}", "Ready:".dimmed(), pool.ready);
+    println!("    {} {}", "Pending:".dimmed(), pool.pending);
+    println!("    {} {}", "Retiring:".dimmed(), pool.retiring);
+    println!("    {} {}", "Revision:".dimmed(), pool.revision);
+    let suspended = if pool.suspended {
+        "yes (deploy a higher warm_pool.revision to resume refills)"
+            .yellow()
+            .to_string()
+    } else {
+        "no".to_string()
+    };
+    println!("    {} {suspended}", "Suspended:".dimmed());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9563,6 +9603,26 @@ mod tests {
 
         assert_eq!(json["labels"]["team"], "runtime");
         assert_eq!(json["annotations"]["owner"], "platform");
+    }
+
+    #[test]
+    fn warm_pool_status_to_json_reports_counts_and_suspension() {
+        let json = super::warm_pool_status_to_json(&super::SandboxTemplateWarmPoolStatus {
+            target: 4,
+            ready: 2,
+            pending: 1,
+            retiring: 3,
+            revision: 7,
+            suspended: true,
+        });
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "target": 4, "ready": 2, "pending": 1, "retiring": 3,
+                "revision": 7, "suspended": true,
+            })
+        );
     }
 
     #[test]

@@ -250,9 +250,10 @@ mod tests {
     // public-only messages alongside main's public APIs; durable schemas
     // and the public/durable overlap remain unchanged.
     // The service backend HTTP version is part of both schemas. Legacy
-    // endpoint records omit it and continue to use HTTP/1.1.
+    // endpoint records omit it and continue to use HTTP/1.1. Template
+    // warm-pool status is a public-only response field that is never persisted.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3c1c932ec40e0c29a8c844f84d936178c19aec8f233ae0fcb2f7980dc13a70a0";
+        "7440a8b7dc891ac57e9fd7750a9a43f9b5f015b28a580c1f84b7a516645bfc15";
     // The storage.v2 refresh root adds retired handles and the first mint's
     // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
@@ -710,7 +711,10 @@ mod tests {
             sandbox_protocol_methods,
             BTreeSet::from(["Exchange", "Mediate"])
         );
-        assert_eq!(supervisor_host_methods, BTreeSet::from(["Attach"]));
+        assert_eq!(
+            supervisor_host_methods,
+            BTreeSet::from(["Attach", "RegisterSupervisor"])
+        );
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -802,7 +806,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (369, 32),
+                (370, 32),
                 (104, 23),
                 (88, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,

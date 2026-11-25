@@ -231,6 +231,8 @@ fn fixture(
         sandbox_api_version: Arc::new(api_version),
         lifecycle_gates: Arc::default(),
         shared_supervisor: None,
+        warm_supervision: None,
+        warm_pools_absent: Arc::default(),
         network_trust_bundle: None,
         config: KubernetesComputeConfig {
             allow_driver_config: true,

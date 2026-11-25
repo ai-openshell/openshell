@@ -148,6 +148,7 @@ records it:
 |---|---|
 | `openshell_server_` | API requests, readiness, supervisor sessions, relays, and requests forwarded between replicas |
 | `openshell_gateway_interceptor_` | Gateway interceptor evaluations, failures, and latency |
+| `openshell_warm_pool_` | Kubernetes template warm pools: claims, claim latency, and spares |
 | `openshell_ocsf_log_` | The gateway's OCSF JSONL file |
 | `openshell_ocsf_otlp_` | OCSF log export over OTLP |
 
@@ -157,8 +158,8 @@ name label, so use your scrape configuration to tell installations apart.
 
 ## Histograms and Summaries
 
-The multi-replica latency metrics and the configuration build and apply
-durations are Prometheus histograms with `_bucket`, `_sum`, and `_count` series
+The multi-replica latency metrics, the configuration build and apply
+durations, and the warm-pool claim duration are Prometheus histograms with `_bucket`, `_sum`, and `_count` series
 and buckets from 1 millisecond to 15 seconds, so `histogram_quantile` can
 aggregate them across replicas. The older
 `*_duration_seconds` metrics and the interceptor latency metric are summaries
@@ -323,6 +324,24 @@ record their evaluations:
 | `openshell_gateway_interceptor_post_commit_observation_failures_total` | Counter | `stage` | Failed post-commit observations. `stage` is `response_body` or `evaluation`. |
 | `openshell_server_provider_profile_source_refreshes_total` | Counter | `outcome` | Refreshes of interceptor provider-profile snapshots. `outcome` is `ok` or `failed`. |
 | `openshell_server_provider_profile_source_snapshot_age_seconds` | Gauge | None | Age of the oldest cached provider-profile snapshot after the last refresh. Reads fail closed past three refresh intervals. |
+
+## Warm Pool Metrics
+
+Kubernetes gateways with [template warm capacity](/how-it-works/sandboxes/templates#request-warm-capacity)
+record how creates use it:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_warm_pool_claims_total` | Counter | `outcome` | Creates from a template whose pool has a positive target. `outcome` is `warm` (claimed a spare), `cold` (no usable spare, so the create continued cold), or `error` (the create failed). Creates without a pool and pool discovery failures are not counted. |
+| `openshell_warm_pool_claim_duration_seconds` | Histogram | `outcome` | Time those creates spent selecting and claiming a spare. For `cold`, the time spent searching before cold creation started. |
+| `openshell_warm_pool_spares` | Gauge | `state` | Unclaimed spares across all template pools after this replica's last reconcile pass. `state` is `ready`, `pending`, or `retiring`. |
+| `openshell_warm_pool_suspended_pools` | Gauge | None | Pools this replica cannot refill because its configuration differs from the recorded pool. |
+
+Every replica reconciles every pool, so each one reports the same spares. Use
+`max` across pods for the spare gauges and `sum` for the counters. The
+warm-hit rate is `sum(rate(openshell_warm_pool_claims_total{outcome="warm"}[5m]))`
+divided by the same expression without the `outcome` filter. Pools whose pass
+failed are left out of that pass's gauges.
 
 ## OCSF Log Metrics
 

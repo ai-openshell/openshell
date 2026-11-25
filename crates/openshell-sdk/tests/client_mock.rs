@@ -426,6 +426,7 @@ impl OpenShell for TestOpenShell {
         *self.state.last_template_create.lock().await = Some(request);
         Ok(Response::new(proto::SandboxTemplateResponse {
             template: Some(template),
+            warm_pool: None,
         }))
     }
 
@@ -439,6 +440,7 @@ impl OpenShell for TestOpenShell {
         *self.state.last_template_get.lock().await = Some(request);
         Ok(Response::new(proto::SandboxTemplateResponse {
             template: Some(template),
+            warm_pool: None,
         }))
     }
 
