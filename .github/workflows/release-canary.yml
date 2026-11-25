@@ -195,9 +195,9 @@ jobs:
   ubuntu-snap-system-docker:
     name: Ubuntu snap with system Docker
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    # Ubuntu 26.04 fails snap installation with another user manager active.
-    # Track investigation in https://github.com/ai-openshell/openshell/issues/5924.
-    runs-on: ubuntu-24.04
+    # Diagnose ubuntu-latest (26.04) snap installation failure with another
+    # user manager active. See https://github.com/ai-openshell/openshell/issues/5924.
+    runs-on: ubuntu-latest
     env:
       OPENSHELL_INSTALL_METHOD: snap
     timeout-minutes: 20
@@ -231,8 +231,29 @@ jobs:
           sudo systemctl start "user@${other_uid}.service"
           systemctl --user set-environment \
             "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
-          curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/${INSTALL_SHA}/install.sh |
-            DOCKER_HOST=unix:///tmp/nonexistent-docker.sock DOCKER_CONTEXT=nonexistent sh
+          if ! curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/${INSTALL_SHA}/install.sh |
+            DOCKER_HOST=unix:///tmp/nonexistent-docker.sock DOCKER_CONTEXT=nonexistent sh; then
+            echo "::error::snap install failed — capturing diagnostics for issue #5924"
+            echo "=== AppArmor denials (dmesg) ==="
+            sudo dmesg | grep -iE "denied|apparmor" | tail -50 || true
+            echo "=== AppArmor denials (audit) ==="
+            sudo journalctl --no-pager -n 200 -k | grep -iE "denied|apparmor|eperm" || true
+            echo "=== snapd log ==="
+            sudo journalctl -u snapd --no-pager -n 100 || true
+            echo "=== other user manager log ==="
+            sudo journalctl -u "user@${other_uid}.service" --no-pager -n 50 2>/dev/null || true
+            echo "=== session agent sockets ==="
+            find /run/user -name "snapd-session-agent.socket" -ls 2>/dev/null || true
+            echo "=== bus sockets ==="
+            ls -la /run/user/*/bus 2>/dev/null || true
+            echo "=== systemctl --user daemon-reload retry as other user ==="
+            sudo -u "$other_user" env \
+              HOME="/home/${other_user}" \
+              XDG_RUNTIME_DIR="/run/user/${other_uid}" \
+              DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${other_uid}/bus" \
+              systemctl --user daemon-reload 2>&1 || true
+            exit 1
+          fi
           sudo snap list openshell
           if sudo snap list docker >/dev/null 2>&1; then
             echo "install.sh unexpectedly installed the Docker snap" >&2
