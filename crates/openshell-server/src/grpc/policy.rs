@@ -16286,65 +16286,41 @@ mod tests {
 
     #[tokio::test]
     async fn provider_env_revision_ignores_unrelated_profile_import_and_delete() {
-        use crate::grpc::provider::{
-            handle_delete_provider_profile, handle_import_provider_profiles,
-        };
-        use openshell_core::proto::{
-            DeleteProviderProfileRequest, ImportProviderProfilesRequest, ProviderProfile,
-            ProviderProfileImportItem, workspace_selector,
-        };
+        use crate::provider_profile_sources::stored_provider_profile;
+        use openshell_core::proto::ProviderProfile;
 
-        let state = test_server_state().await;
-        let workspace_scope = Some(workspace_selector("default".to_string()));
-        let import_profile = async |id: &str| {
-            let response = handle_import_provider_profiles(
-                &state,
-                with_user(Request::new(ImportProviderProfilesRequest {
-                    profiles: vec![ProviderProfileImportItem {
-                        profile: Some(ProviderProfile {
-                            id: id.to_string(),
-                            display_name: id.to_string(),
-                            ..Default::default()
-                        }),
-                        source: format!("{id}.yaml"),
-                    }],
-                    workspace_scope: workspace_scope.clone(),
-                    ..Default::default()
-                })),
-            )
-            .await
-            .unwrap()
-            .into_inner();
-            assert!(response.imported, "{:?}", response.diagnostics);
-        };
-
-        import_profile("used-profile").await;
-        state
-            .store
-            .put_message(&test_provider("work-provider", "used-profile"))
-            .await
-            .unwrap();
-        let provider_names = ["work-provider".to_string()];
-        let revision =
-            || compute_provider_env_revision(state.store.as_ref(), "default", &provider_names);
+        let store = test_store().await;
+        let mut provider = test_provider("work-github", "github");
+        provider.profile_workspace.clear();
+        store.put_message(&provider).await.unwrap();
+        let providers = ["work-github".to_string()];
+        let revision = || compute_provider_env_revision(&store, "default", &providers);
         let before = revision().await.unwrap();
 
-        import_profile("unrelated-profile").await;
-        let after_import = revision().await.unwrap();
-        handle_delete_provider_profile(
-            &state,
-            with_user(Request::new(DeleteProviderProfileRequest {
-                id: "unrelated-profile".to_string(),
-                workspace_scope,
-                ..Default::default()
-            })),
-        )
-        .await
-        .unwrap();
-        let after_delete = revision().await.unwrap();
+        let mut unrelated = stored_provider_profile(ProviderProfile {
+            id: "unrelated".to_string(),
+            display_name: "Unrelated".to_string(),
+            ..Default::default()
+        });
+        unrelated.metadata.as_mut().unwrap().workspace = "default".to_string();
+        store.put_message(&unrelated).await.unwrap();
+        assert_eq!(
+            before,
+            revision().await.unwrap(),
+            "unrelated profile import"
+        );
 
-        assert_eq!(before, after_import, "unrelated profile import");
-        assert_eq!(after_import, after_delete, "unrelated profile delete");
+        assert!(
+            store
+                .delete(StoredProviderProfile::object_type(), unrelated.object_id())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            before,
+            revision().await.unwrap(),
+            "unrelated profile delete"
+        );
     }
 
     #[tokio::test]
