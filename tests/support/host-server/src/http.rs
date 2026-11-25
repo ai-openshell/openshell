@@ -3,7 +3,9 @@
 
 use std::fmt::Write as _;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use testkit::{Poll, Result};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -21,6 +23,11 @@ pub struct Request {
     /// The server's address on the connection the request arrived on: the
     /// address of the test host the client reached it by.
     pub local_addr: Option<SocketAddr>,
+    /// The connection the request arrived on, numbered from 1 in the order
+    /// the server accepted them.
+    pub connection: usize,
+    /// The number of bytes the request took on the connection.
+    pub size: usize,
 }
 
 impl Request {
@@ -36,6 +43,17 @@ impl Request {
     /// The value of the first header named `name`, in any case.
     pub fn header(&self, name: &str) -> Option<String> {
         header(&self.head, name)
+    }
+
+    /// The values of every header named `name`, in any case.
+    pub fn headers(&self, name: &str) -> Vec<String> {
+        self.head
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(header, _)| header.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_string())
+            .collect()
     }
 
     fn request_line(&self) -> (&str, &str) {
@@ -140,22 +158,34 @@ fn reason(status: u16) -> &'static str {
         202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         418 => "I'm a teapot",
+        503 => "Service Unavailable",
         _ => "Status",
     }
 }
 
 type Handler = dyn Fn(&Request) -> Response + Send + Sync;
 
+/// What an [`HttpRecorder`]'s connections have shared with the test.
+#[derive(Default)]
+struct Recorded {
+    requests: Mutex<Vec<Request>>,
+    accepted: AtomicUsize,
+    open: AtomicUsize,
+    received: AtomicUsize,
+    cut: AtomicUsize,
+}
+
 /// An HTTP server that records each request it read and answers it with a
 /// handler's response. A connection stays open for another request while
 /// the responses keep it alive and the requests don't close it.
 pub struct HttpRecorder {
     pub port: u16,
-    requests: Arc<Mutex<Vec<Request>>>,
+    recorded: Arc<Recorded>,
     server: Server,
 }
 
@@ -202,40 +232,52 @@ impl HttpRecorder {
     async fn listen(
         port: u16,
         tls: Option<TlsAcceptor>,
+        read_timeout: Duration,
         handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
     ) -> Result<Self> {
         let handler: Arc<Handler> = Arc::new(handler);
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let task_requests = Arc::clone(&requests);
+        let recorded = Arc::new(Recorded::default());
+        let task_recorded = Arc::clone(&recorded);
         let server = Server::start(port, move |stream| {
             let _ = stream.set_nodelay(true);
-            let local_addr = stream.local_addr().ok();
+            let peer = Peer {
+                local_addr: stream.local_addr().ok(),
+                connection: task_recorded.accepted.fetch_add(1, Ordering::AcqRel) + 1,
+                read_timeout,
+            };
+            task_recorded.open.fetch_add(1, Ordering::AcqRel);
             let handler = Arc::clone(&handler);
-            let requests = Arc::clone(&task_requests);
+            let recorded = Arc::clone(&task_recorded);
             let tls = tls.clone();
             async move {
-                match tls {
-                    None => respond(stream, local_addr, handler, requests).await,
+                let clean = match tls {
+                    None => respond(stream, &peer, &*handler, &recorded).await,
                     Some(tls) => {
-                        let handshake = tokio::time::timeout(READ_TIMEOUT, tls.accept(stream));
-                        if let Ok(Ok(stream)) = handshake.await {
-                            respond(stream, local_addr, handler, requests).await;
+                        let handshake = tokio::time::timeout(read_timeout, tls.accept(stream));
+                        match handshake.await {
+                            Ok(Ok(stream)) => respond(stream, &peer, &*handler, &recorded).await,
+                            _ => false,
                         }
                     }
+                };
+                if !clean {
+                    recorded.cut.fetch_add(1, Ordering::AcqRel);
                 }
+                recorded.open.fetch_sub(1, Ordering::AcqRel);
             }
         })
         .await?;
         Ok(Self {
             port: server.port,
-            requests,
+            recorded,
             server,
         })
     }
 
     /// The requests the server has read so far.
     pub fn requests(&self) -> Vec<Request> {
-        self.requests
+        self.recorded
+            .requests
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -244,6 +286,12 @@ impl HttpRecorder {
     /// The number of connections the server has accepted.
     pub fn connections(&self) -> usize {
         self.server.connections()
+    }
+
+    /// The number of bytes the server has read, including any it never
+    /// parsed into a whole request.
+    pub fn received(&self) -> usize {
+        self.recorded.received.load(Ordering::Acquire)
     }
 
     /// The requests the server has read, once there are at least `count`.
@@ -266,6 +314,37 @@ impl HttpRecorder {
         )
         .await
     }
+
+    /// Wait up to `timeout` for every connection the server accepted to
+    /// close, so [`received`](Self::received) counts all they sent. Fails if
+    /// a connection ended other than at a request boundary: by a read
+    /// timeout or error, or partway through a request.
+    pub async fn wait_closed(&self, timeout: Duration) -> Result {
+        testkit::poll_until(
+            &format!(
+                "every connection to the host server on port {} to close",
+                self.port
+            ),
+            timeout,
+            WAIT_INTERVAL,
+            async || {
+                let open = self.recorded.open.load(Ordering::Acquire);
+                Ok(if open == 0 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending(format!("{open} open connection(s)"))
+                })
+            },
+        )
+        .await?;
+        let cut = self.recorded.cut.load(Ordering::Acquire);
+        testkit::ensure!(
+            cut == 0,
+            "{cut} connection(s) to the host server on port {} ended without closing at a request boundary",
+            self.port
+        );
+        Ok(())
+    }
 }
 
 /// Options for an [`HttpRecorder`], from [`HttpRecorder::builder`].
@@ -273,6 +352,7 @@ impl HttpRecorder {
 pub struct HttpRecorderBuilder {
     port: u16,
     tls: Option<Identity>,
+    read_timeout: Option<Duration>,
 }
 
 impl HttpRecorderBuilder {
@@ -293,6 +373,15 @@ impl HttpRecorderBuilder {
         self
     }
 
+    /// Close a connection that sends nothing for `timeout` while the server
+    /// waits for the rest of a request or the next one, instead of 10
+    /// seconds.
+    #[must_use]
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = Some(timeout);
+        self
+    }
+
     /// Answer every request with `200` and `body`.
     pub async fn start(self, body: impl Into<String>) -> Result<HttpRecorder> {
         let body = body.into();
@@ -305,34 +394,100 @@ impl HttpRecorderBuilder {
         handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
     ) -> Result<HttpRecorder> {
         let tls = self.tls.as_ref().map(Identity::acceptor).transpose()?;
-        HttpRecorder::listen(self.port, tls, handler).await
+        let read_timeout = self.read_timeout.unwrap_or(READ_TIMEOUT);
+        HttpRecorder::listen(self.port, tls, read_timeout, handler).await
     }
 }
 
+/// The connection an [`HttpRecorder`] serves.
+struct Peer {
+    local_addr: Option<SocketAddr>,
+    connection: usize,
+    read_timeout: Duration,
+}
+
 /// Read requests, record each, and answer with `handler` until a response
-/// or request closes the connection.
+/// or request closes the connection. Returns whether the connection closed
+/// at a request boundary.
 async fn respond(
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
-    local_addr: Option<SocketAddr>,
-    handler: Arc<Handler>,
-    requests: Arc<Mutex<Vec<Request>>>,
-) {
+    peer: &Peer,
+    handler: &Handler,
+    recorded: &Recorded,
+) -> bool {
     let mut buffer = Vec::new();
-    while let Some(request) = read_request(&mut stream, local_addr, &mut buffer).await {
+    let clean = loop {
+        let read = next_request(
+            &mut stream,
+            &mut buffer,
+            &recorded.received,
+            peer.read_timeout,
+        );
+        let mut request = match read.await {
+            Next::Request(request) => request,
+            Next::Closed => break true,
+            Next::Cut => break false,
+        };
+        request.local_addr = peer.local_addr;
+        request.connection = peer.connection;
         let response = handler(&request);
         let close = !response.keep_alive
             || request
                 .header("connection")
                 .is_some_and(|value| value.eq_ignore_ascii_case("close"));
-        requests
+        recorded
+            .requests
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(request);
-        if stream.write_all(&response.encode(close)).await.is_err() || close {
-            break;
+        if stream.write_all(&response.encode(close)).await.is_err() {
+            break false;
+        }
+        if close {
+            break true;
+        }
+    };
+    let _ = stream.shutdown().await;
+    clean
+}
+
+/// How reading the next request from a connection ended.
+enum Next {
+    Request(Request),
+    /// The client closed the connection before sending another byte.
+    Closed,
+    /// A read timed out or failed, or the client closed the connection or
+    /// exceeded the size limit partway through a request.
+    Cut,
+}
+
+/// Read the next request from `stream`, starting with the bytes already in
+/// `buffer`, and leave any bytes after it in `buffer`. Counts every byte read
+/// in `received`.
+async fn next_request(
+    stream: &mut (impl AsyncRead + Unpin),
+    buffer: &mut Vec<u8>,
+    received: &AtomicUsize,
+    timeout: Duration,
+) -> Next {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        if let Some((request, length)) = parse_request(buffer) {
+            buffer.drain(..length);
+            return Next::Request(request);
+        }
+        match tokio::time::timeout(timeout, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) if buffer.is_empty() => return Next::Closed,
+            Ok(Ok(read)) if read > 0 => {
+                received.fetch_add(read, Ordering::AcqRel);
+                if buffer.len() >= MAX_REQUEST {
+                    return Next::Cut;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            _ => return Next::Cut,
         }
     }
-    let _ = stream.shutdown().await;
 }
 
 /// Read one request from `stream`, starting with the bytes already in
@@ -343,19 +498,12 @@ pub(crate) async fn read_request(
     local_addr: Option<SocketAddr>,
     buffer: &mut Vec<u8>,
 ) -> Option<Request> {
-    let mut chunk = [0_u8; 4096];
-    loop {
-        if let Some((mut request, length)) = parse_request(buffer) {
-            buffer.drain(..length);
+    match next_request(stream, buffer, &AtomicUsize::new(0), READ_TIMEOUT).await {
+        Next::Request(mut request) => {
             request.local_addr = local_addr;
-            return Some(request);
+            Some(request)
         }
-        match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
-            Ok(Ok(read)) if read > 0 && buffer.len() < MAX_REQUEST => {
-                buffer.extend_from_slice(&chunk[..read]);
-            }
-            _ => return None,
-        }
+        Next::Closed | Next::Cut => None,
     }
 }
 
@@ -380,6 +528,8 @@ fn parse_request(bytes: &[u8]) -> Option<(Request, usize)> {
             head,
             body,
             local_addr: None,
+            connection: 0,
+            size: end + 4 + length,
         },
         end + 4 + length,
     ))
@@ -530,15 +680,19 @@ mod tests {
             response.ends_with("Connection: close\r\n\r\n/two"),
             "{response}"
         );
-        let paths: Vec<_> = recorder
-            .wait_for_requests(2)
-            .await
-            .unwrap()
+        let requests = recorder.wait_for_requests(2).await.unwrap();
+        let paths: Vec<_> = requests
             .iter()
             .map(|request| request.path().to_string())
             .collect();
         assert_eq!(paths, ["/one", "/two"]);
+        assert!(requests.iter().all(|request| request.connection == 1));
         assert_eq!(recorder.connections(), 1);
+        recorder.wait_closed(READ_TIMEOUT).await.unwrap();
+        assert_eq!(
+            recorder.received(),
+            requests.iter().map(|request| request.size).sum::<usize>()
+        );
     }
 
     #[tokio::test]
