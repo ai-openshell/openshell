@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Let callers pass driver config with volume and bind mounts. Resource admission
+# blocks bind mounts, which can't carry approval labels, so this disables it, as
+# the legacy e2e gateways did. The settings go to the gateway overrides (the
+# gateway_overrides role), which every installer applies to the gateway's
+# configuration.
+---
+- name: Caller driver config for tests
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Allow caller driver config and bind mounts
+      ansible.builtin.include_role:
+        name: gateway_overrides
+      vars:
+        gateway_overrides_name: driver-config
+        gateway_overrides_content: |
+          [openshell.drivers.{{ environment_driver }}]
+          allow_driver_config = true
+          enable_bind_mounts = true
+
+          [openshell.drivers.{{ environment_driver }}.resource_admission]
+          enabled = false
