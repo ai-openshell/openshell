@@ -12,27 +12,37 @@
 //! }
 //! ```
 //!
-//! It has three subcommands:
+//! Its subcommands:
 //!
 //! - `list [FILTER]...` prints each test's name and description.
 //! - `ready [--timeout SECS]` waits for the gateway, as `testkit-ready` does.
 //! - `run [FILTER]...` runs tests one at a time, each in its own process with
 //!   a timeout, and can write a `JUnit` report. Unix only.
+//! - `nextest-metadata DIR` describes the executable to nextest, so it can
+//!   run the prebuilt program without Cargo.
 //!
 //! Any other arguments are libtest's, so the program also works as a
 //! `harness = false` test target under `cargo test` and nextest: it answers
 //! `--list --format terse`, `--ignored`, and `<name> --exact --nocapture`.
 //! In that mode tests run in the program's own process, one at a time unless
 //! `--test-threads` says otherwise.
+//!
+//! `OPENSHELL_TEST_UNSUPPORTED` lists tests an environment does not support
+//! yet (see `unsupported.rs`). They are reported as ignored under every
+//! interface, and a forced run of one fails.
 
 #[cfg(unix)]
 mod capture;
 #[cfg(unix)]
 mod junit;
+mod nextest;
 #[cfg(unix)]
 mod process;
 #[cfg(unix)]
 mod supervisor;
+mod unsupported;
+
+pub(crate) use unsupported::Unsupported;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -55,9 +65,19 @@ pub fn main() -> ExitCode {
     main_with(&TESTS)
 }
 
+/// Run a suite program with the package and binary names it has under Cargo.
+/// These names are used by `nextest-metadata`, even if the executable is renamed.
+pub fn main_for(package: &str, binary: &str) -> ExitCode {
+    dispatch(&TESTS, Some((package, binary)))
+}
+
 /// [`main`] over `tests` instead of every registered test.
 #[doc(hidden)]
 pub fn main_with(tests: &'static [Test]) -> ExitCode {
+    dispatch(tests, None)
+}
+
+fn dispatch(tests: &'static [Test], identity: Option<(&str, &str)>) -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     let program = program_name(&args);
     // A suite crate that the program never names is not linked, and its
@@ -73,6 +93,13 @@ pub fn main_with(tests: &'static [Test]) -> ExitCode {
         eprintln!("{program}: {error}");
         return ExitCode::from(ERROR_EXIT);
     }
+    let unsupported = match Unsupported::from_env(tests) {
+        Ok(unsupported) => unsupported,
+        Err(error) => {
+            eprintln!("{program}: {error}");
+            return ExitCode::from(ERROR_EXIT);
+        }
+    };
     let first = args.get(1).and_then(|arg| arg.to_str());
     if first.is_some_and(|arg| RESERVED_NAMES.contains(&arg) || arg == "-h" || arg == "--help") {
         let cli = match Cli::try_parse_from(&args) {
@@ -82,9 +109,9 @@ pub fn main_with(tests: &'static [Test]) -> ExitCode {
                 return ExitCode::from(if error.use_stderr() { ERROR_EXIT } else { 0 });
             }
         };
-        command(&program, tests, cli.command)
+        command(&program, tests, unsupported, cli.command, identity)
     } else {
-        libtest(tests, args)
+        libtest(tests, unsupported, args)
     }
 }
 
@@ -104,6 +131,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Write metadata to run the prebuilt executable with cargo-nextest.
+    NextestMetadata {
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+    },
     /// Print each test's name and description, including ignored tests.
     List {
         /// Show tests whose name contains any of these (all if none).
@@ -148,10 +180,30 @@ fn seconds(value: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("{value:?} is not a positive number of seconds"))
 }
 
-fn command(program: &str, tests: &'static [Test], command: Command) -> ExitCode {
+fn command(
+    program: &str,
+    tests: &'static [Test],
+    unsupported: Unsupported,
+    command: Command,
+    identity: Option<(&str, &str)>,
+) -> ExitCode {
     match command {
+        Command::NextestMetadata { dir } => {
+            let package = tests[0].package();
+            let (package, binary) = identity.unwrap_or((package, program));
+            match nextest::write(&dir, package, binary) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!(
+                        "{program}: write nextest metadata to {}: {error}",
+                        dir.display()
+                    );
+                    ExitCode::from(ERROR_EXIT)
+                }
+            }
+        }
         Command::List { filters } => {
-            list(tests, filters);
+            list(tests, &unsupported, filters);
             ExitCode::SUCCESS
         }
         Command::Ready { timeout } => ready(program, timeout),
@@ -167,6 +219,7 @@ fn command(program: &str, tests: &'static [Test], command: Command) -> ExitCode 
             Selection {
                 filters,
                 include_ignored,
+                unsupported,
             },
             timeout,
             grace,
@@ -197,6 +250,7 @@ fn run(
         grace,
         junit,
     };
+    announce(&options.selection.unsupported);
     supervisor::run(program, &exe, tests, &options)
 }
 
@@ -216,16 +270,18 @@ fn run(
 }
 
 /// One line per test: name and description, in aligned columns.
-/// An ignored test's description ends with `[ignored]` or its reason.
-fn list(tests: &[Test], filters: Vec<String>) {
+/// An ignored test's description ends with `[ignored]` or its reason, an
+/// unsupported one's with `[unsupported: <issue>]`.
+fn list(tests: &[Test], unsupported: &Unsupported, filters: Vec<String>) {
     let selection = Selection {
         filters,
         include_ignored: true,
+        ..Selection::default()
     };
     let rows: Vec<_> = selection
         .apply(tests)
         .into_iter()
-        .map(|(test, _)| (test.name(), describe(test)))
+        .map(|(test, _)| (test.name(), describe(test, unsupported)))
         .collect();
     let name_width = rows.iter().map(|row| row.0.len()).max().unwrap_or(0);
     for (name, description) in rows {
@@ -233,12 +289,13 @@ fn list(tests: &[Test], filters: Vec<String>) {
     }
 }
 
-fn describe(test: &Test) -> String {
+fn describe(test: &Test, unsupported: &Unsupported) -> String {
     let description = test.info.description;
-    match (test.ignored, test.ignore_reason) {
-        (false, _) => description.to_string(),
-        (true, None) => format!("{description} [ignored]"),
-        (true, Some(reason)) => format!("{description} [ignored: {reason}]"),
+    match (test.ignored, test.ignore_reason, unsupported.issue(test)) {
+        (_, _, Some(issue)) => format!("{description} [unsupported: {issue}]"),
+        (false, _, None) => description.to_string(),
+        (true, None, None) => format!("{description} [ignored]"),
+        (true, Some(reason), None) => format!("{description} [ignored: {reason}]"),
     }
 }
 
@@ -263,7 +320,7 @@ fn ready(program: &str, timeout: Duration) -> ExitCode {
 
 /// libtest's interface, for `cargo test` and nextest, and for `run`'s test
 /// processes.
-fn libtest(tests: &'static [Test], args: Vec<OsString>) -> ExitCode {
+fn libtest(tests: &'static [Test], unsupported: Unsupported, args: Vec<OsString>) -> ExitCode {
     let mut args = libtest_mimic::Arguments::from_iter(args);
     // Tests share one gateway; run them one at a time unless asked otherwise.
     if args.test_threads.is_none() {
@@ -274,11 +331,18 @@ fn libtest(tests: &'static [Test], args: Vec<OsString>) -> ExitCode {
     let trials = tests
         .into_iter()
         .map(|test| {
+            let issue = unsupported.issue(test).map(str::to_string);
+            let ignored = test.ignored || issue.is_some();
             libtest_mimic::Trial::test(test.name(), move || {
+                // An unsupported test is ignored, so this runs only when a
+                // forced run asks for it.
+                if let Some(issue) = issue {
+                    return Err(Unsupported::refusal(&issue).into());
+                }
                 run_in_process(test);
                 Ok(())
             })
-            .with_ignored_flag(test.ignored)
+            .with_ignored_flag(ignored)
         })
         .collect();
     let conclusion = libtest_mimic::run(&args, trials);
@@ -295,6 +359,16 @@ fn libtest(tests: &'static [Test], args: Vec<OsString>) -> ExitCode {
         return ExitCode::from(ERROR_EXIT);
     }
     conclusion.exit_code()
+}
+
+/// Print the active entries to stderr, so a forgotten variable shows.
+fn announce(unsupported: &Unsupported) {
+    for (name, issue) in unsupported.entries() {
+        eprintln!(
+            "testkit: {} lists {name} as unsupported: {issue}",
+            unsupported::ENV
+        );
+    }
 }
 
 /// Run one test on a fresh current-thread runtime, as `#[tokio::test]` does.

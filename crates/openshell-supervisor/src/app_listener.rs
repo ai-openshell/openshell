@@ -11,13 +11,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
-use http::{Request, Response, StatusCode, header};
+use http::{Method, Request, Response, StatusCode, Version, header};
+use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper::rt::Executor as _;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::grpc_client::SettingsPollResult;
-use openshell_core::proto::SandboxServiceRoute;
-use openshell_isolation_interface::contract::LoopbackTarget;
+use openshell_core::proto::{SandboxServiceRoute, ServiceBackendHttpVersion};
+use openshell_isolation_interface::contract::{BoundaryDuplexStream, LoopbackTarget};
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DispositionId,
     HttpActivityBuilder, HttpResponse, NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
@@ -25,7 +27,7 @@ use openshell_ocsf::{
 use openshell_sandbox_backend::BoundaryLoopbackConnector;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::sync::Mutex;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
@@ -33,6 +35,46 @@ use tokio_rustls::TlsAcceptor;
 const FRESHNESS: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_INSTANCE_CONNECTIONS: usize = 64;
+const MAX_HTTP2_STREAMS: u32 = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallRejection {
+    ConfigurationNotAdmitted,
+    InvalidWorkspace,
+    InvalidRoute,
+    DuplicateServiceName,
+    TooManyRoutes,
+    HostnameOutsideDomain,
+    InvalidHostname,
+    DuplicateHostname,
+    HostnameInUse,
+    Stopped,
+}
+
+impl InstallRejection {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::ConfigurationNotAdmitted => "configuration was not admitted",
+            Self::InvalidWorkspace => "workspace is not a canonical DNS label",
+            Self::InvalidRoute => "service route declaration is invalid",
+            Self::DuplicateServiceName => "service name is duplicated",
+            Self::TooManyRoutes => "service route limit exceeded",
+            Self::HostnameOutsideDomain => "application hostname is outside the listener domain",
+            Self::InvalidHostname => "application hostname is not a valid DNS name",
+            Self::DuplicateHostname => "application hostname is duplicated",
+            Self::HostnameInUse => "application hostname is registered to another sandbox",
+            Self::Stopped => "listener is stopped",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RejectedConfiguration {
+    instance_id: String,
+    revision: u64,
+    reason: InstallRejection,
+}
 
 pub struct Config {
     address: SocketAddr,
@@ -57,24 +99,26 @@ impl Config {
             }
         }
         let address = read("OPENSHELL_APP_LISTEN_ADDRESS");
-        let domain = read("OPENSHELL_APP_SERVICE_DOMAIN");
+        let base_url = read("OPENSHELL_APP_BASE_URL");
         let certificate = read("OPENSHELL_APP_TLS_CERT");
         let key = read("OPENSHELL_APP_TLS_KEY");
-        let (Some(address), Some(domain), Some(certificate), Some(key)) =
-            (address, domain, certificate, key)
+        let (Some(address), Some(base_url), Some(certificate), Some(key)) =
+            (address, base_url, certificate, key)
         else {
             return Err(miette::miette!(
-                "app listener requires address, domain, certificate, and key"
+                "app listener requires address, base_url, certificate, and key"
             ));
         };
         let address: SocketAddr = address.parse().into_diagnostic()?;
-        openshell_core::app_listener::AppListenerConfig {
+        let listener = openshell_core::app_listener::AppListenerConfig {
             enabled: true,
             port: address.port(),
-            domain: domain.clone(),
-        }
-        .validate()
-        .map_err(|error| miette::miette!(error))?;
+            base_url: Some(base_url),
+        };
+        listener
+            .validate()
+            .map_err(|error| miette::miette!(error))?;
+        let domain = listener.domain();
         Ok(Some(Self {
             address,
             domain,
@@ -94,7 +138,7 @@ impl Config {
             .with_no_client_auth()
             .with_single_cert(certificates, key)
             .into_diagnostic()?;
-        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let socket = std::net::TcpListener::bind(self.address).into_diagnostic()?;
         socket.set_nonblocking(true).into_diagnostic()?;
         let listener = tokio::net::TcpListener::from_std(socket).into_diagnostic()?;
@@ -104,16 +148,6 @@ impl Config {
             domain: self.domain,
         })
     }
-}
-
-fn valid_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= 63
-        && !label.starts_with('-')
-        && !label.ends_with('-')
-        && label
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 #[derive(Clone, Default)]
@@ -126,8 +160,19 @@ struct Snapshot {
     workspace: String,
     configuration_instance_id: String,
     config_revision: u64,
+    rejection: Option<RejectedConfiguration>,
     // Whole-sandbox suspension fence, independent of individual service edits.
     epoch: u64,
+}
+
+impl Snapshot {
+    fn suspend(&mut self) {
+        self.routes.clear();
+        self.generations.clear();
+        self.expires = None;
+        self.authority_expires = None;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -250,42 +295,47 @@ impl Routes {
         }
         let mut routes = BTreeMap::new();
         if !result.configuration_admitted {
-            self.suspend();
+            self.reject(result, InstallRejection::ConfigurationNotAdmitted);
             return;
         }
-        if result.configuration_admitted
-            && valid_label(&result.workspace)
-            && !result.workspace.contains("--")
+        if !openshell_core::app_listener::valid_dns_label(&result.workspace)
+            || result.workspace.contains("--")
         {
-            for route in &result.service_routes {
-                if route.endpoint_id.is_empty()
-                    || route.target_port == 0
-                    || route.target_port > 65535
-                    || !matches!(route.authorization_mode, 0..=2)
-                    || (!route.name.is_empty()
-                        && (!valid_label(&route.name) || route.name.contains("--")))
-                {
-                    self.suspend();
-                    return;
-                }
-                if routes.insert(route.name.clone(), route.clone()).is_some() {
-                    self.suspend();
-                    return;
-                }
+            self.reject(result, InstallRejection::InvalidWorkspace);
+            return;
+        }
+        for route in &result.service_routes {
+            if route.endpoint_id.is_empty()
+                || route.target_port == 0
+                || route.target_port > 65535
+                || !matches!(route.authorization_mode, 0..=2)
+                || ServiceBackendHttpVersion::try_from(route.backend_http_version).is_err()
+                || (!route.name.is_empty()
+                    && (!openshell_core::app_listener::valid_dns_label(&route.name)
+                        || route.name.contains("--")))
+            {
+                self.reject(result, InstallRejection::InvalidRoute);
+                return;
+            }
+            if routes.insert(route.name.clone(), route.clone()).is_some() {
+                self.reject(result, InstallRejection::DuplicateServiceName);
+                return;
             }
         }
-        if routes.len() > 1024 || !valid_label(&result.workspace) || result.workspace.contains("--")
-        {
-            self.suspend();
+        if routes.len() > 1024 {
+            self.reject(result, InstallRejection::TooManyRoutes);
             return;
         }
         if let Some(registration) = &self.registration
-            && !registration.bind(&result.workspace, &self.stopped)
+            && let Err(reason) = registration.bind(&result.workspace, &routes, &self.stopped)
         {
-            self.suspend();
+            self.reject(result, reason);
             return;
         }
-        let changed = self.sender.borrow().routes != routes;
+        let changed = {
+            let snapshot = self.sender.borrow();
+            snapshot.routes != routes || snapshot.rejection.is_some()
+        };
         self.sender.send_modify(|snapshot| {
             // Renewal after a lapse cannot revive a connection whose lease expired.
             if snapshot
@@ -318,6 +368,7 @@ impl Routes {
                 .configuration_instance_id
                 .clone_from(&result.configuration_instance_id);
             snapshot.config_revision = result.config_revision;
+            snapshot.rejection = None;
             snapshot.routes = routes;
             snapshot.generations = generations;
             snapshot.expires = Some(Instant::now() + FRESHNESS);
@@ -330,6 +381,45 @@ impl Routes {
                     .message("App listener service routes updated")
                     .build()
             );
+        }
+    }
+
+    fn reject(&self, result: &SettingsPollResult, reason: InstallRejection) {
+        let rejection = RejectedConfiguration {
+            instance_id: result.configuration_instance_id.clone(),
+            revision: result.config_revision,
+            reason,
+        };
+        let mut changed = false;
+        self.sender.send_modify(|snapshot| {
+            snapshot.suspend();
+            if reason != InstallRejection::Stopped
+                && !self.stopped.load(Ordering::Acquire)
+                && snapshot.rejection.as_ref() != Some(&rejection)
+            {
+                snapshot.rejection = Some(rejection);
+                changed = true;
+            }
+        });
+        if changed {
+            let mut event = ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .unmapped("reason", reason.reason())
+                .unmapped("config_revision", result.config_revision)
+                .message(format!(
+                    "App listener service routes rejected: {}",
+                    reason.reason()
+                ));
+            if let Some(registration) = &self.registration {
+                event = event.unmapped("sandbox", registration.sandbox.as_str());
+            }
+            if openshell_core::app_listener::valid_dns_label(&result.workspace)
+                && !result.workspace.contains("--")
+            {
+                event = event.unmapped("workspace", result.workspace.as_str());
+            }
+            ocsf_emit!(event.build());
         }
     }
 
@@ -350,13 +440,7 @@ impl Routes {
     }
 
     pub(crate) fn suspend(&self) {
-        self.sender.send_modify(|snapshot| {
-            snapshot.routes.clear();
-            snapshot.generations.clear();
-            snapshot.expires = None;
-            snapshot.authority_expires = None;
-            snapshot.epoch = snapshot.epoch.wrapping_add(1);
-        });
+        self.sender.send_modify(Snapshot::suspend);
     }
 
     fn resolve(
@@ -366,15 +450,19 @@ impl Routes {
         domain: &str,
     ) -> Option<(SandboxServiceRoute, RouteToken)> {
         let encoded = sni.strip_suffix(&format!(".{domain}"))?;
-        let service = if encoded == prefix {
-            ""
-        } else {
-            encoded.strip_prefix(&format!("{prefix}--"))?
-        };
         let snapshot = self.sender.borrow();
         if self.serving_expiry(&snapshot)? <= Instant::now() {
             return None;
         }
+        let service = if let Some(route) = snapshot.routes.values().find(|route| {
+            !route.application_hostname.is_empty() && route.application_hostname == sni
+        }) {
+            route.name.as_str()
+        } else if encoded == prefix {
+            ""
+        } else {
+            encoded.strip_prefix(&format!("{prefix}--"))?
+        };
         Some((
             snapshot.routes.get(service)?.clone(),
             RouteToken {
@@ -401,7 +489,11 @@ impl Routes {
                 expiry
             };
             tokio::select! {
-                () = tokio::time::sleep_until(expiry) => return,
+                () = tokio::time::sleep_until(expiry) => {
+                    // A renewal and the old timer can both become ready before
+                    // this task is polled. Check the current lease before closing.
+                    if !self.valid(route, token) { return; }
+                },
                 result = receiver.changed() => if result.is_err() { return; },
             }
         }
@@ -425,19 +517,47 @@ pub struct Router {
 
 struct Accepted {
     tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
 }
 
 struct Registration {
     router: Router,
     sandbox: String,
     prefix: Mutex<String>,
+    hostnames: Mutex<Vec<String>>,
     sender: mpsc::Sender<Accepted>,
 }
 
 impl Registration {
-    fn bind(&self, workspace: &str, stopped: &AtomicBool) -> bool {
+    fn bind(
+        &self,
+        workspace: &str,
+        routes: &BTreeMap<String, SandboxServiceRoute>,
+        stopped: &AtomicBool,
+    ) -> std::result::Result<(), InstallRejection> {
         let next = format!("{workspace}--{}", self.sandbox);
+        let mut names = vec![next.clone()];
+        for route in routes.values() {
+            if route.application_hostname.is_empty() {
+                continue; // Older gateways only supplied the readable route identity.
+            }
+            let Some(label) = route
+                .application_hostname
+                .strip_suffix(&format!(".{}", self.router.domain))
+            else {
+                return Err(InstallRejection::HostnameOutsideDomain);
+            };
+            if !openshell_core::app_listener::valid_dns_label(label)
+                || route.application_hostname.len() > 253
+            {
+                return Err(InstallRejection::InvalidHostname);
+            }
+            names.push(route.application_hostname.clone());
+        }
+        names.sort();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(InstallRejection::DuplicateHostname);
+        }
         let mut prefix = self
             .prefix
             .lock()
@@ -446,35 +566,50 @@ impl Registration {
         // the registration. An install that passed its first check must not
         // reinsert the old sender after that removal.
         if stopped.load(Ordering::Acquire) {
-            return false;
+            return Err(InstallRejection::Stopped);
         }
+        let mut hostnames = self
+            .hostnames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut entries = self
             .router
             .registrations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if entries
-            .get(&next)
-            .is_some_and(|sender| !sender.same_channel(&self.sender))
-        {
-            return false;
+        // Check the whole replacement before changing any registration. An exact
+        // hashed label must never select an arbitrary sandbox on a shared host.
+        if names.iter().any(|name| {
+            entries
+                .get(name)
+                .is_some_and(|sender| !sender.same_channel(&self.sender))
+        }) {
+            return Err(InstallRejection::HostnameInUse);
         }
-        if *prefix != next {
+        for name in hostnames.iter() {
             if entries
-                .get(&*prefix)
-                .is_some_and(|s| s.same_channel(&self.sender))
+                .get(name)
+                .is_some_and(|sender| sender.same_channel(&self.sender))
             {
-                entries.remove(&*prefix);
+                entries.remove(name);
             }
-            prefix.clone_from(&next);
         }
-        entries.insert(next, self.sender.clone());
-        true
+        for name in &names {
+            entries.insert(name.clone(), self.sender.clone());
+        }
+        *prefix = next;
+        *hostnames = names;
+        Ok(())
     }
 
     fn remove(&self) {
-        let prefix = self
+        // Use the same lock as bind's stopped check, including exact aliases.
+        let _prefix = self
             .prefix
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hostnames = self
+            .hostnames
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut entries = self
@@ -482,11 +617,13 @@ impl Registration {
             .registrations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if entries
-            .get(&*prefix)
-            .is_some_and(|s| s.same_channel(&self.sender))
-        {
-            entries.remove(&*prefix);
+        for name in hostnames.iter() {
+            if entries
+                .get(name)
+                .is_some_and(|sender| sender.same_channel(&self.sender))
+            {
+                entries.remove(name);
+            }
         }
     }
 }
@@ -543,7 +680,7 @@ impl Drop for Handle {
 
 impl Router {
     pub(crate) fn instance(&self, sandbox: &str) -> Result<InstanceListener> {
-        if !valid_label(sandbox) || sandbox.contains("--") {
+        if !openshell_core::app_listener::valid_dns_label(sandbox) || sandbox.contains("--") {
             return Err(miette::miette!(
                 "app listener requires a canonical sandbox name"
             ));
@@ -553,6 +690,7 @@ impl Router {
             router: self.clone(),
             sandbox: sandbox.to_string(),
             prefix: Mutex::new(String::new()),
+            hostnames: Mutex::new(Vec::new()),
             sender,
         });
         Ok(InstanceListener {
@@ -592,10 +730,15 @@ impl BoundListener {
                             let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await else { return; };
                             let Some(sni) = tls.get_ref().1.server_name() else { return; };
                             let Some(label) = sni.strip_suffix(&format!(".{domain}")) else { return; };
-                            let mut segments = label.split("--");
-                            let (Some(workspace), Some(sandbox)) = (segments.next(), segments.next()) else { return; };
-                            let prefix = format!("{workspace}--{sandbox}");
-                            let sender = dispatch.registrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&prefix).cloned();
+                            let sender = {
+                                let entries = dispatch.registrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                entries.get(sni).cloned().or_else(|| {
+                                    // Keep readable aliases during migration, as gateway routing does.
+                                    let mut segments = label.split("--");
+                                    let (Some(workspace), Some(sandbox)) = (segments.next(), segments.next()) else { return None; };
+                                    entries.get(&format!("{workspace}--{sandbox}")).cloned()
+                                })
+                            };
                             if let Some(sender) = sender { let _ = sender.try_send(Accepted { tls, permit }); }
                         });
                     }
@@ -607,8 +750,9 @@ impl BoundListener {
 }
 
 struct Permits {
-    _host: tokio::sync::OwnedSemaphorePermit,
-    _instance: tokio::sync::OwnedSemaphorePermit,
+    _host: OwnedSemaphorePermit,
+    _instance: OwnedSemaphorePermit,
+    relays: Arc<Semaphore>,
 }
 
 impl InstanceListener {
@@ -619,7 +763,9 @@ impl InstanceListener {
         let retained_routes = self.routes.clone();
         let task = tokio::spawn(async move {
             let routes = self.routes.clone();
-            let permits = Arc::new(Semaphore::new(64));
+            let permits = Arc::new(Semaphore::new(MAX_INSTANCE_CONNECTIONS));
+            // Multiplexed requests share the previous per-instance relay budget.
+            let relays = Arc::new(Semaphore::new(MAX_INSTANCE_CONNECTIONS));
             let mut connections = JoinSet::new();
             ocsf_emit!(
                 AppLifecycleBuilder::new(crate::ocsf_ctx())
@@ -642,17 +788,40 @@ impl InstanceListener {
                         };
                         let routes = routes.clone();
                         let connector = connector.clone();
+                        let relays = relays.clone();
                         connections.spawn(async move {
                             let connection_routes = routes.clone();
                             let connection_route = route.clone();
-                            let permit = Arc::new(Permits { _host: host_permit, _instance: instance_permit });
-                            let service = hyper::service::service_fn(move |req| {
+                            let permit = Arc::new(Permits { _host: host_permit, _instance: instance_permit, relays });
+                            let service = move |req| {
                                 proxy(req, sni.clone(), route.clone(), routes.clone(), connector.clone(), permit.clone(), token)
-                            });
-                            let connection = hyper::server::conn::http1::Builder::new()
-                                .timer(TokioTimer::new()).header_read_timeout(HANDSHAKE_TIMEOUT)
-                                .max_buf_size(65536).max_headers(64)
-                                .serve_connection(TokioIo::new(tls), service).with_upgrades();
+                            };
+                            let connection = async {
+                                if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                                    let first_request = Arc::new(Notify::new());
+                                    let started = first_request.clone();
+                                    let service = hyper::service::service_fn(move |req| {
+                                        started.notify_one();
+                                        service(req)
+                                    });
+                                    let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                                        .max_concurrent_streams(MAX_HTTP2_STREAMS)
+                                        .max_header_list_size(65536)
+                                        .serve_connection(TokioIo::new(tls), service);
+                                    tokio::pin!(connection);
+                                    tokio::select! {
+                                        result = &mut connection => return result,
+                                        () = first_request.notified() => {},
+                                        () = tokio::time::sleep(HANDSHAKE_TIMEOUT) => return Ok(()),
+                                    }
+                                    connection.await
+                                } else {
+                                    hyper::server::conn::http1::Builder::new()
+                                        .timer(TokioTimer::new()).header_read_timeout(HANDSHAKE_TIMEOUT)
+                                        .max_buf_size(65536).max_headers(64)
+                                        .serve_connection(TokioIo::new(tls), hyper::service::service_fn(service)).with_upgrades().await
+                                }
+                            };
                             tokio::select! {
                                 _ = connection => {},
                                 () = connection_routes.revoked(&connection_route, token) => {},
@@ -720,31 +889,33 @@ fn emit_denial(message: &str) {
     );
 }
 
-fn authority_matches<B>(req: &Request<B>, sni: &str) -> bool {
+fn request_authority<B>(req: &Request<B>, sni: &str) -> Option<header::HeaderValue> {
     let mut values = req.headers().get_all(header::HOST).iter();
-    let Some(value) = values.next() else {
-        return false;
+    let host = values
+        .next()
+        .map(header::HeaderValue::to_str)
+        .transpose()
+        .ok()?;
+    let uri_authority = req.uri().authority().map(http::uri::Authority::as_str);
+    let value = if req.version() == Version::HTTP_2 {
+        uri_authority?
+    } else {
+        host?
     };
-    if values.next().is_some() {
-        return false;
+    if values.next().is_some()
+        || host.is_some_and(|host| !host.eq_ignore_ascii_case(value))
+        || uri_authority.is_some_and(|uri| !uri.eq_ignore_ascii_case(value))
+        || value.contains('@')
+    {
+        return None;
     }
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    if value.contains('@') {
-        return false;
+    let authority = value.parse::<http::uri::Authority>().ok()?;
+    if !authority.host().eq_ignore_ascii_case(sni)
+        || (authority.port().is_some() && authority.port_u16().is_none())
+    {
+        return None;
     }
-    let Ok(authority) = value.parse::<http::uri::Authority>() else {
-        return false;
-    };
-    if authority.port().is_some() && authority.port_u16().is_none() {
-        return false;
-    }
-    authority.host().eq_ignore_ascii_case(sni)
-        && req
-            .uri()
-            .authority()
-            .is_none_or(|uri| uri.as_str().eq_ignore_ascii_case(value))
+    value.parse().ok()
 }
 
 fn gateway_header(name: &str) -> bool {
@@ -870,20 +1041,34 @@ async fn proxy(
     if !routes.valid(&route, token) {
         return Ok(error(StatusCode::SERVICE_UNAVAILABLE));
     }
-    if !authority_matches(&req, &sni) {
+    let Some(authority) = request_authority(&req, &sni) else {
         return Ok(error(StatusCode::MISDIRECTED_REQUEST));
+    };
+    let downstream_http2 = req.version() == Version::HTTP_2;
+    let backend_http2 = route.backend_http_version == ServiceBackendHttpVersion::Http2 as i32;
+    if backend_http2 && !downstream_http2 {
+        return Ok(error(StatusCode::HTTP_VERSION_NOT_SUPPORTED));
     }
-    // Keep the public authority after validating it against SNI. The dial target
-    // is loopback, but rewriting Host would break application same-origin checks.
-    let authority = req.headers()[header::HOST].clone();
-    let websocket = req
+    if downstream_http2 && req.method() == Method::CONNECT {
+        return Ok(error(StatusCode::METHOD_NOT_ALLOWED));
+    }
+    let websocket = !downstream_http2
+        && req
+            .headers()
+            .get(header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    let te_trailers = req
         .headers()
-        .get(header::UPGRADE)
-        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+        .get(header::TE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"trailers"));
     if !sanitize_headers(req.headers_mut(), route.authorization_mode == 2, websocket) {
         return Ok(error(StatusCode::BAD_REQUEST));
     }
-    let downstream = websocket.then(|| hyper::upgrade::on(&mut req));
+    // Preserve the validated public authority for application same-origin checks.
+    req.headers_mut().insert(header::HOST, authority);
+    let Ok(relay_permit) = permit.relays.clone().try_acquire_owned() else {
+        return Ok(error(StatusCode::SERVICE_UNAVAILABLE));
+    };
     let target = LoopbackTarget::new(
         "127.0.0.1".parse().expect("loopback"),
         u16::try_from(route.target_port).expect("validated route port"),
@@ -893,25 +1078,37 @@ async fn proxy(
     else {
         return Ok(error(StatusCode::BAD_GATEWAY));
     };
+    let (active, receiver) = watch::channel(());
+    let executor = RelayExecutor {
+        active: receiver,
+        permit: Arc::new(relay_permit),
+    };
+    if backend_http2 {
+        if te_trailers {
+            req.headers_mut()
+                .insert(header::TE, header::HeaderValue::from_static("trailers"));
+        }
+        return Ok(proxy_http2(req, stream, executor, active).await);
+    }
+    let downstream = websocket.then(|| hyper::upgrade::on(&mut req));
     let Ok((mut sender, connection)) =
         hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
     else {
         return Ok(error(StatusCode::BAD_GATEWAY));
     };
-    let upstream_task = tokio::spawn(async move {
-        let _ = connection.with_upgrades().await;
-    });
+    executor.execute(connection.with_upgrades());
     let (mut parts, body) = req.into_parts();
+    if downstream_http2 {
+        parts.version = Version::HTTP_11;
+    }
     parts.uri = parts
         .uri
         .path_and_query()
         .map_or("/", |path| path.as_str())
         .parse()
         .expect("valid path");
-    parts.headers.insert(header::HOST, authority);
     let response = sender.send_request(Request::from_parts(parts, body)).await;
     let Ok(mut response) = response else {
-        upstream_task.abort();
         return Ok(error(StatusCode::BAD_GATEWAY));
     };
     let upgraded = response.status() == StatusCode::SWITCHING_PROTOCOLS && websocket;
@@ -920,7 +1117,8 @@ async fn proxy(
         let upstream = hyper::upgrade::on(&mut response);
         let downstream = downstream.expect("websocket upgrade");
         tokio::spawn(async move {
-            let _permit = permit;
+            let _connection_permits = permit;
+            let _relay = (active, executor);
             tokio::select! {
                 () = async {
                     if let (Ok(upstream), Ok(downstream)) = tokio::join!(upstream, downstream) {
@@ -929,20 +1127,80 @@ async fn proxy(
                 } => {},
                 () = routes.revoked(&route, token) => {},
             }
-            upstream_task.abort();
         });
         let (parts, _) = response.into_parts();
         return Ok(Response::from_parts(parts, Body::empty()));
     }
-    let (parts, body) = response.into_parts();
-    Ok(Response::from_parts(parts, Body::new(body)))
+    Ok(response.map(|body| relay_body(body, active)))
+}
+
+#[derive(Clone)]
+struct RelayExecutor {
+    active: watch::Receiver<()>,
+    permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl<F> hyper::rt::Executor<F> for RelayExecutor
+where
+    F: Future + Send + 'static,
+{
+    fn execute(&self, future: F) {
+        let mut active = self.active.clone();
+        let permit = self.permit.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                _ = future => {},
+                _ = active.changed() => {},
+            }
+        });
+    }
+}
+
+fn relay_body(body: Incoming, active: watch::Sender<()>) -> Body {
+    Body::new(body.map_frame(move |frame| {
+        // Dropping the downstream body releases this request's loopback connection.
+        let _active = &active;
+        frame
+    }))
+}
+
+async fn proxy_http2(
+    req: Request<Incoming>,
+    stream: BoundaryDuplexStream,
+    executor: RelayExecutor,
+    active: watch::Sender<()>,
+) -> Response<Body> {
+    let handshake = hyper::client::conn::http2::handshake(executor.clone(), TokioIo::new(stream));
+    let Ok(Ok((mut sender, connection))) = tokio::time::timeout(CONNECT_TIMEOUT, handshake).await
+    else {
+        return error(StatusCode::BAD_GATEWAY);
+    };
+    executor.execute(connection);
+    let req = req.map(|body| {
+        body.map_frame(|mut frame| {
+            if let Some(trailers) = frame.trailers_mut() {
+                // Credentials are allowed only in the initial request headers.
+                sanitize_headers(trailers, false, false);
+            }
+            frame
+        })
+    });
+    let Ok(mut response) = sender.send_request(req).await else {
+        return error(StatusCode::BAD_GATEWAY);
+    };
+    strip_hop_headers(response.headers_mut(), false);
+    response.map(|body| relay_body(body, active))
 }
 
 #[cfg(test)]
 mod tests {
+    mod http2;
+
     use super::*;
     use futures::{SinkExt as _, StreamExt as _};
     use openshell_isolation_interface::contract::{BackendError, BoundaryDuplexStream};
+    use openshell_ocsf::test_support::OcsfCapture;
     use openshell_sandbox_backend::test_support as rpc_test;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -958,6 +1216,8 @@ mod tests {
             target_port: 8080,
             authorization_mode: 1,
             resource_version: 1,
+            application_hostname: String::new(),
+            backend_http_version: 0,
         };
         let mut config = installed(vec![route.clone()]);
         config.config_revision = 42;
@@ -984,6 +1244,45 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn queued_authority_renewal_preserves_stream_until_current_expiry() {
+        // Exercise selection with both the old timer and renewal notification
+        // ready, without letting the stream task observe the renewal early.
+        for _ in 0..64 {
+            let routes = Routes {
+                requires_authority: true,
+                ..Default::default()
+            };
+            routes.serving.store(true, Ordering::Release);
+            let route = SandboxServiceRoute {
+                endpoint_id: "endpoint".into(),
+                name: "web".into(),
+                target_port: 8080,
+                authorization_mode: 1,
+                resource_version: 1,
+                application_hostname: String::new(),
+                backend_http_version: 0,
+            };
+            routes.install(&installed(vec![route.clone()]));
+            let source = routes.installation_source();
+            source(Duration::from_secs(15));
+            let (_, token) = routes
+                .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+                .unwrap();
+            let revoked = routes.revoked(&route, token);
+            tokio::pin!(revoked);
+            assert!(futures::poll!(&mut revoked).is_pending());
+            tokio::time::advance(Duration::from_secs(10)).await;
+            source(Duration::from_secs(15));
+            tokio::time::advance(Duration::from_secs(6)).await;
+            assert!(routes.valid(&route, token));
+            assert!(futures::poll!(&mut revoked).is_pending());
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert!(!routes.valid(&route, token));
+            assert!(futures::poll!(&mut revoked).is_ready());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn shared_authority_expires_despite_config_renewal_and_fences_old_streams() {
         let routes = Routes {
             requires_authority: true,
@@ -996,6 +1295,8 @@ mod tests {
             target_port: 8080,
             authorization_mode: 1,
             resource_version: 1,
+            application_hostname: String::new(),
+            backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
         assert!(
@@ -1039,7 +1340,10 @@ mod tests {
     fn listener_requires_explicit_enablement_and_complete_configuration() {
         let complete = BTreeMap::from([
             ("OPENSHELL_APP_LISTEN_ADDRESS", "0.0.0.0:9443"),
-            ("OPENSHELL_APP_SERVICE_DOMAIN", "services.example.com"),
+            (
+                "OPENSHELL_APP_BASE_URL",
+                "https://SERVICES.example.com:10443",
+            ),
             ("OPENSHELL_APP_TLS_CERT", "/operator/cert.pem"),
             ("OPENSHELL_APP_TLS_KEY", "/operator/key.pem"),
         ]);
@@ -1056,14 +1360,11 @@ mod tests {
                 .is_none()
         );
         values.insert("OPENSHELL_APP_LISTENER_ENABLED", "true");
-        assert_eq!(
-            Config::from_values(|name| values.get(name).map(ToString::to_string))
-                .unwrap()
-                .unwrap()
-                .address
-                .port(),
-            9443
-        );
+        let configured = Config::from_values(|name| values.get(name).map(ToString::to_string))
+            .unwrap()
+            .unwrap();
+        assert_eq!(configured.address.port(), 9443);
+        assert_eq!(configured.domain, "services.example.com");
         values.remove("OPENSHELL_APP_TLS_KEY");
         assert!(Config::from_values(|name| values.get(name).map(ToString::to_string)).is_err());
         assert!(
@@ -1097,6 +1398,131 @@ mod tests {
             policy_validation_failure_mode: openshell_core::PolicyValidationFailureMode::default(),
             extension_authentication_enabled: false,
         }
+    }
+
+    #[test]
+    fn rejected_installations_emit_reasons_and_withdraw_routes() {
+        for reason in [
+            InstallRejection::ConfigurationNotAdmitted,
+            InstallRejection::InvalidWorkspace,
+            InstallRejection::InvalidRoute,
+            InstallRejection::DuplicateServiceName,
+            InstallRejection::HostnameOutsideDomain,
+            InstallRejection::InvalidHostname,
+            InstallRejection::DuplicateHostname,
+            InstallRejection::HostnameInUse,
+        ] {
+            let router = Router {
+                domain: "apps.example.com".into(),
+                ..Default::default()
+            };
+            let instance = router.instance("sandbox-a").unwrap();
+            let route = SandboxServiceRoute {
+                endpoint_id: "endpoint-a".into(),
+                name: "web".into(),
+                target_port: 8080,
+                application_hostname: "web.apps.example.com".into(),
+                ..Default::default()
+            };
+            let initial = installed(vec![SandboxServiceRoute {
+                application_hostname: "initial.apps.example.com".into(),
+                ..route.clone()
+            }]);
+            instance.routes.install(&initial);
+            let owner = router.instance("sandbox-b").unwrap();
+            let mut rejected = installed(vec![route.clone()]);
+            match reason {
+                InstallRejection::ConfigurationNotAdmitted => {
+                    rejected.configuration_admitted = false;
+                    rejected.configuration_error = "unvalidated-error-details".into();
+                }
+                InstallRejection::InvalidWorkspace => {
+                    rejected.workspace = "invalid/workspace".into();
+                }
+                InstallRejection::InvalidRoute => rejected.service_routes[0].target_port = 0,
+                InstallRejection::DuplicateServiceName => {
+                    rejected.service_routes.push(route.clone());
+                }
+                InstallRejection::HostnameOutsideDomain => {
+                    rejected.service_routes[0].application_hostname =
+                        "web.other.example.com".into();
+                }
+                InstallRejection::InvalidHostname => {
+                    rejected.service_routes[0].application_hostname =
+                        "bad.label.apps.example.com".into();
+                }
+                InstallRejection::DuplicateHostname => {
+                    rejected.service_routes.push(SandboxServiceRoute {
+                        name: "other".into(),
+                        endpoint_id: "endpoint-b".into(),
+                        ..route.clone()
+                    });
+                }
+                InstallRejection::HostnameInUse => owner.routes.install(&installed(vec![route])),
+                _ => unreachable!("only tested rejections"),
+            }
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            instance.routes.install(&rejected);
+            instance.routes.install(&rejected);
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{reason:?}");
+            let event = &events[0];
+            assert_eq!(event["class_uid"], 5019);
+            assert_eq!(event["status_id"], StatusId::Failure as u8);
+            assert_eq!(event["severity_id"], SeverityId::Low as u8);
+            assert_eq!(event["unmapped"]["reason"], reason.reason());
+            assert_eq!(event["unmapped"]["sandbox"], "sandbox-a");
+            if reason == InstallRejection::InvalidWorkspace {
+                assert!(event["unmapped"].get("workspace").is_none());
+            } else {
+                assert_eq!(event["unmapped"]["workspace"], "default");
+            }
+            assert_eq!(
+                event["unmapped"]["config_revision"],
+                rejected.config_revision
+            );
+            assert_eq!(
+                event["message"],
+                format!("App listener service routes rejected: {}", reason.reason())
+            );
+            assert!(!event.to_string().contains("unvalidated-error-details"));
+            let snapshot = instance.routes.sender.borrow();
+            assert!(snapshot.routes.is_empty());
+            assert!(snapshot.expires.is_none());
+            drop(snapshot);
+            if reason == InstallRejection::HostnameInUse {
+                assert!(
+                    router.registrations.lock().unwrap()["web.apps.example.com"]
+                        .same_channel(&owner.routes.registration.as_ref().unwrap().sender)
+                );
+            }
+            rejected.config_revision += 1;
+            instance.routes.install(&rejected);
+            assert_eq!(capture.events().len(), 2);
+            rejected.configuration_instance_id = "runtime-b".into();
+            instance.routes.install(&rejected);
+            assert_eq!(capture.events().len(), 3);
+        }
+    }
+
+    #[test]
+    fn successful_installation_resets_rejection_logging() {
+        let routes = Routes::default();
+        let accepted = installed(Vec::new());
+        let mut rejected = accepted.clone();
+        rejected.configuration_admitted = false;
+        let capture = OcsfCapture::default();
+        let _guard = capture.install();
+        routes.install(&rejected);
+        routes.install(&rejected);
+        routes.install(&accepted);
+        routes.install(&rejected);
+        let events = capture.json_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["status_id"], StatusId::Failure as u8);
+        assert_eq!(events[1]["status_id"], StatusId::Success as u8);
+        assert_eq!(events[2]["status_id"], StatusId::Failure as u8);
     }
 
     struct Connector {
@@ -1162,6 +1588,13 @@ mod tests {
                             .body(Body::from("upstream closed"))
                             .unwrap());
                     }
+                    if req.uri().path() == "/stream" {
+                        return Ok(Response::new(Body::from_stream(
+                            futures::stream::pending::<
+                                Result<hyper::body::Bytes, std::convert::Infallible>,
+                            >(),
+                        )));
+                    }
                     let body = format!(
                         "{} {} {} {}",
                         req.uri(),
@@ -1187,7 +1620,7 @@ mod tests {
     }
 
     struct Fixture {
-        _directory: tempfile::TempDir,
+        directory: tempfile::TempDir,
         handle: Handle,
         address: SocketAddr,
         tls: Arc<rustls::ClientConfig>,
@@ -1232,6 +1665,8 @@ mod tests {
             target_port: 8080,
             authorization_mode: 1,
             resource_version: 1,
+            application_hostname: String::new(),
+            backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
         let connector = Arc::new(Connector {
@@ -1239,7 +1674,7 @@ mod tests {
         });
         let handle = instance.start(rpc_test::loopback(connector.clone()));
         Fixture {
-            _directory: directory,
+            directory,
             handle,
             address,
             tls,
@@ -1261,7 +1696,7 @@ mod tests {
         host: &str,
         extra: &str,
     ) -> String {
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(f.address)
             .await
             .unwrap();
         let server_name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
@@ -1290,7 +1725,7 @@ mod tests {
         use http_body_util::BodyExt as _;
 
         let f = fixture();
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(f.address)
             .await
             .unwrap();
         let tls = tokio_rustls::TlsConnector::from(f.tls.clone())
@@ -1354,6 +1789,96 @@ mod tests {
         assert!(
             response.contains(&format!("/hello?x=1 {authority} stripped {origin}")),
             "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hashed_sni_routes_to_the_correct_instance_and_replacement_withdraws_old_names() {
+        let f = fixture();
+        let hostname = |gateway, sandbox, service| {
+            format!(
+                "{}.svc.openshell.internal",
+                openshell_core::app_listener::service_route_hash_label(
+                    gateway,
+                    "default",
+                    sandbox,
+                    Some(service)
+                )
+            )
+        };
+        let first_host = hostname("gateway-a", "sandbox-a", "web");
+        let mut first = f.route.clone();
+        first.application_hostname.clone_from(&first_host);
+        f.routes.install(&installed(vec![first.clone()]));
+        assert!(
+            request(&f, &first_host, &first_host, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            request(&f, &first_host, HOST, "")
+                .await
+                .starts_with("HTTP/1.1 421")
+        );
+        // Readable migration aliases remain usable, as with gateway-mediated hosts.
+        assert!(
+            request(&f, HOST, HOST, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        let before = f.connector.calls.load(Ordering::SeqCst);
+        let foreign = hostname("gateway-b", "sandbox-a", "web");
+        assert!(
+            !request(&f, &foreign, &foreign, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert_eq!(f.connector.calls.load(Ordering::SeqCst), before);
+
+        let second = f.host.router().instance("sandbox-b").unwrap();
+        let second_routes = second.routes.clone();
+        let connector = Arc::new(Connector {
+            calls: AtomicUsize::new(0),
+        });
+        let handle = second.start(rpc_test::loopback(connector.clone()));
+        // A canonical hostname collision cannot steal another instance's mapping.
+        second_routes.install(&installed(vec![first.clone()]));
+        assert!(second_routes.sender.borrow().routes.is_empty());
+        let second_host = hostname("gateway-a", "sandbox-b", "web");
+        second_routes.install(&installed(vec![SandboxServiceRoute {
+            application_hostname: second_host.clone(),
+            endpoint_id: "endpoint-b".into(),
+            ..first.clone()
+        }]));
+        assert!(
+            request(&f, &second_host, &second_host, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+        let (_, token) = f
+            .routes
+            .resolve(&first_host, "default--sandbox-a", "svc.openshell.internal")
+            .unwrap();
+        let mut replacement = first.clone();
+        replacement.application_hostname.clone_from(&foreign);
+        f.routes.install(&installed(vec![replacement]));
+        assert!(!f.routes.valid(&first, token));
+        assert!(
+            !request(&f, &first_host, &first_host, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            request(&f, &foreign, &foreign, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        drop(handle);
+        assert!(
+            !request(&f, &second_host, &second_host, "")
+                .await
+                .starts_with("HTTP/1.1 200")
         );
     }
 
@@ -1439,14 +1964,34 @@ mod tests {
         });
         let mut installing_routes = f.routes.clone();
         installing_routes.install_probe = Some(probe.clone());
-        let snapshot = installed(vec![f.route.clone()]);
-        let installer = std::thread::spawn(move || installing_routes.install(&snapshot));
+        let hostname = format!(
+            "{}.svc.openshell.internal",
+            openshell_core::app_listener::service_route_hash_label(
+                "gateway-a",
+                "default",
+                "sandbox-a",
+                Some("web")
+            )
+        );
+        let mut route = f.route.clone();
+        route.application_hostname.clone_from(&hostname);
+        let snapshot = installed(vec![route.clone()]);
+        let capture = OcsfCapture::default();
+        let thread_capture = capture.clone();
+        let installer = std::thread::spawn(move || {
+            let _guard = thread_capture.install();
+            installing_routes.install(&snapshot);
+        });
         probe.checked_running.wait();
         // Complete shutdown after install's optimistic stopped check but
         // before its registration insertion, rather than relying on timing.
         drop(f.handle);
         probe.resume.wait();
         installer.join().unwrap();
+        assert!(
+            capture.events().is_empty(),
+            "shutdown is not a configuration failure"
+        );
         assert!(
             !f.host
                 .router()
@@ -1455,12 +2000,20 @@ mod tests {
                 .unwrap()
                 .contains_key("default--sandbox-a")
         );
+        assert!(
+            !f.host
+                .router()
+                .registrations
+                .lock()
+                .unwrap()
+                .contains_key(&hostname)
+        );
         let replacement = f.host.router().instance("sandbox-a").unwrap();
-        replacement.routes.install(&installed(vec![f.route]));
+        replacement.routes.install(&installed(vec![route]));
         assert!(
             replacement
                 .routes
-                .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+                .resolve(&hostname, "default--sandbox-a", "svc.openshell.internal")
                 .is_some(),
             "the stopped instance must not prevent its replacement from serving"
         );
@@ -1475,6 +2028,8 @@ mod tests {
             target_port: 8080,
             authorization_mode: 1,
             resource_version: 1,
+            application_hostname: String::new(),
+            backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
         for _ in 0..10 {
@@ -1587,47 +2142,68 @@ mod tests {
         assert!(!headers.contains_key("x-internal"));
     }
     #[tokio::test]
-    async fn websocket_echo_closes_on_route_withdrawal() {
-        let f = fixture();
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
-            .await
-            .unwrap();
-        let name = rustls::pki_types::ServerName::try_from(HOST.to_string()).unwrap();
-        let tls = tokio_rustls::TlsConnector::from(f.tls.clone())
-            .connect(name, stream)
-            .await
-            .unwrap();
-        let mut request = format!("wss://{HOST}/echo").into_client_request().unwrap();
-        request
-            .headers_mut()
-            .insert(header::ORIGIN, format!("https://{HOST}").parse().unwrap());
-        let (mut ws, response) = tokio_tungstenite::client_async(request, tls).await.unwrap();
-        assert_eq!(response.headers()["x-test-upstream-host"], HOST);
-        assert_eq!(
-            response.headers()["x-test-upstream-origin"],
-            format!("https://{HOST}")
-        );
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            "hello".into(),
-        ))
-        .await
-        .unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), ws.next())
+    async fn readable_and_hashed_websocket_echo_closes_on_route_withdrawal() {
+        for hashed in [false, true] {
+            let f = fixture();
+            let hostname = if hashed {
+                format!(
+                    "{}.svc.openshell.internal",
+                    openshell_core::app_listener::service_route_hash_label(
+                        "gateway-a",
+                        "default",
+                        "sandbox-a",
+                        Some("web")
+                    )
+                )
+            } else {
+                HOST.to_string()
+            };
+            let mut route = f.route.clone();
+            route.application_hostname.clone_from(&hostname);
+            f.routes.install(&installed(vec![route]));
+            let stream = openshell_core::net::connect_tcp_nodelay_best_effort(f.address)
                 .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-                .to_text()
-                .unwrap(),
-            "hello"
-        );
-        f.routes.suspend();
-        let closed = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .unwrap();
+            let name = rustls::pki_types::ServerName::try_from(hostname.clone()).unwrap();
+            let tls = tokio_rustls::TlsConnector::from(f.tls.clone())
+                .connect(name, stream)
+                .await
+                .unwrap();
+            let mut request = format!("wss://{hostname}/echo")
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().insert(
+                header::ORIGIN,
+                format!("https://{hostname}").parse().unwrap(),
+            );
+            let (mut ws, response) = tokio_tungstenite::client_async(request, tls).await.unwrap();
+            assert_eq!(response.headers()["x-test-upstream-host"], hostname);
+            assert_eq!(
+                response.headers()["x-test-upstream-origin"],
+                format!("https://{hostname}")
+            );
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                "hello".into(),
+            ))
             .await
             .unwrap();
-        assert!(closed.is_none() || closed.unwrap().is_err());
-        assert_eq!(f.connector.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), ws.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .to_text()
+                    .unwrap(),
+                "hello"
+            );
+            f.routes.suspend();
+            let closed = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .unwrap();
+            assert!(closed.is_none() || closed.unwrap().is_err());
+            assert_eq!(f.connector.calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     type TestWebSocket =
@@ -1639,7 +2215,7 @@ mod tests {
 
     async fn sandbox_websocket(f: &Fixture, sandbox: &str, service: &str) -> TestWebSocket {
         let host = format!("default--{sandbox}--{service}.svc.openshell.internal");
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(f.address)
             .await
             .unwrap();
         let name = rustls::pki_types::ServerName::try_from(host.clone()).unwrap();

@@ -29,6 +29,14 @@ struct Args {
         default_value = "{}"
     )]
     admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
+    /// Runtime bootstrap budget in seconds.
+    #[arg(long, env = "OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_SECONDS", default_value = "300",
+        value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    runtime_bootstrap_grace_seconds: u64,
+    /// Initial attachment budget passed to dedicated supervisor Pods.
+    #[arg(long, env = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    sandbox_attach_request_timeout_seconds: Option<u64>,
     /// Public compute-driver Unix socket used by an external gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
@@ -177,6 +185,15 @@ struct Args {
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CA_BUNDLE")]
     proxy_ca_bundle: Option<String>,
 
+    /// AAAA handling for the supervisor's mediated policy DNS: `auto`,
+    /// `enabled` or `disabled`.
+    #[arg(long, env = "OPENSHELL_POLICY_DNS_IPV6_EGRESS")]
+    policy_dns_ipv6_egress: Option<openshell_core::PolicyDnsIpv6Egress>,
+
+    /// NAT64 prefixes (RFC 6052 CIDRs) of the cluster network.
+    #[arg(long, env = "OPENSHELL_NAT64_PREFIXES", value_delimiter = ',')]
+    nat64_prefixes: Vec<String>,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -234,6 +251,7 @@ async fn main() -> Result<()> {
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
+            ansi: openshell_core::color::stdout_ansi(),
         },
     );
     args.otlp.warn_deprecated();
@@ -286,6 +304,8 @@ async fn main() -> Result<()> {
                     openshell_driver_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
             },
+            runtime_bootstrap_grace_seconds: args.runtime_bootstrap_grace_seconds,
+            sandbox_attach_request_timeout_seconds: args.sandbox_attach_request_timeout_seconds,
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,
             proxy_auth_secret_name: args.proxy_auth_secret_name,
@@ -293,6 +313,8 @@ async fn main() -> Result<()> {
             proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
+            policy_dns_ipv6_egress: args.policy_dns_ipv6_egress,
+            nat64_prefixes: args.nat64_prefixes,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
             supervisor_otlp,
             supervisor_gateway_name: args.gateway_name.clone(),
@@ -310,6 +332,10 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
                 .unwrap_or_default(),
+            supervisor_runtime_class_name: std::env::var(
+                "OPENSHELL_K8S_SUPERVISOR_RUNTIME_CLASS_NAME",
+            )
+            .unwrap_or_default(),
             allowed_pod_annotations: args.allowed_pod_annotations,
             allowed_pod_labels: args.allowed_pod_labels,
             sa_token_ttl_secs: args.sa_token_ttl_secs,
@@ -365,6 +391,33 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_timeout_arguments_reject_invalid_values() {
+        let defaults = Args::try_parse_from(["openshell-driver-kubernetes"]).unwrap();
+        assert_eq!(defaults.runtime_bootstrap_grace_seconds, 300);
+        assert!(defaults.sandbox_attach_request_timeout_seconds.is_none());
+        for flag in [
+            "--runtime-bootstrap-grace-seconds",
+            "--sandbox-attach-request-timeout-seconds",
+        ] {
+            for value in ["0", "86401", "invalid"] {
+                assert!(
+                    Args::try_parse_from(["openshell-driver-kubernetes", flag, value]).is_err()
+                );
+            }
+            for value in ["1", "900", "86400"] {
+                let args =
+                    Args::try_parse_from(["openshell-driver-kubernetes", flag, value]).unwrap();
+                let seconds = value.parse::<u64>().unwrap();
+                if flag == "--runtime-bootstrap-grace-seconds" {
+                    assert_eq!(args.runtime_bootstrap_grace_seconds, seconds);
+                } else {
+                    assert_eq!(args.sandbox_attach_request_timeout_seconds, Some(seconds));
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

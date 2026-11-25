@@ -7,8 +7,8 @@ use std::sync::Arc;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
     DeleteServiceRequest, DeleteServiceResponse, ExposeServiceRequest, GetServiceRequest,
-    ListServicesRequest, ListServicesResponse, Sandbox, ServiceAuthorizationMode, ServiceEndpoint,
-    ServiceEndpointResponse,
+    ListServicesRequest, ListServicesResponse, Sandbox, ServiceAuthorizationMode,
+    ServiceBackendHttpVersion, ServiceEndpoint, ServiceEndpointResponse,
 };
 use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message as _;
@@ -25,7 +25,7 @@ use crate::persistence::{ObjectListQuery, ObjectType, WriteCondition};
 use crate::service_routing;
 
 const MAX_SERVICE_NAME_LEN: usize = super::MAX_ROUTABLE_NAME_LEN;
-const MAX_APP_SERVICE_ROUTES: u32 = 1024;
+pub(super) const MAX_APP_SERVICE_ROUTES: u32 = 1024;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -54,6 +54,21 @@ pub(super) async fn handle_expose_service(
             .ensure_active()?;
     let authorization_mode =
         validate_service_exposure_request(&req.name, req.target_port, req.authorization_mode)?;
+    let backend_http_version = match ServiceBackendHttpVersion::try_from(req.backend_http_version) {
+        Ok(ServiceBackendHttpVersion::Unspecified | ServiceBackendHttpVersion::Http1) => {
+            // Older supervisors omit zero-valued fields in their installation reports.
+            ServiceBackendHttpVersion::Unspecified
+        }
+        Ok(ServiceBackendHttpVersion::Http2) if state.config.supervisor_app_listener.enabled => {
+            ServiceBackendHttpVersion::Http2
+        }
+        Ok(ServiceBackendHttpVersion::Http2) => {
+            return Err(Status::failed_precondition(
+                "HTTP/2 backends require the supervisor application listener",
+            ));
+        }
+        Err(_) => return Err(Status::invalid_argument("backend_http_version is invalid")),
+    };
     expose_service_endpoint(
         state,
         &workspace,
@@ -61,6 +76,7 @@ pub(super) async fn handle_expose_service(
         &req.name,
         req.target_port,
         authorization_mode,
+        backend_http_version,
     )
     .await
 }
@@ -92,6 +108,7 @@ pub(super) async fn expose_service_endpoint(
     service: &str,
     target_port: u32,
     authorization_mode: ServiceAuthorizationMode,
+    backend_http_version: ServiceBackendHttpVersion,
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     // Hold the hardening guard across sandbox validation, route counting and
     // persistence. Acquisition is unconditional because advertisements also
@@ -186,6 +203,7 @@ pub(super) async fn expose_service_endpoint(
         target_port,
         domain: true,
         authorization_mode: authorization_mode as i32,
+        backend_http_version: backend_http_version as i32,
     };
 
     let route_reserved = state
@@ -227,14 +245,13 @@ pub(super) async fn expose_service_endpoint(
         meta.resource_version = result.resource_version;
     }
 
-    let url = service_routing::endpoint_url(&state.config, workspace, sandbox_name, service)
-        .unwrap_or_default();
-    service_routing::emit_service_endpoint_config_event(&endpoint, &url, created);
-
-    Ok(Response::new(ServiceEndpointResponse {
-        endpoint: Some(endpoint),
-        url,
-    }))
+    let response = service_endpoint_response(state, endpoint);
+    service_routing::emit_service_endpoint_config_event(
+        response.endpoint.as_ref().expect("endpoint populated"),
+        &response.url,
+        created,
+    );
+    Ok(Response::new(response))
 }
 
 pub(super) async fn handle_get_service(
@@ -421,8 +438,23 @@ pub(super) async fn configured_app_routes(
     if !state.config.supervisor_app_listener.enabled {
         return Ok(Vec::new());
     }
-    let mut service_routes: Vec<_> = app_service_endpoints(state, sandbox)
-        .await?
+    configured_app_routes_from_endpoints(
+        state,
+        sandbox,
+        app_service_endpoints(state, sandbox).await?,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+pub(super) fn configured_app_routes_from_endpoints(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    endpoints: Vec<ServiceEndpoint>,
+) -> Result<Vec<openshell_core::proto::SandboxServiceRoute>, Status> {
+    if !state.config.supervisor_app_listener.enabled {
+        return Ok(Vec::new());
+    }
+    let mut service_routes: Vec<_> = endpoints
         .into_iter()
         .filter(|ep| {
             ep.sandbox_id == sandbox.object_id()
@@ -432,14 +464,29 @@ pub(super) async fn configured_app_routes(
                     .as_ref()
                     .is_none_or(|m| m.deletion_time.is_none())
         })
-        .map(|ep| openshell_core::proto::SandboxServiceRoute {
-            endpoint_id: ep.object_id().to_string(),
-            name: ep.name.clone(),
-            target_port: ep.target_port,
-            authorization_mode: ep.authorization_mode,
-            resource_version: ep.metadata.as_ref().map_or(0, |m| m.resource_version),
+        .map(|ep| {
+            Ok(openshell_core::proto::SandboxServiceRoute {
+                endpoint_id: ep.object_id().to_string(),
+                name: ep.name.clone(),
+                target_port: ep.target_port,
+                authorization_mode: ep.authorization_mode,
+                backend_http_version: ep.backend_http_version,
+                resource_version: ep.metadata.as_ref().map_or(0, |m| m.resource_version),
+                application_hostname: state
+                    .config
+                    .supervisor_app_listener
+                    .service_hostname(
+                        sandbox.object_workspace(),
+                        sandbox.object_name(),
+                        &ep.name,
+                        state.config.service_routing_discriminator(),
+                    )
+                    .ok_or_else(|| {
+                        Status::failed_precondition("application listener hostname unavailable")
+                    })?,
+            })
         })
-        .collect();
+        .collect::<Result<_, Status>>()?;
     service_routes.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(service_routes)
 }
@@ -483,10 +530,7 @@ async fn get_service_endpoint(
         .map_err(|e| Status::internal(format!("fetch endpoint failed: {e}")))
 }
 
-fn service_endpoint_response(
-    state: &Arc<ServerState>,
-    mut endpoint: ServiceEndpoint,
-) -> ServiceEndpointResponse {
+pub(super) fn service_response_endpoint(mut endpoint: ServiceEndpoint) -> ServiceEndpoint {
     endpoint.authorization_mode =
         match ServiceAuthorizationMode::try_from(endpoint.authorization_mode) {
             Ok(ServiceAuthorizationMode::BearerPassthrough) => {
@@ -495,14 +539,55 @@ fn service_endpoint_response(
             Ok(ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip)
             | Err(_) => ServiceAuthorizationMode::Strip as i32,
         };
-    let workspace = endpoint.object_workspace();
-    let url =
-        service_routing::endpoint_url(&state.config, workspace, &endpoint.sandbox, &endpoint.name)
-            .unwrap_or_default();
-    ServiceEndpointResponse {
-        endpoint: Some(endpoint),
-        url,
+    if endpoint.backend_http_version == ServiceBackendHttpVersion::Unspecified as i32 {
+        endpoint.backend_http_version = ServiceBackendHttpVersion::Http1 as i32;
     }
+    endpoint
+}
+
+fn service_endpoint_response(
+    state: &Arc<ServerState>,
+    endpoint: ServiceEndpoint,
+) -> ServiceEndpointResponse {
+    let mut response = ServiceEndpointResponse {
+        endpoint: Some(service_response_endpoint(endpoint)),
+        ..Default::default()
+    };
+    refresh_response_urls(state, &mut response);
+    response.url = if response.application_url.is_empty() {
+        response.gateway_url.clone()
+    } else {
+        response.application_url.clone()
+    };
+    response
+}
+
+/// Populate explicit access paths from the current configuration.
+fn refresh_response_urls(state: &ServerState, response: &mut ServiceEndpointResponse) {
+    let Some(endpoint) = response.endpoint.as_ref() else {
+        return;
+    };
+    response.gateway_url = if endpoint.backend_http_version() == ServiceBackendHttpVersion::Http2 {
+        String::new()
+    } else {
+        service_routing::endpoint_url(
+            &state.config,
+            endpoint.object_workspace(),
+            &endpoint.sandbox,
+            &endpoint.name,
+        )
+        .unwrap_or_default()
+    };
+    response.application_url = state
+        .config
+        .supervisor_app_listener
+        .service_url(
+            endpoint.object_workspace(),
+            &endpoint.sandbox,
+            &endpoint.name,
+            state.config.service_routing_discriminator(),
+        )
+        .unwrap_or_default();
 }
 
 #[allow(clippy::result_large_err)]
@@ -538,21 +623,12 @@ fn validate_non_empty_endpoint_name(
             "{field} must not contain '--'"
         )));
     }
-    if !is_dns_label(value) {
+    if !openshell_core::app_listener::valid_dns_label(value) {
         return Err(Status::invalid_argument(format!(
             "{field} must be a lowercase DNS label"
         )));
     }
     Ok(())
-}
-
-fn is_dns_label(value: &str) -> bool {
-    if value.starts_with('-') || value.ends_with('-') {
-        return false;
-    }
-    value
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 #[cfg(test)]
@@ -589,7 +665,7 @@ mod tests {
             .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
             enabled: true,
             port: 9443,
-            domain: "services.example.com".into(),
+            base_url: Some("https://services.example.com".into()),
         };
         seed_sandbox(&state, "limited").await;
         state
@@ -614,6 +690,7 @@ mod tests {
                     target_port: 8080,
                     domain: true,
                     authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                    backend_http_version: 0,
                 })
                 .await
                 .unwrap();
@@ -705,6 +782,177 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn application_and_gateway_url_publication_are_independent() {
+        for gateway_enabled in [false, true] {
+            for application_enabled in [false, true] {
+                let mut state = test_server_state().await;
+                let config = &mut Arc::get_mut(&mut state).unwrap().config;
+                config.service_routing.enabled = gateway_enabled;
+                config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+                    enabled: application_enabled,
+                    port: 9443,
+                    base_url: application_enabled
+                        .then(|| "https://services.example.com:10443".into()),
+                };
+                seed_sandbox(&state, "demo").await;
+                for name in ["", "web"] {
+                    let created = handle_expose_service(
+                        &state,
+                        authed_request(ExposeServiceRequest {
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            sandbox: "demo".into(),
+                            name: name.into(),
+                            target_port: 8080,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                    .into_inner();
+                    assert_eq!(
+                        created.endpoint.as_ref().unwrap().backend_http_version(),
+                        ServiceBackendHttpVersion::Http1
+                    );
+                    assert_eq!(!created.gateway_url.is_empty(), gateway_enabled);
+                    assert_eq!(!created.application_url.is_empty(), application_enabled);
+                    if application_enabled {
+                        let label = if name.is_empty() {
+                            "default--demo"
+                        } else {
+                            "default--demo--web"
+                        };
+                        assert_eq!(
+                            created.application_url,
+                            format!("https://{label}.services.example.com:10443/")
+                        );
+                        assert_eq!(created.url, created.application_url);
+                    } else {
+                        assert_eq!(created.url, created.gateway_url);
+                    }
+                    let fetched = handle_get_service(
+                        &state,
+                        authed_request(GetServiceRequest {
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            sandbox: "demo".into(),
+                            name: name.into(),
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                    .into_inner();
+                    assert_eq!(created, fetched);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http2_service_requires_application_ingress_and_reaches_its_route() {
+        let mut state = test_server_state().await;
+        seed_sandbox(&state, "demo").await;
+        let mut request = ExposeServiceRequest {
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            sandbox: "demo".into(),
+            name: "agent".into(),
+            target_port: 50051,
+            backend_http_version: ServiceBackendHttpVersion::Http2 as i32,
+            ..Default::default()
+        };
+
+        let error = handle_expose_service(&state, authed_request(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.service_routing.enabled = true;
+        config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            base_url: Some("https://services.example.com:10443".into()),
+        };
+
+        let response = handle_expose_service(&state, authed_request(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response.url,
+            "https://default--demo--agent.services.example.com:10443/"
+        );
+        assert!(response.gateway_url.is_empty());
+        let endpoint = response.endpoint.unwrap();
+        assert_eq!(
+            endpoint.backend_http_version(),
+            ServiceBackendHttpVersion::Http2
+        );
+
+        request.backend_http_version = 99;
+        let error = handle_expose_service(&state, authed_request(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        let stored = get_service_endpoint(&state, "default", "demo", "agent")
+            .await
+            .unwrap()
+            .unwrap();
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(&stored.sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let routes = configured_app_routes_from_endpoints(&state, &sandbox, vec![stored]).unwrap();
+        assert_eq!(
+            routes[0].backend_http_version,
+            ServiceBackendHttpVersion::Http2 as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn hashed_gateway_url_keeps_the_independent_application_origin() {
+        let mut state = test_server_state().await;
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.name = "gateway-a".into();
+        config.service_routing.service_hostname_format = ServiceHostnameFormat::Hashed;
+        config.service_routing.base_domains = vec!["gateway.example.com".into()];
+        config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            base_url: Some("https://services.example.com:10443".into()),
+        };
+        let response = service_endpoint_response(
+            &state,
+            ServiceEndpoint {
+                metadata: Some(ObjectMeta {
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                sandbox: "demo".into(),
+                name: "web".into(),
+                ..Default::default()
+            },
+        );
+        let gateway = url::Url::parse(&response.gateway_url).unwrap();
+        let label =
+            service_routing::service_route_hash_label("gateway-a", "default", "demo", Some("web"));
+        assert_eq!(
+            gateway.host_str(),
+            Some(format!("{label}.gateway.example.com").as_str())
+        );
+        assert_eq!(
+            response.application_url,
+            format!("https://{label}.services.example.com:10443/")
+        );
+        assert_eq!(response.url, response.application_url);
+    }
+
     #[test]
     fn validates_good_endpoint_name() {
         validate_endpoint_name("service", "web-api", 28).unwrap();
@@ -717,9 +965,9 @@ mod tests {
             .expect("unshared test state")
             .config
             .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            base_url: Some("https://services.example.com".into()),
             enabled: true,
             port: 9443,
-            domain: "services.example.com".into(),
         };
         seed_sandbox(&state, "first").await;
         seed_sandbox(&state, "second").await;
@@ -1007,6 +1255,7 @@ mod tests {
                 target_port: 8080,
                 domain: true,
                 authorization_mode: ServiceAuthorizationMode::Unspecified as i32,
+                backend_http_version: 0,
             }),
         )
         .await
@@ -1203,6 +1452,7 @@ mod tests {
                     target_port: 8080,
                     domain: true,
                     authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                    backend_http_version: 0,
                 }),
             )
             .await
@@ -1222,6 +1472,7 @@ mod tests {
                     target_port: 9090,
                     domain: true,
                     authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                    backend_http_version: 0,
                 }),
             )
             .await
@@ -1275,6 +1526,7 @@ mod tests {
                 target_port: 7070,
                 domain: true,
                 authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                backend_http_version: 0,
             }),
         )
         .await
@@ -1295,6 +1547,7 @@ mod tests {
                     target_port: 8080,
                     domain: true,
                     authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                    backend_http_version: 0,
                 }),
             )
             .await
@@ -1314,6 +1567,7 @@ mod tests {
                     target_port: 9090,
                     domain: true,
                     authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                    backend_http_version: 0,
                 }),
             )
             .await
@@ -1405,6 +1659,7 @@ mod tests {
                 target_port: 8080,
                 domain: true,
                 authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                backend_http_version: 0,
             }),
         )
         .await
@@ -1422,6 +1677,7 @@ mod tests {
                 target_port: 9090,
                 domain: true,
                 authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                backend_http_version: 0,
             }),
         )
         .await
@@ -1566,6 +1822,7 @@ mod tests {
                 target_port: 3000,
                 domain: true,
                 authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                backend_http_version: 0,
             }),
         )
         .await

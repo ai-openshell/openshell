@@ -612,10 +612,6 @@ fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     }
 }
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
-/// Unsupervised shared sandbox instances removed at once by one reconcile pass.
-/// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
-const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
-
 fn random_sandbox_runtime_token() -> Result<String, KubernetesDriverError> {
     use std::fmt::Write as _;
 
@@ -3544,9 +3540,8 @@ impl KubernetesComputeDriver {
             .ensure_network_additional_ca_config_map(namespace)
             .await?;
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        pods.create(
-            &PostParams::default(),
-            &crate::app_listener::configure_supervisor_pod(
+        let pod = crate::sandbox_runtime::with_runtime_class(
+            crate::app_listener::configure_supervisor_pod(
                 supervisor_pod(
                     namespace,
                     names,
@@ -3573,6 +3568,7 @@ impl KubernetesComputeDriver {
                     self.config.proxy_auth_allow_insecure == Some(true),
                     self.config.proxy_connect_by_hostname == Some(true),
                     upstream_proxy_ca_bundle_staged,
+                    &self.config.ipv6_egress_config().supervisor_args(),
                     self.config.provider_spiffe_enabled().then_some(
                         self.config
                             .provider_spiffe_workload_api_socket_path
@@ -3583,16 +3579,19 @@ impl KubernetesComputeDriver {
                         .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
                     owner,
                     &self.supervisor_otlp_environment(),
+                    self.config.sandbox_attach_request_timeout_seconds,
                 )
                 .map_err(KubernetesDriverError::Message)?,
                 &self.config.sandbox_runtime.app_listener,
             ),
-        )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?
-        .metadata
-        .uid
-        .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
+            &self.config.supervisor_runtime_class_name,
+        );
+        pods.create(&PostParams::default(), &pod)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?
+            .metadata
+            .uid
+            .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
     }
 
     /// Read the gateway's shared supervisor Service: its address and the
@@ -4102,6 +4101,7 @@ impl KubernetesComputeDriver {
             sandbox_api.api.clone(),
             cr_name.to_string(),
             Some(cr_uid.to_string()),
+            Duration::from_secs(self.config.runtime_bootstrap_grace_seconds),
         );
         Ok(())
     }
@@ -4778,7 +4778,8 @@ impl KubernetesComputeDriver {
             generation_secrets.splice(0..0, [names.sandbox_secret, names.supervisor_secret]);
             for name in &generation_secrets {
                 match secrets.delete(name, &DeleteParams::default()).await {
-                    Ok(_) | Err(KubeError::Api(kube::core::ErrorResponse { code: 404, .. })) => {}
+                    Ok(_) => {}
+                    Err(KubeError::Api(error)) if error.code == 404 => {}
                     Err(error) => return Err(KubernetesDriverError::from_kube(error)),
                 }
             }
@@ -4814,75 +4815,64 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, _workspace, preconditions, pod_name, placement) =
-            match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
-                Ok(Ok(list)) => {
-                    if let Some(obj) = list.items.into_iter().next() {
-                        match obj.metadata.name.clone() {
-                            Some(name) => {
-                                let ns = obj
-                                    .metadata
-                                    .namespace
-                                    .clone()
-                                    .unwrap_or_else(|| self.config.namespace.clone());
-                                let ws = obj
-                                    .metadata
-                                    .labels
-                                    .as_ref()
-                                    .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
-                                    .unwrap_or_default();
-                                // An unreadable placement leaves any instance to reconciliation.
-                                let placement = supervisor_placement(&obj).ok();
-                                let pc = Preconditions {
-                                    uid: obj.metadata.uid,
-                                    resource_version: obj.metadata.resource_version,
-                                };
-                                let pod_name = obj
-                                    .metadata
-                                    .annotations
-                                    .as_ref()
-                                    .and_then(|annotations| {
-                                        annotations.get(SANDBOX_POD_NAME_ANNOTATION)
-                                    })
-                                    .cloned()
-                                    .unwrap_or_else(|| name.clone());
-                                (name, ns, ws, pc, pod_name, placement)
-                            }
-                            None => return Ok(false),
-                        }
-                    } else {
-                        debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
-                        return Ok(false);
-                    }
-                }
-                Ok(Err(err)) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %err,
-                        "Failed to list sandbox for deletion from Kubernetes"
-                    );
-                    return Err(err.to_string());
-                }
-                Err(_elapsed) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
-                        "Timed out listing sandbox for deletion from Kubernetes"
-                    );
-                    return Err(format!(
-                        "timed out after {}s waiting for Kubernetes API",
-                        KUBE_API_TIMEOUT.as_secs()
-                    ));
-                }
-            };
+        let list = match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
+            Ok(Ok(list)) => list,
+            Ok(Err(err)) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "Failed to list sandbox for deletion from Kubernetes"
+                );
+                return Err(err.to_string());
+            }
+            Err(_elapsed) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                    "Timed out listing sandbox for deletion from Kubernetes"
+                );
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ));
+            }
+        };
+        let Some(obj) = list.items.into_iter().next() else {
+            debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
+            return Ok(false);
+        };
+        // An unreadable placement leaves any instance to reconciliation.
+        let placement = supervisor_placement(&obj).ok();
+        let kube_name = obj.metadata.name.ok_or("Sandbox CR has no name")?;
+        let obj_namespace = obj
+            .metadata
+            .namespace
+            .unwrap_or_else(|| self.config.namespace.clone());
+        let uid = obj
+            .metadata
+            .uid
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| format!("Sandbox CR {obj_namespace}/{kube_name} has no UID"))?;
+        let pod_name = obj
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
+            .cloned()
+            .unwrap_or_else(|| kube_name.clone());
 
         let delete_api = self
             .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
             .await?;
-        let dp = DeleteParams::default().preconditions(preconditions);
+        // Delete this identity, not this revision. A controller status write
+        // must not block deletion, and a same-name replacement has another UID.
+        let dp = DeleteParams::default().preconditions(Preconditions {
+            uid: Some(uid),
+            resource_version: None,
+        });
         match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
             Ok(Ok(_response)) => {
-                info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
+                info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Kubernetes accepted Sandbox CR deletion");
                 // The workload is going away, so its sandbox instance cannot
                 // stop it gracefully; end the instance without delaying the
                 // delete.
@@ -4915,10 +4905,7 @@ impl KubernetesComputeDriver {
                     if !matches!(
                         tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.get(&kube_name))
                             .await,
-                        Ok(Err(KubeError::Api(kube::core::ErrorResponse {
-                            code: 404,
-                            ..
-                        })))
+                        Ok(Err(KubeError::Api(error))) if error.code == 404
                     ) {
                         warn!(sandbox_id, "Sandbox CR deletion was not confirmed");
                         return Ok(true);
@@ -4926,11 +4913,14 @@ impl KubernetesComputeDriver {
                 }
                 Ok(true)
             }
-            Ok(Err(KubeError::Api(err))) if err.code == 404 || err.code == 409 => {
-                debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted or replaced)");
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
                 Ok(false)
             }
             Ok(Err(err)) => {
+                // In particular, a 409 is not proof of absence. Returning
+                // false would let the gateway release the name without a
+                // deletion event or an independent lookup.
                 warn!(
                     sandbox_id = %sandbox_id,
                     error = %err,
@@ -5543,7 +5533,7 @@ impl KubernetesComputeDriver {
         if !sandbox_runtime_bootstrap_is_stale(
             object,
             SystemTime::now(),
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
+            Duration::from_secs(self.config.runtime_bootstrap_grace_seconds),
         ) {
             return;
         }
@@ -5771,7 +5761,10 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Init | Event::InitDone) => {}
+                        Some(Event::Init) => {}
+                        Some(Event::InitDone) => {
+                            info!(namespace = %namespace, "Kubernetes sandbox watcher listed sandboxes");
+                        }
                         None => {
                             let _ = tx.send(Err(KubernetesDriverError::Message(
                                 "sandbox watcher stream ended unexpectedly".to_string()
@@ -5986,9 +5979,10 @@ fn spawn_sandbox_runtime_bootstrap_completion(
     sandboxes: Api<DynamicObject>,
     sandbox_name: String,
     expected_sandbox_uid: Option<String>,
+    bootstrap_grace: Duration,
 ) {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + SANDBOX_RUNTIME_BOOTSTRAP_GRACE;
+        let deadline = tokio::time::Instant::now() + bootstrap_grace;
         match tokio::time::timeout_at(deadline, control.wait_available()).await {
             Ok(true) => {}
             Ok(false) | Err(_) => return,
@@ -6202,7 +6196,10 @@ where
                             }
                         }
                     }
-                    Some(Event::Init | Event::InitDone) => {}
+                    Some(Event::Init) => {}
+                    Some(Event::InitDone) => {
+                        info!("Kubernetes sandbox watcher listed sandboxes");
+                    }
                     None => {
                         let _ = tx.send(Err(KubernetesDriverError::Message(
                             "sandbox watcher stream ended unexpectedly".to_string()
@@ -6364,13 +6361,13 @@ fn managed_ssh_network_policy(namespace: &str, config: &KubernetesComputeConfig)
             ..Default::default()
         },
         spec: Some(NetworkPolicySpec {
-            pod_selector: LabelSelector {
+            pod_selector: Some(LabelSelector {
                 match_labels: Some(BTreeMap::from([(
                     LABEL_MANAGED_BY.to_string(),
                     LABEL_MANAGED_BY_VALUE.to_string(),
                 )])),
                 ..Default::default()
-            },
+            }),
             policy_types: Some(vec!["Ingress".to_string()]),
             ingress: Some(vec![NetworkPolicyIngressRule {
                 from: Some(vec![NetworkPolicyPeer {
@@ -7297,7 +7294,7 @@ fn map_kube_event_to_platform(
         .last_timestamp
         .as_ref()
         .or(obj.first_timestamp.as_ref())
-        .map_or(0, |t| t.0.timestamp_millis());
+        .map_or(0, |t| t.0.as_millisecond());
 
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("involved_kind".to_string(), involved_kind);
@@ -9959,38 +9956,31 @@ mod tests {
     }
 
     fn kube_api_error(code: u16, message: &str) -> KubeError {
-        KubeError::Api(kube::core::ErrorResponse {
-            status: if code == 404 {
-                "404 Not Found".to_string()
-            } else {
-                "Failure".to_string()
-            },
-            message: message.to_string(),
-            reason: "Failed to parse error data".to_string(),
-            code,
-        })
+        KubeError::Api(
+            kube::core::Status::failure(message, "Failed to parse error data")
+                .with_code(code)
+                .boxed(),
+        )
     }
 
     #[test]
     fn resource_version_conflicts_are_not_reported_as_duplicate_sandboxes() {
-        let conflict = KubeError::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "the object has been modified".to_string(),
-            reason: "Conflict".to_string(),
-            code: 409,
-        });
+        let conflict = KubeError::Api(
+            kube::core::Status::failure("the object has been modified", "Conflict")
+                .with_code(409)
+                .boxed(),
+        );
         assert!(is_kube_resource_version_conflict(&conflict));
         assert!(matches!(
             KubernetesDriverError::from_kube(conflict),
             KubernetesDriverError::Message(_)
         ));
 
-        let duplicate = KubeError::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "already exists".to_string(),
-            reason: "AlreadyExists".to_string(),
-            code: 409,
-        });
+        let duplicate = KubeError::Api(
+            kube::core::Status::failure("already exists", "AlreadyExists")
+                .with_code(409)
+                .boxed(),
+        );
         assert!(matches!(
             KubernetesDriverError::from_kube(duplicate),
             KubernetesDriverError::AlreadyExists
@@ -9998,12 +9988,11 @@ mod tests {
     }
 
     fn expired_watch_error() -> watcher::Error {
-        watcher::Error::WatchError(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "too old resource version".to_string(),
-            reason: "Expired".to_string(),
-            code: 410,
-        })
+        watcher::Error::WatchError(
+            kube::core::Status::failure("too old resource version", "Expired")
+                .with_code(410)
+                .boxed(),
+        )
     }
 
     #[tokio::test]
@@ -10513,6 +10502,7 @@ mod tests {
     #[test]
     fn sandbox_runtime_bootstrap_marker_and_age_gate_rollback() {
         let started = Duration::from_hours(490_896);
+        let bootstrap_grace = Duration::from_mins(5);
         let mut object: DynamicObject = serde_json::from_value(serde_json::json!({
             "apiVersion": "agents.x-k8s.io/v1beta1",
             "kind": "Sandbox",
@@ -10535,13 +10525,13 @@ mod tests {
         let started_at = SystemTime::UNIX_EPOCH + started;
         assert!(!sandbox_runtime_bootstrap_is_stale(
             &object,
-            started_at + SANDBOX_RUNTIME_BOOTSTRAP_GRACE - Duration::from_secs(1),
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            started_at + bootstrap_grace - Duration::from_secs(1),
+            bootstrap_grace
         ));
         assert!(sandbox_runtime_bootstrap_is_stale(
             &object,
-            started_at + SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            started_at + bootstrap_grace,
+            bootstrap_grace
         ));
         object
             .metadata
@@ -10552,7 +10542,7 @@ mod tests {
         assert!(sandbox_runtime_bootstrap_is_stale(
             &object,
             started_at,
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            bootstrap_grace
         ));
         object
             .metadata
@@ -14422,9 +14412,10 @@ mod tests {
         }
 
         let mut deleting = reconnecting;
-        deleting.metadata.deletion_timestamp = Some(
-            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(k8s_openapi::chrono::Utc::now()),
-        );
+        deleting.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ));
         assert_eq!(
             sandbox_runtime_control_availability_from_pod(&deleting),
             SandboxRuntimeControlAvailability::Unavailable

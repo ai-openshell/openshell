@@ -48,6 +48,33 @@ enum SupervisorRole {
     NetworkProxy,
 }
 
+/// AAAA handling for mediated policy DNS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum PolicyDnsIpv6EgressArg {
+    /// Answer AAAA only when the supervisor has an IPv6 default route and no
+    /// IPv4 default route.
+    #[default]
+    Auto,
+    /// Always answer AAAA from the synthetic IPv6 pool.
+    Enabled,
+    /// Always answer AAAA with an empty NOERROR response.
+    Disabled,
+}
+
+impl From<PolicyDnsIpv6EgressArg> for openshell_supervisor_network::run::PolicyDnsIpv6Egress {
+    fn from(value: PolicyDnsIpv6EgressArg) -> Self {
+        match value {
+            PolicyDnsIpv6EgressArg::Auto => Self::Auto,
+            PolicyDnsIpv6EgressArg::Enabled => Self::Enabled,
+            PolicyDnsIpv6EgressArg::Disabled => Self::Disabled,
+        }
+    }
+}
+
+fn parse_nat64_prefix(raw: &str) -> Result<openshell_supervisor_network::run::Nat64Prefix, String> {
+    raw.parse()
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "openshell-supervisor health")]
 struct HealthArgs {
@@ -101,6 +128,18 @@ struct Args {
     /// port is appended. Required for `--mode=shared`.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP")]
     pool_advertise_ip: Option<std::net::IpAddr>,
+
+    /// Most sandbox instances this pool member runs, from 1 to 1024. Set it
+    /// to the gateway's `[openshell.gateway.supervisor_pool]`
+    /// `max_instances_per_member`; it also sizes the gateway stream's message
+    /// bounds.
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES",
+        default_value_t = 128,
+        value_parser = clap::value_parser!(u32).range(1..=1024)
+    )]
+    pool_max_instances: u32,
 
     /// Supervisor responsibility to run.
     #[arg(long, value_enum, default_value_t)]
@@ -208,6 +247,17 @@ struct Args {
     #[arg(long)]
     additional_ca_bundle: Option<String>,
 
+    /// Driver-selected AAAA handling for mediated policy DNS.
+    #[arg(long, value_enum, default_value_t)]
+    policy_dns_ipv6_egress: PolicyDnsIpv6EgressArg,
+
+    /// NAT64 prefix (RFC 6052) used by the sandbox network. Repeatable.
+    /// Addresses inside it are classified by their embedded IPv4 address for
+    /// SSRF checks, in addition to `64:ff9b::/96` and the prefix discovered
+    /// through `ipv4only.arpa`.
+    #[arg(long = "nat64-prefix", value_parser = parse_nat64_prefix)]
+    nat64_prefixes: Vec<openshell_supervisor_network::run::Nat64Prefix>,
+
     #[arg(long)]
     backend_descriptor_file: Option<PathBuf>,
 
@@ -237,6 +287,17 @@ struct Args {
     /// Stdin is a driver-owned liveness pipe. EOF means the driver exited.
     #[arg(long, hide = true)]
     parent_liveness_stdin: bool,
+
+    /// Attach and policy-discover request timeout, in seconds. Slow
+    /// VM-backed runtimes (CoCo/peer-pods) need longer than the default for
+    /// the remote boundary to boot before the supervisor gives up.
+    #[arg(
+        long,
+        env = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS",
+        default_value = "300",
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    attach_request_timeout_seconds: u64,
 }
 
 #[cfg(unix)]
@@ -445,7 +506,14 @@ fn main() -> Result<()> {
             .into_diagnostic()?;
         return runtime.block_on(async move {
             openshell_crypto::tls::ensure_default_provider();
-            let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
+            let exit = openshell_supervisor_process::debug_rpc::run(
+                &raw_args[2..],
+                openshell_core::extension_protocol::capabilities_if(
+                    openshell_core::extension_protocol::POLICY_CEDAR_V1,
+                    cfg!(feature = "experimental"),
+                ),
+            )
+            .await?;
             std::process::exit(exit);
         });
     }
@@ -656,16 +724,24 @@ fn main() -> Result<()> {
                     shared_ssh_socket: openshell_supervisor::shared_ssh_socket_from_env(),
                     upstream_proxy_args,
                     additional_ca_bundle: args.additional_ca_bundle,
+                    policy_dns_ipv6_egress: args.policy_dns_ipv6_egress.into(),
+                    nat64_prefixes: args.nat64_prefixes,
                     backend_descriptor,
                     auth_bundle,
                     admitted_isolation_backend: Some(admitted_backend),
                     main_exit_marker: args.main_exit_marker,
+                    attach_request_timeout: std::time::Duration::from_secs(
+                        args.attach_request_timeout_seconds,
+                    ),
                     trace_context: openshell_supervisor::trace_context_from_environment(),
-                    provider_workload_api_socket: std::env::var_os(
-                        openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-                    )
-                    .filter(|path| !path.is_empty())
-                    .map(PathBuf::from),
+                    provider_identity:
+                        openshell_supervisor_network::run::ProviderIdentitySource::WorkloadApi(
+                            std::env::var_os(
+                                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+                            )
+                            .filter(|path| !path.is_empty())
+                            .map(PathBuf::from),
+                        ),
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
                     takeover: None,
                     supervisor_recovery_timeout_secs: None,
@@ -699,14 +775,15 @@ fn main() -> Result<()> {
                         "network-proxy role started without validated policy files"
                     ));
                 };
-                openshell_supervisor::run_network_proxy(
+                Box::pin(openshell_supervisor::run_network_proxy(
                     listen,
                     policy_rules,
                     policy_data,
                     args.tls_dir,
                     upstream_proxy_args,
                     args.additional_ca_bundle,
-                )
+                    args.nat64_prefixes,
+                ))
                 .await
             }
         }
@@ -873,6 +950,37 @@ fn supervisor_exit(result: Result<i32>) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_timeout_arguments_reject_invalid_values() {
+        assert_eq!(
+            Args::try_parse_from(["openshell-supervisor"])
+                .unwrap()
+                .attach_request_timeout_seconds,
+            300
+        );
+        for value in ["0", "86401", "invalid"] {
+            assert!(
+                Args::try_parse_from([
+                    "openshell-supervisor",
+                    "--attach-request-timeout-seconds",
+                    value
+                ])
+                .is_err()
+            );
+        }
+        for value in ["1", "900", "86400"] {
+            let args = Args::try_parse_from([
+                "openshell-supervisor",
+                "--attach-request-timeout-seconds",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(
+                args.attach_request_timeout_seconds,
+                value.parse::<u64>().unwrap()
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1296,7 +1404,7 @@ mod tests {
         );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("backends.json");
-        std::fs::write(&path, r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"/trusted/backend.sock"}}]}"#).unwrap();
+        std::fs::write(&path, r#"{"backends":[{"name":"external","endpoint":{"kind":"tcp","authority":"backend.example:443","addresses":["127.0.0.1:47000"]}}]}"#).unwrap();
         let args = Args::try_parse_from([
             "openshell-supervisor",
             "--isolation-backends-file",
@@ -1333,6 +1441,67 @@ mod tests {
         .expect("network-proxy arguments");
         assert_eq!(args.role, SupervisorRole::NetworkProxy);
         assert!(validate_role_arguments(&args).is_ok());
+    }
+
+    #[test]
+    fn policy_dns_ipv6_egress_defaults_to_auto_and_accepts_overrides() {
+        let args = Args::try_parse_from(["openshell-supervisor"]).expect("parse defaults");
+        assert_eq!(args.policy_dns_ipv6_egress, PolicyDnsIpv6EgressArg::Auto);
+        for (value, expected) in [
+            (
+                "enabled",
+                openshell_supervisor_network::run::PolicyDnsIpv6Egress::Enabled,
+            ),
+            (
+                "disabled",
+                openshell_supervisor_network::run::PolicyDnsIpv6Egress::Disabled,
+            ),
+        ] {
+            let args =
+                Args::try_parse_from(["openshell-supervisor", "--policy-dns-ipv6-egress", value])
+                    .expect("policy DNS IPv6 egress argument");
+            assert_eq!(
+                openshell_supervisor_network::run::PolicyDnsIpv6Egress::from(
+                    args.policy_dns_ipv6_egress
+                ),
+                expected
+            );
+        }
+        assert!(
+            Args::try_parse_from(["openshell-supervisor", "--policy-dns-ipv6-egress", "yes"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn nat64_prefixes_are_repeatable_and_validated() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--nat64-prefix",
+            "64:ff9b:1::/96",
+            "--nat64-prefix",
+            "2001:db8:122:344::/64",
+        ])
+        .expect("NAT64 prefixes");
+        assert_eq!(
+            args.nat64_prefixes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["64:ff9b:1::/96", "2001:db8:122:344::/64"]
+        );
+        assert!(
+            Args::try_parse_from(["openshell-supervisor"])
+                .unwrap()
+                .nat64_prefixes
+                .is_empty()
+        );
+        for bad in ["2001:db8::/80", "10.0.0.0/8", "nope"] {
+            assert!(
+                Args::try_parse_from(["openshell-supervisor", "--nat64-prefix", bad]).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

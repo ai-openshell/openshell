@@ -235,6 +235,7 @@ impl PreparedBackend for HeldPreparedBackend {
     async fn discover_policy(
         &self,
         _bearer: openshell_core::jwt::SessionBearerTokenSlot,
+        _attach_request_timeout: Duration,
     ) -> Result<(Option<String>, bool), BackendError> {
         self.0.discovered.store(true, Ordering::SeqCst);
         Ok((None, false))
@@ -303,6 +304,8 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         upstream_proxy_args:
             openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
         additional_ca_bundle: None,
+        policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Disabled,
+        nat64_prefixes: Vec::new(),
         backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor {
             backend_name: "test-held".into(),
             payload: Vec::new(),
@@ -310,8 +313,9 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         auth_bundle,
         admitted_isolation_backend: Some("test-held".into()),
         main_exit_marker: None,
+        attach_request_timeout: Duration::from_mins(5),
         trace_context: None,
-        provider_workload_api_socket: None,
+        provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::default(),
         proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
         takeover: None,
         supervisor_recovery_timeout_secs: None,
