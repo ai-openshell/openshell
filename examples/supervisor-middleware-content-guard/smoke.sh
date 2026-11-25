@@ -26,6 +26,9 @@ Environment:
                             gateway and sandbox containers.
   CONTENT_GUARD_SMOKE_DRIVER
                             Compute driver: docker (default) or podman.
+  POLICY_FORMAT             Sandbox policy format: yaml (default) uses
+                            policy.yaml; cedar uses policy.cedar with
+                            middleware.yaml.
 EOF
 }
 
@@ -110,6 +113,14 @@ case "$COMPUTE_DRIVER" in
   docker | podman) ;;
   *)
     echo "CONTENT_GUARD_SMOKE_DRIVER must be docker or podman" >&2
+    exit 1
+    ;;
+esac
+POLICY_FORMAT="${POLICY_FORMAT:-yaml}"
+case "$POLICY_FORMAT" in
+  yaml | cedar) ;;
+  *)
+    echo "POLICY_FORMAT must be yaml or cedar" >&2
     exit 1
     ;;
 esac
@@ -410,6 +421,24 @@ wait_for_gateway() {
   fail "gateway starts with content guard"
 }
 
+# Creates the sandbox from the policy for POLICY_FORMAT. A YAML policy carries
+# its middleware; the argument is that policy. The CLI sends Cedar source
+# only, so a Cedar sandbox is created through the policy API with the
+# middleware from the argument file.
+create_with_policy() {
+  local step="$1" policy_or_config="$2"
+  if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+    run_setup_step "$step" uv run --quiet --project "$ROOT" python \
+      "$ROOT/e2e/support/cedar_sandbox.py" create \
+      --endpoint "$GATEWAY_ENDPOINT" --name "$SANDBOX_NAME" \
+      --policy "$EXAMPLE_DIR/policy.cedar" --config "$policy_or_config" \
+      -- sleep infinity
+  else
+    run_setup_step "$step" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" \
+      --policy "$policy_or_config" --no-tty --detach -- sleep infinity
+  fi
+}
+
 create_sandbox() {
   CLI=(
     env
@@ -418,9 +447,11 @@ create_sandbox() {
     --gateway-endpoint "$GATEWAY_ENDPOINT"
   )
   SANDBOX_CREATED=1
-  run_setup_step \
-    "creating content guard sandbox" \
-    "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --policy "$EXAMPLE_DIR/policy.yaml" --no-tty --detach -- sleep infinity
+  if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+    create_with_policy "creating content guard sandbox" "$EXAMPLE_DIR/middleware.yaml"
+  else
+    create_with_policy "creating content guard sandbox" "$EXAMPLE_DIR/policy.yaml"
+  fi
 }
 
 request() {
@@ -479,9 +510,13 @@ run_suite() {
   # Recreate with the same terms in deny mode, through the external service.
   "${CLI[@]}" sandbox delete "$SANDBOX_NAME" >>"$SETUP_LOG" 2>&1
   SANDBOX_CREATED=0
-  sed '/replacement:/d; s/mode: redact/mode: deny/' "$EXAMPLE_DIR/policy.yaml" >"$SMOKE_TMP_DIR/deny.yaml"
+  if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+    sed '/replacement:/d; s/mode: redact/mode: deny/' "$EXAMPLE_DIR/middleware.yaml" >"$SMOKE_TMP_DIR/deny.yaml"
+  else
+    sed '/replacement:/d; s/mode: redact/mode: deny/' "$EXAMPLE_DIR/policy.yaml" >"$SMOKE_TMP_DIR/deny.yaml"
+  fi
   SANDBOX_CREATED=1
-  run_setup_step "creating deny sandbox" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --policy "$SMOKE_TMP_DIR/deny.yaml" --no-tty --detach -- sleep infinity
+  create_with_policy "creating deny sandbox" "$SMOKE_TMP_DIR/deny.yaml"
   if ! response_request sensitive >"$response_output" 2>>"$SETUP_LOG" ||
     ! grep -Fq 'HTTP/1.1 403 Forbidden' "$response_output" ||
     ! grep -Fq 'content_match' "$response_output" ||

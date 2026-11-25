@@ -9,6 +9,7 @@
 //! Known backend differences and expected evaluation failures remain explicit
 //! at their scenario definitions. The ported modules identify their source tests.
 
+mod examples;
 mod ported_opa_a;
 mod ported_opa_b;
 mod ported_phase1;

@@ -121,14 +121,16 @@ PY
 sed -e "s|__HOST__|${UP_HOST}|g" -e "s|__PORT__|${UP_PORT}|g" -e "s|__PREFIX__|${UP_PREFIX}|g" \
     "${SCRIPT_DIR}/policy.template.cedar" > "${TMP_DIR}/policy.cedar"
 
-# The gateway validates Cedar support and returns any policy error to the CLI.
-"$OPENSHELL_BIN" sandbox create \
+sed -e "s|__HOST__|${UP_HOST}|g" \
+    "${SCRIPT_DIR}/middleware.template.yaml" > "${TMP_DIR}/middleware.yaml"
+
+# The CLI sends Cedar source only, so the sandbox is created through the
+# policy API with the middleware attached.
+(cd "$REPO_ROOT" && uv run --quiet python e2e/support/cedar_sandbox.py create \
     --name "$SANDBOX" \
     --policy "${TMP_DIR}/policy.cedar" \
-    --no-auto-providers \
-    --no-tty \
-    --detach \
-    -- sh -c "exec sleep infinity" >/dev/null
+    --config "${TMP_DIR}/middleware.yaml" \
+    -- sh -c "exec sleep infinity") >/dev/null
 
 ready=0
 for _ in $(seq 1 60); do
@@ -203,6 +205,44 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Middleware: configured through the policy API
+# ---------------------------------------------------------------------------
+
+# The check needs the upstream to echo the request body. A shared public
+# upstream (CEDAR_E2E_UPSTREAM_URL) can be flaky, so a non-2xx response is
+# retried before it is reported as an upstream failure.
+middleware_checks() {
+    local label="$1" echo_body="" echo_status="" echo_response attempt
+    for attempt in 1 2 3; do
+        echo_response="$(capture_in_sandbox "curl -s --max-time 20 -X POST -H 'Content-Type: text/plain' \
+            --data 'key=sk-abcdefghijklmnopqrstuvwxyz' -w '\n%{http_code}' '${ECHO_URL}/allowed/echo'")"
+        echo_status="${echo_response##*$'\n'}"
+        echo_body="${echo_response%$'\n'*}"
+        if [[ "$echo_status" =~ ^2[0-9][0-9]$ ]]; then
+            break
+        fi
+        echo "upstream ${ECHO_URL} returned HTTP ${echo_status} on attempt ${attempt}/3" >&2
+        sleep 2
+    done
+    if [[ "$echo_status" =~ ^2[0-9][0-9]$ ]]; then
+        expect_contains "${label}: request body is redacted before upstream" "$echo_body" "[REDACTED]"
+    elif [[ "$echo_status" == "403" ]]; then
+        fail "${label}: request body is redacted before upstream" \
+            "OpenShell denied the permitted POST ${ECHO_URL}/allowed/echo: $echo_body"
+    else
+        fail "${label}: request body is redacted before upstream" \
+            "the upstream ${ECHO_URL}, not OpenShell, returned HTTP ${echo_status} on 3 attempts"
+    fi
+    if [[ "$echo_body" == *"sk-abcdefghijklmnopqrstuvwxyz"* ]]; then
+        fail "${label}: secret never reaches upstream" "$echo_body"
+    else
+        pass "${label}: secret never reaches upstream"
+    fi
+}
+
+middleware_checks "middleware"
+
+# ---------------------------------------------------------------------------
 # Policy update: `policy set --wait` on the running sandbox
 # ---------------------------------------------------------------------------
 
@@ -237,6 +277,9 @@ else
 fi
 expect_eq "policy set: a newly permitted path reaches upstream" "$(status "" /blocked)" "200"
 expect_eq "policy set: a newly forbidden path is denied" "$(status "" /allowed/ok)" "403"
+# The CLI sends only the Cedar source; middleware set through the API must
+# survive the update rather than be silently dropped.
+middleware_checks "policy set: middleware survives a CLI update"
 
 # ---------------------------------------------------------------------------
 # Providers: real attachment, credential injection, denial, and rotation
@@ -473,10 +516,10 @@ expect_contains "logs: a staged audit forbid is logged" "$sandbox_logs" "cedar_a
 policy_view="$("$OPENSHELL_BIN" policy get "$SANDBOX" --full 2>&1 || true)"
 expect_contains "policy get: shows the Cedar policy" "$policy_view" 'Sandbox::Action::"NetworkConnect"'
 policy_json="$("$OPENSHELL_BIN" policy get "$SANDBOX" --full --output json 2>/dev/null || true)"
-if printf '%s' "$policy_json" | python3 -c 'import json,sys; policy=json.load(sys.stdin)["policy"]; assert policy["cedar_policy"]["source"] and not policy.get("network_middlewares")'; then
-    pass "policy get: includes Cedar source without middleware"
+if printf '%s' "$policy_json" | python3 -c 'import json,sys; policy=json.load(sys.stdin)["policy"]; assert policy["cedar_policy"]["source"] and "redact-keys" in policy.get("network_middlewares", {})'; then
+    pass "policy get: includes Cedar source and the API-set middleware"
 else
-    fail "policy get: includes Cedar source without middleware" "$policy_json"
+    fail "policy get: includes Cedar source and the API-set middleware" "$policy_json"
 fi
 
 echo

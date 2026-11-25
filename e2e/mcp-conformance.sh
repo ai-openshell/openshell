@@ -7,6 +7,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh disable=SC1091
 source "${ROOT}/e2e/support/gateway-common.sh"
+# POLICY_FORMAT=cedar runs the client sandbox with policy-template.cedar. It
+# needs a gateway and supervisor built with the `experimental` feature.
+export POLICY_FORMAT="${POLICY_FORMAT:-yaml}"
 CONFORMANCE_DIR="${OPENSHELL_MCP_CONFORMANCE_DIR:-${ROOT}/.cache/mcp-conformance}"
 # Pinned after v0.1.16 for the upstream tools_call fixture fix. The current
 # checkout still needs temporary client-fixture patches for
@@ -319,32 +322,51 @@ create_client_sandbox() {
     return
   fi
 
-  local sandbox_name policy_file openshell
+  local sandbox_name policy_file config_file openshell
   sandbox_name="mcp-client-$$"
-  policy_file="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-base-policy.XXXXXX.yaml")"
+  policy_file="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-base-policy.XXXXXX.${POLICY_FORMAT}")"
+  config_file=""
   openshell="$(openshell_bin)"
 
   # The upstream runner binds its per-scenario test server with listen(0), and
   # the port can be outside the OS ephemeral range. Create the reusable sandbox
   # with a harmless placeholder; the client wrapper installs the exact policy
   # for each scenario URL before executing the TypeScript client.
-  python3 "${ROOT}/e2e/mcp-conformance/render-policy.py" \
-    "http://192.0.2.1:1/" "${policy_file}" \
-    "${ROOT}/e2e/mcp-conformance/policy-template.yaml" \
-    "${SPEC_VERSION}" >/dev/null
+  local -a render_args=(
+    "http://192.0.2.1:1/" "${policy_file}"
+    "${ROOT}/e2e/mcp-conformance/policy-template.${POLICY_FORMAT}"
+    "${SPEC_VERSION}"
+  )
+  if [ "${POLICY_FORMAT}" = "cedar" ]; then
+    config_file="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-base-config.XXXXXX.yaml")"
+    render_args+=("${config_file}" "${ROOT}/e2e/mcp-conformance/middleware-template.yaml")
+  fi
+  python3 "${ROOT}/e2e/mcp-conformance/render-policy.py" "${render_args[@]}" >/dev/null
 
   echo "Creating MCP conformance client sandbox ${sandbox_name}..." >&2
-  if ! "${openshell}" sandbox create \
+  local created=0
+  if [ "${POLICY_FORMAT}" = "cedar" ]; then
+    # The CLI sends Cedar source only; endpoint settings and process identity
+    # go through the policy API.
+    uv run --quiet --project "${ROOT}" python "${ROOT}/e2e/support/cedar_sandbox.py" create \
+      --name "${sandbox_name}" \
+      --image "${CLIENT_IMAGE}" \
+      --policy "${policy_file}" \
+      --config "${config_file}" \
+      -- sleep infinity && created=1
+  elif "${openshell}" sandbox create \
     --name "${sandbox_name}" \
     --from "${CLIENT_IMAGE}" \
     --policy "${policy_file}" \
     --no-tty \
     --detach \
     -- sleep infinity; then
-    rm -f "${policy_file}"
+    created=1
+  fi
+  rm -f "${policy_file}" "${config_file}"
+  if [ "${created}" != "1" ]; then
     return 1
   fi
-  rm -f "${policy_file}"
 
   export OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX="${sandbox_name}"
   export OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT="${OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT:-1}"

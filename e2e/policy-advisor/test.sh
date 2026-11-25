@@ -7,7 +7,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-POLICY_TEMPLATE="${SCRIPT_DIR}/policy.template.yaml"
+# POLICY_FORMAT=cedar starts the sandbox from policy.template.cedar instead of
+# policy.template.yaml, with middleware.yaml carrying the process identity the
+# YAML policy's `process` section sets. The CLI sends Cedar source only, so
+# that sandbox is created through the policy API. A Cedar policy accepts no
+# merged rules, so the test then checks that the gateway rejects the proposal.
+POLICY_FORMAT="${POLICY_FORMAT:-yaml}"
+case "$POLICY_FORMAT" in
+    yaml | cedar) ;;
+    *)
+        printf 'POLICY_FORMAT must be yaml or cedar\n' >&2
+        exit 2
+        ;;
+esac
+POLICY_TEMPLATE="${SCRIPT_DIR}/policy.template.${POLICY_FORMAT}"
 RUNNER_SOURCE="${SCRIPT_DIR}/sandbox-runner.sh"
 
 if [[ -z "${OPENSHELL_BIN:-}" ]]; then
@@ -216,7 +229,7 @@ Enable it with:
 
 create_temp_workspace() {
     TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-agent-policy.XXXXXX")"
-    POLICY_FILE="${TMP_DIR}/policy.yaml"
+    POLICY_FILE="${TMP_DIR}/policy.${POLICY_FORMAT}"
     SSH_CONFIG="${TMP_DIR}/ssh_config"
 }
 
@@ -224,6 +237,22 @@ create_sandbox() {
     step "Creating sandbox with read-only GitHub L7 policy"
     cp "$POLICY_TEMPLATE" "$POLICY_FILE"
     "$OPENSHELL_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
+    if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+        (cd "$REPO_ROOT" && uv run --quiet python e2e/support/cedar_sandbox.py create \
+            --name "$DEMO_SANDBOX_NAME" \
+            --provider "$DEMO_GITHUB_PROVIDER_NAME" \
+            --policy "$POLICY_FILE" \
+            --config "${SCRIPT_DIR}/middleware.yaml")
+        local i
+        for i in $(seq 1 60); do
+            "$OPENSHELL_BIN" sandbox exec --name "$DEMO_SANDBOX_NAME" --no-tty -- true \
+                >/dev/null 2>&1 </dev/null && break
+            sleep 2
+        done
+        "$OPENSHELL_BIN" sandbox upload "$DEMO_SANDBOX_NAME" "$RUNNER_SOURCE" \
+            /sandbox/policy-validation-runner.sh --no-git-ignore
+        return
+    fi
     "$OPENSHELL_BIN" sandbox create \
         --name "$DEMO_SANDBOX_NAME" \
         --provider "$DEMO_GITHUB_PROVIDER_NAME" \
@@ -327,6 +356,14 @@ submit_and_approve() {
     status="$(printf '%s\n' "$output" | http_status)"
     body="$(printf '%s\n' "$output" | http_body)"
 
+    if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+        printf '%s\n' "$body" \
+            | jq -e '(.accepted_chunks // 0) == 0
+                and any(.rejection_reasons[]; contains("exactly one policy format"))' >/dev/null \
+            || fail "expected the gateway to reject a proposal for a Cedar sandbox (HTTP $status): $body"
+        info "${GREEN}Gateway rejected the proposal: a Cedar policy accepts no merged rules.${RESET}"
+        return
+    fi
     [[ "$status" == "202" ]] || fail "expected proposal submit HTTP 202, got HTTP $status"
     [[ "$(printf '%s\n' "$body" | jq -r '.accepted_chunks // 0')" != "0" ]] \
         || fail "proposal was not accepted"
@@ -397,7 +434,9 @@ main() {
     run_policy_local_checks
     capture_initial_denial
     submit_and_approve
-    retry_until_allowed
+    if [[ "$POLICY_FORMAT" == "yaml" ]]; then
+        retry_until_allowed
+    fi
     show_logs
 
     printf "\n${BOLD}${GREEN}✓ Validation complete.${RESET}\n\n"

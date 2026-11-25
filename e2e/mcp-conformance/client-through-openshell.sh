@@ -47,7 +47,17 @@ require_active_gateway() {
 
 SERVER_URL="$1"
 CLIENT_SANDBOX="${OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX:?set OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX to the reusable conformance client sandbox name}"
-POLICY_TEMPLATE="${ROOT}/e2e/mcp-conformance/policy-template.yaml"
+# POLICY_FORMAT=cedar renders policy-template.cedar and its endpoint settings
+# instead of policy-template.yaml. The client sandbox keeps one format.
+POLICY_FORMAT="${POLICY_FORMAT:-yaml}"
+case "${POLICY_FORMAT}" in
+  yaml | cedar) ;;
+  *)
+    echo "ERROR: POLICY_FORMAT must be yaml or cedar, not ${POLICY_FORMAT}" >&2
+    exit 2
+    ;;
+esac
+POLICY_TEMPLATE="${ROOT}/e2e/mcp-conformance/policy-template.${POLICY_FORMAT}"
 POLICY_WAIT="${OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT:-0}"
 POLICY_WAIT_TIMEOUT="${OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT_TIMEOUT:-60}"
 CLIENT_TIMEOUT_SECONDS="${OPENSHELL_MCP_CONFORMANCE_CLIENT_TIMEOUT_SECONDS:-120}"
@@ -55,10 +65,15 @@ MCP_VERSION="${MCP_CONFORMANCE_PROTOCOL_VERSION:-${OPENSHELL_MCP_CONFORMANCE_SPE
 
 require_active_gateway
 
-POLICY_FILE="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-policy.XXXXXX.yaml")"
-trap 'rm -f "${POLICY_FILE}"' EXIT
+POLICY_FILE="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-policy.XXXXXX.${POLICY_FORMAT}")"
+RENDER_ARGS=("${SERVER_URL}" "${POLICY_FILE}" "${POLICY_TEMPLATE}" "${MCP_VERSION}")
+if [ "${POLICY_FORMAT}" = "cedar" ]; then
+  CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-config.XXXXXX.yaml")"
+  RENDER_ARGS+=("${CONFIG_FILE}" "${ROOT}/e2e/mcp-conformance/middleware-template.yaml")
+fi
+trap 'rm -f "${POLICY_FILE}" "${CONFIG_FILE:-}"' EXIT
 
-CLIENT_SERVER_URL="$(python3 "${ROOT}/e2e/mcp-conformance/render-policy.py" "${SERVER_URL}" "${POLICY_FILE}" "${POLICY_TEMPLATE}" "${MCP_VERSION}")"
+CLIENT_SERVER_URL="$(python3 "${ROOT}/e2e/mcp-conformance/render-policy.py" "${RENDER_ARGS[@]}")"
 
 ENV_ARGS=()
 
@@ -78,6 +93,16 @@ POLICY_SET_COMMAND=(
 )
 if [ "${POLICY_WAIT}" = "1" ]; then
   POLICY_SET_COMMAND+=(--wait --timeout "${POLICY_WAIT_TIMEOUT}")
+fi
+if [ "${POLICY_FORMAT}" = "cedar" ]; then
+  # The CLI sends Cedar source only; endpoint settings go through the API.
+  POLICY_SET_COMMAND=(
+    uv run --quiet --project "${ROOT}" python "${ROOT}/e2e/support/cedar_sandbox.py" update
+    --name "${CLIENT_SANDBOX}" --policy "${POLICY_FILE}" --config "${CONFIG_FILE}"
+  )
+  if [ "${POLICY_WAIT}" != "1" ]; then
+    POLICY_SET_COMMAND+=(--no-wait)
+  fi
 fi
 "${POLICY_SET_COMMAND[@]}"
 
