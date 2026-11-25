@@ -203,14 +203,10 @@ async fn google_metadata_serves_placeholder_token(cx: &mut Context) -> testkit::
     const KEY: &str = "GCP_ADC_ACCESS_TOKEN";
 
     let provider = cx.name("gcp");
-    let provider_type = cx.import_profile(GOOGLE_CLOUD_PROFILE).await?;
-    cx.create_provider_with_config(
-        &provider,
-        &provider_type,
-        &[(KEY, SECRET)],
-        &[("project_id", PROJECT), ("service_account_email", EMAIL)],
-    )
-    .await?;
+    cx.install_provider(&provider, GOOGLE_CLOUD_PROFILE, &[(KEY, SECRET)])
+        .config("project_id", PROJECT)
+        .config("service_account_email", EMAIL)
+        .await?;
 
     let mut bound = policy::base();
     policy::allow(

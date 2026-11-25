@@ -18,7 +18,8 @@ use crate::auth::workspace_authz::{
 use crate::compute::{MutationScope, SandboxDeletePreconditions};
 use crate::pagination::Pagination;
 use crate::persistence::{
-    ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
+    ObjectLabels, ObjectListQuery, ObjectType, PersistenceResult, Store, WriteCondition,
+    generate_name,
 };
 use crate::tracing_bus::CursoredEvent;
 use crate::watch_cursor::WatchCursor;
@@ -42,7 +43,7 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
-    SandboxRestartPolicy, SandboxTemplate, SshSession,
+    SandboxRestartPolicy, SandboxTemplate, ServiceBackendHttpVersion, SshSession,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
@@ -69,9 +70,10 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique_with_catalog,
 };
 use super::validation::{
-    level_matches, source_matches, validate_and_canonicalize_policy, validate_dns1123_label,
-    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
+    level_matches, require_gateway_cedar_support, source_matches, validate_and_canonicalize_policy,
+    validate_dns1123_label, validate_exec_request_fields,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_sandbox_governance_spec, validate_sandbox_spec,
 };
 use super::{MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN};
 use crate::persistence::current_time_ms;
@@ -841,6 +843,7 @@ async fn handle_create_sandbox_inner(
                 exposure.target_port,
                 exposure.authorization_mode,
             )?,
+            ServiceBackendHttpVersion::Unspecified,
         )
         .await
         {
@@ -1932,6 +1935,9 @@ async fn handle_start_sandbox_inner(
         MinWorkspaceRole::User,
     )
     .await?;
+    if let Some(policy) = resolved.spec.as_ref().and_then(|spec| spec.policy.as_ref()) {
+        require_gateway_cedar_support(policy)?;
+    }
     let workspace = resolved.object_workspace().to_string();
     let name = resolved.object_name().to_string();
     let mut sandbox = state
@@ -2032,6 +2038,9 @@ async fn handle_resume_sandbox_inner(
         MinWorkspaceRole::User,
     )
     .await?;
+    if let Some(policy) = resolved.spec.as_ref().and_then(|spec| spec.policy.as_ref()) {
+        require_gateway_cedar_support(policy)?;
+    }
     let workspace = resolved.object_workspace().to_string();
     let name = resolved.object_name().to_string();
     let mut sandbox = state
@@ -2117,7 +2126,7 @@ async fn update_sandbox_cas<F>(
     sandbox_id: &str,
     expected_resource_version: u64,
     mut mutate: F,
-) -> crate::persistence::PersistenceResult<Sandbox>
+) -> PersistenceResult<Sandbox>
 where
     F: FnMut(&mut Sandbox),
 {
@@ -3474,6 +3483,57 @@ async fn sandbox_relay_reachable(
     }
 }
 
+/// Maximum number of random-name attempts when persisting a new SSH session.
+const SSH_SESSION_NAME_ATTEMPTS: usize = 3;
+const _: () = assert!(SSH_SESSION_NAME_ATTEMPTS >= 1);
+
+/// Persist a new SSH session record, retrying with a fresh random name when
+/// the insert collides with an existing object name in the workspace.
+///
+/// Session names are 6 random lowercase letters and records linger for up to
+/// the configured TTL (about two hours with the defaults), so a busy
+/// workspace can make a freshly drawn name collide on `objects_name_uq`. A
+/// redraw is effectively certain to succeed, so the insert is retried with a
+/// regenerated name instead of failing the connection. Any other error,
+/// including a primary-key collision on the token, is returned to the caller.
+async fn persist_ssh_session(
+    store: &Store,
+    session: &mut SshSession,
+    labels_json: Option<&str>,
+) -> PersistenceResult<()> {
+    // Every caller validates metadata before persisting; the redraw below
+    // relies on it being present.
+    debug_assert!(session.metadata.is_some());
+    for attempt in 1..=SSH_SESSION_NAME_ATTEMPTS {
+        let result = store
+            .create_relaxed(
+                SshSession::object_type(),
+                &session.token,
+                session.object_name(),
+                session.object_workspace(),
+                &session.encode_to_vec(),
+                labels_json,
+            )
+            .await;
+        match result {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if attempt < SSH_SESSION_NAME_ATTEMPTS
+                    && error.is_unique_violation_on("objects_name_uq") =>
+            {
+                // A session without metadata cannot be redrawn; surface the
+                // collision instead of retrying an identical insert.
+                let Some(metadata) = session.metadata.as_mut() else {
+                    return Err(error);
+                };
+                metadata.name = generate_name();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the final attempt returns its error instead of retrying")
+}
+
 pub(super) async fn handle_create_ssh_session(
     state: &Arc<ServerState>,
     request: Request<CreateSshSessionRequest>,
@@ -3501,7 +3561,7 @@ pub(super) async fn handle_create_ssh_session(
     } else {
         0
     };
-    let session = SshSession {
+    let mut session = SshSession {
         metadata: Some(ObjectMeta {
             id: token.clone(),
             name: generate_name(),
@@ -3534,16 +3594,7 @@ pub(super) async fn handle_create_ssh_session(
                 .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
         )
     };
-    state
-        .store
-        .create_relaxed(
-            SshSession::object_type(),
-            &token,
-            session.object_name(),
-            session.object_workspace(),
-            &session.encode_to_vec(),
-            session_labels_json.as_deref(),
-        )
+    persist_ssh_session(&state.store, &mut session, session_labels_json.as_deref())
         .await
         .map_err(|e| Status::internal(format!("persist ssh session failed: {e}")))?;
     super::mutation_audit::record_ssh_session(session.object_name());
@@ -4382,6 +4433,134 @@ mod tests {
     use openshell_core::proto::{
         GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
     };
+
+    #[cfg(not(feature = "experimental"))]
+    /// A test state whose compute driver records provisioning calls.
+    async fn test_server_state_with_fake_driver() -> (
+        Arc<ServerState>,
+        Arc<crate::test_support::FakeComputeDriver>,
+    ) {
+        let mut state = test_server_state().await;
+        let driver = Arc::new(
+            crate::test_support::FakeComputeDriver::new().with_capabilities(
+                openshell_core::proto::compute::v1::GetCapabilitiesResponse {
+                    driver_name: "test".to_string(),
+                    default_image: "test/image:latest".to_string(),
+                    resource_admission_policy:
+                        openshell_core::resource_admission::DriverAdmissionConfig::default()
+                            .acknowledgement(),
+                    extension: Some(openshell_core::extension_protocol::extension_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::Compute,
+                        "test/fake",
+                        "test",
+                        [],
+                    )),
+                    ..Default::default()
+                },
+            ),
+        );
+        let compute = crate::compute::ComputeRuntime::from_driver(
+            "test".to_string(),
+            driver.clone(),
+            None,
+            state.store.clone(),
+            crate::sandbox_index::SandboxIndex::new(),
+            crate::sandbox_watch::SandboxWatchBus::new(),
+            crate::tracing_bus::TracingLogBus::new(),
+            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().compute = compute;
+        driver.clear_calls();
+        (state, driver)
+    }
+
+    #[cfg(not(feature = "experimental"))]
+    fn create_request_with_policy(
+        name: &str,
+        policy: openshell_core::proto::SandboxPolicy,
+    ) -> Request<CreateSandboxRequest> {
+        authed_request(CreateSandboxRequest {
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            name: name.to_string(),
+            spec: Some(SandboxSpec {
+                policy: Some(policy),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Stores a stopped sandbox whose spec holds a Cedar policy, as a
+    /// Cedar-enabled gateway with a supervisor-enforced driver created it.
+    #[cfg(not(feature = "experimental"))]
+    async fn put_stopped_cedar_sandbox(state: &ServerState, name: &str) {
+        let mut sandbox = test_sandbox(name, Vec::new());
+        sandbox.spec.as_mut().unwrap().policy = Some(crate::grpc::test_support::cedar_policy());
+        sandbox.set_phase(SandboxPhase::Stopped as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+    }
+
+    #[cfg(not(feature = "experimental"))]
+    fn start_request(name: &str) -> Request<StartSandboxRequest> {
+        authed_request(StartSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            ..Default::default()
+        })
+    }
+
+    #[cfg(not(feature = "experimental"))]
+    #[tokio::test]
+    async fn create_rejects_cedar_without_cedar_support() {
+        let (state, driver) = test_server_state_with_fake_driver().await;
+        let error = handle_create_sandbox(
+            &state,
+            create_request_with_policy("cedar", crate::grpc::test_support::cedar_policy()),
+        )
+        .await
+        .expect_err("Cedar is unsupported");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
+        assert!(error.message().contains("without Cedar"), "{error:?}");
+        assert!(driver.calls().is_empty(), "{:?}", driver.calls());
+    }
+
+    #[cfg(not(feature = "experimental"))]
+    #[tokio::test]
+    async fn start_rejects_a_stored_cedar_sandbox_without_cedar_support() {
+        let (state, driver) = test_server_state_with_fake_driver().await;
+        put_stopped_cedar_sandbox(&state, "stored-cedar").await;
+
+        let error = handle_start_sandbox(&state, start_request("stored-cedar"))
+            .await
+            .expect_err("Cedar is unsupported");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
+        assert!(error.message().contains("without Cedar"), "{error:?}");
+        assert!(driver.calls().is_empty(), "{:?}", driver.calls());
+    }
+
+    /// Resuming starts the workload again, so it applies the start checks.
+    #[cfg(not(feature = "experimental"))]
+    #[tokio::test]
+    async fn resume_rejects_a_stored_cedar_sandbox_without_cedar_support() {
+        let (state, driver) = test_server_state_with_fake_driver().await;
+        put_stopped_cedar_sandbox(&state, "stored-cedar").await;
+
+        let error = handle_resume_sandbox(
+            &state,
+            authed_request(ResumeSandboxRequest {
+                name: "stored-cedar".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("Cedar is unsupported");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
+        assert!(error.message().contains("without Cedar"), "{error:?}");
+        assert!(driver.calls().is_empty(), "{:?}", driver.calls());
+    }
 
     #[tokio::test]
     async fn missing_launch_signer_precedes_driver_validation_and_preserves_staged_archive() {
@@ -9681,6 +9860,94 @@ mod tests {
             .unwrap();
         assert!(session1.is_some());
         assert!(session2.is_some());
+    }
+
+    fn collision_test_session(id: &str, name: &str) -> SshSession {
+        SshSession {
+            metadata: Some(ObjectMeta {
+                id: id.to_string(),
+                name: name.to_string(),
+                created_time: None,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_time: None,
+            }),
+            sandbox_id: "sandbox-work".to_string(),
+            token: id.to_string(),
+            revoked: false,
+            expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(0)
+                .unwrap(),
+        }
+    }
+
+    async fn assert_ssh_session_name_collision_is_retried(store: &Store) {
+        // Occupy the name the new session draws first.
+        store
+            .put_message(&collision_test_session("existing-token", "collided"))
+            .await
+            .unwrap();
+
+        let mut session = collision_test_session("fresh-token", "collided");
+        persist_ssh_session(store, &mut session, None)
+            .await
+            .expect("a name collision should be retried with a fresh name");
+
+        let stored = store
+            .get_message::<SshSession>("fresh-token")
+            .await
+            .unwrap()
+            .expect("session should be stored");
+        assert_ne!(stored.object_name(), "collided");
+        assert_eq!(stored.object_name(), session.object_name());
+        assert_eq!(stored.token, "fresh-token");
+    }
+
+    #[tokio::test]
+    async fn create_ssh_session_retries_on_name_collision() {
+        let state = test_server_state().await;
+        assert_ssh_session_name_collision_is_retried(&state.store).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_create_ssh_session_retries_on_name_collision() {
+        let schema =
+            crate::persistence::test_postgres::TestSchema::create("ssh_name_collision").await;
+        let store = schema.connect_store().await;
+        assert_ssh_session_name_collision_is_retried(&store).await;
+        drop(store);
+        schema.drop_schema().await;
+    }
+
+    #[tokio::test]
+    async fn persist_ssh_session_returns_token_collision_without_redraw() {
+        let state = test_server_state().await;
+        // A record already owns the token, so the insert trips the primary
+        // key, not the workspace name constraint.
+        state
+            .store
+            .put_message(&collision_test_session("dup-token", "occupied-name"))
+            .await
+            .unwrap();
+
+        let mut session = collision_test_session("dup-token", "unrelated-name");
+        let error = persist_ssh_session(&state.store, &mut session, None)
+            .await
+            .expect_err("a primary-key collision must surface to the caller");
+        assert!(
+            matches!(
+                error,
+                crate::persistence::PersistenceError::UniqueViolation { .. }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            session.object_name(),
+            "unrelated-name",
+            "the name must not be redrawn for a non-name violation"
+        );
     }
 
     #[tokio::test]
