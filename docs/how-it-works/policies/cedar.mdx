@@ -48,7 +48,7 @@ The CLI sends the file's text to the gateway, which validates it and rejects an 
 
 `openshell policy get <name>` prints the Cedar text of a Cedar sandbox's policy.
 
-The CLI does not currently configure middleware, endpoint settings, or a custom process identity for Cedar policies. YAML policies retain their existing configuration sections.
+The CLI does not currently configure middleware, endpoint settings, or a custom process identity for Cedar policies. When one of these, or Landlock compatibility, is set through the policy API, `openshell policy set` with a Cedar file keeps it and replaces only the Cedar source. YAML policies retain their existing configuration sections.
 
 ## Policy Model
 
