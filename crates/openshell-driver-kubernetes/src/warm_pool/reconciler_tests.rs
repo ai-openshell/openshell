@@ -274,7 +274,7 @@ fn warm_pool_configuration_rejects_unsupported_or_unbounded_pools() {
     assert!(config.validate_warm_pools().is_ok());
     config.workspace_mode = WorkspaceMode::Managed;
     assert!(config.validate_warm_pools().is_ok());
-    assert!(config.warm_pool.enabled);
+    assert!(!config.warm_pool.enabled);
     config.warm_pool.max_size = 257;
     assert!(config.validate_warm_pools().is_err());
     config.warm_pool.max_size = 16;

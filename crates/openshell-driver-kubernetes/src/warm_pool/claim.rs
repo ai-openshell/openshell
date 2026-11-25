@@ -69,6 +69,9 @@ impl KubernetesComputeDriver {
         if let Some(identity) = selected? {
             return Ok(Some(identity));
         }
+        if self.warm_pools_inactive() {
+            return Ok(None);
+        }
         // Fence delayed warm selection before creating cold infrastructure.
         if let Some(intent) = self
             .warm_supervision()?
@@ -82,6 +85,13 @@ impl KubernetesComputeDriver {
                 .map(Some);
         }
         Ok(None)
+    }
+
+    fn warm_pools_inactive(&self) -> bool {
+        !self.config.warm_pool.enabled
+            && self
+                .warm_pools_absent
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Sets `pooled` once a pool with a positive target could serve this
@@ -121,6 +131,9 @@ impl KubernetesComputeDriver {
                     "the sandbox already owns another runtime generation",
                 ));
             }
+            return Ok(None);
+        }
+        if self.warm_pools_inactive() {
             return Ok(None);
         }
         if let Some(intent) = supervision

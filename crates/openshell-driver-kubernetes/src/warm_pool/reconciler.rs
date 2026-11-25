@@ -568,6 +568,38 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
+    /// A disabled driver only drains pools that already have a journal.
+    pub(super) async fn pools_to_reconcile(
+        &self,
+        supervision: &SharedSupervision,
+    ) -> Result<Vec<WarmPoolConfig>, KubernetesDriverError> {
+        let enabled = self.config.warm_pool.enabled;
+        let pools = async {
+            let pools = self.template_warm_pools(None).await?;
+            if enabled {
+                return Ok(pools);
+            }
+            let mut recorded = Vec::new();
+            for pool in pools {
+                if supervision
+                    .warm_pool_state(&pool.workspace, &pool.name)
+                    .await
+                    .map_err(KubernetesDriverError::Message)?
+                    .is_some()
+                {
+                    recorded.push(pool);
+                }
+            }
+            Ok(recorded)
+        }
+        .await;
+        self.warm_pools_absent.store(
+            !enabled && pools.as_ref().is_ok_and(Vec::is_empty),
+            std::sync::atomic::Ordering::Release,
+        );
+        pools
+    }
+
     pub(in crate::driver) fn spawn_warm_pool_reconciler(
         &self,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -586,7 +618,7 @@ impl KubernetesComputeDriver {
                 tokio::select! {
                     result = shutdown.changed() => { if result.is_err() || *shutdown.borrow() { break; } }
                     _ = interval.tick() => {
-                        let pools = match driver.template_warm_pools(None).await {
+                        let pools = match driver.pools_to_reconcile(&supervision).await {
                             Ok(pools) => pools,
                             Err(error) => { warn!(%error, "warm template inventory unavailable"); continue; }
                         };

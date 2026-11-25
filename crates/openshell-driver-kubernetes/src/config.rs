@@ -289,8 +289,8 @@ fn is_dns_label(value: &str) -> bool {
 /// Each pass may run this many Kubernetes operations concurrently per pool.
 pub const MAX_REFILL_PER_PASS: u32 = 64;
 
-/// Operator limits for template-driven spare capacity. Templates supply the
-/// workload and desired count; this switch only disables the optimization.
+/// Operator limits for template-driven spare capacity. Pools stay off until an
+/// operator sets `enabled`; templates then supply the workload and desired count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WarmPoolSettings {
@@ -309,7 +309,7 @@ pub struct WarmPoolSettings {
 impl Default for WarmPoolSettings {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             revision: 1,
             max_size: 16,
             max_age_secs: 3600,
@@ -355,7 +355,7 @@ impl WarmPoolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
-    /// Template-driven spare capacity, enabled by default.
+    /// Template-driven spare capacity, disabled by default.
     pub warm_pool: WarmPoolSettings,
     /// Supervise new sandbox generations with one supervisor shared by the
     /// gateway instead of a supervisor Pod per sandbox. Existing generations

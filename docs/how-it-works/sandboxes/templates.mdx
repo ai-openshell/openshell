@@ -49,7 +49,9 @@ openshell sandbox template create agents \
   --max-burst 2
 ```
 
-Pooling is enabled by default. Both startup options must be present, with a
+Pooling requires an operator to set
+[`openshell.drivers.kubernetes.warm_pool.enabled`](/how-it-works/gateways/configuration)
+on the gateway. Both startup options must be present, with a
 positive burst count. This template requests two unassigned runtimes using its
 image, environment, resources, and driver settings. The gateway's per-template
 capacity limit may cap that count. `--ready-within` expresses a desired startup
@@ -58,8 +60,7 @@ time; it does not guarantee that deadline.
 Create with `--template agents` to use that capacity. An empty pool falls back to
 cold creation. Deleting the template drains its unclaimed runtimes; it does not
 delete sandboxes already created from it. Templates without startup tuning do not
-create pools. Operators can disable pooling with
-[`openshell.drivers.kubernetes.warm_pool.enabled`](/how-it-works/gateways/configuration).
+create pools.
 
 If a gateway restarts during creation and the reserved runtime has disappeared,
 recovery marks the pending sandbox as failed. You can delete it and create a new

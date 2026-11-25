@@ -241,7 +241,10 @@ permissions. Secrets deliver bootstrap material to Pods; gateway persistence own
 preparation and claim recovery. Inventory includes preparing, retiring and deleting
 resources; a released gate does not prove that a runtime is claimable.
 
-Template-driven pooling is enabled by default through `warm_pool.enabled`.
+Template-driven pooling is disabled by default; operators opt in with
+`warm_pool.enabled`. A disabled reconciler only drains pools that already have a
+journal. After a pass finds none, creates skip warm lookups and the cold-launch
+fence because no claim can exist.
 The gateway supplies stored template targets through the existing in-process
 supervision coordinator. Only templates with `startup.ready_within` and positive
 `startup.max_burst` request spares; the target is capped by `warm_pool.max_size`.

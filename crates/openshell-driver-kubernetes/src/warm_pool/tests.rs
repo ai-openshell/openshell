@@ -766,6 +766,10 @@ fn fixture(state: Arc<Mutex<State>>) -> KubernetesComputeDriver {
         default_image: "workload-image".into(),
         sandbox_runtime_image: "runtime-image".into(),
         shared_supervisor: Some(shared_config.clone()),
+        warm_pool: crate::config::WarmPoolSettings {
+            enabled: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut driver = KubernetesComputeDriver::new_for_test(config);
@@ -1521,6 +1525,79 @@ async fn discovery_fallback_resumes_claim_that_wins_the_cold_launch_fence() {
     assert!(state.cold_launches.is_empty());
     assert_eq!(state.claims.len(), 1);
     assert_eq!(state.activated.len(), 1);
+}
+
+#[tokio::test]
+async fn disabled_pools_skip_claim_lookups_only_after_a_pass_finds_no_journal() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut driver = fixture(state.clone());
+    driver.config.warm_pool.enabled = false;
+    let supervision = driver.warm_supervision().unwrap().clone();
+    let sandbox = claiming_sandbox(&request(), "logical-disabled");
+    let cold_launches = || state.lock().unwrap().cold_launches.len();
+
+    // Before any pass the driver cannot rule out a claim, so it fences.
+    assert!(
+        driver
+            .try_claim_warm_runtime(&sandbox, "openshell")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(cold_launches(), 1);
+
+    assert!(
+        driver
+            .pools_to_reconcile(&supervision)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        driver
+            .try_claim_warm_runtime(&sandbox, "openshell")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(cold_launches(), 1);
+    assert!(state.lock().unwrap().journal.is_none());
+
+    state.lock().unwrap().fail_journal_read = true;
+    assert!(driver.pools_to_reconcile(&supervision).await.is_err());
+    state.lock().unwrap().fail_journal_read = false;
+    assert!(
+        driver
+            .try_claim_warm_runtime(&sandbox, "openshell")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(cold_launches(), 2);
+}
+
+#[tokio::test]
+async fn disabled_pools_keep_draining_and_fencing_recorded_pools() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let (mut driver, request, _) = Box::pin(ready_pool(state.clone(), 1)).await;
+    driver.config.warm_pool.enabled = false;
+    let supervision = driver.warm_supervision().unwrap().clone();
+    assert!(state.lock().unwrap().journal.is_some());
+
+    let pools = driver.pools_to_reconcile(&supervision).await.unwrap();
+    assert_eq!(pools.len(), 1);
+    assert_eq!(pools[0].target_size, 0);
+    let sandbox = claiming_sandbox(&request, "logical-draining");
+    assert!(
+        driver
+            .try_claim_warm_runtime(&sandbox, "openshell")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let state = state.lock().unwrap();
+    assert_eq!(state.cold_launches.len(), 1);
+    assert!(state.claims.is_empty());
 }
 
 #[tokio::test]

@@ -140,6 +140,7 @@ mod lifecycle_reconciliation {
             operator_allowlist: None,
             shared_supervisor: None,
             warm_supervision: None,
+            warm_pools_absent: Arc::default(),
         };
         (driver, steps, Arc::default())
     }

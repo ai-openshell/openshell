@@ -1382,8 +1382,9 @@ and does not redistribute existing owners; check individual Pod memory as well
 as the average. See the published High Availability guide for configuration
 and enabling or disabling autoscaling on an existing release.
 
-Template-driven warm pooling is enabled by default in managed, shared and operator Kubernetes
-workspaces with TLS and JWT signing. No spares exist until a template requests both
+Template-driven warm pooling is off unless `warm_pool.enabled=true`. It works in managed,
+shared and operator Kubernetes workspaces with TLS and JWT signing. No spares exist until a
+template requests both
 `--ready-within` and positive `--max-burst`. Inspect the template's startup tuning,
 its workload shape, and `warm_pool.enabled` before investigating missing capacity.
 `openshell sandbox template get <name>` shows the pool's target, ready, pending

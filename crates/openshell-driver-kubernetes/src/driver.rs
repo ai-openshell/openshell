@@ -1097,6 +1097,10 @@ pub struct KubernetesComputeDriver {
     /// topology.
     shared_supervisor: Option<SharedSupervisor>,
     warm_supervision: Option<SharedSupervision>,
+    /// Set only by a disabled reconciler pass that found no recorded pool.
+    /// Without a pool journal there is no claim to recover or race, so creates
+    /// skip warm lookups and the cold-launch fence.
+    warm_pools_absent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for KubernetesComputeDriver {
@@ -1141,6 +1145,7 @@ impl KubernetesComputeDriver {
             operator_allowlist: None,
             shared_supervisor: None,
             warm_supervision: None,
+            warm_pools_absent: Arc::default(),
         }
     }
 
@@ -1308,6 +1313,7 @@ impl KubernetesComputeDriver {
             operator_allowlist,
             shared_supervisor,
             warm_supervision: supervision,
+            warm_pools_absent: Arc::default(),
         };
 
         if driver.workspace_mode() == WorkspaceMode::Shared {
@@ -9689,6 +9695,7 @@ mod tests {
             operator_allowlist: None,
             shared_supervisor: None,
             warm_supervision: None,
+            warm_pools_absent: Arc::default(),
         };
         driver
             .sandbox_api_version
@@ -10955,6 +10962,7 @@ mod tests {
             operator_allowlist: None,
             shared_supervisor: None,
             warm_supervision: None,
+            warm_pools_absent: Arc::default(),
             network_trust_bundle: None,
         };
         driver
@@ -11049,6 +11057,7 @@ mod tests {
             operator_allowlist: None,
             shared_supervisor: None,
             warm_supervision: None,
+            warm_pools_absent: Arc::default(),
             network_trust_bundle: None,
         };
 
@@ -13819,6 +13828,7 @@ mod tests {
             operator_allowlist: None,
             shared_supervisor: None,
             warm_supervision: None,
+            warm_pools_absent: Arc::default(),
         };
         (driver, steps, bodies)
     }
@@ -14126,6 +14136,7 @@ mod tests {
                 operator_allowlist: None,
                 shared_supervisor: None,
                 warm_supervision: None,
+                warm_pools_absent: Arc::default(),
             };
             let service = crate::ComputeDriverService::new(driver);
 
