@@ -24,6 +24,12 @@ rest when they are submitted. Settings that configure inspection rather than
 grant access, such as middleware and MCP revisions, are separate fields of
 the policy message, outside the Cedar text.
 
+Two gaps remain while Cedar is development-only. A gateway released before
+Cedar support ignores a Cedar policy and accepts the request as an empty YAML
+policy, under which attached providers open their endpoints. A Cedar sandbox
+restarted while a gateway-wide YAML policy is set starts under that YAML
+policy. Both are listed under [Open questions](#open-questions).
+
 The reason is expressiveness that stays analyzable: authors can write
 conditions the YAML structure never anticipated, and every policy remains
 open to the kind of decidable analysis the policy prover gives YAML today
@@ -122,27 +128,37 @@ This RFC does not restate Cedar; see:
 |---|---|---|
 | Policy file | `.yaml`, `.yml`, or any other extension | `.cedar` (any case) |
 | Create | `openshell sandbox create --policy p.yaml` | `openshell sandbox create --policy p.cedar` |
-| Replace on a live sandbox | `openshell policy set` | `openshell policy set` with the whole policy |
+| Replace on a live sandbox | `openshell policy set` | `openshell policy set` with a `.cedar` file replaces the Cedar text only; to keep fields set through the API, use the API (below) |
 | Incremental edits | `openshell policy update`, policy advisor proposals | Not available; replace the whole policy |
 | Middleware | `network_middlewares:` in the policy | The `network_middlewares` field beside the Cedar text, set through the API; the CLI does not set it yet |
 | Inspection settings (`tls: skip`, MCP revisions, body limits, persisted queries) | Fields on the endpoint | The `endpoint_settings` field, set through the API |
 | `process:` section | Set in the policy | The `process` field, set through the API, same schema and validation |
 | `landlock:` section | Set in the policy | No Cedar form; defaults apply |
 | Attached providers | Grant access to their endpoints and supply credentials | Supply credentials only; your policy must allow the endpoints |
-| Gateway-wide configuration applied to every sandbox (`openshell policy set --global`), policy templates | Supported | YAML only |
-| Format of a sandbox | — | Fixed for its lifetime; recreate to switch |
+| Gateway-wide configuration applied to every sandbox (`openshell policy set --global`), policy templates | Supported | YAML only; a Cedar sandbox restarted while one is set starts under it (see [Open questions](#open-questions)) |
+| Format of a sandbox | — | Fixed while its supervisor runs; recreate to switch |
 | Gateway and runtime versions | Any | Development builds of both; a gateway without Cedar support rejects a Cedar policy, the gateway withholds a Cedar policy from a runtime that does not advertise support, and a gateway released before Cedar may ignore it (see [Open questions](#open-questions)) |
-| View the policy | `openshell policy get` | `openshell policy get` prints the Cedar text |
+| View the policy | `openshell policy get <name> --base` | `openshell policy get <name> --base` prints the Cedar text; `--full --output json` adds middleware, endpoint settings, `process`, and provider credential rules |
 
 Validation happens twice with the same checks: at the gateway when the policy
 is submitted, and in the supervisor when it is loaded. The CLI and SDKs do not
 link the Cedar engine; they read the `.cedar` file, send its text as is, and
 show the gateway's error when it rejects the policy. Load-time warnings are
-computed by the policy crates but not returned to clients (see
-[Open questions](#open-questions)). A policy OpenShell cannot
+logged by the supervisor as OCSF configuration events but not returned to
+clients (see [Open questions](#open-questions)). A policy OpenShell cannot
 enforce exactly is rejected with the reason, never loaded with part of its
 meaning dropped. Rejected revisions on a live sandbox follow the gateway's
 `policy_validation_failure_mode`, as for YAML.
+
+A policy replacement is the whole policy message, and a `.cedar` file carries
+only the Cedar text. `openshell policy set` with a `.cedar` file therefore
+removes middleware and endpoint settings that were set through the API, and
+the gateway rejects it if the sandbox has a `process` field, which cannot
+change on a live sandbox. To change the Cedar text and keep those fields, an
+API client reads the current policy (`openshell policy get <name> --base
+--output json` shows the same fields), replaces `cedar_policy.source`, and
+sends the whole `SandboxPolicy`, with the same `network_middlewares`,
+`endpoint_settings`, and `process`, through the `UpdateConfig` RPC.
 
 ### How a YAML policy maps to Cedar
 
@@ -518,6 +534,7 @@ endpoints:
     port: 443
     path: /graphql
     protocol: graphql
+    enforcement: enforce
     rules:
       - allow:
           operation_type: query
@@ -653,8 +670,8 @@ has YAML's audit-endpoint semantics: it decides requests on every path of its
 endpoint, and a path whose deciding policies are all audit runs in audit mode,
 where the routed path's mode decides whether a denial blocks even when the
 denying policy is an enforced one on another path. Because one audit policy
-with a new `@path` is enough to put that path in audit mode, the CLI and the
-supervisor warn when an audit-only path sits beside enforced policies on the
+with a new `@path` is enough to put that path in audit mode, the supervisor
+logs a warning when an audit-only path sits beside enforced policies on the
 same host and port.
 
 A *staged* policy is different: `@enforcement("staged")` marks a policy that
@@ -917,8 +934,12 @@ the Cedar policy and validates it with the checks YAML gets, including
 middleware and endpoint settings. Only then does it advance the middleware
 generation, activate the policy (closing inspected tunnels pinned to the old
 generation), install provider credentials, and publish the middleware. A
-rejected revision leaves all four on the previous revision, and a change to
-middleware alone keeps Cedar's generation so it does not close tunnels.
+rejected revision leaves all four on the previous revision. A change to the
+authored middleware advances Cedar's generation and closes inspected tunnels
+even when the Cedar text is unchanged, as one Rego generation does for YAML,
+so no tunnel runs the old middleware again. Reconciling the middleware
+registry while the authored middleware is unchanged keeps the generation and
+the tunnels.
 
 ## Implementation plan
 
@@ -944,17 +965,20 @@ credentials-only providers with token-grant admission, the
 policies documentation page, and the crate READMEs.
 
 A panel review of the pull request found six defects and one documentation
-gap, each since fixed with a regression test: host-glob overlap analysis
-that could allocate memory quadratic in selector length; no capability
-negotiation, so an older gateway read a Cedar policy as empty YAML; a
-`resource.protocol` check that also matched other `resource` attributes and
-let a REST permit decide GraphQL requests; a per-tunnel rather than
-sandbox-wide WebSocket budget; staged policies that could change an enforced
-decision through the query budget or an evaluation error; Cedar MCP endpoints
-missing from endpoint status; and public skills that round-tripped every
-policy through YAML. The review also recommended splitting the change; the
-pull requests above do that, separating build configuration, the Cedar
-integration, and the examples.
+gap. Five defects and the documentation gap are fixed with regression tests:
+host-glob overlap analysis that could allocate memory quadratic in selector
+length; a `resource.protocol` check that also matched other `resource`
+attributes and let a REST permit decide GraphQL requests; a per-tunnel rather
+than sandbox-wide WebSocket budget; staged policies that could change an
+enforced decision through the query budget or an evaluation error; Cedar MCP
+endpoints missing from endpoint status; and public skills that round-tripped
+every policy through YAML. The sixth, an older component reading a Cedar
+policy as empty YAML, is fixed toward the runtime by supervisor capability
+negotiation but remains open toward gateways released before Cedar support,
+since clients no longer check gateway support before sending (see
+[Open questions](#open-questions)). The review also recommended splitting
+the change; the pull requests above do that, separating build configuration,
+the Cedar integration, and the examples.
 
 Remaining steps:
 
@@ -962,7 +986,7 @@ Remaining steps:
 - Keep `ai-openshell/cedar` moving with the Cedar team: track delimited
   `like` upstream (cedar-policy/rfcs#115) and bump the pin as features land.
 - Let the CLI set middleware, endpoint settings, and `process` for Cedar
-  sandboxes.
+  sandboxes, and replace the Cedar text while keeping them.
 - Extend `e2e/cedar` to endpoint settings, `@path`, WebSocket, query
   parameters, native TCP, `destination_ip`, and `binary_aliases`, which
   today are covered by unit and parity tests.
@@ -1112,6 +1136,12 @@ maintainers to confirm.
   `retain_last_valid` it keeps its own policy. Should the supervisor quarantine
   regardless of the failure mode, since the operator asked for the global
   policy to win, and should the gateway warn when Cedar sandboxes exist?
+  The format guarantee also covers only a running supervisor. When a Cedar
+  sandbox starts again while a global policy is set, the gateway delivers the
+  global policy without reading the stored Cedar policy, and the new
+  supervisor chooses Rego from that payload. Should the gateway refuse to
+  start a Cedar sandbox under a global YAML policy, or deliver its stored
+  Cedar policy, so the format holds for the sandbox's lifetime?
 - Should `@protocol` become an attribute of `NetworkEndpoint` instead of an
   annotation?
 - Can Cedar add a narrow "any member matches" form over sets? It would cover
@@ -1144,8 +1174,8 @@ maintainers to confirm.
   capability that clients check close that case again, or is documenting it
   enough while Cedar is development-only?
 - Load-time analysis warnings, such as an audit-only path beside enforced
-  rules on the same endpoint, are computed but no longer returned to
-  clients. Should an additive response field return them?
+  rules on the same endpoint, are logged by the supervisor but no longer
+  returned to clients. Should an additive response field return them?
 - Should CI assert that stable binaries exclude `cedar-policy`, for example
   with a `cargo tree -i cedar-policy` check that must fail?
 - What would make Cedar the default rather than an opt-in?
