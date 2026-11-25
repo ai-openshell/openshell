@@ -126,12 +126,19 @@ ADDITIONAL_CA_SERVER_PID=""
 ADDITIONAL_CA_SERVER_LOG="${WORKDIR}/additional-ca-server.log"
 ADDITIONAL_CA_DIR="${WORKDIR}/additional-ca"
 ADDITIONAL_CA_PORT=""
+CONTENT_GUARD_PID=""
+CONTENT_GUARD_PORT=""
 IMAGE_UPDATES_MODE="${OPENSHELL_E2E_DOCKER_IMAGE_UPDATES:-0}"
 SUPERVISOR_NETWORK_MODE="${OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE:-}"
 case "${SUPERVISOR_NETWORK_MODE}" in
   ""|host|bridge|auto) ;;
   *) echo "ERROR: invalid Docker supervisor network mode for e2e." >&2; exit 2 ;;
 esac
+
+if [ -n "${OPENSHELL_E2E_CONTENT_GUARD_BIN:-}" ] && [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
+  echo "ERROR: The content guard fixture requires a gateway started by this wrapper." >&2
+  exit 2
+fi
 
 if [ "${IMAGE_UPDATES_MODE}" = "1" ] && [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
   echo "ERROR: Docker image-update qualification requires a new gateway owned by this wrapper." >&2
@@ -156,6 +163,7 @@ cleanup() {
 
   e2e_stop_gateway "${GATEWAY_PID}" "${GATEWAY_PID_FILE}"
   e2e_stop_process "${ADDITIONAL_CA_SERVER_PID}" "additional CA HTTPS fixture"
+  e2e_stop_process "${CONTENT_GUARD_PID}" "content guard middleware"
 
   if [ "${exit_code}" -ne 0 ] \
      && [ -n "${E2E_NAMESPACE}" ] \
@@ -608,6 +616,27 @@ fi
 export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 GATEWAY_ENDPOINT="https://${SUPERVISOR_GATEWAY_HOST}:${HOST_PORT}"
 
+if [ -n "${OPENSHELL_E2E_CONTENT_GUARD_BIN:-}" ]; then
+  CONTENT_GUARD_PORT="$(e2e_pick_port)"
+  "${OPENSHELL_E2E_CONTENT_GUARD_BIN}" --bind "0.0.0.0:${CONTENT_GUARD_PORT}" &
+  CONTENT_GUARD_PID=$!
+  for ((attempt = 0; attempt < 30; attempt++)); do
+    if ! kill -0 "${CONTENT_GUARD_PID}" 2>/dev/null; then
+      echo "ERROR: Content guard exited before it started listening." >&2
+      exit 1
+    fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/${CONTENT_GUARD_PORT}") 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  if [ "${attempt}" -eq 30 ]; then
+    echo "ERROR: Content guard did not start listening." >&2
+    exit 1
+  fi
+  export OPENSHELL_TEST_CONTENT_GUARD_REGISTRATION=content-guard-example
+fi
+
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
 e2e_generate_gateway_jwt "${JWT_DIR}"
@@ -677,6 +706,12 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
   printf '\n[openshell.drivers.docker.resource_admission]\n'
   printf 'enabled = false\n'
+  if [ -n "${CONTENT_GUARD_PORT}" ]; then
+    printf '\n[[openshell.supervisor.middleware]]\n'
+    printf 'name = %s\n' "$(toml_string "${OPENSHELL_TEST_CONTENT_GUARD_REGISTRATION}")"
+    printf 'grpc_endpoint = %s\n' "$(toml_string "http://${SUPERVISOR_GATEWAY_HOST}:${CONTENT_GUARD_PORT}")"
+    printf 'allow_insecure_transport = true\nmax_payload_bytes = 262144\ntimeout = "2s"\n'
+  fi
 } > "${GATEWAY_CONFIG}"
 
 GATEWAY_ARGS=(

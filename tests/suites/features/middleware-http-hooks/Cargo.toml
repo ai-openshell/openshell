@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "middleware-http-hooks"
+description = "Features suite: HTTP hooks against a registered middleware service"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/ai-openshell/openshell"
+publish = false
+
+[[test]]
+name = "middleware-http-hooks"
+path = "tests/http_hooks.rs"
+harness = false
+
+[dependencies]
+flate2 = "1"
+host-server-support = { path = "../../../support/host-server" }
+middleware-support = { path = "../../../support/middleware" }
+openshell-testkit = { path = "../../../testkit/testkit" }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time"] }

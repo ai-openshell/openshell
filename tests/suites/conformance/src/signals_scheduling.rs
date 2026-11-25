@@ -9,9 +9,7 @@
 //! failed with EPERM. The broker now mediates them: the caller's own thread
 //! group is allowed and every other target stays denied.
 
-#![cfg(feature = "e2e")]
-
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use testkit::Context;
 
 const SUCCESS_MARKER: &str = "sandbox_compat_signals_sched=ok";
 
@@ -175,17 +173,24 @@ sys.exit(0 if not failures else 1)
 "#
 }
 
-#[tokio::test]
-async fn sandbox_allows_own_group_and_denies_foreign_scheduling_and_signals() {
-    let mut sandbox = SandboxGuard::create(&["--", "python3", "-c", compat_script()])
-        .await
-        .expect("sandbox create");
-
-    assert!(
-        sandbox.create_output.contains(SUCCESS_MARKER),
-        "expected own-group probes to pass and foreign-target probes to be denied:\n{}",
-        sandbox.create_output
+/// Scheduling and signal probes may act on the caller's thread group, but
+/// scheduling changes that target another process must fail with EPERM.
+#[testkit::test]
+async fn sandbox_allows_own_group_and_denies_foreign_scheduling_and_signals(
+    cx: &mut Context,
+) -> testkit::Result {
+    let sandbox = cx
+        .sandbox("sig")
+        .image(testkit::python_image())
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
+    let output = sandbox.run_python(compat_script(), &[]).await?;
+    testkit::ensure!(
+        output.stdout.lines().any(|line| line == SUCCESS_MARKER),
+        "missing successful syscall probes:\n{}{}",
+        output.stdout,
+        output.stderr
     );
-
-    sandbox.cleanup().await;
+    Ok(())
 }

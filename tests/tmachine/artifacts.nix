@@ -274,9 +274,22 @@ rec {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
       podmanE2eArchive
+      pkgs.coreutils
+      pkgs.git
+      rustToolchain
     ];
+    runtimeEnv = toolchainEnv;
     text = ''
       build-podman-e2e-test-archive
+
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+      cargo build --locked --target ${muslToolchain.target} \
+        --target-dir "$root/target" \
+        --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
+      install -D -m 0755 \
+        target/${muslToolchain.target}/debug/supervisor-middleware-content-guard \
+        artifacts/test-fixtures/${muslToolchain.target}/supervisor-middleware-content-guard
     '';
   };
 
