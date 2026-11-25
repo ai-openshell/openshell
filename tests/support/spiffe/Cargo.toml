@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "spiffe-support"
+description = "Verifies JWT-SVIDs from the SPIFFE Workload APIs a test environment runs"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/ai-openshell/openshell"
+publish = false
+
+[dependencies]
+jsonwebtoken = { version = "10", default-features = false }
+openshell-crypto = { path = "../../../crates/openshell-crypto" }
+openshell-testkit = { path = "../../testkit/testkit" }
+serde_json = "1"

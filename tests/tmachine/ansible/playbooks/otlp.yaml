@@ -1,0 +1,172 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Run an OTLP collector in the environment, point the gateway's OTLP export
+# and agent trace relay at it, and publish where tests read what it received.
+#
+# The collector is a stock OpenTelemetry Collector whose file exporter appends
+# every trace export it receives to a JSONL file, one
+# ExportTraceServiceRequest per line. Tests find their own spans in it by
+# name, so any number of them can share the collector. Environment setup
+# applies this once and caches the disk, so the container restarts on every
+# boot. Supervisors in Podman containers reach the test VM as
+# host.containers.internal. The OTLP fixture (tests/support/otlp) reads the
+# variables published below.
+---
+- name: OTLP collector for tests
+  hosts: all
+  gather_facts: false
+  vars:
+    otlp_container_name: openshell-otlp-collector
+    otlp_image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.166.0
+    otlp_port: 4317
+    otlp_endpoint: "http://host.containers.internal:{{ otlp_port }}"
+    otlp_directory: /var/lib/openshell-test/otlp
+    otlp_log: "{{ otlp_directory }}/traces.jsonl"
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Detect tmachine container runtime
+      ansible.builtin.include_role:
+        name: tmachine_container_runtime
+
+    - name: Set collector runtime values
+      ansible.builtin.set_fact:
+        otlp_runtime_user: >-
+          {{ 'tmachine' if tmachine_container_runtime_is_rootless else 'root' }}
+        otlp_runtime_home: >-
+          {{ '/home/tmachine' if tmachine_container_runtime_is_rootless else '/root' }}
+        # Docker restarts the container itself. Podman has no daemon: its
+        # podman-restart.service starts `--restart always` containers at boot.
+        otlp_restart_policy: >-
+          {{ 'unless-stopped' if tmachine_container_runtime_name == 'docker' else 'always' }}
+
+    # The collector runs as its image's own user, which owns nothing here, so
+    # it needs a directory anyone can write. It creates the log with mode
+    # 0644, which the test user can read.
+    - name: Create the collector directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ otlp_directory }}"
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0777"
+
+    - name: Configure the collector
+      become: true
+      ansible.builtin.copy:
+        dest: "{{ otlp_directory }}/config.yaml"
+        owner: tmachine
+        group: tmachine
+        mode: "0644"
+        content: |
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: 0.0.0.0:4317
+          exporters:
+            file:
+              path: /otlp/{{ otlp_log | basename }}
+              # A restarted collector keeps what it already received.
+              append: true
+              # otlp-relay expects a span in the log within 1 s of the
+              # collector acknowledging it.
+              flush_interval: 10ms
+          service:
+            pipelines:
+              traces:
+                receivers: [otlp]
+                exporters: [file]
+
+    - name: Remove an existing collector
+      become: true
+      become_user: "{{ otlp_runtime_user }}"
+      ansible.builtin.command:
+        argv:
+          - "{{ tmachine_container_runtime_name }}"
+          - rm
+          - --force
+          - "{{ otlp_container_name }}"
+      environment:
+        HOME: "{{ otlp_runtime_home }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Start the collector
+      become: true
+      become_user: "{{ otlp_runtime_user }}"
+      ansible.builtin.command:
+        argv:
+          - "{{ tmachine_container_runtime_name }}"
+          - run
+          - --detach
+          - --name
+          - "{{ otlp_container_name }}"
+          - --restart
+          - "{{ otlp_restart_policy }}"
+          # Every host address, so supervisors reach it through the host alias.
+          - --publish
+          - "{{ otlp_port }}:4317"
+          - --volume
+          - "{{ otlp_directory }}:/otlp:z"
+          - "{{ otlp_image }}"
+          - --config
+          - /otlp/config.yaml
+      environment:
+        HOME: "{{ otlp_runtime_home }}"
+      changed_when: true
+
+    - name: Restart the collector with rootful Podman at boot
+      become: true
+      ansible.builtin.systemd_service:
+        name: podman-restart.service
+        enabled: true
+      when:
+        - tmachine_container_runtime_name == 'podman'
+        - not tmachine_container_runtime_is_rootless
+
+    # tmachine lingers (see podman-rootless.yaml), so its user manager, and
+    # this unit, start at boot.
+    - name: Restart the collector with rootless Podman at boot
+      become: true
+      become_user: tmachine
+      ansible.builtin.systemd_service:
+        name: podman-restart.service
+        scope: user
+        enabled: true
+      environment:
+        HOME: /home/tmachine
+        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_container_runtime_tmachine_uid.stdout }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ tmachine_container_runtime_tmachine_uid.stdout }}/bus"
+      when:
+        - tmachine_container_runtime_name == 'podman'
+        - tmachine_container_runtime_is_rootless
+
+    - name: Wait for the collector
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ otlp_port }}"
+        timeout: 60
+
+    - name: Export traces and relay agent traces to the collector
+      ansible.builtin.include_role:
+        name: gateway_overrides
+      vars:
+        gateway_overrides_name: otlp
+        gateway_overrides_content: |
+          [openshell.gateway.otlp]
+          endpoint = "{{ otlp_endpoint }}"
+
+          [openshell.gateway.otlp.agent]
+          enabled = true
+
+    - name: Publish OTLP test variables
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: otlp
+        test_env_vars:
+          OPENSHELL_TEST_OTLP_LOG: "{{ otlp_log }}"
+          OPENSHELL_TEST_OTLP_ENDPOINT: "{{ otlp_endpoint }}"
