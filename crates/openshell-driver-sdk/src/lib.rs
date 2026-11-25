@@ -12,6 +12,7 @@ mod endpoint;
 mod gateway;
 #[cfg(unix)]
 mod guard;
+mod lifecycle;
 mod start;
 mod table;
 mod telemetry;
@@ -22,6 +23,7 @@ pub use endpoint::{endpoint_uses_tls, validate_grpc_endpoint};
 pub use gateway::GatewayContext;
 #[cfg(unix)]
 pub use guard::watch_parent;
+pub use lifecycle::{EXTERNAL_STOP_GRACE, stop_when_released};
 pub use openshell_driver_launch as launch;
 pub use start::{EXIT_CONFIG, EXIT_UNAVAILABLE, StartKind, StartReport, StartResult};
 pub use table::{MAX_TABLE_BYTES, read_stdin_table, read_table};

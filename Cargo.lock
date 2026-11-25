@@ -5148,7 +5148,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]
