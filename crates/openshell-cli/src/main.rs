@@ -1609,7 +1609,7 @@ enum SandboxCommands {
         #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs", "env_from"])]
         template: Option<String>,
 
-        /// Create the sandbox as a child of this root sandbox.
+        /// Experimental: create the sandbox as a child of this root sandbox.
         /// The child uses the parent's policy, and `--provider` picks from
         /// the parent's providers (all of them when omitted).
         #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
@@ -1857,7 +1857,7 @@ enum SandboxCommands {
         #[arg(long)]
         selector: Option<String>,
 
-        /// List only the child sandboxes of this root sandbox.
+        /// Experimental: list only the child sandboxes of this root sandbox.
         #[arg(long, conflicts_with = "all_workspaces", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         parent: Option<String>,
 

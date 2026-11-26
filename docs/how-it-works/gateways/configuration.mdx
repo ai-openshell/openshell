@@ -349,8 +349,9 @@ mutation_replay_window_seconds = 86400
 
 # Experimental. Allow child sandboxes under a root sandbox and serve /mcp.
 experimental_enable_child_sandboxes = false
-# Most children one parent may have at once; 0 allows none. At most 1000.
-max_concurrent_children = 10
+# Experimental. Most children one parent may have at once; 0 allows none.
+# At most 1000.
+experimental_max_concurrent_children = 10
 
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
@@ -864,7 +865,7 @@ and the MCP tools: agents in sandboxes and `openshell mcp serve` can no longer
 reach any tool. Existing children keep running, keep following their parent's
 policy, and can still be listed, used and deleted from the CLI.
 
-`max_concurrent_children` limits how many children one parent may have at
+`experimental_max_concurrent_children` limits how many children one parent may have at
 once. Every existing child counts, whatever its state, until it is deleted.
 The default is 10, `0` allows none, and the gateway refuses to start with a
 value above 1000.
@@ -872,7 +873,7 @@ value above 1000.
 ```toml
 [openshell.gateway]
 experimental_enable_child_sandboxes = true
-max_concurrent_children = 10
+experimental_max_concurrent_children = 10
 ```
 
 The gateway reads both settings at startup. Refer to

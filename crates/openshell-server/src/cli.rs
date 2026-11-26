@@ -821,11 +821,11 @@ fn prepare_server_config_with_drivers(
     }
     if let Some(limit) = file
         .as_ref()
-        .and_then(|f| f.openshell.gateway.max_concurrent_children)
+        .and_then(|f| f.openshell.gateway.experimental_max_concurrent_children)
     {
         if limit > 1000 {
             return Err(miette::miette!(
-                "max_concurrent_children must be between 0 and 1000"
+                "experimental_max_concurrent_children must be between 0 and 1000"
             ));
         }
         config.max_concurrent_children = limit;
@@ -5540,9 +5540,9 @@ mem_mib = "not-a-number"
                 let cases = [
                     ("", false, 10),
                     ("experimental_enable_child_sandboxes = true\n", true, 10),
-                    ("max_concurrent_children = 0\n", false, 0),
+                    ("experimental_max_concurrent_children = 0\n", false, 0),
                     (
-                        "experimental_enable_child_sandboxes = true\nmax_concurrent_children = 1000\n",
+                        "experimental_enable_child_sandboxes = true\nexperimental_max_concurrent_children = 1000\n",
                         true,
                         1000,
                     ),
@@ -5583,7 +5583,7 @@ mem_mib = "not-a-number"
                 let config_path = state.join("gateway.toml");
                 std::fs::write(
                     &config_path,
-                    "[openshell]\nversion = 2\n[openshell.gateway]\nmax_concurrent_children = 1001\n",
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nexperimental_max_concurrent_children = 1001\n",
                 )
                 .unwrap();
                 let (mut args, matches) = parse_with_args(&[
@@ -5602,7 +5602,7 @@ mem_mib = "not-a-number"
                 assert!(
                     error
                         .to_string()
-                        .contains("max_concurrent_children must be between 0 and 1000")
+                        .contains("experimental_max_concurrent_children must be between 0 and 1000")
                 );
             });
     }

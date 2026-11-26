@@ -1210,12 +1210,14 @@ message Sandbox {
   string host_key_fingerprint = 6;
   // Read-only provenance for sandboxes created from a reusable workload template.
   SandboxWorkloadTemplateProvenance created_from_workload_template = 20;
-  // Read-only parent of a child sandbox, set by the gateway at creation.
-  // Absent on root sandboxes. Never changes.
+  // EXPERIMENTAL: Read-only parent of a child sandbox, set by the gateway at
+  // creation. Absent on root sandboxes. Never changes. This API and its
+  // behavior may change or be removed.
   SandboxParent parent = 21;
-  // Read-only identity of who created this sandbox, set by the gateway: the
-  // user who created it, or `sandbox:<id>` when a sandbox created it over
-  // MCP. Empty on sandboxes created before this field existed.
+  // EXPERIMENTAL: Read-only identity of who created this sandbox, set by the
+  // gateway: the user who created it, or `sandbox:<id>` when a sandbox created
+  // it over MCP. Empty on sandboxes created before this field existed. This
+  // API and its behavior may change or be removed.
   string created_by = 22;
 
   reserved 4, 5;
@@ -1363,7 +1365,8 @@ message SandboxWorkloadTemplateProvenance {
   string resource_version = 2;
 }
 
-// The parent of a child sandbox.
+// EXPERIMENTAL: The parent of a child sandbox. This API and its behavior may
+// change or be removed.
 message SandboxParent {
   // The parent's name, for display.
   string name = 1;
@@ -1499,8 +1502,9 @@ message CreateSandboxRequest {
   // registered after the sandbox has been persisted and route only while the
   // sandbox is ready.
   repeated SandboxServiceExposure service_exposures = 9;
-  // Optional name of a root sandbox in the same workspace to create this
-  // sandbox under. Empty creates a root sandbox.
+  // EXPERIMENTAL: Optional name of a root sandbox in the same workspace to
+  // create this sandbox under. Empty creates a root sandbox. This API and its
+  // behavior may change or be removed.
   string parent = 10;
 }
 
@@ -1640,8 +1644,9 @@ message ListSandboxesRequest {
   string page_token = 2;
   // Optional label selector for filtering (format: "key1=value1,key2=value2").
   string label_selector = 3;
-  // Optional name of a root sandbox; lists only its children. Needs a named
-  // workspace scope. A child of a deleted root of the same name is not listed.
+  // EXPERIMENTAL: Optional name of a root sandbox; lists only its children.
+  // Needs a named workspace scope. A child of a deleted root of the same name
+  // is not listed. This API and its behavior may change or be removed.
   string parent = 5;
 }
 

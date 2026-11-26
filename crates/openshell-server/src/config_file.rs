@@ -198,9 +198,10 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub experimental_enable_child_sandboxes: Option<bool>,
     /// Most children one parent may have at once, counting every child that
-    /// exists. Omit for the default of 10; 0 allows none; at most 1000.
+    /// exists. Experimental. Omit for the default of 10; 0 allows none; at
+    /// most 1000.
     #[serde(default)]
-    pub max_concurrent_children: Option<u32>,
+    pub experimental_max_concurrent_children: Option<u32>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Publish gateway URLs and forward application requests. Defaults to true.
