@@ -1247,18 +1247,9 @@ pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
                 .await?
             };
 
-            let username = jwt_preferred_username(&bundle.access_token);
             openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
             openshell_bootstrap::oidc_token::clear_oidc_login_prompt(name)?;
-
-            if let Some(user) = username {
-                eprintln!(
-                    "{} Authenticated to gateway '{name}' as {user}",
-                    "✓".green().bold(),
-                );
-            } else {
-                eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold());
-            }
+            eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold());
         }
         _ => {
             return Err(miette::miette!(
