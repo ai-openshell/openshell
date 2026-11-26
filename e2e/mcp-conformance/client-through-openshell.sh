@@ -117,7 +117,7 @@ SANDBOX_COMMAND=(
   --name "${CLIENT_SANDBOX}"
   --no-tty
   --timeout "${CLIENT_TIMEOUT_SECONDS}"
-  "${ENV_ARGS[@]}"
+  ${ENV_ARGS[@]+"${ENV_ARGS[@]}"}
   --
   sh -c "${SANDBOX_CLIENT_SCRIPT}" \
   sh "${CLIENT_SERVER_URL}"

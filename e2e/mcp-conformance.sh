@@ -306,7 +306,7 @@ build_client_image() {
     pull_args=(--pull)
   fi
 
-  docker build "${pull_args[@]}" \
+  docker build ${pull_args[@]+"${pull_args[@]}"} \
     --label "${CLIENT_IMAGE_REF_LABEL}=${conformance_head}" \
     --label "${CLIENT_IMAGE_DOCKERFILE_LABEL}=${dockerfile_hash}" \
     --label "${CLIENT_IMAGE_DOCKERIGNORE_LABEL}=${dockerignore_hash}" \
@@ -412,7 +412,7 @@ create_runner_container() {
   if ! docker run -d --rm \
     --name "${RUNNER_CONTAINER}" \
     --network "${network}" \
-    "${add_host_args[@]}" \
+    ${add_host_args[@]+"${add_host_args[@]}"} \
     "${CLIENT_IMAGE}" \
     sleep infinity >/dev/null; then
     RUNNER_CONTAINER=""

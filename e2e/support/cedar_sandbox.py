@@ -81,6 +81,8 @@ def _create(
     if args.image:
         spec.template.image = args.image
     client.create(workspace=args.workspace, spec=spec, name=args.name)
+    # Like `sandbox create`, return once the sandbox is ready.
+    client.wait_ready(args.name, workspace=args.workspace)
 
 
 def _update(client: SandboxClient, args: argparse.Namespace) -> None:

@@ -249,6 +249,19 @@ timeout = "500ms"
 [openshell.drivers.$COMPUTE_DRIVER]
 supervisor_image = "$SUPERVISOR_IMAGE"
 EOF
+  # Optional driver overrides, named as in e2e/with-docker-gateway.sh. On
+  # Docker Desktop, set OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE=bridge,
+  # and use local images to avoid slow registry refreshes at startup.
+  {
+    [[ -z "${OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE:-}" ]] ||
+      printf 'supervisor_network_mode = "%s"\n' "$OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE"
+    [[ -z "${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-}" ]] ||
+      printf 'default_image = "%s"\n' "$OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE"
+    [[ -z "${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-}" ]] ||
+      printf 'image_pull_policy = "%s"\n' "$OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY"
+    [[ -z "${OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE:-}" ]] ||
+      printf 'sandbox_runtime_image = "%s"\n' "$OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE"
+  } >>"$GATEWAY_CONFIG"
 }
 
 write_gateway_config
@@ -581,13 +594,23 @@ EXAMPLE_TARGET_DIR="$(cargo_target_dir "$EXAMPLE_DIR/Cargo.toml")"
 GATEWAY_BIN="$ROOT_TARGET_DIR/debug/openshell-gateway"
 CLI_BIN="$ROOT_TARGET_DIR/debug/openshell"
 MIDDLEWARE_BIN="$EXAMPLE_TARGET_DIR/debug/supervisor-middleware-content-guard"
-run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway
+# Cedar policies need a gateway and supervisor built with the `experimental`
+# feature.
+GATEWAY_FEATURES=()
+SUPERVISOR_FEATURES=""
+if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+  GATEWAY_FEATURES=(--features experimental)
+  SUPERVISOR_FEATURES=experimental
+fi
+run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway \
+  ${GATEWAY_FEATURES[@]+"${GATEWAY_FEATURES[@]}"}
 # Always rebuild from this checkout and load into the selected runtime. Native
 # macOS binaries cannot run in Linux sandboxes; Podman also needs an image.
 # A unique tag prevents the driver from selecting an older published runtime.
 run_setup_step "building Linux sandbox supervisor image" \
   env -u CI -u DOCKER_PLATFORM -u DOCKER_PUSH -u DOCKER_OUTPUT \
   CONTAINER_ENGINE="$COMPUTE_DRIVER" PREBUILT_AUTO_STAGE=1 \
+  EXTRA_CARGO_FEATURES="$SUPERVISOR_FEATURES" \
   IMAGE_REGISTRY=localhost/openshell-content-guard IMAGE_TAG="$RUN_ID" \
   mise run docker:build:supervisor
 run_setup_step "building content guard" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"

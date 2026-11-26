@@ -393,6 +393,21 @@ phases = ["validate"]
 rpc = "openshell.v1.OpenShell/DeleteProviderProfile"
 phases = ["validate"]
 EOF
+  # Optional Docker driver overrides, named as in e2e/with-docker-gateway.sh.
+  # On Docker Desktop, set OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE=bridge,
+  # and use local images to avoid slow registry refreshes at startup.
+  local overrides=""
+  [[ -z "${OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE:-}" ]] ||
+    overrides+="supervisor_network_mode = \"$OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE\""$'\n'
+  [[ -z "${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-}" ]] ||
+    overrides+="default_image = \"$OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE\""$'\n'
+  [[ -z "${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-}" ]] ||
+    overrides+="image_pull_policy = \"$OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY\""$'\n'
+  [[ -z "${OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE:-}" ]] ||
+    overrides+="sandbox_runtime_image = \"$OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE\""$'\n'
+  if [[ -n "$overrides" ]]; then
+    printf '\n[openshell.drivers.docker]\n%s' "$overrides" >>"$GATEWAY_CONFIG"
+  fi
 }
 
 start_interceptor() {
@@ -724,7 +739,14 @@ wait_until_stopped() {
 
 cd "$ROOT"
 
-run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway
+# Cedar policies need a gateway built with the `experimental` feature, and a
+# supervisor image built with it (set OPENSHELL_SUPERVISOR_IMAGE).
+GATEWAY_FEATURES=()
+if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+  GATEWAY_FEATURES=(--features experimental)
+fi
+run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway \
+  ${GATEWAY_FEATURES[@]+"${GATEWAY_FEATURES[@]}"}
 run_setup_step "building governance interceptor" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
 run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
 
