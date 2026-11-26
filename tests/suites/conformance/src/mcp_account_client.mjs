@@ -14,8 +14,17 @@ if (account === 'unknown') {
   assert(value, 'the selected account has no credential placeholder');
 }
 
+let finishEventStream;
+const eventStream = new Promise((resolve) => { finishEventStream = resolve; });
 const transport = new StreamableHTTPClientTransport(new URL(url), {
-  requestInit: { headers: value ? { Authorization: `Bearer ${value}` } : {} }
+  requestInit: { headers: value ? { Authorization: `Bearer ${value}` } : {} },
+  fetch: (input, init) => {
+    const response = fetch(input, init);
+    if (init?.method === 'GET') {
+      response.then((reply) => finishEventStream(reply.status), () => finishEventStream(-1));
+    }
+    return response;
+  }
 });
 const client = new Client(
   { name: 'openshell-account-policy-test', version: '1' },
@@ -30,6 +39,7 @@ try {
     console.log('SDK_CONNECT_DENIED');
   } else {
     await client.connect(transport);
+    assert.equal(await eventStream, 405);
     const tools = await client.listTools();
     assert.deepEqual(tools.tools.map(({ name }) => name), ['search', 'send']);
     for (const [name, allowed] of JSON.parse(toolsJson)) {

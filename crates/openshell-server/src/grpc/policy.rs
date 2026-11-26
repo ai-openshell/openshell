@@ -11006,7 +11006,7 @@ mod tests {
         extend_credentialed_scopes_from_policy_bindings(
             &mut scopes,
             &bindings,
-            &HashSet::from(["bound".to_string()]),
+            &HashMap::from([("bound".to_string(), "bound-provider-id".to_string())]),
         );
 
         assert_eq!(

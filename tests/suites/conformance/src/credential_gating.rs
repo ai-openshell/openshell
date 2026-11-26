@@ -546,11 +546,11 @@ async fn account_bound_mcp_sdk_client_isolates_accounts(cx: &mut Context) -> tes
     .await?;
     let requests = server.requests();
     for secret in [MCP_SECRET_A, MCP_SECRET_B] {
+        let authorization = format!("Bearer {secret}");
         let methods: Vec<_> = requests
             .iter()
             .filter(|request| {
-                request.header("authorization").as_deref()
-                    == Some(format!("Bearer {secret}").as_str())
+                request.header("authorization").as_deref() == Some(authorization.as_str())
             })
             .filter_map(|request| serde_json::from_str::<serde_json::Value>(&request.body).ok())
             .map(|request| request["method"].as_str().unwrap_or_default().to_owned())
@@ -562,6 +562,15 @@ async fn account_bound_mcp_sdk_client_isolates_accounts(cx: &mut Context) -> tes
                 "tools/list".into()
             ]),
             "account {secret} did not initialize and discover through its own credential: {methods:?}"
+        );
+        testkit::ensure!(
+            requests
+                .iter()
+                .filter(|request| request.method() == "GET"
+                    && request.header("authorization").as_deref() == Some(authorization.as_str()))
+                .count()
+                == 1,
+            "account {secret} did not open its own optional MCP event stream"
         );
     }
     let calls: Vec<_> = requests
@@ -611,7 +620,7 @@ async fn account_bound_mcp_sdk_client_isolates_accounts(cx: &mut Context) -> tes
     .await?;
     let after = server.requests();
     testkit::ensure!(
-        after.len() == before_denied + 4
+        after.len() == before_denied + 5
             && after[before_denied..]
                 .iter()
                 .all(|request| request.header("authorization").as_deref()
@@ -704,6 +713,10 @@ async fn mcp_accounts(
 }
 
 fn mcp_account_fixture(request: &Request) -> Response {
+    if request.method() == "GET" {
+        // Streamable HTTP permits a server to decline the optional SSE stream.
+        return Response::new(405);
+    }
     let Ok(message) = serde_json::from_str::<serde_json::Value>(&request.body) else {
         return Response::new(400);
     };
