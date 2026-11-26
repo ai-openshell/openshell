@@ -1262,18 +1262,6 @@ pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
     Ok(())
 }
 
-/// Extract `preferred_username` from a JWT payload without signature verification.
-fn jwt_preferred_username(token: &str) -> Option<String> {
-    let payload = token.split('.').nth(1)?;
-    let decoded =
-        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    claims
-        .get("preferred_username")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-}
-
 /// Clear stored authentication credentials for a gateway.
 pub fn gateway_logout(name: &str) -> Result<()> {
     let metadata = openshell_bootstrap::load_gateway_metadata(name).map_err(|_| {
