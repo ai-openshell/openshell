@@ -19,6 +19,13 @@ ignore = [
     # oauth2, oci-client, russh-sftp, and russh-util.
     # https://github.com/chronotope/chrono/issues/1768
     { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; remove after first-party time APIs and all covered dependency graphs migrate to maintained alternatives and pass validation" },
+    # kube 5.0.0 pins kube-client to =5.0.0. OpenShell uses rustls-tls.
+    # The cluster CA advisory affects the openssl-tls connector.
+    # The 5.2.0 fix requires Rust 1.95, above OpenShell's minimum of 1.94.
+    # The 4.2.1 backport drops kubeconfig impersonation UID and extra headers.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0600.html
+    # https://github.com/kube-rs/kube/pull/2116
+    { id = "RUSTSEC-2026-0600", reason = "Remove once a patched kube release preserves Kubernetes client behavior on OpenShell's supported Rust versions and passes validation across the covered workspaces" },
 ]
 
 # -- Licenses ------------------------------------------------------------------
