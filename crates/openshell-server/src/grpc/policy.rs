@@ -5315,6 +5315,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         let mut config_request = Request::new(GetSandboxConfigRequest {
             supported_capabilities: vec![
                 openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+                openshell_core::extension_protocol::POLICY_REQUEST_BOUND_CREDENTIALS_V1.to_string(),
             ],
             name: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
@@ -5336,6 +5337,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         let mut config_request = Request::new(GetSandboxConfigRequest {
             supported_capabilities: vec![
                 openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+                openshell_core::extension_protocol::POLICY_REQUEST_BOUND_CREDENTIALS_V1.to_string(),
             ],
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             name: sandbox_name,
