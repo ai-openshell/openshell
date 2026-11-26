@@ -14,6 +14,10 @@ A child sandbox is an ordinary sandbox created under a root sandbox. It always r
 Child sandboxes are experimental. A gateway operator enables them, and the MCP tools, with `experimental_enable_child_sandboxes`. Refer to [Gateway Configuration](/how-it-works/gateways/configuration#child-sandboxes).
 </Note>
 
+<Warning>
+Delete child sandboxes before you roll back to a gateway version without them or run gateway replicas of different versions. An older gateway drops a child's link to its parent, and the child becomes a root for good.
+</Warning>
+
 ## Roots and Children
 
 A sandbox created without a parent is a root. A sandbox created with a parent is a child. Only a root can be a parent, so trees are one level deep: a child cannot have children of its own. Apart from the rules on this page, a child behaves like any other sandbox, with the same lifecycle and commands.
