@@ -68,10 +68,8 @@ jobs:
       security-events: write
     with:
       candidate_ref: ${{ inputs.candidate_ref }}
-      # Informational only; Release Dev owns the Trivy alerts on main.
-      fail-on-findings: false
-      severity: HIGH,CRITICAL
       ignore-unfixed: false
+      # Release Dev owns the Trivy alerts on main.
       upload-sarif: false
       images: ${{ inputs.images }}
       charts: ${{ inputs.charts }}
