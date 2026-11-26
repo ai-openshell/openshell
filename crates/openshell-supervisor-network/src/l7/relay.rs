@@ -23,7 +23,11 @@ use crate::l7::middleware::{
 use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
-use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
+// Test fixtures in child modules build the engine their tunnels pin to.
+#[cfg(test)]
+use crate::policy_engine::PolicyEngine;
+use crate::policy_engine::{PassthroughMiddleware, TunnelPolicyEngine};
+use crate::policy_types::PolicyGenerationGuard;
 use crate::telemetry::egress_emit;
 use futures::FutureExt;
 use miette::{IntoDiagnostic, Result, miette};
@@ -38,7 +42,7 @@ use openshell_ocsf::{
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 #[cfg(test)]
@@ -52,7 +56,7 @@ const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
 
 /// Context for L7 request policy evaluation.
 #[derive(Clone)]
-#[cfg_attr(test, derive(Default))]
+#[cfg_attr(any(test, feature = "test-support"), derive(Default))]
 pub struct L7EvalContext {
     /// Host from the CONNECT request.
     pub host: String,
@@ -97,6 +101,17 @@ pub struct L7EvalContext {
 }
 
 impl L7EvalContext {
+    pub fn policy_context(&self) -> openshell_policy_runtime_interface::L7PolicyContext {
+        openshell_policy_runtime_interface::L7PolicyContext {
+            host: self.host.clone(),
+            port: self.port,
+            policy_name: self.policy_name.clone(),
+            binary_path: self.binary_path.clone(),
+            ancestors: self.ancestors.clone(),
+            cmdline_paths: self.cmdline_paths.clone(),
+        }
+    }
+
     /// Whether the inspected transport is plaintext rather than TLS-terminated.
     fn is_plaintext(&self) -> bool {
         self.request_default_port == Some(80)
@@ -234,7 +249,9 @@ pub(crate) async fn prepare_inspected_request(
             &owners,
             request_id,
             observation_context.filter(|context| {
-                context.matches_config(&config.policy_hash, Some(snapshot.revision))
+                let policy_hash =
+                    crate::l7::observation_policy_hash(config, Some(engine.generation_guard()));
+                context.matches_config(&policy_hash, Some(snapshot.revision))
             }),
             correlation,
         )
@@ -1638,6 +1655,19 @@ where
 
     loop {
         if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        // Wait for a request before capturing its observation authority. A
+        // keep-alive connection can follow an unrelated reload while idle;
+        // partial headers and bodies must still retain the captured epoch.
+        let ready = parse_next_http_request(
+            async { Ok((!client.fill_buf().await.into_diagnostic()?.is_empty()).then_some(())) },
+            upstream,
+            ctx,
+        )
+        .await?;
+        if ready.is_none() || close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
 
@@ -3204,8 +3234,21 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let mut client_buffer =
+        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, client);
+    let client = &mut client_buffer;
     loop {
         if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let ready = parse_next_http_request(
+            async { Ok((!client.fill_buf().await.into_diagnostic()?.is_empty()).then_some(())) },
+            upstream,
+            ctx,
+        )
+        .await?;
+        if ready.is_none() || close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
 
@@ -4061,14 +4104,15 @@ pub fn evaluate_l7_request(
         && !jsonrpc.calls.is_empty()
     {
         if jsonrpc.has_response {
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+            let (allowed, reason) = engine.evaluate_request(&ctx.policy_context(), request)?;
             if !allowed {
                 return Ok((false, reason));
             }
         }
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
+            let (allowed, reason) =
+                engine.evaluate_request(&ctx.policy_context(), &item_request)?;
             if !allowed {
                 return Ok((false, reason));
             }
@@ -4076,7 +4120,7 @@ pub fn evaluate_l7_request(
         return Ok((true, String::new()));
     }
 
-    evaluate_l7_request_once(engine, ctx, request)
+    engine.evaluate_request(&ctx.policy_context(), request)
 }
 
 fn evaluate_jsonrpc_l7_request_for_log(
@@ -4086,7 +4130,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
     jsonrpc: &crate::l7::jsonrpc::JsonRpcRequestInfo,
 ) -> Result<JsonRpcEvaluation> {
     if jsonrpc.has_response {
-        let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+        let (allowed, reason) = engine.evaluate_request(&ctx.policy_context(), request)?;
         if !allowed || !jsonrpc.is_batch || jsonrpc.calls.is_empty() {
             return Ok(JsonRpcEvaluation {
                 allowed,
@@ -4101,7 +4145,8 @@ fn evaluate_jsonrpc_l7_request_for_log(
         let mut first_denied_reason = None;
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
+            let (allowed, reason) =
+                engine.evaluate_request(&ctx.policy_context(), &item_request)?;
             if !allowed {
                 if first_denied_reason.is_none() {
                     first_denied_reason = Some(reason);
@@ -4133,7 +4178,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
         });
     }
 
-    let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+    let (allowed, reason) = engine.evaluate_request(&ctx.policy_context(), request)?;
     Ok(JsonRpcEvaluation {
         allowed,
         reason,
@@ -4319,32 +4364,12 @@ fn emit_transformed_body_decision(
     crate::l7::correlation::emit_request_events(correlation, [event]);
 }
 
-fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_json::Value {
-    let call = if info.is_batch {
-        None
-    } else {
-        info.calls.first()
-    };
-    serde_json::json!({
-        "method": call.map(|call| call.method.as_str()),
-        "params": call.map(|call| &call.params),
-        "tool": call.and_then(|call| call.tool.as_deref()),
-        "mcp_method_classification": call
-            .and_then(|call| call.mcp_classification),
-        "receive_stream": info.receive_stream,
-        "has_response": info.has_response,
-        // Rust keeps the inspection failure kind typed. Rego's stable boundary is
-        // still the original diagnostic string or null.
-        "error": info
-            .error
-            .as_ref()
-            .map(crate::l7::jsonrpc::JsonRpcInspectionError::detail),
-    })
-}
+#[cfg(test)]
+use openshell_policy_runtime_interface::l7::jsonrpc_policy_input;
 
 /// A batch may be allowed by several endpoints, but one credential owner must
 /// admit every member before its token can authenticate the combined request.
-fn admitted_token_grant_owners(
+pub(crate) fn admitted_token_grant_owners(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
@@ -4380,88 +4405,7 @@ fn admitted_token_grant_owners_once(
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
 ) -> Result<HashSet<String>> {
-    if engine.is_stale() {
-        return Err(miette!("policy changed before token grant selection"));
-    }
-    let mut engine = engine
-        .engine()
-        .lock()
-        .map_err(|_| miette!("OPA engine lock poisoned"))?;
-    crate::opa::set_regorus_input(&mut engine, l7_request_policy_input(ctx, request))?;
-    let owners = engine
-        .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
-        .map_err(|error| miette!("{error}"))?;
-    let regorus::Value::Array(owners) = owners else {
-        return Err(miette!("invalid credential owner admission result"));
-    };
-    owners
-        .iter()
-        .map(|owner| match owner {
-            regorus::Value::String(owner) => Ok(owner.to_string()),
-            _ => Err(miette!("invalid credential owner identity")),
-        })
-        .collect()
-}
-
-fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serde_json::Value {
-    serde_json::json!({
-        "network": { "host": ctx.host, "port": ctx.port },
-        "exec": {
-            "path": ctx.binary_path,
-            "ancestors": ctx.ancestors,
-            "cmdline_paths": ctx.cmdline_paths,
-        },
-        "request": {
-            "method": request.action,
-            "path": request.target,
-            "query_params": request.query_params.clone(),
-            "graphql": request.graphql.clone(),
-            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
-        }
-    })
-}
-
-fn evaluate_l7_request_once(
-    engine: &TunnelPolicyEngine,
-    ctx: &L7EvalContext,
-    request: &L7RequestInfo,
-) -> Result<(bool, String)> {
-    if engine.is_stale() {
-        return Err(miette!(
-            "L7 tunnel policy generation is stale [captured_generation:{} current_generation:{}]",
-            engine.captured_generation(),
-            engine.current_generation(),
-        ));
-    }
-
-    let input = l7_request_policy_input(ctx, request);
-
-    let mut engine = engine
-        .engine()
-        .lock()
-        .map_err(|_| miette!("OPA engine lock poisoned"))?;
-
-    crate::opa::set_regorus_input(&mut engine, input)?;
-
-    let allowed = engine
-        .eval_rule("data.openshell.sandbox.allow_request".into())
-        .map_err(|e| miette!("{e}"))?;
-    let allowed = allowed == regorus::Value::from(true);
-
-    let reason = if allowed {
-        String::new()
-    } else {
-        let val = engine
-            .eval_rule("data.openshell.sandbox.request_deny_reason".into())
-            .map_err(|e| miette!("{e}"))?;
-        match val {
-            regorus::Value::String(s) => s.to_string(),
-            regorus::Value::Undefined => "request denied by policy".to_string(),
-            other => other.to_string(),
-        }
-    };
-
-    Ok((allowed, reason))
+    engine.admitted_token_grant_owners(&ctx.policy_context(), request)
 }
 
 /// Read a request while watching the otherwise idle upstream connection.
@@ -4525,12 +4469,15 @@ fn emit_idle_upstream_close(ctx: &L7EvalContext, result: std::io::Result<usize>)
 /// Used when TLS is auto-terminated but no L7 policy (`protocol` + `access`/`rules`)
 /// is configured. Parses HTTP requests minimally to rewrite credential
 /// placeholders and log requests for observability, then forwards everything.
+///
+/// `middleware`, when given, is where each request's middleware chain is
+/// selected from; see [`PassthroughMiddleware`].
 pub async fn relay_passthrough_with_credentials<C, U>(
     client: &mut C,
     upstream: &mut U,
     ctx: &L7EvalContext,
     generation_guard: &PolicyGenerationGuard,
-    middleware_engine: Option<&crate::opa::OpaEngine>,
+    middleware: Option<&PassthroughMiddleware<'_>>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -4541,7 +4488,7 @@ where
         upstream,
         ctx,
         generation_guard,
-        middleware_engine,
+        middleware,
     ))
     .await
 }
@@ -4551,7 +4498,7 @@ async fn relay_passthrough_with_credentials_inner<C, U>(
     upstream: &mut U,
     ctx: &L7EvalContext,
     generation_guard: &PolicyGenerationGuard,
-    middleware_engine: Option<&crate::opa::OpaEngine>,
+    middleware: Option<&PassthroughMiddleware<'_>>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -4574,12 +4521,12 @@ where
             .as_ref()
             .filter(|_| ctx.token_grant_resolver.is_some())
             .and_then(EndpointObservationSender::capture);
-        let middleware_selection = middleware_engine.map(|engine| {
-            engine.query_middleware_chain_with_generation(&middleware_network_input(ctx))
-        });
+        let mut middleware_selection =
+            middleware.map(|mw| mw.select(&middleware_network_input(ctx), generation_guard));
+        let selected_generation = generation_guard.captured_generation();
         let inspected = matches!(
             &middleware_selection,
-            Some(Ok((chain, _))) if !chain.is_empty()
+            Some(Ok(Some((chain, _)))) if !chain.is_empty()
         );
         // Read next request from client.
         let parsed = async {
@@ -4617,6 +4564,19 @@ where
         }
         if close_if_stale(generation_guard, ctx) {
             return Ok(());
+        }
+
+        if generation_guard.captured_generation() != selected_generation
+            || matches!(&middleware_selection, Some(Ok(None)))
+        {
+            middleware_selection =
+                middleware.map(|mw| mw.select(&middleware_network_input(ctx), generation_guard));
+            // Parsing already used the original selection's inspection mode.
+            if let Some(Ok(Some((chain, _)))) = &middleware_selection
+                && chain.is_empty() == inspected
+            {
+                return Ok(());
+            }
         }
 
         request_count += 1;
@@ -4657,12 +4617,12 @@ where
         let request_id = correlation.request_id().to_string();
         let mut response_selection = None;
         let mut live_body = None;
-        let req = if let Some((engine, selection)) = middleware_engine.zip(middleware_selection) {
-            let (chain, generation) = selection.map_err(&capture_error)?;
-            if generation != generation_guard.captured_generation() {
+        let req = if let Some(selection) = middleware_selection {
+            // Stop if the tunnel's policy is stale or, for a live selection,
+            // the middleware changed between the selection and the check.
+            let Some((chain, runner)) = selection.map_err(&capture_error)? else {
                 return Ok(());
-            }
-            let runner = engine.middleware_runner().map_err(&capture_error)?;
+            };
             let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
                 request_id.clone(),
                 chain,
@@ -4948,7 +4908,8 @@ mod trace_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opa::{NetworkInput, OpaEngine};
+    use crate::opa::OpaEngine;
+    use crate::policy_types::NetworkInput;
     use crate::test_support::response_request_id;
     use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
     use openshell_core::provider_credentials::ProviderCredentialState;
@@ -5080,7 +5041,7 @@ mod tests {
             receiver.recv().await,
             Some(EndpointStatusCommand::Reset { .. })
         ));
-        let value = regorus::Value::from_json_str(
+        let value = serde_json::from_str::<crate::policy_types::EndpointConfig>(
             r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:body-test","policy_hash":"policy","provider_credentialed":true}"#,
         )
         .expect("parse endpoint configuration");
@@ -9913,13 +9874,15 @@ network_policies:
             let subscriber = tracing_subscriber::registry().with(capture.clone());
             let (mut app, mut relay_client) = tokio::io::duplex(8192);
             let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let policy_engine = PolicyEngine::from(Arc::new(engine));
+            let passthrough = policy_engine.passthrough_middleware().unwrap();
             let relay = async move {
                 relay_passthrough_with_credentials(
                     &mut relay_client,
                     &mut relay_upstream,
                     &ctx,
                     &generation_guard,
-                    Some(&engine),
+                    Some(&passthrough),
                 )
                 .await
             }
@@ -10038,14 +10001,17 @@ network_policies:
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
-        let engine_task = Arc::clone(&engine);
+        let engine_task = PolicyEngine::from(Arc::clone(&engine));
         let relay = tokio::spawn(async move {
+            let middleware = engine_task
+                .passthrough_middleware()
+                .expect("passthrough middleware");
             relay_passthrough_with_credentials(
                 &mut relay_client,
                 &mut relay_upstream,
                 &ctx,
                 &generation_guard,
-                Some(engine_task.as_ref()),
+                Some(&middleware),
             )
             .await
         });
@@ -10141,13 +10107,17 @@ network_policies:
 
             let (mut app, mut relay_client) = tokio::io::duplex(8192);
             let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let engine_task = PolicyEngine::from(Arc::clone(&engine));
             let relay = tokio::spawn(async move {
+                let middleware = engine_task
+                    .passthrough_middleware()
+                    .expect("passthrough middleware");
                 relay_passthrough_with_credentials(
                     &mut relay_client,
                     &mut relay_upstream,
                     &ctx,
                     &generation_guard,
-                    Some(engine.as_ref()),
+                    Some(&middleware),
                 )
                 .await
             });
@@ -14590,7 +14560,7 @@ network_policies:
     #[test]
     fn withheld_routes_keep_the_body_limit_of_their_signing_or_rewrite_step() {
         let delivery = |fields: &str| {
-            let val = regorus::Value::from_json_str(&format!(
+            let val: crate::policy_types::EndpointConfig = serde_json::from_str(&format!(
                 r#"{{"protocol": "rest", "host": "api.example.test", "port": 443{fields}}}"#
             ))
             .unwrap();
@@ -16415,5 +16385,211 @@ network_policies:
             .expect("relay should complete")
             .unwrap()
             .unwrap();
+    }
+
+    // --- Passthrough middleware across policy reloads ---
+
+    const PASSTHROUGH_RELOAD_POLICY: &str = r#"
+network_middlewares:
+  scheme:
+    middleware: test/scheme
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  passthrough_api:
+    name: passthrough_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+    /// [`PASSTHROUGH_RELOAD_POLICY`] after approving an endpoint for another host.
+    const PASSTHROUGH_RELOAD_AND_OTHER_POLICY: &str = r#"
+network_middlewares:
+  scheme:
+    middleware: test/scheme
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  passthrough_api:
+    name: passthrough_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+  other:
+    name: other
+    endpoints:
+      - host: other.example.test
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+    /// [`PASSTHROUGH_RELOAD_POLICY`] with this host's chain made fail-open.
+    const PASSTHROUGH_RELOAD_CHAIN_CHANGED_POLICY: &str = r#"
+network_middlewares:
+  scheme:
+    middleware: test/scheme
+    on_error: fail_open
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  passthrough_api:
+    name: passthrough_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+    fn passthrough_reload_input() -> NetworkInput {
+        NetworkInput {
+            host: "api.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        }
+    }
+
+    /// The guard the proxy pins for an established passthrough connection:
+    /// it re-pins through reloads that leave the connection's contract intact.
+    fn established_passthrough_guard(
+        engine: &Arc<OpaEngine>,
+        input: &NetworkInput,
+    ) -> PolicyGenerationGuard {
+        let generation = engine.authorize_egress(input).unwrap().generation;
+        assert!(
+            crate::opa::PolicyRevalidator::capture(engine, input.clone(), generation, None)
+                .is_some(),
+            "fixture must authorize the connection"
+        );
+        engine
+            .revalidating_generation_guard(input.clone(), generation, None)
+            .unwrap()
+    }
+
+    async fn read_http_head<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = reader.read(&mut byte).await.unwrap();
+            assert!(n > 0, "peer closed before a complete HTTP head");
+            head.push(byte[0]);
+        }
+        head
+    }
+
+    /// Send one request on a kept-alive passthrough connection with
+    /// middleware, reload the policy to `reload_data`, then send a second.
+    ///
+    /// Returns how many requests reached middleware and whether the second
+    /// request reached upstream.
+    async fn second_passthrough_request_after_reload(reload_data: &str) -> (usize, bool) {
+        use openshell_supervisor_middleware::{ChainRunner, MiddlewareRegistry};
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine =
+            Arc::new(OpaEngine::from_strings(TEST_POLICY, PASSTHROUGH_RELOAD_POLICY).unwrap());
+        let registry = MiddlewareRegistry::connect_services(
+            vec![Arc::new(SchemeRecorder(seen.clone()))],
+            Vec::new(),
+        )
+        .await
+        .expect("connect named middleware services");
+        engine.set_middleware_runner_for_tests(ChainRunner::from_registry(registry));
+        let generation_guard = established_passthrough_guard(&engine, &passthrough_reload_input());
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            request_default_port: Some(443),
+            policy_name: "passthrough_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay_engine = Arc::clone(&engine);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+                Some(
+                    &PolicyEngine::from(relay_engine)
+                        .passthrough_middleware()
+                        .unwrap(),
+                ),
+            )
+            .await
+        });
+        let timeout = std::time::Duration::from_secs(1);
+        let request = b"GET /v1/messages HTTP/1.1\r\nHost: api.example.test\r\n\r\n";
+
+        app.write_all(request).await.unwrap();
+        tokio::time::timeout(timeout, read_http_head(&mut upstream))
+            .await
+            .expect("first request should reach upstream");
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(timeout, read_http_head(&mut app))
+            .await
+            .expect("first response should reach the client");
+        assert!(String::from_utf8_lossy(&response).contains("204 No Content"));
+
+        engine.reload(TEST_POLICY, reload_data).unwrap();
+
+        app.write_all(request).await.unwrap();
+        let mut second = [0u8; 1024];
+        let forwarded = matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), upstream.read(&mut second))
+                .await,
+            Ok(Ok(n)) if n > 0
+        );
+        let middleware_calls = seen.lock().unwrap().len();
+
+        drop(app);
+        drop(upstream);
+        let _ = tokio::time::timeout(timeout, relay).await;
+        (middleware_calls, forwarded)
+    }
+
+    #[tokio::test]
+    async fn passthrough_middleware_connection_serves_next_request_after_unrelated_reload() {
+        let (middleware_calls, forwarded) =
+            second_passthrough_request_after_reload(PASSTHROUGH_RELOAD_AND_OTHER_POLICY).await;
+
+        assert_eq!(middleware_calls, 2, "both requests ran through middleware");
+        assert!(
+            forwarded,
+            "approving another host must not end the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_middleware_connection_drops_next_request_after_its_chain_changes() {
+        let (middleware_calls, forwarded) =
+            second_passthrough_request_after_reload(PASSTHROUGH_RELOAD_CHAIN_CHANGED_POLICY).await;
+
+        assert_eq!(
+            middleware_calls, 1,
+            "only the first request reached middleware"
+        );
+        assert!(
+            !forwarded,
+            "a changed chain must not apply to the old connection"
+        );
     }
 }

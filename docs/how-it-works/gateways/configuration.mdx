@@ -489,7 +489,7 @@ namespace              = "openshell"
 grpc_endpoint          = "https://openshell-gateway.openshell.svc:8080"
 default_image          = "nvcr.io/nvidia/base/ubuntu:24.04"
 # Defaults to the gateway version; override to pin a specific build.
-# supervisor_image     = "ghcr.io/nvidia/openshell/supervisor:<version>"
+# supervisor_image     = "quay.io/ai-openshell/supervisor:<version>"
 client_tls_secret_name = "openshell-client-tls"
 service_account_name   = "openshell-sandbox"
 host_gateway_ip        = "10.0.0.1"
@@ -1539,6 +1539,22 @@ Each example is a complete TOML file for one compute driver. The examples repeat
 
 Kubernetes configurations set `namespace`, `service_account_name`, and `enable_user_namespaces` in `[openshell.drivers.kubernetes]`. Docker configurations use `sandbox_label`; the legacy `sandbox_namespace` key is rejected.
 
+### IPv6 Egress and NAT64
+
+The Kubernetes, Docker, Podman, and MicroVM driver tables accept two keys that the driver passes to each supervisor on its command line:
+
+- `policy_dns_ipv6_egress` sets how mediated policy DNS answers AAAA queries: `auto` (default), `enabled`, or `disabled`. `auto` answers AAAA only when the supervisor network namespace has an IPv6 default route and no IPv4 default route. `disabled` answers AAAA with an empty response so dual-stack clients fall back to IPv4.
+- `nat64_prefixes` lists the NAT64 prefixes of the sandbox network as RFC 6052 CIDRs (`/32`, `/40`, `/48`, `/56`, `/64`, or `/96`). The supervisor applies the IPv4 SSRF rules to the IPv4 address embedded in any destination inside these prefixes. It always recognizes the well-known prefix `64:ff9b::/96` and also discovers the network prefix through `ipv4only.arpa` (RFC 7050), so set this key when the network uses a prefix that discovery cannot find.
+
+With `supervisor_topology = "gateway"`, the Helm chart passes the Kubernetes keys to the shared supervisors.
+
+The gateway rejects an unknown mode or a malformed prefix at startup.
+
+```toml
+policy_dns_ipv6_egress = "auto"
+nat64_prefixes         = ["2001:db8:64::/96"]
+```
+
 ### Kubernetes
 
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
@@ -1586,10 +1602,10 @@ image_pull_secrets             = ["regcred"]
 # runtime_bootstrap_grace_seconds = 900
 # sandbox_attach_request_timeout_seconds = 900
 # Defaults to the gateway version; override to pin a specific build.
-# sandbox_runtime_image        = "ghcr.io/nvidia/openshell/sandbox:<version>"
+# sandbox_runtime_image        = "quay.io/ai-openshell/sandbox:<version>"
 sandbox_runtime_image_pull_policy = "if_not_present"
 # Defaults to the gateway version; override to pin a specific build.
-# supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
+# supervisor_image             = "quay.io/ai-openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "if_not_present"
 
 # Optional corporate forward proxy for policy-approved TLS egress. The sandbox
@@ -1630,6 +1646,9 @@ supervisor_image_pull_policy   = "if_not_present"
 # and its TLS stack, so a full merged trust bundle wastes the sandbox
 # boundary's control-frame budget on duplicated roots.
 # proxy_ca_bundle              = "/etc/openshell-tls/proxy-ca/ca.crt"
+# Policy DNS AAAA handling and NAT64 prefixes; see IPv6 Egress and NAT64.
+# policy_dns_ipv6_egress       = "auto"
+# nat64_prefixes               = ["2001:db8:64::/96"]
 # Required in raw gateway TOML because `namespace` identifies sandbox
 # placement, not the gateway Service. Helm renders this from the release's
 # gateway Service name and namespace.
@@ -1848,9 +1867,9 @@ supervisor_network_mode = "host"
 # Optional override. Omit for automatic host or bridge callback selection.
 # grpc_endpoint = "https://gateway.example.com:17670"
 # Workload-side runtime. Defaults to the gateway version.
-# sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
+# sandbox_runtime_image = "quay.io/ai-openshell/sandbox:<version>"
 # Supervisor runtime. Defaults to the gateway version.
-# supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
+# supervisor_image = "quay.io/ai-openshell/supervisor:<version>"
 # Unsafe operator override. Host bind mounts, including Docker local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.
@@ -1874,6 +1893,9 @@ proxy_connect_by_hostname = false
 # Operator-owned gateway-host PEM bundle trusted for an HTTPS proxy and for
 # destination certificates re-signed by a TLS-intercepting proxy.
 proxy_ca_bundle = "/etc/openshell/tls/proxy-ca.pem"
+# Policy DNS AAAA handling and NAT64 prefixes; see IPv6 Egress and NAT64.
+# policy_dns_ipv6_egress = "auto"
+# nat64_prefixes = ["2001:db8:64::/96"]
 # Project a host Unix Workload API socket into the supervisor for provider
 # token exchange. The socket parent must be a dedicated absolute directory.
 provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
@@ -1969,9 +1991,9 @@ gateway_port            = 17670
 ssh_socket_path         = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 45
 # Statically linked workload-side runtime. Defaults to the gateway version.
-# sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
+# sandbox_runtime_image = "quay.io/ai-openshell/sandbox:<version>"
 # Dynamically linked supervisor runtime. Defaults to the gateway version.
-# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
+# supervisor_image      = "quay.io/ai-openshell/supervisor:<version>"
 # Unsafe operator override. Host bind mounts, including Podman local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.
@@ -2069,6 +2091,9 @@ health_check_interval_secs = 10
 # proxy_connect_by_hostname = true
 # Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
+# Policy DNS AAAA handling and NAT64 prefixes; see IPv6 Egress and NAT64.
+# policy_dns_ipv6_egress    = "auto"
+# nat64_prefixes            = ["2001:db8:64::/96"]
 # Project a host Workload API Unix socket into the supervisor, or use an
 # explicit container-reachable TCP endpoint, for provider token exchange.
 # provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
@@ -2122,6 +2147,14 @@ grpc_endpoint    = "https://host.openshell.internal:17670"
 # configuration when both fields are empty; sandbox-requested images are never
 # bootstrap images.
 bootstrap_image  = "nvcr.io/nvidia/base/ubuntu:24.04"
+# On a registry bootstrap cache miss, this limit applies across all layers.
+# It caps both the total decoded tar bytes (including trailing data) and the
+# output budget for staging and merging. Each entry costs at least 4 KiB.
+# Staging also charges 4 KiB per parent component, including repeated parents.
+# Larger files count at their logical size, including sparse holes. Each copy
+# into the merged rootfs counts again.
+# Defaults to 10 GiB. Downloads and the final ext4 disk use additional space.
+# bootstrap_extraction_max_bytes = 10737418240
 krun_log_level   = 1
 vcpus            = 2
 mem_mib          = 2048
@@ -2162,6 +2195,10 @@ overlay_disk_mib = 4096
 # Gateway-host PEM bundle trusted for an https:// proxy and for server
 # certificates re-signed by a TLS-intercepting proxy. Requires https_proxy.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
+# Policy DNS AAAA handling and NAT64 prefixes for the host-side supervisors;
+# see IPv6 Egress and NAT64.
+# policy_dns_ipv6_egress    = "auto"
+# nat64_prefixes            = ["2001:db8:64::/96"]
 # VM guests cannot mount a host Workload API Unix socket. Configure only a
 # separately operated guest-reachable TCP listener and explicitly acknowledge
 # the exposure; host-only sockets are never exposed automatically.
@@ -2292,6 +2329,11 @@ WebSocket services. Application traffic reaches the supervisor directly and uses
 authentication supplied by your application or ingress edge. Gateway service
 ingress remains available independently.
 
+The listener negotiates HTTP/2 and HTTP/1.1 through TLS ALPN. WebSocket upgrades
+use HTTP/1.1. The listener uses HTTP/1.1 to reach the sandbox service by default.
+Set `--backend-http-version 2` when exposing a service to use HTTP/2 on the
+sandbox connection. [Expose long-running services](/how-it-works/sandboxes/overview#expose-long-running-services)
+
 ```toml
 [openshell.supervisor.app_listener]
 enabled = true
@@ -2344,6 +2386,11 @@ unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
 `default--demo.services.example.com`; a service named `web` uses
 `default--demo--web.services.example.com`. Configure DNS or your ingress to reach
 the owning supervisor while preserving that hostname.
+
+For a service with an HTTP/2 backend, any ingress that terminates client TLS
+must connect to the supervisor using HTTP/2 over TLS. Use the service hostname
+for both TLS SNI and HTTP/2 `:authority`. The supervisor checks this match
+per request and applies the service's authorization mode.
 
 Both ingress paths use `[openshell.gateway].service_hostname_format`; the app
 listener has no separate naming mode. Keeping the same installation name and
@@ -2425,7 +2472,8 @@ the listener; configuring `base_url` alone does not enable routing or create DNS
 certificates, or ingress.
 
 When configured, service responses return the application address as `url` and
-`application_url`, with `gateway_url` available as a separate alternative.
+`application_url`. For HTTP/1.1 backends, `gateway_url` is also available when
+gateway service routing is enabled.
 Create-time exposure returns corresponding preferred, application, and gateway
 URL maps. CLI and SDK callers preserve the application origin, including its
 port, when the gateway is reached through a port-forward. With the listener

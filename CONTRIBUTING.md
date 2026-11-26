@@ -63,7 +63,7 @@ Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTA
 
 Pull requests that touch the enforcement machinery or reviewer routing — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `REVIEWERS.md`, `.github/CODEOWNERS`, or the enforcement and reviewer-routing scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
 
-Once your pull request represents [accepted work](#accepted-work), it needs exactly one `area:` label and any relevant `topic:` labels; see [Labeling and Notifications](#labeling-and-notifications) for guidance. The [reviewer routing workflow](.github/workflows/review-readiness.yml) adds reviewers from [REVIEWERS.md](REVIEWERS.md) based on these labels. The same workflow fails a ready PR from a personal fork that does not allow edits by maintainers; `gh pr create` enables that setting by default.
+Once your pull request represents [accepted work](#accepted-work), it needs exactly one `area:` label and any relevant `topic:` labels; see [Labeling and Notifications](#labeling-and-notifications) for guidance. Choose labels from the `area:*` and `topic:*` headings in [REVIEWERS.md](REVIEWERS.md); labels without a matching heading do not route reviewers. The [reviewer routing workflow](.github/workflows/review-readiness.yml) adds reviewers from that file based on these labels. The same workflow fails a ready PR from a personal fork that does not allow edits by maintainers; `gh pr create` enables that setting by default.
 
 Branch Checks requires accounts in `REVIEWERS.md` to appear in the repository collaborator list or have confirmed write or admin permission. Public read access alone does not qualify; read and triage accounts must appear in the collaborator list.
 
@@ -346,6 +346,18 @@ mise trust
 mise run gateway
 ```
 
+The workspace build, check, lint, and test tasks (`build:rust:workspace`,
+`rust:check`, `rust:lint`, `test:rust`) and CI Branch Checks enable the
+`experimental` feature flag. Standalone launchers such as `mise run gateway`
+and direct Cargo builds leave it off unless you pass `--features experimental`;
+prerelease and stable builds leave it off as well.
+
+Workspace builds select the Cedar runtime member and unify its shared policy
+features, so use per-package checks to verify that Cedar is excluded.
+
+The `experimental` build flag includes Cedar. Build the gateway and supervisor
+with `--features experimental`, or use published Release Dev artifacts.
+
 ## Building the `openshell` CLI
 
 Inside this repository, `openshell` is a local shortcut script at `scripts/bin/openshell`. The script will
@@ -425,12 +437,18 @@ The TypeScript SDK moved to [ai-openshell/sdk-typescript](https://github.com/ai-
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
+| `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies, enabled by the development `experimental` feature |
+| `crates/openshell-policy-cedar-schema/` | Canonical Cedar schema and entity, action, and context names, linked only with the `experimental` feature |
+| `crates/openshell-policy-cedar-adapter/` | Cedar analysis adapted to policy messages for gateway and runtime composition |
+| `crates/openshell-policy-cedar-runtime/` | Cedar implementation of the shared runtime contracts, selected by supervisor composition |
+| `crates/openshell-policy-runtime-interface/` | Shared policy decisions, request metadata, snapshots, and staged reload contracts; no engine implementations |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK (frozen, moved to ai-openshell/sdk-python) |
 | `sdk/typescript/` | Deprecated `@nvidia/openshell-sdk` stub re-exporting `@ai-openshell/sdk` (moved to ai-openshell/sdk-typescript) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |
+| `tests/policy-conformance/` | Policy backend conformance through production networking paths |
 | `tests/suites/` | End-to-end suites, grouped by test family |
 | `tests/tmachine/` | QEMU test machines provisioned with Ansible, and the `Session` API that drives them |
 | `tests/runner/` | `openshell-test-runner`: builds a test family for tmachine guests, runs it in a tmachine environment and checks the results |
@@ -560,7 +578,7 @@ chore(deps): bump tokio to 1.40
 
 ### DCO
 
-All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. Dependabot-authored dependency update PRs are allowlisted because the bot cannot sign commits.
+All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. The DCO check fails a PR if any of its commits lacks the trailer; add it with `git rebase --signoff` and force-push.
 
 The project uses version 1.1 of the [Developer Certificate of Origin](https://developercertificate.org/):
 
@@ -607,7 +625,7 @@ git commit --signoff --message "feat(sandbox): add new capability"
 
 DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
 
-- **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
+- **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor and every commit.
 - **Cryptographic commit signing** applies to org members and collaborators only; see [CI.md](CI.md#commit-signing) for setup.
 
 ### PR testing checklist

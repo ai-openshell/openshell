@@ -99,17 +99,19 @@ pub(crate) struct SocketTrustedResolver {
 }
 
 impl SocketTrustedResolver {
-    #[cfg(test)]
     pub(crate) fn new(server: SocketAddr) -> Self {
-        Self::with_timeout(server, DEFAULT_EXCHANGE_TIMEOUT)
+        Self {
+            servers: Mutex::new(vec![server]),
+            conf_path: None,
+            exchange_timeout: DEFAULT_EXCHANGE_TIMEOUT,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn with_timeout(server: SocketAddr, exchange_timeout: Duration) -> Self {
         Self {
-            servers: Mutex::new(vec![server]),
-            conf_path: None,
             exchange_timeout,
+            ..Self::new(server)
         }
     }
 
