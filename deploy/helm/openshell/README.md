@@ -163,6 +163,17 @@ supported Sandbox API (`agents.x-k8s.io/v1beta1` or
 `agentSandbox.preflight.enabled=false` for offline `helm template` rendering,
 where Helm cannot discover cluster APIs.
 
+Run `kubectl get storageclass` before installing. For dynamic provisioning
+without a default, set `server.dataStorageClass` (gateway StatefulSet) and
+`server.workspaceStorageClass` (sandbox workspaces).
+
+`storageClass.preflight.enabled=true` checks gateway storage on fresh StatefulSet
+installs with no gateway class set. The Helm identity needs cluster-scoped
+`list storageclasses` permission. A denied lookup stops Helm rendering. If
+that permission is unavailable, set `server.dataStorageClass` explicitly or
+disable the preflight. If a reinstall reuses retained gateway PVCs, set
+`storageClass.preflight.enabled=false`. Preview with `helm template --dry-run=server`.
+
 ## Install on Kubernetes
 
 ```shell
@@ -717,6 +728,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
 | securityContext.allowPrivilegeEscalation | bool | `false` | Whether the gateway container can gain additional privileges. |
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
+| securityContext.readOnlyRootFilesystem | bool | `true` | Mount the gateway container root filesystem read-only. Mount additional writable paths with server.extraVolumes and server.extraVolumeMounts. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | securityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the gateway container. |
@@ -807,6 +819,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
+| storageClass.preflight.enabled | bool | `false` | On a fresh StatefulSet install with no server.dataStorageClass, check for a default StorageClass. The Helm identity must be allowed to list StorageClasses. |
 | supervisor.affinity | object | `{}` | Affinity rules for the shared supervisor pod, rendered only when gatewayConfig selects supervisor_topology = "gateway". Top-level affinity applies only to the gateway pod. |
 | supervisor.autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":120,"type":"Pods","value":1}],"stabilizationWindowSeconds":300}}` | HPA scaling behavior. Remove at most one member every two minutes, after a five-minute stabilization window, to allow ownership handoff. |
 | supervisor.autoscaling.enabled | bool | `false` | Enable memory-based autoscaling of the shared supervisor Deployment. Requires supervisor_topology = "gateway" and the Kubernetes resource metrics API (usually Metrics Server). When enabled, the HPA owns the replica count and supervisor.replicas is ignored. |
