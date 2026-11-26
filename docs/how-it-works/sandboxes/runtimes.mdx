@@ -54,6 +54,10 @@ and `SUPERVISOR_BASE_IMAGE` build arguments override their pinned bases. See
 [Container Image Base Overrides](https://github.com/ai-openshell/openshell/blob/main/CONTRIBUTING.md#container-image-base-overrides)
 for build commands and base compatibility requirements.
 
+The supervisor image defaults to UID/GID `65534:65534`, including with a custom
+base. Compute drivers select the runtime identity explicitly. For direct image
+launches, make mounted runtime and log directories writable by the selected user.
+
 For TLS-enabled Docker, Podman, and MicroVM gateways, set `guest_tls_ca` in
 `[openshell.gateway]` or use the package-managed local CA. Remove the retired
 `guest_tls_cert` and `guest_tls_key` fields. Supervisors receive only the

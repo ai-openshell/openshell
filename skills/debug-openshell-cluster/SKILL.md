@@ -245,7 +245,8 @@ the driver did not supply an immutable image ID; Kubernetes currently omits it.
 When no image UID is available, `unmapped.container_image` preserves any known
 workload image reference, including for VM and shared-supervisor records.
 For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
-runtime libraries, CA certificates, and inherited user and working directory.
+runtime libraries, CA certificates, and working directory. The image defaults
+to UID/GID `65534:65534`; compute drivers select the runtime identity explicitly.
 Use container logs, engine inspection and the configured exec health probe for
 diagnostics; `exec ... sh`, package installation and in-container shell scripts
 are unavailable. Workload shells belong to the separate sandbox image. Preserve
