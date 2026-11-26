@@ -106,7 +106,7 @@ fn proto_execution_timeout(timeout_seconds: u32) -> Result<Option<prost_types::D
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
 pub use crate::ssh::{
-    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward, sandbox_ssh_proxy,
+    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward,
     sandbox_ssh_proxy_by_name, sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
 pub use openshell_core::forward::{
@@ -114,7 +114,7 @@ pub use openshell_core::forward::{
 };
 
 #[derive(Debug, PartialEq, Eq)]
-enum SandboxUploadPlan {
+pub(crate) enum SandboxUploadPlan {
     GitAware {
         base_dir: PathBuf,
         files: Vec<String>,
@@ -1601,10 +1601,11 @@ pub async fn sandbox_create(
                 }
                 // Boxed so the upload state machine lives on the heap instead of
                 // inflating the `sandbox_create` future (clippy::large_futures).
-                Box::pin(sandbox_upload_planned(
+                Box::pin(crate::ssh::sandbox_upload_planned(
                     upload_plan,
                     &effective_server,
                     &sandbox_name,
+                    Some(sandbox.object_id()),
                     Path::new(local_path),
                     dest,
                     &effective_tls,
@@ -5880,38 +5881,6 @@ fn git_filtered_upload_plan(local_path: &Path) -> Result<SandboxUploadPlan> {
     Ok(SandboxUploadPlan::GitAware { base_dir, files })
 }
 
-async fn sandbox_upload_planned(
-    plan: SandboxUploadPlan,
-    server: &str,
-    name: &str,
-    local_path: &Path,
-    sandbox_path: Option<&str>,
-    tls: &TlsOptions,
-    workspace: &str,
-) -> Result<Option<String>> {
-    match plan {
-        SandboxUploadPlan::GitAware { base_dir, files } => {
-            sandbox_sync_up_files(
-                server,
-                name,
-                &base_dir,
-                &files,
-                local_path,
-                sandbox_path,
-                tls,
-                workspace,
-            )
-            .await?;
-            Ok(None)
-        }
-        SandboxUploadPlan::Regular => {
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace)
-                .await
-                .map(Some)
-        }
-    }
-}
-
 /// Upload a local path to a sandbox.
 ///
 /// Symlink sources, including dangling links, bypass Git-aware filtering so
@@ -5933,10 +5902,11 @@ pub async fn sandbox_upload(
         dest_display
     );
 
-    let uploaded_path = sandbox_upload_planned(
+    let uploaded_path = crate::ssh::sandbox_upload_planned(
         upload_plan,
         server,
         name,
+        None,
         local_path,
         sandbox_path,
         tls,
@@ -8371,21 +8341,47 @@ mod tests {
 
     #[test]
     fn parse_credential_expiry_rejects_invalid_timestamp() {
-        let err = parse_credential_expiry_pairs(&["API_TOKEN=next-week".to_string()])
-            .expect_err("invalid timestamp should error");
+        for value in ["next-week", "2026-01-01T00:00:00"] {
+            let err = parse_credential_expiry_pairs(&[format!("API_TOKEN={value}")])
+                .expect_err("invalid timestamp should error");
 
-        assert!(
-            err.to_string()
-                .contains("must be a Unix epoch millisecond timestamp or RFC3339 timestamp")
-        );
+            assert!(
+                err.to_string()
+                    .contains("must be a Unix epoch millisecond timestamp, RFC3339 timestamp, or ISO 8601 timestamp with a UTC offset")
+            );
+        }
     }
 
     #[test]
-    fn parse_credential_expiry_cli_value_accepts_rfc3339_offsets() {
-        let parsed = parse_credential_expiry_cli_value("2026-01-01T01:00:00+01:00")
-            .expect("parse RFC3339 with offset");
+    fn parse_credential_expiry_cli_value_accepts_rfc3339_and_iso8601() {
+        for value in ["2026-01-01T01:00:00+01:00", "2026-01-01T01+01"] {
+            assert_eq!(
+                parse_credential_expiry_cli_value(value).unwrap(),
+                1_767_225_600_000,
+                "{value}"
+            );
+        }
+    }
 
-        assert_eq!(parsed, 1_767_225_600_000);
+    #[test]
+    fn parse_credential_expiry_preserves_fractional_millis_and_leap_seconds() {
+        for (value, expected) in [
+            ("2026-01-01T00:00:00.123999999Z", 1_767_225_600_123),
+            ("2016-12-31T23:59:60.250Z", 1_483_228_800_250),
+        ] {
+            assert_eq!(
+                parse_credential_expiry_cli_value(value).unwrap(),
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_credential_expiry_rejects_pre_epoch_values() {
+        for value in ["-1", "1969-12-31T23:59:59.999999999Z"] {
+            assert!(parse_credential_expiry_cli_value(value).is_err(), "{value}");
+        }
     }
 
     #[test]

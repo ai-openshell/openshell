@@ -1529,7 +1529,7 @@ dependencies = [
  "bitflags 2.13.2",
  "crossterm_winapi",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustix 0.38.44",
  "signal-hook",
  "signal-hook-mio",
@@ -1547,7 +1547,7 @@ dependencies = [
  "derive_more",
  "document-features",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustix 1.1.6",
  "signal-hook",
  "signal-hook-mio",
@@ -1746,9 +1746,9 @@ dependencies = [
  "cfg-if",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "lock_api",
+ "lock_api 0.4.14",
  "once_cell",
- "parking_lot_core",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -2501,8 +2501,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d930c203dd0b6ff06e0201a4a2fe9149b43c684fd4420555b26d21b1a02956f"
 dependencies = [
  "futures-core",
- "lock_api",
- "parking_lot",
+ "lock_api 0.4.14",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -3773,9 +3773,9 @@ dependencies = [
 
 [[package]]
 name = "kube"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c73b082f549411623a4f8949bd24dcaedacb1511379c461c76d579fde301d021"
+checksum = "f95e1a9107878bef32cfbe2e5e084584db832c9616df9981adc4673f9fb1c853"
 dependencies = [
  "k8s-openapi",
  "kube-client",
@@ -3786,9 +3786,9 @@ dependencies = [
 
 [[package]]
 name = "kube-client"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae56b223bca490db1f1b115bfc606d411177511d7748d8cc019a7e3b2935430b"
+checksum = "703ee17477c86501627e83492895c06ab6fc2c55a319bb2fbc582ccae739ba67"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3823,9 +3823,9 @@ dependencies = [
 
 [[package]]
 name = "kube-core"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6de84b47fc1aa35ba0ef9059ef54b47c8b47f0979afd15487e525282f2d73fb9"
+checksum = "b5e9a9aa533b2f4106ac1ac45e168bb452325eb9e918d57335444f60bef34ffc"
 dependencies = [
  "derive_more",
  "form_urlencoded",
@@ -3842,9 +3842,9 @@ dependencies = [
 
 [[package]]
 name = "kube-derive"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de1fb46ac34371491ac0277c13e0e1bb9288000e64c86ca3d91343754818e64e"
+checksum = "cedc991dbe7757a646098dead35e070e13ce66e2996b02162ac7f97eb97f4d6e"
 dependencies = [
  "darling 0.24.1",
  "proc-macro2",
@@ -3856,9 +3856,9 @@ dependencies = [
 
 [[package]]
 name = "kube-runtime"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dea60005024b6ec1819c426209aa29b9eaca64f6b3988ab73c55f43fa484392"
+checksum = "ca78d9eeb4674eb75e381e6a956e8a5005942928dec87de4db9ef9701af8a637"
 dependencies = [
  "ahash",
  "async-broadcast",
@@ -3871,7 +3871,7 @@ dependencies = [
  "json-patch 4.2.0",
  "k8s-openapi",
  "kube-client",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project",
  "serde",
  "serde_json",
@@ -3950,9 +3950,9 @@ checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libloading"
@@ -4049,6 +4049,15 @@ name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
 dependencies = [
  "scopeguard",
 ]
@@ -4770,7 +4779,6 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
- "chrono",
  "clap",
  "clap_complete",
  "console",
@@ -4782,6 +4790,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "indicatif",
+ "jiff 1.0.2",
  "miette",
  "nix 0.29.0",
  "noyalib",
@@ -4801,9 +4810,11 @@ dependencies = [
  "prost-types",
  "rcgen",
  "reqwest 0.12.28",
+ "russh",
  "rustls",
  "serde",
  "serde_json",
+ "shell-words",
  "tar",
  "temp-env",
  "tempfile",
@@ -4823,11 +4834,11 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "chrono",
  "clap",
  "glob",
  "h2",
  "ipnet",
+ "jiff 1.0.2",
  "jsonwebtoken",
  "libc",
  "miette",
@@ -4853,6 +4864,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -4861,6 +4873,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -4872,9 +4885,9 @@ dependencies = [
  "aws-config",
  "aws-sdk-sts",
  "axum",
- "chrono",
  "futures",
  "hyper-util",
+ "jiff 1.0.2",
  "jsonwebtoken",
  "openshell-core",
  "openshell-crypto",
@@ -4949,9 +4962,11 @@ dependencies = [
  "clap",
  "futures",
  "http 1.4.0",
+ "hyper-util",
  "libc",
  "miette",
  "openshell-core",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -4971,6 +4986,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tower",
  "tower-http 0.6.8",
  "tracing",
  "tracing-opentelemetry",
@@ -5045,6 +5061,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-launch"
+version = "0.0.0"
+dependencies = [
+ "http 1.4.0",
+ "prost",
+ "protoc-bin-vendored",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+]
+
+[[package]]
 name = "openshell-driver-mxc"
 version = "0.0.0"
 dependencies = [
@@ -5082,6 +5113,7 @@ dependencies = [
  "nix 0.29.0",
  "openshell-core",
  "openshell-crypto",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -5100,13 +5132,34 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
+ "tower",
  "tower-http 0.6.8",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "openshell-driver-sdk"
+version = "0.0.0"
+dependencies = [
+ "http 1.4.0",
+ "libc",
+ "nix 0.29.0",
+ "openshell-core",
+ "openshell-crypto",
+ "openshell-driver-launch",
+ "openshell-otel",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -5145,6 +5198,7 @@ dependencies = [
  "flate2",
  "futures",
  "http 1.4.0",
+ "hyper-util",
  "libc",
  "libloading",
  "miette",
@@ -5152,7 +5206,9 @@ dependencies = [
  "oci-client",
  "openshell-core",
  "openshell-crypto",
+ "openshell-driver-launch",
  "openshell-driver-podman",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -5174,7 +5230,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
+ "tower",
  "tower-http 0.6.8",
  "tracing",
  "tracing-opentelemetry",
@@ -5211,19 +5269,19 @@ dependencies = [
  "nix 0.29.0",
  "openshell-core",
  "openshell-crypto",
- "openshell-driver-docker",
  "openshell-driver-kubernetes",
+ "openshell-driver-launch",
  "openshell-driver-mxc",
- "openshell-driver-podman",
+ "openshell-driver-sdk",
  "openshell-otel",
- "openshell-policy",
+ "openshell-otel-test-support",
  "openshell-server",
  "rcgen",
  "rustix 1.1.6",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml",
  "tonic",
  "tower",
@@ -5265,7 +5323,7 @@ dependencies = [
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
- "chrono",
+ "jiff 1.0.2",
  "openshell-ocsf-validate",
  "serde",
  "serde_json",
@@ -5622,7 +5680,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
- "chrono",
  "clap",
  "futures",
  "futures-util",
@@ -5636,6 +5693,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "ipnet",
+ "jiff 1.0.2",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
@@ -6255,8 +6313,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.4.14",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -6268,6 +6336,18 @@ dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link",
 ]
@@ -6398,7 +6478,7 @@ checksum = "9cd31dcfdbbd7431a807ef4df6edd6473228e94d5c805e8cf671227a21bad068"
 dependencies = [
  "anyhow",
  "clap",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "proc-macro2",
  "quote",
  "rand 0.8.6",
@@ -7210,6 +7290,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_syscall"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
 name = "ref-cast"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7241,7 +7330,7 @@ dependencies = [
  "hashbrown 0.17.0",
  "itoa",
  "micromap",
- "parking_lot",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "serde_json",
 ]
@@ -8282,9 +8371,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.15.1"
+version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 dependencies = [
  "serde",
 ]
@@ -8346,7 +8435,7 @@ version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
- "lock_api",
+ "lock_api 0.4.14",
 ]
 
 [[package]]
@@ -8638,7 +8727,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf776ba3fa74f83bf4b63c3dcbbf82173db2632ed8452cb2d891d33f459de70f"
 dependencies = [
  "new_debug_unreachable",
- "parking_lot",
+ "parking_lot 0.12.5",
  "phf_shared",
  "precomputed-hash",
 ]
@@ -8802,7 +8891,7 @@ version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
 dependencies = [
- "parking_lot",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -8834,7 +8923,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9048a889effe34a5cddee0af7f53285198b16dca3be510858d38dfdb3e62a04e"
 dependencies = [
  "bitflags 2.13.2",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustix 1.1.6",
  "signal-hook",
  "windows-sys 0.61.2",
@@ -9072,7 +9161,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
