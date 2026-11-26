@@ -195,7 +195,9 @@ jobs:
   ubuntu-snap-system-docker:
     name: Ubuntu snap with system Docker
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 fails snap installation with another user manager active.
+    # Track investigation in https://github.com/ai-openshell/openshell/issues/5924.
+    runs-on: ubuntu-24.04
     env:
       OPENSHELL_INSTALL_METHOD: snap
     timeout-minutes: 20
@@ -408,10 +410,10 @@ jobs:
       - name: Install Agent Sandbox controller
         run: bash e2e/support/install-agent-sandbox.sh
 
-      - name: Install OpenShell Helm chart from GHCR OCI
+      - name: Install OpenShell Helm chart from Quay
         run: |
           set -euo pipefail
-          helm install "$RELEASE_NAME" oci://ghcr.io/nvidia/openshell/helm-chart \
+          helm install "$RELEASE_NAME" oci://quay.io/ai-openshell/charts/openshell \
             --version 0.0.0-dev \
             --namespace "$RELEASE_NAMESPACE" --create-namespace \
             --set server.disableTls=true \

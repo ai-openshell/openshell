@@ -19,7 +19,8 @@ use openshell_gateway_interceptors::{
     ProviderProfileSourceSnapshot as InterceptorProfileSnapshot,
 };
 use openshell_providers::{
-    ProfileValidationDiagnostic, ProviderTypeProfile, normalize_profile_id, validate_profile_set,
+    ProfileValidationDiagnostic, ProviderTypeProfile, normalize_profile_id,
+    validate_catalog_profiles,
 };
 use prost::Message as _;
 use sha2::{Digest, Sha256};
@@ -802,7 +803,11 @@ impl EffectiveProviderProfileCatalog {
 fn hash_scoped_profile_revision(entry: &ScopedProfileEntry, hasher: &mut Sha256) {
     hasher.update(b"provider-profile-source-entry");
     hasher.update(entry.source_id.as_bytes());
-    hasher.update(entry.source_revision.as_bytes());
+    // Stored profile revisions already live in the entry payload. Hashing the
+    // whole source snapshot would make unrelated imports supersede waits.
+    if !entry.user_managed {
+        hasher.update(entry.source_revision.as_bytes());
+    }
     let scope_tag: &[u8] = match entry.scope {
         ProfileScope::Static => b"static",
         ProfileScope::Platform => b"platform",
@@ -1026,7 +1031,7 @@ fn validate_source_profiles(
     source_id: &str,
     profiles: &[(String, ProviderTypeProfile)],
 ) -> Result<(), Status> {
-    let diagnostics = validate_profile_set(profiles);
+    let diagnostics = validate_catalog_profiles(profiles);
     if let Some(diagnostic) = diagnostics
         .into_iter()
         .find(|diagnostic| diagnostic.severity == "error")

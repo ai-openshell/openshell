@@ -38,6 +38,16 @@ pub struct AuthzPolicy {
     pub scopes_enabled: bool,
 }
 
+impl From<&openshell_core::config::OidcConfig> for AuthzPolicy {
+    fn from(oidc: &openshell_core::config::OidcConfig) -> Self {
+        Self {
+            admin_role: oidc.admin_role.clone(),
+            user_role: oidc.user_role.clone(),
+            scopes_enabled: !oidc.scopes_claim.is_empty(),
+        }
+    }
+}
+
 impl AuthzPolicy {
     /// The policy for the configured user authentication mode, or `None`
     /// when neither OIDC nor edge authentication is configured.

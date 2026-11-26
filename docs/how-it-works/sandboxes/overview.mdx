@@ -584,6 +584,17 @@ Pass an optional service name to create a named service URL:
 openshell service expose my-sandbox 8080 web
 ```
 
+For a native gRPC server or another service that needs HTTP/2 on loopback,
+enable the supervisor application listener and expose the service with
+`--backend-http-version 2`. [Supervisor application listener setup](/how-it-works/gateways/configuration#supervisor-application-listener)
+
+```shell
+openshell service expose demo 50051 agent --backend-http-version 2
+```
+
+Use the printed HTTPS URL with an HTTP/2 client. The sandbox server must accept
+cleartext HTTP/2 with prior knowledge on the declared loopback port.
+
 OpenShell strips the incoming `Authorization` header by default. Opt a service
 into forwarding one valid bearer credential unchanged when the application
 performs its own authentication:
@@ -612,9 +623,7 @@ edge authentication cookies remain stripped.
 
 <Warning>
 Bearer passthrough delivers the caller's credential to the sandbox service.
-Enable it only when that service is trusted to receive the credential. Exposed
-services still use the gateway listener and its TLS configuration in this
-release.
+Enable it only when that service is trusted to receive the credential.
 </Warning>
 
 For example, Codex App Server can keep the raw capability outside the sandbox
@@ -910,6 +919,7 @@ openshell sandbox ssh-config my-sandbox
 ```
 
 Append the output to `~/.ssh/config` or use `--editor` on `sandbox create`/`sandbox connect` for automatic setup.
+If the gateway URL contains credentials, a path, a query, or a fragment, register it under a gateway name and use that name when generating the SSH config.
 
 ## Transfer Files
 
@@ -1182,6 +1192,8 @@ the supervisor completes startup without recreating the sandbox. Starting a
 stopped sandbox repeats configuration admission before launching its workload.
 
 Image preparation and initial supervisor startup have an absolute deadline of 1800 seconds by default, independently of the CLI wait timeout. `sandbox create --timeout <seconds>` sets how long the CLI waits without provisioning progress (300 seconds by default); it does not change the gateway deadline. Operators can set `image_preparation_timeout_seconds` in `[openshell.gateway]` to any value from 1 through 86400. Each new create or explicit start stores its deadline. Progress events, configuration edits, and gateway or driver restarts cannot extend it. Changing the gateway setting affects new attempts only.
+
+`sandbox create` retries when the gateway reports that the create lost the mutation lock, for 60 seconds by default. Set the budget with `--create-retry-timeout <seconds>` or `OPENSHELL_CREATE_RETRY_TIMEOUT` (both clamped to 24 hours), or pass `--no-create-retry` to fail on the first busy reply. Retry progress goes to stderr.
 
 The first authenticated configuration report from the current supervisor ends preparation and starts a separate admission repair window (300 seconds by default). A slow image download therefore does not consume time reserved for fixing policy. During admission, an effective policy, settings, provider, profile, or attachment change resets the window from its stored change time. The first failed configuration load for that change grants another full window. Repeated failures, duplicate reports, and reconnects do not extend it; reaching `Ready` clears it.
 

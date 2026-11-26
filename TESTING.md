@@ -203,6 +203,12 @@ re-locks a workspace from the root lockfile. Add new testkit workspaces to
 
 #### What a conformance test may assert
 
+Conformance tests must work concurrently on a shared gateway. Use
+`Context::name` (or testkit's sandbox builder) for gateway resource names,
+use test-unique selector values and host fixtures, and scope assertions and
+cleanup to resources the test owns. Do not change gateway-wide settings or
+routes.
+
 Conformance tests run on every compute driver, so they check the public
 contract and nothing a driver is free to change.
 
@@ -251,10 +257,13 @@ prebuilt testkit program, such as a static `openshell-conformance` for the
 guest's architecture, instead of building the family's tests; it can't be
 combined with `--package`. With it, `--filter` (repeatable) takes parts of test
 names, as the program does, such as `--filter policy_advisor::`, rather than a
-nextest filterset. The runner runs the program's `ready`
-and `run` commands in the guest and still writes `junit.xml` and `nextest.log`
-(the program's output) to the results directory. Branch E2E builds
+nextest filterset. The runner runs the program's `ready` command in the
+guest, then uses nextest to run the prebuilt binary. It writes `junit.xml`
+and `nextest.log` to the results directory. Branch E2E builds
 `openshell-conformance` once and passes it to every conformance row this way.
+`--test-threads N` runs up to N tests concurrently in the guest, whether
+the runner builds the suite or uses `--bundle` or `--program`. The default
+is one. CI rows can opt in with `test_threads`.
 
 `openshell-test-runner build --family <family> --out <dir>` builds a family's
 test bundle for the guest without booting a VM, and `run --bundle <dir>` runs
@@ -320,7 +329,9 @@ service.
   clients there from the variables. A missing variable fails the test; it
   never skips it.
 - **Documentation.** Document the variables in the fixture's module docs, so
-  anyone can run the suite against their own deployment by setting them.
+  anyone can run the suite against their own deployment by setting them, and
+  add a row for each to the
+  [environment contract table](tests/support/README.md#environment-contract).
 
 The Keycloak fixture is `tests/support/keycloak`. Run the suite that uses it
 with:
@@ -514,6 +525,9 @@ feature variable (`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURE
 `e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
 it skips them. Unset or empty values select the driver's default Rust
 features. The selector is handled by the runner; it is not a Cargo feature.
+The wrappers use nextest, which runs one test per CPU by default. Set
+`NEXTEST_TEST_THREADS` to change the worker count. For a standalone run without nextest,
+invoke `openshell-conformance run` directly.
 
 ```shell
 OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes
@@ -627,11 +641,27 @@ nix run .#openshell-test-runner -- run \
 
 #### Gateway overrides in an environment
 
-An environment overrides gateway settings by writing the tables to change to
-`/etc/openshell-test/gateway-overrides.toml` in a playbook that runs before the
-installer. The file holds whole tables, such as `[openshell.gateway]` or
-`[openshell.drivers.podman]`, and is not a complete configuration. Each
-installer applies it to the gateway's own file:
+An environment overrides gateway settings with the `gateway_overrides` role,
+which takes a name and the tables to change, such as `[openshell.gateway]` or
+`[openshell.drivers.podman]`:
+
+```yaml
+- name: Push configuration to supervisors
+  ansible.builtin.include_role:
+    name: gateway_overrides
+  vars:
+    gateway_overrides_name: config-push
+    gateway_overrides_content: |
+      [openshell.gateway]
+      config_delivery_mode = "push"
+```
+
+The role writes each name as its own marked block in
+`/etc/openshell-test/gateway-overrides.toml`, so writers keep each other's
+settings, and `gateway_overrides_state: absent` removes a name's block.
+Two blocks must not declare the same table. Don't write the file
+directly. The file is not a complete configuration. Each installer applies it
+to the gateway's own file:
 
 - `binaries` applies it to the `/etc/openshell/gateway.toml` it generates.
 - `deb` and `rpm` apply it to the service user's
@@ -685,6 +715,22 @@ host through `host.openshell.internal`. CI runs it on Docker rootful, Podman
 rootful and rootless, and the `k3s` and `k3s-ha` installers. The tests run on
 the K3s node, so the K3s installers set the chart's `server.hostGatewayIP` to
 the node's address.
+
+The `routable-host-ip` feature suite (`tests/suites/features/routable-host-ip`)
+checks that a policy endpoint whose host is an IP literal reaches that address,
+with or without `allowed_ips`. The test reaches a host server by
+`host.openshell.internal`, then uses the address that request arrived at, or
+the host's outbound address when it arrived on loopback from a host-network
+supervisor. The address must be one the supervisor lets an IP literal reach.
+Rootless Podman's is link-local and always blocked, so CI runs the suite on
+Docker rootful, Podman rootful, and the `k3s` and `k3s-ha` installers.
+
+The `policy-dns-ipv6` feature suite (`tests/suites/features/policy-dns-ipv6`)
+checks that policy DNS answers AAAA queries with a synthetic address that
+reaches only the policy endpoint's server. CI runs it on `ubuntu-k3s-ipv6`, an
+IPv6-only cluster where sandboxes have no IPv4 route, so the default
+`policy_dns_ipv6_egress = "auto"` turns on. The K3s installers set
+`server.hostGatewayIP` to the node's IPv6 address there.
 
 The `connect-ssh-supervision` feature suite
 (`tests/suites/features/connect-ssh-supervision`) checks how `sandbox connect`
@@ -811,8 +857,8 @@ branch CLI needs a newer feature, pin the SHA of your branch's base instead.
 Confirm a tag exists before relying on it (set `TAG` to the tag you plan to use):
 
 ```shell
-TAG=0.0.115
-skopeo inspect "docker://ghcr.io/nvidia/openshell/gateway:${TAG}"
+TAG=0.1.10
+skopeo inspect "docker://quay.io/ai-openshell/gateway:${TAG}"
 ```
 
 `IMAGE_TAG` sets the default tag for the gateway/supervisor image pair; the CLI

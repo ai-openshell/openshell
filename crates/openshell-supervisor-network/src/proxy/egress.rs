@@ -12,7 +12,7 @@
 //! drifting as more adapters are added.
 
 use super::destination::DestinationValidationPlan;
-use crate::opa::NetworkAction;
+use crate::policy_types::NetworkAction;
 use openshell_isolation_interface::contract::ProcessInstance;
 use openshell_ocsf::Process;
 use std::path::PathBuf;
@@ -39,13 +39,15 @@ pub(super) struct EndpointDecision {
     pub(super) l7_route: Option<L7RouteSnapshot>,
     /// Destination authorization selected from the captured endpoint metadata.
     pub(super) destination: Option<DestinationValidationPlan>,
-    /// Raw endpoint configs returned with the authoritative egress decision.
-    pub(super) policy_configs: Vec<regorus::Value>,
+    /// Endpoint configs returned with the authoritative egress decision.
+    pub(super) policy_configs: Vec<crate::policy_types::EndpointConfig>,
     /// Full endpoint identities and metadata captured in the same generation.
     #[allow(dead_code, reason = "consumed when the policy DNS adapter lands")]
-    pub(super) matched_endpoints: Vec<crate::opa::MatchedEndpoint>,
+    pub(super) matched_endpoints: Vec<crate::policy_types::MatchedEndpoint>,
     /// Whether policy matched the requested hostname exactly (not by glob).
     pub(super) exact_declared_host: bool,
+    /// For a Cedar sandbox, how resolved addresses are checked.
+    pub(super) destination_policy: Option<openshell_policy_runtime_interface::DestinationPolicy>,
 }
 
 impl Default for EndpointDecision {
@@ -57,16 +59,20 @@ impl Default for EndpointDecision {
             policy_configs: Vec::new(),
             matched_endpoints: Vec::new(),
             exact_declared_host: false,
+            destination_policy: None,
         }
     }
 }
 
 impl EndpointDecision {
-    pub(super) fn from_authorization(authorization: &crate::opa::EgressAuthorization) -> Self {
+    pub(super) fn from_authorization(
+        authorization: &crate::policy_types::EgressAuthorization,
+    ) -> Self {
         Self {
             policy_configs: authorization.endpoint_configs.clone(),
             matched_endpoints: authorization.matched_endpoints.clone(),
             exact_declared_host: authorization.exact_declared_endpoint_host,
+            destination_policy: authorization.destination_policy.clone(),
             ..Self::default()
         }
     }
@@ -158,6 +164,8 @@ pub(super) struct EgressDecision {
     pub(super) action: NetworkAction,
     /// Policy generation used for the complete authorization snapshot.
     pub(super) policy_generation: u64,
+    /// Engine that made the decision (`opa` or `cedar`), for OCSF events.
+    pub(super) engine: &'static str,
     /// Whether process identity evidence was available to policy evaluation.
     pub(super) identity: ProcessIdentityEvidence,
     /// Endpoint behavior hydrated for destination validation and relays.
@@ -176,6 +184,23 @@ pub(super) struct EgressDecision {
 }
 
 impl EgressDecision {
+    /// The policy input this decision was evaluated with.
+    ///
+    /// Every adapter builds its OPA input from the intent destination and the
+    /// identity fields stored here (an absent binary is the empty path used by
+    /// endpoint-only mode). The binary digest is omitted because Rego never
+    /// reads it; integrity is enforced in Rust before authorization.
+    pub(super) fn policy_input(&self) -> crate::opa::NetworkInput {
+        crate::opa::NetworkInput {
+            host: self.intent.destination.host.clone(),
+            port: self.intent.destination.port,
+            binary_path: self.binary.clone().unwrap_or_default(),
+            binary_sha256: String::new(),
+            ancestors: self.ancestors.clone(),
+            cmdline_paths: self.cmdline_paths.clone(),
+        }
+    }
+
     pub(super) fn binary_display(&self) -> String {
         self.binary
             .as_ref()
@@ -320,6 +345,7 @@ mod tests {
             intent,
             action,
             policy_generation: 1,
+            engine: "opa",
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::default(),
             binary: None,

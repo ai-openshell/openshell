@@ -109,7 +109,8 @@ mod linux {
     /// Bounds connecting to one supervisor address and negotiating the route
     /// there, so an unreachable cached owner leaves time for the configured
     /// addresses.
-    const RUNTIME_ROUTE_HOP_TIMEOUT: Duration = Duration::from_secs(2);
+    const RUNTIME_ROUTE_HOP_TIMEOUT: Duration =
+        openshell_sandbox_backend::runtime_routed::ROUTE_HOP_TIMEOUT;
     /// Redirects followed from each supervisor address a dial starts at.
     const MAX_RUNTIME_ROUTE_REDIRECTS: usize = 2;
     /// Spares a routed runtime keeps unused at once: one at its owner, and in
@@ -1155,7 +1156,7 @@ mod linux {
         stream: tokio::net::TcpStream,
         /// The supervisor named itself, as only a pool member does.
         named: bool,
-        /// A member's route directory led here.
+        /// A member's redirect led here.
         redirected: bool,
     }
 
@@ -1820,10 +1821,12 @@ mod linux {
         // Do not retain the response sender while the client request direction
         // stays open: finite exchanges must still observe the server's EOF.
         let invalid_frames = outbound.downgrade();
+        let (cancel_inbound, inbound_cancelled) = tokio::sync::oneshot::channel();
         let mut inbound_closed = connection_closed.clone();
         tokio::spawn(async move {
             tokio::select! {
             _ = inbound_closed.changed() => {},
+            Ok(()) = inbound_cancelled => {},
             () = async {
             let mut mode = openshell_sandbox_backend::stream_adapter::Mode::Request;
             loop {
@@ -1860,6 +1863,7 @@ mod linux {
         tokio::spawn(async move {
             tokio::select! {
             _ = outbound_closed.changed() => {},
+            () = outbound.closed() => {},
             () = async {
             let mut mode = openshell_sandbox_backend::stream_adapter::Mode::Response;
             loop {
@@ -1870,6 +1874,11 @@ mod linux {
                 }
             }
             } => {},
+            }
+            // A reset must release both halves even if the inbound pump is
+            // blocked writing to the local stream. Backend EOF keeps it open.
+            if outbound.is_closed() {
+                let _ = cancel_inbound.send(());
             }
         });
         (application, ReceiverStream::new(outbound_rx))

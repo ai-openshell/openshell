@@ -28,11 +28,12 @@ async fn probe(
 ) {
     let (open, completion) = staged_curl_open(destination, engine.current_generation());
     let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
-    let dns = store.map(|store| policy_dns_test_service(store, engine));
+    let network_engine = PolicyEngine::from(Arc::clone(engine));
+    let dns = store.map(|store| policy_dns_test_service(store, &network_engine));
     let accepted = preauthorize_transparent_open(
         open,
         dns.as_ref(),
-        engine,
+        &network_engine,
         &BinaryIdentityCache::new(),
         None,
         None,
@@ -72,13 +73,7 @@ async fn allowed_ipv4_endpoint_accepts_mapped_form() {
 async fn policy_dns_recovers_hostname_for_mapped_form() {
     let engine = engine_for("db.example");
     let store = policy_dns_test_store();
-    let record = publish_mapping(
-        &store,
-        "db.example",
-        "database",
-        5432,
-        engine.current_generation(),
-    );
+    let record = publish_mapping(&store, "db.example", engine.current_generation());
     let IpAddr::V4(ipv4) = record.synthetic_address else {
         panic!("test publishes an IPv4 mapping");
     };

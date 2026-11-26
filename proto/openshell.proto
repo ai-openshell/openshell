@@ -49,6 +49,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "user"
     };
   }
@@ -66,11 +67,14 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "user"
     };
   }
 
-  // Fetch a sandbox by name.
+  // Fetch a sandbox by name. Response metadata x-openshell-direct-ssh: 1
+  // advertises support for TcpForwardInit.direct_ssh_sandbox_id for this
+  // caller. ForwardTcp authorizes each connection independently.
   rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
@@ -94,6 +98,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "admin"
     };
   }
@@ -124,6 +129,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -144,6 +150,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "user"
     };
   }
@@ -154,6 +161,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "delete"
       workspace_role: "user"
     };
   }
@@ -173,6 +181,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "delete"
       workspace_role: "user"
     };
   }
@@ -182,6 +191,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "update"
       workspace_role: "user"
     };
   }
@@ -191,6 +201,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "update"
       workspace_role: "user"
     };
   }
@@ -202,6 +213,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "update"
       workspace_role: "user"
     };
   }
@@ -211,6 +223,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "update"
       workspace_role: "user"
     };
   }
@@ -220,6 +233,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "user"
     };
   }
@@ -229,6 +243,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "user"
     };
   }
@@ -256,6 +271,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "delete"
       workspace_role: "user"
     };
   }
@@ -265,6 +281,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "delete"
       workspace_role: "user"
     };
   }
@@ -274,6 +291,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "other"
       workspace_role: "user"
     };
   }
@@ -283,6 +301,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "other"
       workspace_role: "user"
     };
   }
@@ -294,6 +313,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "other"
       workspace_role: "user"
     };
   }
@@ -303,6 +323,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "create"
       workspace_role: "admin"
     };
   }
@@ -358,6 +379,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "create"
       workspace_role: "admin"
     };
   }
@@ -368,6 +390,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -387,6 +410,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -407,6 +431,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -417,6 +442,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -429,6 +455,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -439,6 +466,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -448,6 +476,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -458,6 +487,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -469,6 +499,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "secret:write"
+      audit: "create"
       workspace_role: "admin"
     };
   }
@@ -496,6 +527,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "secret:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -505,6 +537,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "secret:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -513,7 +546,7 @@ service OpenShell {
   // Disabled unless the gateway sets enable_secret_reveal. Only directly
   // authenticated mTLS operators may call this method. Every call is audited.
   rpc RevealSecret(RevealSecretRequest) returns (RevealSecretResponse) {
-    option (openshell.options.v1.authorization) = { auth_mode: "operator" };
+    option (openshell.options.v1.authorization) = { auth_mode: "operator" audit: "read" };
   }
 
   // Get sandbox settings by id (called by users, and by supervisors at startup
@@ -549,6 +582,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "dual"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -778,6 +812,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -788,6 +823,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -798,6 +834,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -807,6 +844,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -816,6 +854,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -826,6 +865,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -872,6 +912,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "workspace:write"
+      audit: "create"
       global_role: "platform_admin"
     };
   }
@@ -899,6 +940,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "workspace:write"
+      audit: "delete"
       global_role: "platform_admin"
     };
   }
@@ -908,6 +950,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "workspace:write"
+      audit: "create"
       workspace_role: "admin"
     };
   }
@@ -917,6 +960,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "workspace:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -964,6 +1008,7 @@ service SandboxUpdates {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "update"
       workspace_role: "user"
     };
   }
@@ -1950,11 +1995,9 @@ message CreateSshSessionRequest {
 
 // Create SSH session response.
 //
-// Fields are interpolated into an SSH `ProxyCommand` string that OpenSSH
-// executes through `/bin/sh -c` on the caller's workstation. Servers MUST
-// uphold the charset contract below; clients MUST reject responses that
-// violate it. The client's own escaping provides defense-in-depth, but
-// narrow charsets close injection vectors at the trust boundary.
+// Servers MUST uphold the charset contract below. Clients MUST validate the
+// response before using it to open a relay. Send the session token only in the
+// authenticated gateway RPCs that use it. Keep it out of SSH command lines.
 message CreateSshSessionResponse {
   reserved 8;
   reserved "expires_at_ms";
@@ -2001,6 +2044,8 @@ message ExposeServiceRequest {
   string request_id = 6;
   // Application authorization behavior. Omission resolves to STRIP.
   ServiceAuthorizationMode authorization_mode = 7;
+  // HTTP version on the loopback hop. Omission uses HTTP/1.1.
+  ServiceBackendHttpVersion backend_http_version = 8;
 }
 
 // Request to fetch an exposed sandbox service endpoint.
@@ -2069,6 +2114,8 @@ message ServiceEndpoint {
   bool domain = 6;
   // Effective application authorization behavior for ingress requests.
   ServiceAuthorizationMode authorization_mode = 7;
+  // HTTP version on the loopback hop. Omission uses HTTP/1.1.
+  ServiceBackendHttpVersion backend_http_version = 8;
 }
 
 // Service addresses. A configured address does not establish readiness.
@@ -2179,9 +2226,14 @@ message TcpForwardInit {
   oneof target {
     SshRelayTarget ssh = 5;
     TcpRelayTarget tcp = 6;
+    // Open SSH using the authenticated gateway caller. Set this to the
+    // immutable ID returned by GetSandbox and leave authorization_token empty.
+    // Use only when GetSandbox advertises x-openshell-direct-ssh: 1. A denied
+    // direct connection must not be retried with a session token.
+    string direct_ssh_sandbox_id = 8;
   }
-  // Optional target-specific authorization token. SSH targets use this as the
-  // short-lived SSH session token issued by CreateSshSession.
+  // The ssh target requires the session token issued by CreateSshSession.
+  // The tcp target accepts tokens from older clients.
   string authorization_token = 7 [(openshell.options.v1.secret) = true];
 }
 
@@ -3171,8 +3223,8 @@ message UpdateConfigRequest {
   // The new policy to apply.
   //
   // Sandbox scope (`global=false`):
-  // - only network_policies may differ from create-time
-  //   policy; static fields must match version 1.
+  // - only network_policies and cedar_policy may differ from
+  //   create-time policy; static fields must match version 1.
   //
   // Global scope (`global=true`):
   // - applies to all sandboxes in full (no merge).
@@ -3508,6 +3560,9 @@ message SupervisorHello {
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
   bool supports_service_advertisements = 8;
+  // Versioned capabilities of the supervisor's compiled policy backends.
+  // Missing capabilities never authorize a policy requiring that backend.
+  repeated string supported_capabilities = 9;
 }
 
 // Gateway accepts the supervisor session.
@@ -4550,4 +4605,14 @@ message DiscoveredServiceRoute {
   string installation_version = 6;
   uint64 declaration_revision = 7;
   google.protobuf.Timestamp expires_at = 8;
+}
+
+// HTTP version the supervisor uses to connect to a sandbox service.
+enum ServiceBackendHttpVersion {
+  // Omission uses HTTP/1.1.
+  SERVICE_BACKEND_HTTP_VERSION_UNSPECIFIED = 0;
+  // Cleartext HTTP/1.1.
+  SERVICE_BACKEND_HTTP_VERSION_HTTP1 = 1;
+  // Cleartext HTTP/2 with prior knowledge, via the supervisor app listener.
+  SERVICE_BACKEND_HTTP_VERSION_HTTP2 = 2;
 }
