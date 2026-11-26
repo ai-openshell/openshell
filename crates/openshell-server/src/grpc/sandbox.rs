@@ -1242,6 +1242,11 @@ async fn parent_policy_copy(
 /// gateway was down or published by a replica the child is not on, and stop
 /// every child whose parent record is gone.
 pub async fn sync_all_children(state: &Arc<ServerState>) -> Result<(), Status> {
+    // The scan reads every sandbox in every workspace; with the feature off
+    // there are no children to find.
+    if !state.config.enable_child_sandboxes {
+        return Ok(());
+    }
     let mut children_by_parent: std::collections::BTreeMap<String, Vec<Sandbox>> =
         std::collections::BTreeMap::new();
     for sandbox in state
@@ -9175,9 +9180,10 @@ mod tests {
 
     async fn child_sandboxes_state_with_limit(limit: u32) -> Arc<ServerState> {
         let mut state = test_server_state().await;
-        let config = &mut Arc::get_mut(&mut state).unwrap().config;
-        config.enable_child_sandboxes = true;
-        config.max_concurrent_children = limit;
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.enable_child_sandboxes = true;
+        inner.config.max_concurrent_children = limit;
+        inner.compute = inner.compute.clone().with_child_sandboxes(true);
         state
     }
 
@@ -9613,6 +9619,73 @@ mod tests {
         assert!(
             lead.metadata.unwrap().deletion_time.is_none(),
             "a refused delete must not mark the parent as deleting"
+        );
+    }
+
+    /// A root and a child record on a gateway with child sandboxes off, as
+    /// left behind after the flag is turned off.
+    async fn lead_and_worker_with_children_off() -> (Arc<ServerState>, String, String) {
+        let state = test_server_state().await;
+        assert!(!state.config.enable_child_sandboxes);
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        let worker_id = put_parent_record(&state, "worker1", &[], Some(link), false).await;
+        (state, lead_id, worker_id)
+    }
+
+    #[tokio::test]
+    async fn with_child_sandboxes_off_a_root_delete_skips_the_child_count() {
+        let (state, _, _) = lead_and_worker_with_children_off().await;
+
+        handle_delete_sandbox_inner(&state, authed_request(delete_request("lead")))
+            .await
+            .expect("the delete does not count children");
+    }
+
+    #[tokio::test]
+    async fn with_child_sandboxes_off_a_policy_load_starts_no_child_sync() {
+        let (state, lead_id, worker_id) = lead_and_worker_with_children_off().await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
+
+        assert!(super::super::policy::spawn_child_policy_sync(&state, &lead_id).is_none());
+        assert_ne!(
+            copied_version(&latest_policy(&state, &worker_id).await),
+            Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn with_child_sandboxes_off_the_startup_scan_does_nothing() {
+        let (state, lead_id, worker_id) = lead_and_worker_with_children_off().await;
+        state
+            .store
+            .delete(Sandbox::object_type(), &lead_id)
+            .await
+            .unwrap();
+        let mut worker = state
+            .store
+            .get_message::<Sandbox>(&worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        worker.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&worker).await.unwrap();
+
+        sync_all_children(&state).await.unwrap();
+
+        let worker = state
+            .store
+            .get_message::<Sandbox>(&worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(worker.phase()).unwrap(),
+            SandboxPhase::Ready,
+            "the scan must not run, so it cannot stop the orphan"
         );
     }
 

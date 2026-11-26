@@ -5440,15 +5440,22 @@ pub(super) async fn handle_report_policy_status(
 }
 
 /// Sync a root's children in the background, so the root's report is not
-/// held up by them.
-pub(super) fn spawn_child_policy_sync(state: &Arc<ServerState>, sandbox_id: &str) {
+/// held up by them. Returns `None` when child sandboxes are off: the sync
+/// reads every sandbox in the workspace, and there are no children to find.
+pub(super) fn spawn_child_policy_sync(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !state.config.enable_child_sandboxes {
+        return None;
+    }
     let state = Arc::clone(state);
     let parent_id = sandbox_id.to_string();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         if let Err(error) = super::sandbox::sync_children(&state, &parent_id).await {
             warn!(parent_id, error = %error, "failed to sync child sandbox policies");
         }
-    });
+    }))
 }
 
 /// Persist the exact sandbox policy revision attempted by a supervisor.

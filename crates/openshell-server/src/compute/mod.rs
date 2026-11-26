@@ -1328,6 +1328,9 @@ pub struct ComputeRuntime {
     image_preparation_timeout_seconds: u32,
     provisioning_repair_window_ms: i64,
     sandbox_updates_enabled: bool,
+    /// `experimental_enable_child_sandboxes`. Off, a root delete skips the
+    /// child count, which reads every sandbox in the workspace.
+    child_sandboxes_enabled: bool,
     update_recovery_sweep: Arc<tokio::sync::Semaphore>,
     update_recovery_backoff: Arc<Mutex<HashMap<String, image_update::UpdateRecoveryBackoff>>>,
     store: Arc<Store>,
@@ -1451,6 +1454,7 @@ impl ComputeRuntime {
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_ms: 300_000,
             sandbox_updates_enabled: false,
+            child_sandboxes_enabled: false,
             update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
             update_recovery_backoff: Arc::default(),
             store,
@@ -1721,6 +1725,11 @@ impl ComputeRuntime {
             restart_if_restore_fails: resume.unwrap_or(false),
             sandbox: Some(driver_sandbox),
         })
+    }
+
+    pub(crate) fn with_child_sandboxes(mut self, enabled: bool) -> Self {
+        self.child_sandboxes_enabled = enabled;
+        self
     }
 
     /// Validate the budget once at startup. Persisted attempts keep their
@@ -3941,7 +3950,7 @@ impl ComputeRuntime {
         // replica also takes on its parent, so a child cannot be added between
         // this check and the delete. Children already being deleted do not
         // block.
-        if current.parent.is_none() {
+        if self.child_sandboxes_enabled && current.parent.is_none() {
             let live_children = self.live_child_count(&current).await?;
             if live_children > 0 {
                 let noun = if live_children == 1 {
@@ -9361,6 +9370,7 @@ pub fn new_test_runtime_with_driver(
         image_preparation_timeout_seconds: 1800,
         provisioning_repair_window_ms: 300_000,
         sandbox_updates_enabled: false,
+        child_sandboxes_enabled: false,
         update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
         update_recovery_backoff: Arc::default(),
         store,
@@ -10705,6 +10715,7 @@ mod tests {
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_ms: 300_000,
             sandbox_updates_enabled: false,
+            child_sandboxes_enabled: false,
             update_recovery_sweep: Arc::new(Semaphore::new(1)),
             update_recovery_backoff: Arc::default(),
             store,
