@@ -22,10 +22,10 @@ kubernetesProvider:
         name: fast-ssd
 
 tests:
-  - it: names the gateway storage setting on a fresh install without a default class
+  - it: explains the gateway class setting and retained PVC opt-out when no default exists
     asserts:
       - failedTemplate:
-          errorPattern: "The cluster has no default StorageClass. Set server.dataStorageClass for the gateway openshell-data PVC"
+          errorPattern: 'The cluster has no default StorageClass\. Set server\.dataStorageClass.*reusing retained gateway PVCs.*storageClass\.preflight\.enabled=false'
 
   - it: skips the check for a gateway Deployment
     set:

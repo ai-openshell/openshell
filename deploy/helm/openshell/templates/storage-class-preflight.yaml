@@ -16,7 +16,7 @@ SPDX-License-Identifier: Apache-2.0
 {{- end }}
 {{- end }}
 {{- if not $hasDefault }}
-{{- fail "The cluster has no default StorageClass. Set server.dataStorageClass for the gateway openshell-data PVC, or disable storageClass.preflight.enabled if you manage the backing storage yourself." }}
+{{- fail "The cluster has no default StorageClass. Set server.dataStorageClass for the gateway openshell-data PVC. If you are reusing retained gateway PVCs or managing the backing storage yourself, set storageClass.preflight.enabled=false." }}
 {{- end }}
 {{- end }}
 {{- end }}

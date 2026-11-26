@@ -167,9 +167,12 @@ Run `kubectl get storageclass` before installing. For dynamic provisioning
 without a default, set `server.dataStorageClass` (gateway StatefulSet) and
 `server.workspaceStorageClass` (sandbox workspaces).
 
-`storageClass.preflight.enabled=true` checks for a default on fresh StatefulSet
-installs with no gateway class set. It requires cluster-scoped
-`list storageclasses` permission. Preview with `helm template --dry-run=server`.
+`storageClass.preflight.enabled=true` checks gateway storage on fresh StatefulSet
+installs with no gateway class set. The Helm identity needs cluster-scoped
+`list storageclasses` permission. A denied lookup stops Helm rendering. If
+that permission is unavailable, set `server.dataStorageClass` explicitly or
+disable the preflight. If a reinstall reuses retained gateway PVCs, set
+`storageClass.preflight.enabled=false`. Preview with `helm template --dry-run=server`.
 
 ## Install on Kubernetes
 
