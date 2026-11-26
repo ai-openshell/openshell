@@ -12,7 +12,7 @@ every environment.
 This is not a GPU workload image. Those live in [`e2e/gpu/`](../gpu/README.md)
 and `mise run e2e:workloads:build` builds them.
 
-Probe scripts in the sandbox use only the Python standard library. Test
-policies allow `python3` from `/usr/bin`, the uv interpreter under
-`/sandbox/.uv/python/`, and the `/sandbox/.venv` in front of it, so keep those
-paths when changing the image.
+The venv has `requests` for the `e2e/rust` OTLP relay tests; other probe
+scripts use only the Python standard library. Test policies allow `python3`
+from `/usr/bin`, the uv interpreter under `/sandbox/.uv/python/`, and the
+`/sandbox/.venv` in front of it, so keep those paths when changing the image.

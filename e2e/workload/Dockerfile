@@ -10,7 +10,8 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 # from this uv interpreter and the venv in front of it, and some tests run the
 # system /usr/bin/python3 directly, so both stay.
 ARG PYTHON_VERSION
-# curl and openssl also support the Rust Docker tests sharing this fixture.
+# curl and openssl also support the Rust Docker tests sharing this fixture, and
+# the e2e/rust OTLP relay tests export spans with requests.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash ca-certificates curl git openssl python3 python-is-python3 \
@@ -21,6 +22,7 @@ RUN apt-get update \
     && useradd --uid 1000 --gid sandbox --create-home --shell /bin/bash sandbox \
     && UV_PYTHON_INSTALL_DIR=/sandbox/.uv/python uv python install "${PYTHON_VERSION}" \
     && UV_PYTHON_INSTALL_DIR=/sandbox/.uv/python uv venv --python "${PYTHON_VERSION}" /sandbox/.venv \
+    && uv pip install --python /sandbox/.venv/bin/python requests==2.32.5 \
     && chown -R sandbox:sandbox /sandbox \
     && uv cache clean
 
