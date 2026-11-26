@@ -77,7 +77,6 @@ experimental = ["openshell-policy/experimental"]
 openshell-policy-cedar-runtime = { path = "../openshell-policy-cedar-runtime" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 
-openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }

@@ -4829,6 +4829,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-container-runtime"
+version = "0.0.0"
+dependencies = [
+ "nix 0.29.0",
+ "openshell-core",
+ "rustix 1.1.6",
+ "serde_json",
+]
+
+[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
@@ -5111,6 +5121,7 @@ dependencies = [
  "hyper-util",
  "miette",
  "nix 0.29.0",
+ "openshell-container-runtime",
  "openshell-core",
  "openshell-crypto",
  "openshell-driver-sdk",
@@ -5204,10 +5215,10 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "oci-client",
+ "openshell-container-runtime",
  "openshell-core",
  "openshell-crypto",
  "openshell-driver-launch",
- "openshell-driver-podman",
  "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
@@ -5934,7 +5945,6 @@ dependencies = [
  "openshell-binary-identity",
  "openshell-core",
  "openshell-crypto",
- "openshell-driver-vm",
  "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-ocsf-validate",

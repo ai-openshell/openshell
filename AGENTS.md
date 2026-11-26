@@ -58,6 +58,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-driver-vault/` | Vault credential driver | In-process `CredentialDriver` backend for Vault-compatible KV storage |
 | `crates/openshell-driver-db-credstore/` | Database credential driver | In-process `CredentialDriver` backend for gateway database credential storage |
 | `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
+| `crates/openshell-container-runtime/` | Container runtime helpers | Code used only by the desktop compute drivers (Docker, Podman, VM), starting with Podman socket discovery; moves with the drivers |
 | `crates/openshell-driver-docker/` | Docker compute driver | Gateway-launched `ComputeDriver` subprocess for local Docker sandbox containers |
 | `crates/openshell-driver-podman/` | Podman compute driver | Gateway-launched `ComputeDriver` subprocess for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |

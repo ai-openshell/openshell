@@ -5883,7 +5883,7 @@ async fn connect_local_container_engine() -> Option<Docker> {
 }
 
 fn detect_podman_socket() -> Option<PathBuf> {
-    openshell_driver_podman::driver::detect_socket()
+    openshell_container_runtime::podman_socket::detect_socket()
 }
 
 fn is_openshell_local_build_image_ref(image_ref: &str) -> bool {

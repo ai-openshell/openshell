@@ -579,7 +579,7 @@ network_policies:
                 .unwrap_or(25);
             let mut results = serde_json::Map::new();
             for (name, connect) in [("connect", true), ("forward", false)] {
-                crate::test_alloc::reset();
+                crate::test_support::alloc::reset();
                 crate::opa::reset_test_opa_query_count();
                 let started = std::time::Instant::now();
                 for _ in 0..iterations {
@@ -587,7 +587,7 @@ network_policies:
                 }
                 let elapsed = started.elapsed();
                 let queries = crate::opa::test_opa_query_count();
-                let (allocations, allocated_bytes) = crate::test_alloc::snapshot();
+                let (allocations, allocated_bytes) = crate::test_support::alloc::snapshot();
                 // One endpoint-policy query precedes the loopback-address
                 // rejection; this denied path never reaches upstream stages.
                 let expected_queries = 1;

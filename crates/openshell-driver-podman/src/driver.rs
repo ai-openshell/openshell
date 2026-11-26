@@ -437,7 +437,7 @@ fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
 /// Return the first responsive local Podman API socket.
 #[must_use]
 pub fn detect_socket() -> Option<PathBuf> {
-    crate::socket_discovery::detect_socket()
+    openshell_container_runtime::podman_socket::detect_socket()
 }
 
 #[must_use]
