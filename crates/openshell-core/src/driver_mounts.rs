@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::container_paths::{CONTROL_ROOTS, OCI_RUNTIME_MOUNT_ROOTS};
+use crate::container_paths::{CONTROL_ROOTS, OCI_RUNTIME_MOUNT_ROOTS, OPENSHELL_ROOT};
 
 /// `SELinux` relabelling mode for bind mounts.
 ///
@@ -30,6 +30,43 @@ pub enum SelinuxLabel {
 /// Compatibility workspace used when an OCI image has no usable working
 /// directory and by drivers whose workspace remains fixed.
 pub const DEFAULT_WORKSPACE_ROOT: &str = "/sandbox";
+
+/// How the VM driver selects the workspace for a new sandbox.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[serde(rename_all = "snake_case")]
+pub enum VmWorkspaceMode {
+    /// Prepare the configured directory for the sandbox account.
+    #[default]
+    Managed,
+    /// Use the workload image's working directory when it supplies one.
+    Image,
+}
+
+impl VmWorkspaceMode {
+    /// Return the mode spelling used by the driver CLI and guest metadata.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::Image => "image",
+        }
+    }
+}
+
+/// Paths reserved by VM guest initialization.
+pub const VM_RESERVED_GUEST_PATHS: &[&str] = &[
+    OPENSHELL_ROOT,
+    "/.openshell-bootstrap",
+    "/overlay",
+    "/lower",
+    "/newroot",
+    "/image-cache",
+    "/srv",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/tmp",
+];
 
 /// Validate a non-empty driver mount source.
 pub fn validate_mount_source(source: &str, field: &str) -> Result<(), String> {
@@ -118,6 +155,42 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
     }
 
     Ok(workspace_root)
+}
+
+/// Resolve a VM workload's image-declared working directory.
+pub fn resolve_vm_image_workspace_root(working_dir: &str) -> Result<String, String> {
+    let root = resolve_oci_workspace_root(working_dir)?;
+    for reserved in VM_RESERVED_GUEST_PATHS.iter().copied().chain(["/run"]) {
+        if paths_overlap(Path::new(&root), Path::new(reserved)) {
+            return Err(format!(
+                "VM workspace '{root}' conflicts with guest path '{reserved}'"
+            ));
+        }
+    }
+    Ok(root)
+}
+
+/// Resolve a VM workspace that guest init will assign to the sandbox user.
+///
+/// Guest init changes the directory's owner and permissions and makes it the
+/// account home. Protect system trees from that operation. For `/home` and
+/// `/var`, protect the directory itself so workspaces can live below it.
+pub fn resolve_vm_managed_workspace_root(root: &str) -> Result<String, String> {
+    if root.is_empty() || root == "/" || root.contains(':') {
+        return Err("VM workspace_root must be a non-root absolute path without ':'".to_string());
+    }
+    let root = resolve_vm_image_workspace_root(root)?;
+    if matches!(root.as_str(), "/home" | "/var")
+        || [
+            "/etc", "/root", "/boot", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32",
+            "/usr",
+        ]
+        .iter()
+        .any(|reserved| Path::new(&root).starts_with(reserved))
+    {
+        return Err(format!("VM workspace '{root}' is a protected system path"));
+    }
+    Ok(root)
 }
 
 fn normalize_absolute_container_path(value: &str, field: &str) -> Result<String, String> {

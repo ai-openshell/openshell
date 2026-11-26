@@ -27,6 +27,7 @@
 
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
+use openshell_core::driver_mounts::{DEFAULT_WORKSPACE_ROOT, VmWorkspaceMode};
 #[cfg(unix)]
 use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
@@ -101,6 +102,12 @@ pub struct VmComputeConfig {
 
     /// Optional GID override for the VM guest sandbox account.
     pub sandbox_gid: Option<u32>,
+
+    /// Select an operator-managed workspace or the image's OCI working directory.
+    pub workspace_mode: VmWorkspaceMode,
+
+    /// Absolute guest workspace path used in `managed` mode.
+    pub workspace_root: String,
 
     /// Directory shared with the gateway for request-scoped rootfs tar staging.
     pub rootfs_tar_staging_dir: Option<PathBuf>,
@@ -185,6 +192,10 @@ impl VmComputeConfig {
             ));
         }
         validate_vm_sandbox_identity(self)?;
+        if self.workspace_mode == VmWorkspaceMode::Managed {
+            openshell_core::driver_mounts::resolve_vm_managed_workspace_root(&self.workspace_root)
+                .map_err(|error| Error::config(format!("invalid workspace_root: {error}")))?;
+        }
         if self
             .rootfs_tar_staging_dir
             .as_ref()
@@ -261,6 +272,8 @@ impl Default for VmComputeConfig {
             overlay_disk_mib: Self::default_overlay_disk_mib(),
             sandbox_uid: None,
             sandbox_gid: None,
+            workspace_mode: VmWorkspaceMode::default(),
+            workspace_root: DEFAULT_WORKSPACE_ROOT.to_string(),
             rootfs_tar_staging_dir: None,
             rootfs_tar_max_bytes: None,
             guest_tls_ca: None,
@@ -587,6 +600,20 @@ pub async fn spawn(
         .arg("--overlay-disk-mib")
         .arg(vm_config.overlay_disk_mib.to_string());
     append_vm_identity_args(&mut command, vm_config);
+    match vm_config.workspace_mode {
+        VmWorkspaceMode::Managed => {
+            if vm_config.workspace_root != DEFAULT_WORKSPACE_ROOT {
+                command
+                    .arg("--workspace-root")
+                    .arg(&vm_config.workspace_root);
+            }
+        }
+        VmWorkspaceMode::Image => {
+            command
+                .arg("--workspace-mode")
+                .arg(VmWorkspaceMode::Image.as_str());
+        }
+    }
     append_vm_image_size_and_staging_args(&mut command, vm_config);
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
@@ -1397,6 +1424,17 @@ nat64_prefixes = ["2001:db8:64::/96"]
         };
         let error = validate_vm_sandbox_identity(&config).expect_err("root UID must fail");
         assert!(error.to_string().contains("sandbox_uid 0"));
+    }
+
+    #[test]
+    fn vm_gateway_config_rejects_reserved_workspace_root() {
+        let config = VmComputeConfig {
+            grpc_endpoint: "http://127.0.0.1:50051".to_string(),
+            workspace_root: "/overlay".to_string(),
+            ..Default::default()
+        };
+        let error = config.validate_configuration().unwrap_err().to_string();
+        assert!(error.contains("workspace_root") && error.contains("/overlay"));
     }
 
     #[test]
