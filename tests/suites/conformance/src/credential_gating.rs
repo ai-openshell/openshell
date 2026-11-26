@@ -605,7 +605,8 @@ async fn account_bound_mcp_sdk_client_isolates_accounts(cx: &mut Context) -> tes
 
     policy.network_policies.remove("account_a");
     policy::set(&sandbox, &policy).await?;
-    run_mcp_sdk(&sandbox, server.port, MCP_ACCOUNT_A, &[], true).await?;
+    // A process may retain A's old placeholder after its environment entry is removed.
+    run_mcp_sdk(&sandbox, server.port, placeholder_a.trim(), &[], true).await?;
     testkit::ensure!(
         server.requests().len() == before_denied,
         "withdrawn account reached upstream"

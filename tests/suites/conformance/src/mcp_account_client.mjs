@@ -9,6 +9,8 @@ const [url, account, toolsJson, expectConnection] = process.argv.slice(1);
 let value;
 if (account === 'unknown') {
   value = 'openshell:resolve:env:E2E_MCP_UNKNOWN';
+} else if (account.startsWith('openshell:resolve:env:')) {
+  value = account;
 } else if (account !== 'missing') {
   value = process.env[account];
   assert(value, 'the selected account has no credential placeholder');
