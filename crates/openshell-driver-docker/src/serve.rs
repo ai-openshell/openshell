@@ -85,9 +85,7 @@ async fn run(
     tracing: openshell_otel::DeferredDriverTracing,
 ) -> Result<(), StartResult> {
     let settings = read_settings()?;
-    check_backend(&settings)
-        .await
-        .map_err(StartResult::unavailable)?;
+    openshell_driver_sdk::check_backend_within("Docker", check_backend(&settings)).await?;
 
     let listener = openshell_core::external_driver_socket::bind_private(&args.bind_socket)
         .map_err(StartResult::error)?;

@@ -23,7 +23,9 @@ pub use endpoint::{endpoint_uses_tls, validate_grpc_endpoint};
 pub use gateway::GatewayContext;
 #[cfg(unix)]
 pub use guard::watch_parent;
-pub use lifecycle::{EXTERNAL_STOP_GRACE, stop_when_released};
+pub use lifecycle::{
+    BACKEND_CHECK_TIMEOUT, EXTERNAL_STOP_GRACE, check_backend_within, stop_when_released,
+};
 pub use openshell_driver_launch as launch;
 pub use start::{EXIT_CONFIG, EXIT_UNAVAILABLE, StartKind, StartReport, StartResult};
 pub use table::{MAX_TABLE_BYTES, read_stdin_table, read_table};

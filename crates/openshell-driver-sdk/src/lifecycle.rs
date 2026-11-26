@@ -1,12 +1,38 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! When a launched driver stops serving.
+//! When a launched driver starts and stops serving.
 
 use std::future::Future;
 use std::time::Duration;
 
 use openshell_driver_launch::Shutdown;
+
+use crate::start::StartResult;
+
+/// How long a launched driver waits for its backend before it reports the
+/// backend unavailable.
+///
+/// It is shorter than the 30 seconds the gateway waits for a driver to start,
+/// so the gateway receives the driver's report and exit status instead of
+/// killing it in the middle of the check.
+pub const BACKEND_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Check a backend within [`BACKEND_CHECK_TIMEOUT`]. A failure or a timeout is
+/// reported as unavailable, which the gateway can retry or skip.
+pub async fn check_backend_within<E: std::fmt::Display>(
+    backend: &str,
+    check: impl Future<Output = Result<(), E>>,
+) -> Result<(), StartResult> {
+    match tokio::time::timeout(BACKEND_CHECK_TIMEOUT, check).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(StartResult::unavailable(error.to_string())),
+        Err(_) => Err(StartResult::unavailable(format!(
+            "{backend} did not answer within {} seconds",
+            BACKEND_CHECK_TIMEOUT.as_secs()
+        ))),
+    }
+}
 
 /// How long a stop signal from elsewhere defers to the gateway.
 ///
@@ -45,7 +71,8 @@ mod tests {
 
     use openshell_driver_launch::Shutdown;
 
-    use super::stop_when_released;
+    use super::{BACKEND_CHECK_TIMEOUT, check_backend_within, stop_when_released};
+    use crate::start::StartKind;
 
     const GRACE: Duration = Duration::from_secs(30);
 
@@ -99,5 +126,39 @@ mod tests {
         tokio::time::sleep(GRACE * 10).await;
 
         assert!(!stopped.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_that_does_not_answer_is_unavailable() {
+        let check = tokio::spawn(check_backend_within(
+            "Podman",
+            std::future::pending::<Result<(), String>>(),
+        ));
+
+        tokio::time::sleep(BACKEND_CHECK_TIMEOUT + Duration::from_secs(1)).await;
+
+        let result = check.await.unwrap().unwrap_err();
+        assert_eq!(result.kind, StartKind::Unavailable);
+        assert!(
+            result.reason.contains("did not answer within 20 seconds"),
+            "{}",
+            result.reason
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_check_is_unavailable_with_its_message() {
+        let result = check_backend_within("Docker", async { Err::<(), _>("no socket") })
+            .await
+            .unwrap_err();
+        assert_eq!(result.kind, StartKind::Unavailable);
+        assert_eq!(result.reason, "no socket");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_that_answers_in_time_is_available() {
+        check_backend_within("Docker", async { Ok::<(), String>(()) })
+            .await
+            .unwrap();
     }
 }
