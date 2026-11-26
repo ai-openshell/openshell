@@ -78,7 +78,7 @@ A child's results live only inside the child, so this keeps one command from del
 
 ## MCP Tools
 
-The gateway serves MCP tools at `/mcp` that create and manage sandboxes. Each tool call runs as the matching sandbox RPC, with the same authorization and gateway interceptors as a CLI call.
+The gateway serves MCP tools at `/mcp` that create and manage sandboxes. Each tool call runs as the matching sandbox RPC, with the same authorization and gateway interceptors as a CLI call. The tools are experimental: their names, arguments and results may change between releases. `tools/list` describes each tool's arguments and results for the caller, a user or a sandbox.
 
 | Tool | What it does |
 |---|---|

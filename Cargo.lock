@@ -5708,6 +5708,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "jiff 1.0.2",
+ "jsonschema",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",

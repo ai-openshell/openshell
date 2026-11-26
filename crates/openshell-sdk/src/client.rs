@@ -197,6 +197,9 @@ impl OpenShellClient {
         self.refresh_on_unauthorized().await
     }
 
+    /// Experimental: the gateway's MCP tools, and this method, may change or be
+    /// removed between releases.
+    ///
     /// Send one MCP message to the gateway's `/mcp`, acting in `workspace`,
     /// with this client's credentials and over its own connection (TLS, mTLS
     /// and the edge tunnel included).

@@ -244,7 +244,8 @@ async fn handle(
                 }
                 _ => Vec::new(),
             };
-            rpc_ok(&id, json!({"tools": tool_definitions(&templates)}))
+            let user = !matches!(principal, Principal::Sandbox(_));
+            rpc_ok(&id, json!({"tools": tool_definitions(&templates, user)}))
         }
         "tools/call" => {
             let name = params
@@ -361,16 +362,18 @@ async fn agent_templates(call: &Call<'_>) -> Result<Vec<SandboxWorkloadTemplate>
         .templates)
 }
 
-/// The tool list. `templates` are the ones a sandbox caller may use; they are
-/// offered on `create_sandbox` so an agent need not be told their names.
-fn tool_definitions(templates: &[SandboxWorkloadTemplate]) -> Vec<Value> {
+/// The tool list for one caller role: a `user` sees the arguments only users
+/// may pass, a sandbox those only sandboxes may pass. `templates` are the
+/// ones a sandbox caller may use; they are offered on `create_sandbox` so an
+/// agent need not be told their names.
+fn tool_definitions(templates: &[SandboxWorkloadTemplate], user: bool) -> Vec<Value> {
     TOOLS
         .iter()
         .map(|tool| {
             let mut description = tool.description.to_string();
             let schema = match tool.name {
                 "create_sandbox" => {
-                    let mut template = json!({"type": "string", "description": "(sandboxes only) Sandbox template made available to agents."});
+                    let mut template = json!({"type": "string", "description": "Sandbox template made available to agents."});
                     if !templates.is_empty() {
                         let names: Vec<&str> =
                             templates.iter().map(ObjectName::object_name).collect();
@@ -394,15 +397,19 @@ fn tool_definitions(templates: &[SandboxWorkloadTemplate]) -> Vec<Value> {
                             offered.join(", ")
                         );
                     }
+                    let mut properties = json!({
+                        "name": {"type": "string", "description": "Name of the new sandbox."},
+                        "providers": {"type": "array", "items": {"type": "string"}, "description": "Providers to attach; for a child, a subset of its parent's, all of them when omitted."},
+                    });
+                    if user {
+                        properties["parent"] = json!({"type": "string", "description": "Root sandbox to create a child of; a root when omitted."});
+                        properties["image"] = json!({"type": "string", "description": "Container image; the gateway default when omitted."});
+                    } else {
+                        properties["template"] = template;
+                    }
                     json!({
                         "type": "object",
-                        "properties": {
-                            "name": {"type": "string", "description": "Name of the new sandbox."},
-                            "parent": {"type": "string", "description": "(users only) Root sandbox to create a child of; a root when omitted."},
-                            "image": {"type": "string", "description": "(users only) Container image; the gateway default when omitted."},
-                            "template": template,
-                            "providers": {"type": "array", "items": {"type": "string"}, "description": "Providers to attach; for a child, a subset of its parent's, all of them when omitted."},
-                        },
+                        "properties": properties,
                         "required": ["name"],
                         "additionalProperties": false,
                     })
@@ -436,16 +443,102 @@ fn tool_definitions(templates: &[SandboxWorkloadTemplate]) -> Vec<Value> {
                     "required": ["name"],
                     "additionalProperties": false,
                 }),
+                "list" if user => json!({
+                    "type": "object",
+                    "properties": {"parent": {"type": "string", "description": "List only this root's children."}},
+                    "additionalProperties": false,
+                }),
                 "list" => json!({
                     "type": "object",
-                    "properties": {"parent": {"type": "string", "description": "(users only) List only this root's children."}},
+                    "properties": {},
                     "additionalProperties": false,
                 }),
                 _ => json!({"type": "object"}),
             };
-            json!({"name": tool.name, "description": description, "inputSchema": schema})
+            json!({
+                "name": tool.name,
+                "description": description,
+                "inputSchema": schema,
+                "outputSchema": output_schema(tool.name),
+            })
         })
         .collect()
+}
+
+/// What a tool's successful `structuredContent` holds. A refused call
+/// (`isError: true`) carries `error`, `message` and `retryable` instead.
+fn output_schema(tool: &str) -> Value {
+    let summary = json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "name": {"type": "string"},
+            "state": {"type": "string", "description": "Lifecycle phase, such as provisioning, ready or error."},
+            "created_at": {"type": ["string", "null"]},
+            "parent": {"type": "string", "description": "The parent's name; absent on a root."},
+        },
+        "required": ["id", "name", "state"],
+    });
+    match tool {
+        "create_sandbox" => {
+            let mut schema = summary;
+            let properties = &mut schema["properties"];
+            properties["already_existed"] =
+                json!({"type": "boolean", "description": "The sandbox existed before this call."});
+            properties["ready"] = json!({"type": "boolean", "description": "False when the wait ended before the sandbox was ready."});
+            properties["timed_out"] = json!({"type": "boolean", "description": "The wait ended first; call again with the same name to keep waiting."});
+            properties["message"] = json!({"type": "string"});
+            schema["required"] = json!(["id", "name", "state", "already_existed"]);
+            schema
+        }
+        "list" => json!({
+            "type": "object",
+            "properties": {"sandboxes": {"type": "array", "items": summary}},
+            "required": ["sandboxes"],
+        }),
+        "exec" => json!({
+            "type": "object",
+            "properties": {
+                "exit_code": {"type": ["integer", "null"], "description": "Null when the command timed out."},
+                "stdout": {"type": "string"},
+                "stderr": {"type": "string"},
+                "stdout_truncated": {"type": "boolean"},
+                "stderr_truncated": {"type": "boolean"},
+                "binary_output": {"type": "boolean"},
+                "timed_out": {"type": "boolean"},
+                "message": {"type": "string"},
+            },
+            "required": ["exit_code", "stdout", "stderr", "stdout_truncated", "stderr_truncated", "binary_output", "timed_out"],
+        }),
+        "delete" => json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "deleting": {"type": "boolean"},
+            },
+            "required": ["name", "deleting"],
+        }),
+        "logs" => json!({
+            "type": "object",
+            "properties": {
+                "lines": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "time": {"type": ["string", "null"]},
+                            "level": {"type": "string"},
+                            "message": {"type": "string"},
+                        },
+                        "required": ["level", "message"],
+                    },
+                },
+                "truncated": {"type": "boolean"},
+            },
+            "required": ["lines", "truncated"],
+        }),
+        _ => json!({"type": "object"}),
+    }
 }
 
 const DEFAULT_EXEC_TIMEOUT_S: u64 = 30;
@@ -1565,8 +1658,23 @@ mod tests {
         }
     }
 
+    fn tool<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        tools.iter().find(|tool| tool["name"] == name).unwrap()
+    }
+
+    fn argument_names(tool: &Value) -> Vec<&str> {
+        let mut names: Vec<&str> = tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
     #[tokio::test]
-    async fn a_users_tool_list_offers_no_templates() {
+    async fn a_users_tool_list_offers_only_user_arguments() {
         // The connection's gRPC stack panics if called.
         let (status, reply) = post_mcp(
             connection(Some(user(IdentityProvider::Oidc))),
@@ -1576,18 +1684,82 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let reply = reply.unwrap();
-        let create = reply["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| tool["name"] == "create_sandbox")
-            .unwrap();
-        assert!(
-            create["inputSchema"]["properties"]["template"]
-                .get("enum")
-                .is_none(),
-            "{create}"
+        let tools = reply["result"]["tools"].as_array().unwrap();
+        assert_eq!(
+            argument_names(tool(tools, "create_sandbox")),
+            ["image", "name", "parent", "providers"]
         );
+        assert_eq!(argument_names(tool(tools, "list")), ["parent"]);
+    }
+
+    #[test]
+    fn a_sandboxs_tool_list_offers_only_sandbox_arguments() {
+        let tools = tool_definitions(&[], false);
+        assert_eq!(
+            argument_names(tool(&tools, "create_sandbox")),
+            ["name", "providers", "template"]
+        );
+        assert!(argument_names(tool(&tools, "list")).is_empty());
+    }
+
+    #[test]
+    fn every_tool_reply_matches_its_output_schema() {
+        let tools = tool_definitions(&[], true);
+        let validator = |name: &str| {
+            jsonschema::validator_for(&tool(&tools, name)["outputSchema"])
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+        };
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "id-1".to_string(),
+                name: "w1".to_string(),
+                ..Default::default()
+            }),
+            parent: Some(openshell_core::proto::SandboxParent {
+                name: "lead".to_string(),
+                id: "id-0".to_string(),
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        let summary = child_summary(&sandbox);
+
+        let mut created = summary.clone();
+        created["already_existed"] = json!(false);
+        created["ready"] = json!(false);
+        created["timed_out"] = json!(true);
+        created["message"] = json!("call again");
+        let (lines, truncated) = newest_log_lines(&[openshell_core::proto::SandboxLogLine {
+            level: "INFO".to_string(),
+            message: "started".to_string(),
+            ..Default::default()
+        }]);
+        let replies = [
+            ("create_sandbox", created),
+            ("list", json!({"sandboxes": [summary]})),
+            (
+                "exec",
+                json!({
+                    "exit_code": null, "stdout": "", "stderr": "", "stdout_truncated": false,
+                    "stderr_truncated": false, "binary_output": false, "timed_out": true,
+                    "message": "still running",
+                }),
+            ),
+            ("delete", json!({"name": "w1", "deleting": true})),
+            ("logs", json!({"lines": lines, "truncated": truncated})),
+        ];
+        for (name, reply) in replies {
+            let errors: Vec<String> = validator(name)
+                .iter_errors(&reply)
+                .map(|error| error.to_string())
+                .collect();
+            assert!(errors.is_empty(), "{name}: {errors:?} for {reply}");
+        }
+        assert!(
+            !validator("delete").is_valid(&json!({"name": "w1"})),
+            "a reply missing a required field must not validate"
+        );
+        assert_eq!(tools.len(), TOOLS.len());
     }
 
     #[tokio::test]
