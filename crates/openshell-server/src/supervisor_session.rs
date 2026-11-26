@@ -2211,6 +2211,7 @@ struct ConfigPushSetup {
 /// session task or drops with early cleanup.
 struct SessionSetup {
     advertises_services: bool,
+    supports_vault_jwt_login: bool,
     state: Arc<ServerState>,
     sandbox_id: String,
     instance_id: String,
@@ -2230,6 +2231,7 @@ struct SessionSetup {
 async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     let SessionSetup {
         advertises_services,
+        supports_vault_jwt_login,
         state,
         sandbox_id,
         instance_id,
@@ -2253,7 +2255,15 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     let rebuild = bootstrap
         .as_ref()
         .is_some_and(config_session::SessionBootstrap::needs_rebuild);
-    let bootstrap = bootstrap.map(|bootstrap| bootstrap.config);
+    let bootstrap = bootstrap.map(|bootstrap| {
+        let mut config = bootstrap.config;
+        crate::config_delivery::restrict_jwt_login_grants(
+            &mut config.provider_environment.dynamic_credentials,
+            &mut config.provider_environment.readiness_reason,
+            supports_vault_jwt_login,
+        );
+        config
+    });
     let session_id = Uuid::new_v4().to_string();
     let mut acceptance = SessionAccepted {
         session_id: session_id.clone(),
@@ -2331,6 +2341,13 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
             ));
         }
     }
+    state
+        .supervisor_sessions
+        .with_config_session(&sandbox_id, &session_id, |session| {
+            if let Some(session) = session {
+                session.supports_vault_jwt_login = supports_vault_jwt_login;
+            }
+        });
     if let Some(bootstrap) = bootstrap_in_flight {
         state.supervisor_sessions.begin_config_bootstrap(
             &sandbox_id,
@@ -2631,6 +2648,7 @@ pub async fn handle_connect_supervisor(
     > = Box::pin(tokio_stream::StreamExt::map(ReceiverStream::new(rx), Ok));
 
     let setup = SessionSetup {
+        supports_vault_jwt_login: hello.supports_vault_jwt_login,
         advertises_services: state.config.supervisor_app_listener.enabled
             && hello.supports_service_advertisements,
         state: Arc::clone(state),

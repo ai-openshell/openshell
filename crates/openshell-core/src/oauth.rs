@@ -34,6 +34,27 @@ pub struct TokenGrantClient {
 }
 
 impl TokenGrantClient {
+    /// Add an operator-managed PEM trust bundle without disabling verification.
+    pub fn with_ca_bundle(path: &str) -> Result<Self, TokenGrantFailure> {
+        let invalid = TokenGrantFailure::new(
+            TokenGrantFailureKind::Configuration,
+            TokenGrantStage::Configuration,
+        );
+        let pem = std::fs::read(path).map_err(|_| invalid)?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| invalid)?;
+        if certificates.is_empty() {
+            return Err(invalid);
+        }
+        let mut builder = Self::builder();
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+        builder
+            .build()
+            .map(|client| Self { client })
+            .map_err(|_| invalid)
+    }
+
     /// Build a verified client with a bounded request and connection lifetime.
     ///
     /// Construction errors contain no TLS configuration or dependency source.
@@ -59,6 +80,87 @@ impl TokenGrantClient {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
     }
+}
+
+/// Vault and `OpenBao` JWT login parameters. The JWT must never enter diagnostics.
+pub struct JwtLoginParams<'a> {
+    pub jwt: &'a str,
+    pub jwt_svid_audience: &'a str,
+    pub role: &'a str,
+    pub namespace: &'a str,
+}
+
+pub use crate::token_grant_config::validate_jwt_login_configuration;
+
+#[derive(Deserialize)]
+struct JwtLoginResponse {
+    auth: JwtLoginAuth,
+}
+
+#[derive(Deserialize)]
+struct JwtLoginAuth {
+    client_token: String,
+    lease_duration: i64,
+}
+
+/// Exchange a JWT-SVID using the shared Vault and `OpenBao` JWT login protocol.
+/// Only bounded failures escape this function, including on malformed JSON.
+pub async fn post_jwt_login(
+    client: &TokenGrantClient,
+    endpoint: &str,
+    params: &JwtLoginParams<'_>,
+    request_id: Option<&str>,
+) -> Result<OAuthTokenResponse, TokenGrantFailure> {
+    // Audience validation happens before SPIFFE acquisition in the caller.
+    validate_jwt_login_configuration(
+        endpoint,
+        params.jwt_svid_audience,
+        params.role,
+        params.namespace,
+    )?;
+    let url = parse_token_endpoint_url(endpoint)?;
+    let mut request = client.client.post(url).json(&serde_json::json!({
+        "role": params.role,
+        "jwt": params.jwt,
+    }));
+    if !params.namespace.is_empty() {
+        request = request.header("X-Vault-Namespace", params.namespace);
+    }
+    if let Some(value) =
+        request_id.and_then(|value| reqwest::header::HeaderValue::from_str(value).ok())
+    {
+        request = request.header(REQUEST_ID_HEADER, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| transport_failure(&error))?;
+    let status = response.status();
+    let body = read_bounded_body(response).await?;
+    if !status.is_success() {
+        // Vault error strings are untrusted and can echo submitted credentials.
+        let kind = if status.as_u16() == 429 || status.is_server_error() {
+            TokenGrantFailureKind::Unavailable
+        } else {
+            TokenGrantFailureKind::Unclassified
+        };
+        return Err(endpoint_failure(kind, status));
+    }
+    let raw: JwtLoginResponse = serde_json::from_slice(&body)
+        .map_err(|_| endpoint_failure(TokenGrantFailureKind::Unclassified, status))?;
+    validate_access_token(&raw.auth.client_token)
+        .map_err(|failure| failure.with_upstream_status(status.as_u16()))?;
+    if raw.auth.lease_duration <= 0 {
+        return Err(endpoint_failure(
+            TokenGrantFailureKind::Unclassified,
+            status,
+        ));
+    }
+    Ok(OAuthTokenResponse {
+        access_token: raw.auth.client_token,
+        expires_in: raw.auth.lease_duration,
+        token_type: String::new(),
+    })
 }
 
 /// `OAuth2` token response.
@@ -435,6 +537,8 @@ mod tests {
     struct CapturedRequest {
         form: HashMap<String, String>,
         request_id: Option<String>,
+        body: String,
+        headers: String,
     }
 
     fn test_client() -> TokenGrantClient {
@@ -444,6 +548,127 @@ mod tests {
                 .build()
                 .expect("test client"),
         }
+    }
+
+    #[tokio::test]
+    async fn jwt_login_posts_json_and_namespace_over_verified_tls() {
+        for namespace in ["", "team/project"] {
+            let (endpoint, client, server) = tls_token_endpoint_once(
+                "200 OK", r#"{"auth":{"client_token":"hvs.test-token","lease_duration":120,"renewable":true}}"#,
+            ).await;
+            let token = post_jwt_login(
+                &client,
+                &endpoint,
+                &JwtLoginParams {
+                    jwt: "jwt-secret-canary",
+                    jwt_svid_audience: "vault-api",
+                    role: "sandbox",
+                    namespace,
+                },
+                Some("test-request-id"),
+            )
+            .await
+            .expect("JWT login");
+            assert_eq!(token.access_token, "hvs.test-token");
+            assert_eq!(token.expires_in, 120);
+            let request = server.await.expect("issuer");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request.body).unwrap(),
+                serde_json::json!({"role":"sandbox", "jwt":"jwt-secret-canary"})
+            );
+            assert!(request.headers.contains("content-type: application/json"));
+            assert_eq!(request.request_id.as_deref(), Some("test-request-id"));
+            assert_eq!(
+                request
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("x-vault-namespace:"),
+                !namespace.is_empty()
+            );
+            if !namespace.is_empty() {
+                assert!(request.headers.contains(namespace));
+            }
+            assert!(!format!("{token:?}").contains("hvs.test-token"));
+        }
+    }
+
+    #[tokio::test]
+    async fn jwt_login_rejects_invalid_leases_responses_and_http_errors_without_secrets() {
+        for (status, body) in [
+            ("200 OK", r#"{"auth":{"client_token":"secret-canary"}}"#),
+            (
+                "200 OK",
+                r#"{"auth":{"client_token":"secret-canary","lease_duration":0}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"auth":{"client_token":"secret-canary","lease_duration":-1}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"auth":{"client_token":"secret-canary","lease_duration":1.5}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"auth":{"client_token":"secret-canary","lease_duration":9223372036854775808}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"auth":{"client_token":"","lease_duration":120}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"auth":{"client_token":"secret\r\ncanary","lease_duration":120}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"access_token":"secret-canary","expires_in":120}"#,
+            ),
+            ("200 OK", "malformed secret-canary"),
+            ("403 Forbidden", r#"{"errors":["secret-canary"]}"#),
+            ("429 Too Many Requests", r#"{"errors":["secret-canary"]}"#),
+            (
+                "500 Internal Server Error",
+                r#"{"errors":["secret-canary"]}"#,
+            ),
+            ("302 Found", r#"{"errors":["secret-canary"]}"#),
+        ] {
+            let (endpoint, client, server) = tls_token_endpoint_once(status, body).await;
+            let failure = post_jwt_login(
+                &client,
+                &endpoint,
+                &JwtLoginParams {
+                    jwt: "jwt-secret-canary",
+                    jwt_svid_audience: "vault-api",
+                    role: "sandbox",
+                    namespace: "",
+                },
+                None,
+            )
+            .await
+            .expect_err("invalid login must fail");
+            assert!(!format!("{failure:?} {failure}").contains("secret-canary"));
+            assert_eq!(failure.stage(), TokenGrantStage::TokenEndpoint);
+            server.await.expect("issuer");
+        }
+        let (endpoint, client, server) =
+            tls_token_endpoint_once("200 OK", &"x".repeat(MAX_TOKEN_RESPONSE_BYTES + 1)).await;
+        assert!(
+            post_jwt_login(
+                &client,
+                &endpoint,
+                &JwtLoginParams {
+                    jwt: "jwt-secret-canary",
+                    jwt_svid_audience: "vault-api",
+                    role: "sandbox",
+                    namespace: "",
+                },
+                None
+            )
+            .await
+            .is_err()
+        );
+        server.await.expect("issuer");
     }
 
     async fn capture_request<S: AsyncRead + Unpin>(stream: &mut S) -> CapturedRequest {
@@ -484,6 +709,8 @@ mod tests {
         CapturedRequest {
             form: parse_form_body(&form_body),
             request_id,
+            body: form_body.into_owned(),
+            headers: headers.into_owned(),
         }
     }
 

@@ -99,6 +99,8 @@ fi
 
 # An empty selector runs the full Podman suite, including provider_token_exchange.
 if [ "${#SELECTED_TESTS[@]}" -eq 0 ] || [[ " ${SELECTED_TESTS[*]} " == *" provider_token_exchange "* ]]; then
+  # JWT login verifies both issuer and destination TLS with the private CA fixture.
+  export OPENSHELL_E2E_ADDITIONAL_CA=1
   export OPENSHELL_E2E_SPIFFE_FIXTURE="${OPENSHELL_E2E_SPIFFE_FIXTURE:-1}"
 fi
 

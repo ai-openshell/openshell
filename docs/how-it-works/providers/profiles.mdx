@@ -607,6 +607,29 @@ The refresh attaches to the primary credential (`access_key_id`). Each reference
 
 `token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credentials, caches each returned access token separately, and injects them before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
 
+For Vault or OpenBao JWT authentication, use `grant_type: vault_jwt_login`:
+
+```yaml
+credentials:
+  - name: client_token
+    auth_style: header
+    header_name: X-Vault-Token
+    token_grant:
+      grant_type: vault_jwt_login
+      token_endpoint: https://vault.example.com/v1/auth/sandbox-jwt/login
+      jwt_svid_audience: vault-internal-api
+      jwt_login_role: sandbox-internal-api
+      jwt_login_namespace: team
+```
+
+Set the full HTTPS login URL, an explicit JWT-SVID audience, and a role. Omit `jwt_login_namespace` when the issuer does not use namespaces. The supervisor posts JSON containing `role` and the sandbox's `jwt`, adds `X-Vault-Namespace` when configured, and reads `auth.client_token` and `auth.lease_duration`. It keeps both credentials outside the workload and injects the client token only into an admitted request matching the attached provider. Choose `bearer` instead when the destination API expects a bearer token.
+
+Configure the issuer's JWT auth method to trust SPIRE's signing keys and bind the role to the approved SPIFFE subject and audience. OpenShell does not configure these issuer-side bindings. The destination API must accept the issued client token. For private issuer certificates, configure the gateway's existing `openshell.supervisor.network.additional_ca_bundle`; hostname verification remains required.
+
+JWT login requires a positive integer lease. Its cache lifetime cannot exceed that lease, the optional `cache_ttl`, or one hour, and subtracts a 30-second safety margin without rounding short leases up. `cache_ttl: 0s` disables caching. After expiry, the supervisor performs another login; it does not renew the token. Invalid leases and login failures block forwarding without returning credential material. OAuth-specific audience, scopes, assertion, subject-token, and audience-override fields are invalid for this grant. Existing OAuth grant cache behavior is unchanged.
+
+Upgrade the gateway and supervisor before attaching this profile. A gateway with support withholds JWT login grants from supervisors that do not advertise support and reports `UnsupportedSupervisor` readiness.
+
 Declare multiple credentials with different destination headers when one request needs independently issued tokens. Each credential keeps its own token endpoint, audience, scopes, and cache lifetime. For example, this profile sends a service bearer token and a separate workload token on the same inspected request:
 
 ```yaml

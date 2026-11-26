@@ -30,6 +30,9 @@ use tonic::body::Body as TonicBody;
 use tonic::codegen::{Body, http};
 use tonic::{Request, Response, Status};
 
+#[path = "provider_token_exchange/vault_jwt_login.rs"]
+mod vault_jwt_login;
+
 const TRUST_DOMAIN: &str = "openshell-e2e.test";
 const ISSUER: &str = "https://spiffe.openshell-e2e.test";
 const KEY_ID: &str = "openshell-e2e-test-key";
@@ -363,7 +366,7 @@ async fn start_spiffe_workload_api(path: &Path, subject: &str) -> FixtureHandle 
 
 // Forms and JWT headers can span TCP reads. Read the bounded, Content-Length
 // framed request completely so packet boundaries cannot change fixture results.
-async fn read_http_request(stream: &mut TcpStream) -> Option<String> {
+async fn read_http_request<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 4096];

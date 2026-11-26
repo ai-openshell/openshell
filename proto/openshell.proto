@@ -2393,11 +2393,12 @@ message ProviderCredentialTokenGrantAudienceOverride {
 }
 
 // Provider credential token grant configuration.
-// When present, the credential is obtained dynamically via OAuth2 grant when needed.
+// When present, the credential is obtained dynamically via the selected protocol.
 enum ProviderCredentialTokenGrantType {
   PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_UNSPECIFIED = 0;
   PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS = 1;
   PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE = 2;
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_VAULT_JWT_LOGIN = 3;
 }
 
 message ProviderCredentialTokenGrantSubjectToken {
@@ -2416,20 +2417,21 @@ message ProviderCredentialTokenGrantSubjectToken {
 message ProviderCredentialTokenGrant {
   reserved 4;
   reserved "cache_ttl_seconds";
-  // OAuth2 token endpoint URL (e.g., https://keycloak.example.com/realms/my-realm/protocol/openid-connect/token)
+  // Token endpoint URL. vault_jwt_login requires the full HTTPS login URL.
   string token_endpoint = 1;
 
   // Optional: default resource audience to request from the token service
   string audience = 2;
 
   // Optional: audience to request when fetching the JWT-SVID from SPIRE.
-  // If omitted, the sandbox derives this from token_endpoint.
+  // Required for vault_jwt_login; OAuth grants derive it from token_endpoint when omitted.
   string jwt_svid_audience = 6;
 
   // Optional: OAuth2 scopes to request
   repeated string scopes = 3;
 
-  // Optional token cache TTL override. If absent, use expires_in from the token response.
+  // Optional token cache TTL override for OAuth. For vault_jwt_login this is
+  // an upper bound, additionally capped by auth.lease_duration and the cache safety margin.
   google.protobuf.Duration cache_ttl = 104;
 
   // Optional: endpoint-specific resource audience overrides.
@@ -2449,6 +2451,11 @@ message ProviderCredentialTokenGrant {
   // OAuth2 requested_token_type. If omitted for token_exchange, OpenShell uses
   // urn:ietf:params:oauth:token-type:access_token.
   string requested_token_type = 10;
+
+  // Required role for vault_jwt_login. Not used by OAuth grants.
+  string jwt_login_role = 11;
+  // Optional X-Vault-Namespace header for vault_jwt_login.
+  string jwt_login_namespace = 12;
 }
 
 // Provider credential declaration.
@@ -2768,6 +2775,8 @@ message GetSandboxProviderEnvironmentRequest {
   // metadata. Gateways withhold credentials that require this behavior when
   // the capability is absent.
   bool supports_stable_placeholder_environment_keys = 3;
+  // Absent/false supervisors must not receive vault_jwt_login grants.
+  bool supports_vault_jwt_login = 4;
 }
 
 // One network endpoint at which a static provider credential may be resolved.
@@ -3246,6 +3255,8 @@ message SupervisorHello {
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
   bool supports_service_advertisements = 8;
+  // The supervisor implements Vault-compatible JWT login provider grants.
+  bool supports_vault_jwt_login = 9;
 }
 
 // Gateway accepts the supervisor session.

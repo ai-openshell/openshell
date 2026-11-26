@@ -309,11 +309,14 @@ pub async fn run_networking(
         denial_log,
         proxy_tls,
     } = instance;
-    let token_grants = SpiffeTokenGrantResolver::new(SandboxInstanceTokenGrants::new(
-        gateway.clone(),
-        sandbox_id.clone(),
-        provider_workload_api_socket,
-    ));
+    let token_grants = SpiffeTokenGrantResolver::new(
+        SandboxInstanceTokenGrants::new(
+            gateway.clone(),
+            sandbox_id.clone(),
+            provider_workload_api_socket,
+        )
+        .with_jwt_login_ca_bundle(additional_ca_bundle),
+    );
     let policy_local_ctx = Arc::new(
         PolicyLocalContext::new(
             retained_proto.cloned(),

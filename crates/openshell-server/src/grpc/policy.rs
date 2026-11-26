@@ -3840,6 +3840,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
     let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
+    let supports_vault_jwt_login = request.get_ref().supports_vault_jwt_login;
     let supports_stable_placeholder_environment_keys = request
         .get_ref()
         .supports_stable_placeholder_environment_keys;
@@ -3848,13 +3849,18 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 
     let sandbox =
         super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
-    let environment = load_sandbox_provider_environment(
+    let mut environment = load_sandbox_provider_environment(
         state,
         &sandbox,
         supports_static_credential_bindings,
         supports_stable_placeholder_environment_keys,
     )
     .await?;
+    crate::config_delivery::restrict_jwt_login_grants(
+        &mut environment.dynamic_credentials,
+        &mut environment.readiness_reason,
+        supports_vault_jwt_login,
+    );
     Ok(Response::new(environment))
 }
 
@@ -12378,6 +12384,7 @@ mod tests {
                 sandbox_id: "sb-snapshot-consistency".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -14325,6 +14332,7 @@ mod tests {
                 sandbox_id: "sb-provider-env".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -14338,6 +14346,7 @@ mod tests {
                 sandbox_id: "sb-provider-env".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -14411,6 +14420,7 @@ mod tests {
                 sandbox_id: "sb-files-and-credentials".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: false,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -14459,6 +14469,7 @@ mod tests {
                 sandbox_id: "sb-static-ready".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: false,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -14518,6 +14529,7 @@ mod tests {
                 sandbox_id: "sb-legacy-provider-env".to_string(),
                 supports_static_credential_bindings: false,
                 supports_stable_placeholder_environment_keys: false,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -14563,6 +14575,7 @@ mod tests {
                 sandbox_id: "sb-unbound-provider-env".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -14678,6 +14691,7 @@ mod tests {
                     sandbox_id: "sb-policy-binding".to_string(),
                     supports_static_credential_bindings: supports_bindings,
                     supports_stable_placeholder_environment_keys: supports_stable,
+                    supports_vault_jwt_login: false,
                 })),
             )
             .await
@@ -14722,6 +14736,7 @@ mod tests {
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -14800,6 +14815,7 @@ mod tests {
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -14866,6 +14882,7 @@ mod tests {
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -14963,6 +14980,7 @@ mod tests {
                 sandbox_id: "sb-mixed-provider-env".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -15072,6 +15090,7 @@ mod tests {
                 sandbox_id: "sb-token-exchange-subject".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -15140,6 +15159,7 @@ mod tests {
                 sandbox_id: "sb-provider-revision".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -15180,6 +15200,7 @@ mod tests {
                 sandbox_id: "sb-provider-revision".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -15805,6 +15826,7 @@ mod tests {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -15839,6 +15861,7 @@ mod tests {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -15881,6 +15904,7 @@ mod tests {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -15986,6 +16010,7 @@ mod tests {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -16023,6 +16048,7 @@ mod tests {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -16064,6 +16090,7 @@ mod tests {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             })),
         )
         .await
@@ -25819,6 +25846,7 @@ mod tests {
                 sandbox_id: "sandbox-other".into(),
                 supports_static_credential_bindings: true,
                 supports_stable_placeholder_environment_keys: true,
+                supports_vault_jwt_login: false,
             }),
         )
         .await

@@ -177,10 +177,12 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // JWT login appends grant kind 3 and role/namespace fields to the shared
+    // profile. Existing grants decode unchanged; absent supervisor support is false.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3b4c2af6cf22e7ed1d84279ff865acb0db7199717bee9bc041caef791334104d";
+        "27aa3327272efaef7027ffd524e088e4f88364e4e8ebeaa26d1e90fdb45ed450";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "1c34f355ff4d441ae19f8f9560b6918157ff5b483df2c5aa74eaa6b079298a09";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these

@@ -78,6 +78,7 @@ impl ConfigFingerprint {
 /// bootstrap, until the supervisor answers it or the session closes.
 #[derive(Debug)]
 pub struct ConfigSessionState {
+    pub(crate) supports_vault_jwt_login: bool,
     /// The session's ordered outbound channel.
     tx: mpsc::Sender<GatewayMessage>,
     in_flight: Option<InFlightConfigUpdate>,
@@ -168,6 +169,7 @@ impl ConfigSessionState {
     pub fn new(tx: mpsc::Sender<GatewayMessage>) -> Self {
         Self {
             tx,
+            supports_vault_jwt_login: false,
             in_flight: None,
             pending: None,
             acknowledged: None,
@@ -176,7 +178,12 @@ impl ConfigSessionState {
         }
     }
 
-    fn deliver(&mut self, config: SupervisorConfig) -> Result<Outgoing, DeliveryDisposition> {
+    fn deliver(&mut self, mut config: SupervisorConfig) -> Result<Outgoing, DeliveryDisposition> {
+        super::restrict_jwt_login_grants(
+            &mut config.provider_environment.dynamic_credentials,
+            &mut config.provider_environment.readiness_reason,
+            self.supports_vault_jwt_login,
+        );
         if self.in_flight.is_none()
             && self.acknowledged.as_ref() == Some(&ConfigFingerprint::of(&config.sandbox_config))
         {
@@ -1135,6 +1142,51 @@ mod tests {
                 ..Default::default()
             },
             provider_environment: ProviderEnvironmentSnapshot::default(),
+        }
+    }
+
+    #[test]
+    fn jwt_login_delivery_requires_explicit_supervisor_support_and_recovers_on_removal() {
+        use openshell_core::proto::{
+            ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType,
+            ProviderProfileCredential, ProviderReadinessReason,
+        };
+        for supported in [false, true] {
+            let (tx, _rx) = mpsc::channel(8);
+            let mut session = ConfigSessionState::new(tx);
+            session.supports_vault_jwt_login = supported;
+            let mut desired = config(1);
+            desired.provider_environment.dynamic_credentials.insert(
+                "provider:token".into(),
+                ProviderProfileCredential {
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        grant_type: ProviderCredentialTokenGrantType::VaultJwtLogin as i32,
+                        token_endpoint: "https://vault.example/login".into(),
+                        jwt_svid_audience: "vault-api".into(),
+                        jwt_login_role: "role".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+            let outgoing = session.deliver(desired).expect("deliver");
+            let update = sent_update(outgoing.message);
+            let environment = update.provider_environment.as_ref().unwrap();
+            assert_eq!(!environment.dynamic_credentials.is_empty(), supported);
+            assert_eq!(
+                environment.readiness_reason
+                    == ProviderReadinessReason::UnsupportedSupervisor as i32,
+                !supported
+            );
+            session.in_flight = None;
+            let outgoing = session
+                .deliver(config(2))
+                .expect("remove unsupported grant");
+            let recovered = sent_update(outgoing.message);
+            assert_eq!(
+                recovered.provider_environment.unwrap().readiness_reason,
+                ProviderReadinessReason::Unspecified as i32
+            );
         }
     }
 

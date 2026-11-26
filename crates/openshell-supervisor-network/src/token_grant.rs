@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `OAuth2` JWT client assertion token grant using SPIFFE JWT-SVID.
+//! Provider token grants authenticated with a sandbox's SPIFFE JWT-SVID.
 //!
 //! When a provider profile includes a `token_grant` configuration, the
-//! supervisor obtains `OAuth2` access tokens on-demand by authenticating to the
-//! token service using the sandbox's SPIFFE JWT-SVID as the client assertion.
+//! supervisor obtains tokens on demand through an OAuth grant or the
+//! Vault-compatible JSON JWT login protocol.
 //!
 //! ## Flow
 //!
@@ -13,7 +13,7 @@
 //! 2. Check token cache for unexpired access token
 //! 3. On cache miss or expiry:
 //!    a. Fetch JWT-SVID from SPIRE agent (via Workload API)
-//!    b. POST to token service with JWT client assertion grant
+//!    b. POST to the token service using the selected grant protocol
 //!    c. Cache the returned access token with TTL
 //! 4. Inject `Authorization: Bearer <access_token>` header
 //!
@@ -25,7 +25,8 @@
 //! - `client_assertion_type` — `OAuth2` client assertion type (optional)
 //! - `audience` — Resource audience to request from the token service
 //! - `scopes` — `OAuth2` scopes to request (optional)
-//! - `cache_ttl` — Optional exact cache override; zero disables caching
+//! - `cache_ttl` — Exact OAuth cache override or JWT login lease cap; zero disables caching
+//! - `jwt_login_role`, `jwt_login_namespace` — Vault-compatible login selectors
 //!
 //! ## Sandbox instance scope
 //!
@@ -38,7 +39,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use openshell_core::grpc_client::GatewayEndpoint;
 use openshell_core::oauth::{
@@ -60,6 +61,7 @@ const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
 struct CachedToken {
     access_token: String,
     expires_at_ms: i64,
+    lease_deadline: Option<Instant>,
 }
 
 /// Thread-safe token cache keyed by provider name.
@@ -79,7 +81,12 @@ impl TokenCache {
         let now_ms = current_time_ms();
         let tokens = self.tokens.read().ok()?;
         let cached = tokens.get(provider_name)?;
-        if cached.expires_at_ms > now_ms {
+        if cached
+            .lease_deadline
+            .map_or(cached.expires_at_ms > now_ms, |deadline| {
+                deadline > Instant::now()
+            })
+        {
             Some(cached.access_token.clone())
         } else {
             None
@@ -94,6 +101,7 @@ impl TokenCache {
                 CachedToken {
                     access_token,
                     expires_at_ms,
+                    lease_deadline: None,
                 },
             );
         }
@@ -109,6 +117,7 @@ pub struct SandboxInstanceTokenGrants {
     cache: TokenCache,
     // Initialization failures stay bounded and typed; acquisition must not panic.
     http_client: Result<TokenGrantClient, TokenGrantFailure>,
+    jwt_login_http_client: Option<Result<TokenGrantClient, TokenGrantFailure>>,
     gateway: Option<GatewayEndpoint>,
     sandbox_id: Option<String>,
     workload_api_socket: Option<PathBuf>,
@@ -126,18 +135,26 @@ impl SandboxInstanceTokenGrants {
         Self {
             cache: TokenCache::new(),
             http_client: TokenGrantClient::new(),
+            jwt_login_http_client: None,
             gateway,
             sandbox_id: sandbox_id.filter(|value| !value.trim().is_empty()),
             workload_api_socket: workload_api_socket.filter(|path| !path.as_os_str().is_empty()),
         }
     }
 
-    /// Obtain an `OAuth2` access token for a provider using JWT client assertion grant.
+    /// Use the supervisor's operator-managed additional CA for JWT login only.
+    #[must_use]
+    pub fn with_jwt_login_ca_bundle(mut self, path: Option<&str>) -> Self {
+        self.jwt_login_http_client = path.map(TokenGrantClient::with_ca_bundle);
+        self
+    }
+
+    /// Obtain a provider token using the configured SPIFFE-authenticated protocol.
     ///
     /// This fetches the sandbox's SPIFFE JWT-SVID from the instance's Workload
-    /// API socket, then exchanges it for an access token with a POST request to
-    /// the provider's token endpoint with the JWT client assertion grant flow
-    /// (RFC 7523).
+    /// API socket, then exchanges it at the provider's token endpoint. JWT login
+    /// sends JSON and bounds caching by the returned lease; OAuth protocols
+    /// retain their existing request and cache semantics.
     ///
     /// Tokens are cached per provider name with TTL in this instance's cache.
     /// Subsequent calls return the cached token if it has not expired.
@@ -156,12 +173,29 @@ impl SandboxInstanceTokenGrants {
     ) -> Result<String, TokenGrantFailure> {
         let grant_type = ProviderCredentialTokenGrantType::try_from(request.grant_type)
             .map_err(|_| configuration_failure())?;
+        if grant_type == ProviderCredentialTokenGrantType::VaultJwtLogin {
+            oauth::validate_jwt_login_configuration(
+                request.token_endpoint,
+                request.jwt_svid_audience,
+                request.jwt_login_role,
+                request.jwt_login_namespace,
+            )?;
+            if !request.audience.is_empty()
+                || !request.scopes.is_empty()
+                || !request.client_assertion_type.is_empty()
+                || !request.requested_token_type.is_empty()
+            {
+                return Err(configuration_failure());
+            }
+        }
         obtain_provider_token_with_grant(
             ObtainProviderTokenInput {
                 cache: &self.cache,
                 provider_name: request.provider_name,
                 token_endpoint: request.token_endpoint,
                 jwt_svid_audience: request.jwt_svid_audience,
+                jwt_login_role: request.jwt_login_role,
+                jwt_login_namespace: request.jwt_login_namespace,
                 client_assertion_type: request.client_assertion_type,
                 audience: request.audience,
                 scopes: request.scopes,
@@ -173,7 +207,8 @@ impl SandboxInstanceTokenGrants {
                 // Resolve local exchange prerequisites before fetching any workload credential.
                 let exchange_context = match grant_type {
                     ProviderCredentialTokenGrantType::ClientCredentials
-                    | ProviderCredentialTokenGrantType::Unspecified => None,
+                    | ProviderCredentialTokenGrantType::Unspecified
+                    | ProviderCredentialTokenGrantType::VaultJwtLogin => None,
                     ProviderCredentialTokenGrantType::TokenExchange => {
                         let (provider, credential_key) =
                             parse_provider_credential_key(request.provider_name)?;
@@ -186,7 +221,14 @@ impl SandboxInstanceTokenGrants {
                         Some((provider, credential_key, gateway, sandbox_id))
                     }
                 };
-                let http_client = self.http_client.as_ref().map_err(|failure| *failure)?;
+                let client = if grant_type == ProviderCredentialTokenGrantType::VaultJwtLogin {
+                    self.jwt_login_http_client
+                        .as_ref()
+                        .unwrap_or(&self.http_client)
+                } else {
+                    &self.http_client
+                };
+                let http_client = client.as_ref().map_err(|failure| *failure)?;
                 let socket_path = self
                     .workload_api_socket
                     .as_deref()
@@ -194,6 +236,21 @@ impl SandboxInstanceTokenGrants {
                 // Fetch JWT-SVID with authorization server as audience
                 // For RFC 7523, the JWT assertion's aud claim identifies the issuer/realm
                 let jwt_svid = fetch_jwt_svid_from_socket(socket_path, &jwt_audience).await?;
+
+                if grant_type == ProviderCredentialTokenGrantType::VaultJwtLogin {
+                    return oauth::post_jwt_login(
+                        http_client,
+                        request.token_endpoint,
+                        &oauth::JwtLoginParams {
+                            jwt: &jwt_svid,
+                            jwt_svid_audience: request.jwt_svid_audience,
+                            role: request.jwt_login_role,
+                            namespace: request.jwt_login_namespace,
+                        },
+                        Some(request.request_id),
+                    )
+                    .await;
+                }
 
                 match exchange_context {
                     None => {
@@ -252,6 +309,8 @@ pub struct ObtainProviderTokenRequest<'a> {
     pub provider_name: &'a str,
     pub token_endpoint: &'a str,
     pub jwt_svid_audience: &'a str,
+    pub jwt_login_role: &'a str,
+    pub jwt_login_namespace: &'a str,
     pub client_assertion_type: &'a str,
     pub audience: &'a str,
     pub scopes: &'a [String],
@@ -268,6 +327,8 @@ struct ObtainProviderTokenInput<'a> {
     provider_name: &'a str,
     token_endpoint: &'a str,
     jwt_svid_audience: &'a str,
+    jwt_login_role: &'a str,
+    jwt_login_namespace: &'a str,
     client_assertion_type: &'a str,
     audience: &'a str,
     scopes: &'a [String],
@@ -289,6 +350,8 @@ where
         provider_name: input.provider_name,
         token_endpoint: input.token_endpoint,
         jwt_svid_audience: &jwt_audience,
+        jwt_login_role: input.jwt_login_role,
+        jwt_login_namespace: input.jwt_login_namespace,
         client_assertion_type: effective_client_assertion_type(input.client_assertion_type),
         audience: input.audience,
         scopes: input.scopes,
@@ -309,8 +372,38 @@ where
     {
         return Err(configuration_failure());
     }
+    let acquisition_started = Instant::now();
     let token_response = grant(jwt_audience).await?;
     validate_access_token(&token_response.access_token)?;
+
+    if input.grant_type == ProviderCredentialTokenGrantType::VaultJwtLogin {
+        let lease = u64::try_from(token_response.expires_in)
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .ok_or_else(configuration_failure)?;
+        let elapsed = acquisition_started.elapsed();
+        if elapsed >= lease {
+            return Err(configuration_failure());
+        }
+        let cache_ttl = jwt_login_cache_ttl(input.cache_ttl_override, lease);
+        if cache_ttl > elapsed {
+            let deadline = acquisition_started
+                .checked_add(cache_ttl)
+                .ok_or_else(configuration_failure)?;
+            if let Ok(mut tokens) = input.cache.tokens.write() {
+                tokens.insert(
+                    cache_key,
+                    CachedToken {
+                        access_token: token_response.access_token.clone(),
+                        expires_at_ms: 0,
+                        lease_deadline: Some(deadline),
+                    },
+                );
+            }
+        }
+        return Ok(token_response.access_token);
+    }
 
     let cache_ttl = token_cache_ttl(input.cache_ttl_override, token_response.expires_in);
     if !cache_ttl.is_zero() {
@@ -430,6 +523,17 @@ fn token_cache_ttl(cache_ttl_override: Option<Duration>, expires_in: i64) -> Dur
     )
 }
 
+fn jwt_login_cache_ttl(cache_ttl_override: Option<Duration>, lease: Duration) -> Duration {
+    lease
+        .min(cache_ttl_override.unwrap_or(Duration::MAX))
+        .min(Duration::from_secs(
+            MAX_TOKEN_EXPIRES_IN_SECONDS.cast_unsigned(),
+        ))
+        .saturating_sub(Duration::from_secs(
+            TOKEN_CACHE_EXPIRY_SKEW_SECONDS.cast_unsigned(),
+        ))
+}
+
 /// Derive the issuer/realm URL from a token endpoint URL.
 ///
 /// For Keycloak token endpoints like:
@@ -474,6 +578,8 @@ struct TokenCacheKeyInput<'a> {
     provider_name: &'a str,
     token_endpoint: &'a str,
     jwt_svid_audience: &'a str,
+    jwt_login_role: &'a str,
+    jwt_login_namespace: &'a str,
     client_assertion_type: &'a str,
     audience: &'a str,
     scopes: &'a [String],
@@ -483,7 +589,7 @@ struct TokenCacheKeyInput<'a> {
 
 fn token_cache_key(input: TokenCacheKeyInput<'_>) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         input.provider_name,
         input.token_endpoint,
         input.jwt_svid_audience,
@@ -491,7 +597,9 @@ fn token_cache_key(input: TokenCacheKeyInput<'_>) -> String {
         input.audience,
         input.scopes.join(" "),
         input.grant_type as i32,
-        input.requested_token_type
+        input.requested_token_type,
+        input.jwt_login_role,
+        input.jwt_login_namespace
     )
 }
 
@@ -602,6 +710,8 @@ pub mod test_support {
                         provider_name: request.provider_key,
                         token_endpoint: request.token_endpoint,
                         jwt_svid_audience: request.jwt_svid_audience,
+                        jwt_login_role: request.jwt_login_role,
+                        jwt_login_namespace: request.jwt_login_namespace,
                         client_assertion_type: request.client_assertion_type,
                         audience: request.audience,
                         scopes: request.scopes,
@@ -614,6 +724,8 @@ pub mod test_support {
                             provider_name: request.provider_key,
                             token_endpoint: request.token_endpoint,
                             jwt_svid_audience: &jwt_audience,
+                            jwt_login_role: request.jwt_login_role,
+                            jwt_login_namespace: request.jwt_login_namespace,
                             client_assertion_type: effective_client_assertion_type(
                                 request.client_assertion_type,
                             ),
@@ -855,6 +967,8 @@ mod tests {
         provider_name: &'a str,
         token_endpoint: &'a str,
         jwt_svid_audience: &'a str,
+        jwt_login_role: &'a str,
+        jwt_login_namespace: &'a str,
         audience: &'a str,
         scopes: &'a [String],
         cache_ttl_override: Option<Duration>,
@@ -871,6 +985,8 @@ mod tests {
                 provider_name: input.provider_name,
                 token_endpoint: input.token_endpoint,
                 jwt_svid_audience: input.jwt_svid_audience,
+                jwt_login_role: input.jwt_login_role,
+                jwt_login_namespace: input.jwt_login_namespace,
                 client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
                 audience: input.audience,
                 scopes: input.scopes,
@@ -908,6 +1024,8 @@ mod tests {
                 provider_name,
                 token_endpoint,
                 jwt_svid_audience,
+                jwt_login_role: "",
+                jwt_login_namespace: "",
                 client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
                 audience,
                 scopes,
@@ -933,6 +1051,8 @@ mod tests {
                 provider_name: "provider:access_token",
                 token_endpoint: endpoint,
                 jwt_svid_audience: "https://auth.example.com",
+                jwt_login_role: "",
+                jwt_login_namespace: "",
                 audience: "api://resource",
                 scopes: &[],
                 cache_ttl_override: ttl,
@@ -977,6 +1097,138 @@ mod tests {
     }
 
     #[test]
+    fn jwt_login_cache_never_extends_the_lease_or_rounds_short_leases_up() {
+        for (configured, lease, expected) in [
+            (None, 120, 90),
+            (Some(300), 120, 90),
+            (Some(60), 120, 30),
+            (Some(0), 120, 0),
+            (None, 30, 0),
+            (None, 1, 0),
+            (None, 7200, 3570),
+        ] {
+            assert_eq!(
+                jwt_login_cache_ttl(
+                    configured.map(Duration::from_secs),
+                    Duration::from_secs(lease)
+                ),
+                Duration::from_secs(expected)
+            );
+        }
+    }
+
+    async fn counted_jwt_login(
+        cache: &TokenCache,
+        role: &str,
+        namespace: &str,
+        calls: &AtomicUsize,
+    ) -> Result<String, TokenGrantFailure> {
+        obtain_provider_token_with_grant(
+            ObtainProviderTokenInput {
+                cache,
+                provider_name: "api.example.com\t443\t/v1/**\tprovider:token",
+                token_endpoint: "https://vault.example.com/v1/auth/jwt/login",
+                jwt_svid_audience: "vault-api",
+                jwt_login_role: role,
+                jwt_login_namespace: namespace,
+                client_assertion_type: "",
+                audience: "",
+                scopes: &[],
+                cache_ttl_override: Some(Duration::from_mins(10)),
+                grant_type: ProviderCredentialTokenGrantType::VaultJwtLogin,
+                requested_token_type: "",
+            },
+            |_| async {
+                let count = calls.fetch_add(1, Ordering::SeqCst);
+                Ok(OAuthTokenResponse {
+                    access_token: format!("inert-vault-{count}"),
+                    expires_in: 120,
+                    token_type: String::new(),
+                })
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn jwt_login_cache_isolates_sandboxes_roles_and_namespaces_and_reacquires() {
+        let cache_a = TokenCache::new();
+        let cache_b = TokenCache::new();
+        let calls = AtomicUsize::new(0);
+        let first = counted_jwt_login(&cache_a, "role-a", "team-a", &calls)
+            .await
+            .unwrap();
+        assert_eq!(
+            counted_jwt_login(&cache_a, "role-a", "team-a", &calls)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_ne!(
+            counted_jwt_login(&cache_a, "role-b", "team-a", &calls)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_ne!(
+            counted_jwt_login(&cache_a, "role-a", "team-b", &calls)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_ne!(
+            counted_jwt_login(&cache_b, "role-a", "team-a", &calls)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        for token in cache_a.tokens.write().unwrap().values_mut() {
+            token.lease_deadline = Instant::now().checked_sub(Duration::from_secs(1));
+            token.expires_at_ms = i64::MAX;
+        }
+        assert_ne!(
+            counted_jwt_login(&cache_a, "role-a", "team-a", &calls)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn jwt_login_rejects_a_lease_exhausted_during_acquisition() {
+        let cache = TokenCache::new();
+        let result = obtain_provider_token_with_grant(
+            ObtainProviderTokenInput {
+                cache: &cache,
+                provider_name: "provider:token",
+                token_endpoint: "https://vault.example.com/login",
+                jwt_svid_audience: "vault-api",
+                jwt_login_role: "role",
+                jwt_login_namespace: "",
+                client_assertion_type: "",
+                audience: "",
+                scopes: &[],
+                cache_ttl_override: None,
+                grant_type: ProviderCredentialTokenGrantType::VaultJwtLogin,
+                requested_token_type: "",
+            },
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                Ok(OAuthTokenResponse {
+                    access_token: "inert-token".into(),
+                    expires_in: 1,
+                    token_type: String::new(),
+                })
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(cache.tokens.read().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_derive_issuer_from_https_keycloak_endpoint() {
         let token_endpoint =
             "https://auth.example.com/realms/production/protocol/openid-connect/token";
@@ -1014,6 +1266,8 @@ mod tests {
             provider_name,
             token_endpoint,
             jwt_svid_audience,
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
             audience: "alpha",
             scopes: &alpha_scopes,
@@ -1024,6 +1278,8 @@ mod tests {
             provider_name,
             token_endpoint,
             jwt_svid_audience,
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
             audience: "delta",
             scopes: &alpha_scopes,
@@ -1034,6 +1290,8 @@ mod tests {
             provider_name,
             token_endpoint,
             jwt_svid_audience,
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
             audience: "alpha",
             scopes: &delta_scopes,
@@ -1044,6 +1302,8 @@ mod tests {
             provider_name,
             token_endpoint,
             jwt_svid_audience,
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
             audience: "alpha",
             scopes: &alpha_scopes,
@@ -1066,6 +1326,8 @@ mod tests {
             provider_name: "api.example.test\t443\t/v1/**\trev:1\tprovider:access_token",
             token_endpoint,
             jwt_svid_audience,
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
             audience: "alpha",
             scopes: &scopes,
@@ -1076,6 +1338,8 @@ mod tests {
             provider_name: "api.example.test\t443\t/v1/**\trev:2\tprovider:access_token",
             token_endpoint,
             jwt_svid_audience,
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
             audience: "alpha",
             scopes: &scopes,
@@ -1161,6 +1425,8 @@ mod tests {
                 provider_name: key,
                 token_endpoint: "https://auth.example.com/token",
                 jwt_svid_audience: "https://auth.example.com",
+                jwt_login_role: "",
+                jwt_login_namespace: "",
                 audience: "api://resource",
                 scopes: &scopes,
                 cache_ttl_override: None,
@@ -1175,6 +1441,8 @@ mod tests {
             provider_name: identity,
             token_endpoint: "https://auth.example.com/token",
             jwt_svid_audience: "https://auth.example.com",
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
             audience: "api://resource",
             scopes: &scopes,
@@ -1199,6 +1467,8 @@ mod tests {
             provider_name: identity,
             token_endpoint: "https://auth.example.com/token",
             jwt_svid_audience: "https://auth.example.com",
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             audience: "api://resource",
             scopes: &scopes,
             cache_ttl_override: None,
@@ -1222,6 +1492,8 @@ mod tests {
             provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
             token_endpoint: "https://auth.example.com/token",
             jwt_svid_audience: "https://auth.example.com",
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             audience: "api://resource",
             scopes: &scopes,
             cache_ttl_override: None,
@@ -1259,6 +1531,8 @@ mod tests {
             provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
             token_endpoint: "https://auth.example.com/token",
             jwt_svid_audience: "https://auth.example.com",
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             audience: "api://resource-one",
             scopes: &read_scope,
             cache_ttl_override: None,
@@ -1272,6 +1546,8 @@ mod tests {
             provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
             token_endpoint: "https://auth.example.com/token",
             jwt_svid_audience: "https://auth.example.com",
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             audience: "api://resource-two",
             scopes: &read_scope,
             cache_ttl_override: None,
@@ -1285,6 +1561,8 @@ mod tests {
             provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
             token_endpoint: "https://auth.example.com/token",
             jwt_svid_audience: "https://auth.example.com",
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             audience: "api://resource-one",
             scopes: &write_scope,
             cache_ttl_override: None,
@@ -1314,6 +1592,8 @@ mod tests {
             provider_name,
             token_endpoint,
             jwt_svid_audience,
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
             audience,
             scopes: &scopes,
@@ -1331,6 +1611,8 @@ mod tests {
             provider_name,
             token_endpoint,
             jwt_svid_audience,
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             audience,
             scopes: &scopes,
             cache_ttl_override: None,
@@ -1355,6 +1637,8 @@ mod tests {
             provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
             token_endpoint: "https://auth.example.com/token",
             jwt_svid_audience: "https://auth.example.com",
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             audience: "api://resource",
             scopes: &scopes,
             cache_ttl_override: Some(Duration::from_mins(1)),
@@ -1390,6 +1674,8 @@ mod tests {
             provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
             token_endpoint: "https://auth.example.com/token",
             jwt_svid_audience: "https://auth.example.com",
+            jwt_login_role: "",
+            jwt_login_namespace: "",
             audience: "api://resource",
             scopes: &scopes,
             cache_ttl_override: Some(Duration::ZERO),

@@ -65,6 +65,32 @@ pub struct SupervisorConfig {
     pub provider_environment: ProviderEnvironmentSnapshot,
 }
 
+/// Older supervisors must never receive a protocol they could interpret as OAuth.
+pub fn restrict_jwt_login_grants(
+    credentials: &mut HashMap<String, openshell_core::proto::ProviderProfileCredential>,
+    readiness_reason: &mut i32,
+    supported: bool,
+) {
+    use openshell_core::proto::ProviderCredentialTokenGrantType;
+    if supported {
+        return;
+    }
+    let before = credentials.len();
+    credentials.retain(|_, credential| {
+        credential.token_grant.as_ref().is_none_or(|grant| {
+            matches!(
+                ProviderCredentialTokenGrantType::try_from(grant.grant_type),
+                Ok(ProviderCredentialTokenGrantType::Unspecified
+                    | ProviderCredentialTokenGrantType::ClientCredentials
+                    | ProviderCredentialTokenGrantType::TokenExchange)
+            )
+        })
+    });
+    if credentials.len() != before {
+        *readiness_reason = ProviderReadinessReason::UnsupportedSupervisor.into();
+    }
+}
+
 impl fmt::Debug for SupervisorConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SupervisorConfig(<redacted>)")

@@ -179,11 +179,22 @@ pub struct TokenGrantProfile {
         skip_serializing_if = "is_client_credentials_grant"
     )]
     pub grant_type: ProviderCredentialTokenGrantType,
+    /// Preserve unsupported wire values so validation never turns them into OAuth.
+    #[serde(
+        skip_deserializing,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "reject_unsupported_grant_type"
+    )]
+    unsupported_grant_type: Option<i32>,
     pub token_endpoint: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub audience: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub jwt_svid_audience: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jwt_login_role: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jwt_login_namespace: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_assertion_type: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -209,9 +220,12 @@ pub struct TokenGrantProfile {
 impl PartialEq for TokenGrantProfile {
     fn eq(&self, other: &Self) -> bool {
         self.grant_type == other.grant_type
+            && self.unsupported_grant_type == other.unsupported_grant_type
             && self.token_endpoint == other.token_endpoint
             && self.audience == other.audience
             && self.jwt_svid_audience == other.jwt_svid_audience
+            && self.jwt_login_role == other.jwt_login_role
+            && self.jwt_login_namespace == other.jwt_login_namespace
             && self.client_assertion_type == other.client_assertion_type
             && self.scopes == other.scopes
             && self.cache_ttl_seconds == other.cache_ttl_seconds
@@ -1284,6 +1298,15 @@ fn default_refresh_strategy() -> ProviderCredentialRefreshStrategy {
     ProviderCredentialRefreshStrategy::Unspecified
 }
 
+// Serde passes the serialized field by reference, including Copy fields.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn reject_unsupported_grant_type<S>(_: &Option<i32>, _: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    Err(serde::ser::Error::custom("unsupported token grant type"))
+}
+
 fn default_token_grant_type() -> ProviderCredentialTokenGrantType {
     ProviderCredentialTokenGrantType::ClientCredentials
 }
@@ -1433,6 +1456,7 @@ pub fn provider_token_grant_type_from_yaml(raw: &str) -> Option<ProviderCredenti
     match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "" | "client_credentials" => Some(ProviderCredentialTokenGrantType::ClientCredentials),
         "token_exchange" => Some(ProviderCredentialTokenGrantType::TokenExchange),
+        "vault_jwt_login" => Some(ProviderCredentialTokenGrantType::VaultJwtLogin),
         _ => None,
     }
 }
@@ -1443,6 +1467,7 @@ pub fn provider_token_grant_type_to_yaml(
 ) -> &'static str {
     match grant_type {
         ProviderCredentialTokenGrantType::TokenExchange => "token_exchange",
+        ProviderCredentialTokenGrantType::VaultJwtLogin => "vault_jwt_login",
         ProviderCredentialTokenGrantType::ClientCredentials
         | ProviderCredentialTokenGrantType::Unspecified => "client_credentials",
     }
@@ -1530,6 +1555,9 @@ fn token_grant_from_proto(
     token_grant: &openshell_core::proto::ProviderCredentialTokenGrant,
 ) -> TokenGrantProfile {
     TokenGrantProfile {
+        unsupported_grant_type: ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
+            .err()
+            .map(|_| token_grant.grant_type),
         grant_type: effective_token_grant_type(
             ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
                 .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials),
@@ -1537,6 +1565,8 @@ fn token_grant_from_proto(
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
+        jwt_login_role: token_grant.jwt_login_role.clone(),
+        jwt_login_namespace: token_grant.jwt_login_namespace.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
         cache_ttl_seconds: 0,
@@ -1558,10 +1588,14 @@ fn token_grant_to_proto(
     token_grant: &TokenGrantProfile,
 ) -> openshell_core::proto::ProviderCredentialTokenGrant {
     openshell_core::proto::ProviderCredentialTokenGrant {
-        grant_type: token_grant.grant_type as i32,
+        grant_type: token_grant
+            .unsupported_grant_type
+            .unwrap_or(token_grant.grant_type as i32),
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
+        jwt_login_role: token_grant.jwt_login_role.clone(),
+        jwt_login_namespace: token_grant.jwt_login_namespace.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
         cache_ttl: profile_duration_to_proto(
@@ -3291,8 +3325,43 @@ fn validate_token_grant_subject_token(
     };
     let grant_type = effective_token_grant_type(token_grant.grant_type);
     let mut diagnostics = Vec::new();
+    if token_grant.unsupported_grant_type.is_some() {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            "credentials.token_grant.grant_type",
+            "unsupported token grant type",
+        ));
+    }
 
     match grant_type {
+        ProviderCredentialTokenGrantType::VaultJwtLogin => {
+            if openshell_core::token_grant_config::validate_jwt_login_configuration(
+                &token_grant.token_endpoint,
+                &token_grant.jwt_svid_audience,
+                &token_grant.jwt_login_role,
+                &token_grant.jwt_login_namespace,
+            )
+            .is_err()
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source, profile_id, "credentials.token_grant",
+                    "vault_jwt_login requires HTTPS, an explicit JWT-SVID audience, a nonempty role, and a valid namespace header",
+                ));
+            }
+            if token_grant.subject_token.is_some()
+                || !token_grant.requested_token_type.is_empty()
+                || !token_grant.client_assertion_type.is_empty()
+                || !token_grant.audience.is_empty()
+                || !token_grant.scopes.is_empty()
+                || !token_grant.audience_overrides.is_empty()
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source, profile_id, "credentials.token_grant",
+                    "vault_jwt_login does not accept OAuth assertion, audience, scope, subject token, or audience override fields",
+                ));
+            }
+        }
         ProviderCredentialTokenGrantType::ClientCredentials => {
             if token_grant.subject_token.is_some() {
                 diagnostics.push(ProfileValidationDiagnostic::error(
@@ -3344,6 +3413,17 @@ fn validate_token_grant_subject_token(
         ProviderCredentialTokenGrantType::Unspecified => {
             unreachable!("effective_token_grant_type must normalize unspecified token grant type")
         }
+    }
+
+    if grant_type != ProviderCredentialTokenGrantType::VaultJwtLogin
+        && (!token_grant.jwt_login_role.is_empty() || !token_grant.jwt_login_namespace.is_empty())
+    {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            "credentials.token_grant",
+            "JWT login role and namespace are only valid for vault_jwt_login",
+        ));
     }
 
     diagnostics
@@ -3742,8 +3822,9 @@ mod tests {
 
     use super::{
         DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
-        ProfileDurationWkt, ProfileError, ProviderTypeProfile, is_mcp_diagnostic_field,
-        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
+        ProfileDurationWkt, ProfileError, ProviderTypeProfile, TokenGrantAudienceOverrideProfile,
+        TokenGrantSubjectTokenProfile, is_mcp_diagnostic_field, normalize_profile_id,
+        parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
         profile_duration_to_proto, profile_to_json, profile_to_yaml, profiles_to_json,
         profiles_to_yaml, token_grant_from_proto, token_grant_to_proto, validate_profile_duration,
         validate_profile_set,
@@ -4660,6 +4741,7 @@ endpoints:
 
             assert!(profile_to_yaml(&profile).is_err());
             assert!(profile_to_json(&profile).is_err());
+            assert!(serde_json::to_string(&profile).is_err());
             assert!(profiles_to_yaml(std::slice::from_ref(&profile)).is_err());
             assert!(profiles_to_json(std::slice::from_ref(&profile)).is_err());
         }
@@ -5418,6 +5500,117 @@ credentials:
         );
     }
 
+    fn vault_login_profile() -> ProviderTypeProfile {
+        parse_profile_yaml(
+            r"
+id: vault-login
+display_name: Vault Login
+credentials:
+  - name: access_token
+    auth_style: header
+    header_name: X-Vault-Token
+    token_grant:
+      grant_type: vault_jwt_login
+      token_endpoint: https://vault.example.com/v1/auth/workloads/login
+      jwt_svid_audience: internal-api
+      jwt_login_role: sandbox-api
+      jwt_login_namespace: team/project
+",
+        )
+        .expect("Vault profile")
+    }
+
+    #[test]
+    fn vault_jwt_login_round_trips_through_proto_and_yaml() {
+        let profile = vault_login_profile();
+        assert!(validate_profile_set(&[("vault.yaml".into(), profile.clone())]).is_empty());
+        let wire = profile.to_proto();
+        assert_eq!(
+            wire.credentials[0].token_grant.as_ref().unwrap().grant_type,
+            ProviderCredentialTokenGrantType::VaultJwtLogin as i32
+        );
+        let restored = ProviderTypeProfile::from_proto(&wire);
+        assert_eq!(restored.credentials, profile.credentials);
+        let yaml = profile_to_yaml(&restored).unwrap();
+        assert!(yaml.contains("grant_type: vault_jwt_login"));
+        assert_eq!(
+            parse_profile_yaml(&yaml).unwrap().credentials,
+            profile.credentials
+        );
+    }
+
+    #[test]
+    fn vault_jwt_login_rejects_invalid_configuration_and_unknown_wire_grants() {
+        for field in [
+            "role",
+            "audience",
+            "namespace",
+            "http",
+            "oauth_audience",
+            "scopes",
+            "assertion",
+            "overrides",
+            "subject",
+            "requested",
+            "wrong_protocol",
+        ] {
+            let mut profile = vault_login_profile();
+            let grant = profile.credentials[0].token_grant.as_mut().unwrap();
+            match field {
+                "role" => grant.jwt_login_role.clear(),
+                "audience" => grant.jwt_svid_audience.clear(),
+                "namespace" => grant.jwt_login_namespace = "team\r\nAuthorization: secret".into(),
+                "http" => grant.token_endpoint = "http://vault.default.svc/login".into(),
+                "oauth_audience" => grant.audience = "oauth".into(),
+                "scopes" => grant.scopes.push("read".into()),
+                "assertion" => grant.client_assertion_type = "oauth".into(),
+                "overrides" => grant
+                    .audience_overrides
+                    .push(TokenGrantAudienceOverrideProfile {
+                        host: "api.example.com".into(),
+                        port: 443,
+                        path: String::new(),
+                        audience: String::new(),
+                        scopes: Vec::new(),
+                    }),
+                "subject" => {
+                    grant.subject_token = Some(TokenGrantSubjectTokenProfile {
+                        source: "provider_credential".into(),
+                        credential: "access_token".into(),
+                        subject_token_type: String::new(),
+                    });
+                }
+                "requested" => grant.requested_token_type = "oauth".into(),
+                "wrong_protocol" => {
+                    grant.grant_type = ProviderCredentialTokenGrantType::ClientCredentials;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !validate_profile_set(&[("vault.yaml".into(), profile)]).is_empty(),
+                "{field}"
+            );
+        }
+        let mut wire = vault_login_profile().to_proto();
+        wire.credentials[0].token_grant.as_mut().unwrap().grant_type = 999;
+        let profile = ProviderTypeProfile::from_proto(&wire);
+        assert!(profile_to_yaml(&profile).is_err());
+        assert!(profile_to_json(&profile).is_err());
+        assert_eq!(
+            profile.to_proto().credentials[0]
+                .token_grant
+                .as_ref()
+                .unwrap()
+                .grant_type,
+            999
+        );
+        assert!(
+            validate_profile_set(&[("wire".into(), profile)])
+                .iter()
+                .any(|diagnostic| diagnostic.message == "unsupported token grant type")
+        );
+    }
+
     #[test]
     fn token_exchange_grant_round_trips_through_proto_and_yaml() {
         let profile = parse_profile_yaml(
@@ -5741,7 +5934,7 @@ endpoints:
             let grant = profile.credentials[0].token_grant.as_mut().unwrap();
             grant
                 .audience_overrides
-                .push(super::TokenGrantAudienceOverrideProfile {
+                .push(TokenGrantAudienceOverrideProfile {
                     host: if field == "host" {
                         value.into()
                     } else {

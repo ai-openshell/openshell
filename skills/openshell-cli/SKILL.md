@@ -144,6 +144,8 @@ Bare `KEY` reads the value from the environment variable of that name and avoids
 
 Other credential sources are `--from-gcloud-adc` for compatible profiles and `--runtime-credentials` when the gateway or sandbox resolves the required credentials at runtime.
 
+For SPIFFE-backed Vault/OpenBao login, use a provider profile with `token_grant.grant_type: vault_jwt_login`, an HTTPS `token_endpoint`, explicit `jwt_svid_audience`, and `jwt_login_role`. `jwt_login_namespace` optionally selects the issuer namespace. Import the profile and create the provider with `--runtime-credentials`; do not copy the JWT-SVID or issued token into workload environment variables. The issuer role must bind the approved SPIFFE subject and audience. The supervisor must advertise support; incompatible supervisors report `UnsupportedSupervisor`. JWT login cache TTL cannot extend the issuer lease. See the published provider profiles documentation for the complete configuration.
+
 Static provider credentials resolve only for hosts, ports, and paths declared by
 the provider profile. Use `profile export` to inspect that boundary
 when a placeholder is present but requests receive

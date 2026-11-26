@@ -714,6 +714,7 @@ async fn run_single_session(
             supports_session_redirect: true,
             supports_config_push: true,
             supports_service_advertisements: config.app_installations.is_some(),
+            supports_vault_jwt_login: true,
         })),
     })
     .await

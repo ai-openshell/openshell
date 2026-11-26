@@ -1442,6 +1442,7 @@ pub async fn fetch_provider_environment_with_stable_placeholders(
             sandbox_id: sandbox_id.to_string(),
             supports_static_credential_bindings: true,
             supports_stable_placeholder_environment_keys: true,
+            supports_vault_jwt_login: true,
         })
         .await
         .map_err(grpc_status_error)?;
@@ -1459,6 +1460,13 @@ fn provider_environment_result(
     inner: GetSandboxProviderEnvironmentResponse,
     requires_stable_placeholders: bool,
 ) -> Result<ProviderEnvironmentResult> {
+    for credential in inner.dynamic_credentials.values() {
+        if let Some(grant) = &credential.token_grant {
+            crate::token_grant_config::validate_token_grant_configuration(grant).map_err(|_| {
+                miette::miette!("invalid or unsupported provider token grant configuration")
+            })?;
+        }
+    }
     // An empty stable-key list cannot distinguish an acknowledged detach from
     // an older gateway silently discarding the activated delivery requirement.
     if !inner.supports_stable_placeholder_environment_keys
@@ -1496,6 +1504,50 @@ mod provider_environment_tests {
     use super::*;
     use crate::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
     use prost::Message;
+
+    #[test]
+    fn token_grant_configuration_is_validated_for_poll_and_push() {
+        use crate::proto::{
+            ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType,
+            ProviderEnvironmentSnapshot, ProviderProfileCredential,
+        };
+        let mut grant = ProviderCredentialTokenGrant {
+            grant_type: ProviderCredentialTokenGrantType::VaultJwtLogin as i32,
+            token_endpoint: "https://vault.example/login".into(),
+            jwt_svid_audience: "internal-api".into(),
+            jwt_login_role: "sandbox".into(),
+            ..Default::default()
+        };
+        for (kind, valid) in [(3, true), (999, false), (1, false)] {
+            grant.grant_type = kind;
+            let credentials = HashMap::from([(
+                "provider:token".into(),
+                ProviderProfileCredential {
+                    token_grant: Some(grant.clone()),
+                    ..Default::default()
+                },
+            )]);
+            assert_eq!(
+                provider_environment_result(
+                    GetSandboxProviderEnvironmentResponse {
+                        dynamic_credentials: credentials.clone(),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .is_ok(),
+                valid
+            );
+            assert_eq!(
+                ProviderEnvironmentResult::try_from(ProviderEnvironmentSnapshot {
+                    dynamic_credentials: credentials,
+                    ..Default::default()
+                })
+                .is_ok(),
+                valid
+            );
+        }
+    }
 
     #[test]
     fn stable_placeholder_gateway_ack_preserves_legacy_compatibility() {

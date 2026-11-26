@@ -140,6 +140,8 @@ fn credentials(entries: &[(&str, &str, &str)]) -> HashMap<String, ProviderProfil
                     token_grant: Some(ProviderCredentialTokenGrant {
                         token_endpoint: "https://auth.example.test/token".into(),
                         jwt_svid_audience: "https://auth.example.test".into(),
+                        jwt_login_role: String::new(),
+                        jwt_login_namespace: String::new(),
                         client_assertion_type:
                             "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".into(),
                         grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,

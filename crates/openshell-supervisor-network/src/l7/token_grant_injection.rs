@@ -35,6 +35,8 @@ pub struct TokenGrantRequest<'a> {
     pub provider_key: &'a str,
     pub token_endpoint: &'a str,
     pub jwt_svid_audience: &'a str,
+    pub jwt_login_role: &'a str,
+    pub jwt_login_namespace: &'a str,
     pub client_assertion_type: &'a str,
     pub audience: &'a str,
     pub scopes: &'a [String],
@@ -77,6 +79,8 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
                     provider_name: request.provider_key,
                     token_endpoint: request.token_endpoint,
                     jwt_svid_audience: request.jwt_svid_audience,
+                    jwt_login_role: request.jwt_login_role,
+                    jwt_login_namespace: request.jwt_login_namespace,
                     client_assertion_type: request.client_assertion_type,
                     audience: request.audience,
                     scopes: request.scopes,
@@ -529,6 +533,8 @@ fn token_grant_request<'a>(
         provider_key,
         token_endpoint: &token_grant.token_endpoint,
         jwt_svid_audience: &token_grant.jwt_svid_audience,
+        jwt_login_role: &token_grant.jwt_login_role,
+        jwt_login_namespace: &token_grant.jwt_login_namespace,
         client_assertion_type: &token_grant.client_assertion_type,
         audience: &token_grant.audience,
         scopes: &token_grant.scopes,
@@ -737,6 +743,8 @@ pub mod test_support {
         provider_key: String,
         token_endpoint: String,
         jwt_svid_audience: String,
+        jwt_login_role: String,
+        jwt_login_namespace: String,
         client_assertion_type: String,
         audience: String,
         scopes: Vec<String>,
@@ -771,6 +779,21 @@ pub mod test_support {
 
         pub fn success_token_exchange(key: &str, token: &str) -> Self {
             Self::new_with_grant(key, Ok(token), token_exchange_grant())
+        }
+
+        pub fn success_vault_jwt_login(key: &str, token: &str) -> Self {
+            Self::new_with_grant(
+                key,
+                Ok(token),
+                ProviderCredentialTokenGrant {
+                    grant_type: ProviderCredentialTokenGrantType::VaultJwtLogin as i32,
+                    token_endpoint: "https://vault.example.com/login".into(),
+                    jwt_svid_audience: "vault-api".into(),
+                    jwt_login_role: "sandbox-api".into(),
+                    jwt_login_namespace: "team/project".into(),
+                    ..Default::default()
+                },
+            )
         }
 
         pub fn failure(key: &str, failure: TokenGrantFailure) -> Self {
@@ -871,6 +894,8 @@ pub mod test_support {
                 .expect("grant was requested");
             assert_eq!(request.token_endpoint, grant.token_endpoint);
             assert_eq!(request.jwt_svid_audience, grant.jwt_svid_audience);
+            assert_eq!(request.jwt_login_role, grant.jwt_login_role);
+            assert_eq!(request.jwt_login_namespace, grant.jwt_login_namespace);
             assert_eq!(request.client_assertion_type, grant.client_assertion_type);
             assert_eq!(request.audience, grant.audience);
             assert_eq!(request.scopes, grant.scopes);
@@ -993,6 +1018,8 @@ pub mod test_support {
             token_endpoint: "https://auth.example.com/token".to_string(),
             audience: "api://example".to_string(),
             jwt_svid_audience: "https://auth.example.com".to_string(),
+            jwt_login_role: String::new(),
+            jwt_login_namespace: String::new(),
             client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
                 .to_string(),
             scopes: vec!["read".to_string()],
@@ -1031,6 +1058,8 @@ pub mod test_support {
                 provider_key: request.provider_key.to_string(),
                 token_endpoint: request.token_endpoint.to_string(),
                 jwt_svid_audience: request.jwt_svid_audience.to_string(),
+                jwt_login_role: request.jwt_login_role.to_string(),
+                jwt_login_namespace: request.jwt_login_namespace.to_string(),
                 client_assertion_type: request.client_assertion_type.to_string(),
                 audience: request.audience.to_string(),
                 scopes: request.scopes.to_vec(),
@@ -1458,6 +1487,32 @@ mod tests {
             raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
         }
+    }
+
+    #[tokio::test]
+    async fn jwt_login_injection_preserves_role_namespace_and_destination_binding() {
+        let key = "api.example.com\t443\t/v1/**\tprovider:access_token";
+        let fixture = TokenGrantTestFixture::success_vault_jwt_login(key, "inert-vault-token");
+        let grant = fixture.dynamic_credentials().read().unwrap()[key]
+            .token_grant
+            .clone()
+            .unwrap();
+        let ctx = grant_context(&fixture);
+        let rewritten = inject_if_needed(grant_request(), &ctx, REQUEST_ID)
+            .await
+            .expect("inject JWT login token");
+        assert!(
+            String::from_utf8(rewritten.raw_header)
+                .unwrap()
+                .contains("Authorization: Bearer inert-vault-token\r\n")
+        );
+        fixture.assert_request_configuration(key, &grant);
+        let mut unmatched = grant_request();
+        unmatched.target = "/unmatched".into();
+        inject_if_needed(unmatched, &ctx, REQUEST_ID)
+            .await
+            .expect("no matching grant");
+        assert_eq!(fixture.requested_ids(), [REQUEST_ID]);
     }
 
     async fn installed_status(

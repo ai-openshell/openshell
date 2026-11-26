@@ -6125,6 +6125,8 @@ mod tests {
                 audience: "api://default".to_string(),
                 jwt_svid_audience: "http://keycloak.default.svc.cluster.local/realms/openshell"
                     .to_string(),
+                jwt_login_role: String::new(),
+                jwt_login_namespace: String::new(),
                 client_assertion_type:
                     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
                 subject_token: None,
@@ -7362,6 +7364,8 @@ mod tests {
                 token_endpoint: "https://auth.example.com/token".to_string(),
                 audience: "api://default".to_string(),
                 jwt_svid_audience: "https://auth.example.com".to_string(),
+                jwt_login_role: String::new(),
+                jwt_login_namespace: String::new(),
                 client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
                     .to_string(),
                 subject_token: None,
@@ -11354,6 +11358,8 @@ mod tests {
                     grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
                     token_endpoint: "https://issuer.example.com/token".to_string(),
                     jwt_svid_audience: "https://issuer.example.com".to_string(),
+                    jwt_login_role: String::new(),
+                    jwt_login_namespace: String::new(),
                     client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
                         .to_string(),
                     subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
