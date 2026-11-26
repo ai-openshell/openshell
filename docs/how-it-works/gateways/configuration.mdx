@@ -862,8 +862,11 @@ never print token files or token responses while diagnosing authentication.
 When it is `true`, a sandbox can be created as a child of a root sandbox, and
 the gateway serves the MCP tools at `/mcp`. Turning it off blocks new children
 and the MCP tools: agents in sandboxes and `openshell mcp serve` can no longer
-reach any tool. Existing children keep running, keep following their parent's
-policy, and can still be listed, used and deleted from the CLI.
+reach any tool. Existing children keep running and can still be listed, used
+and deleted from the CLI. They pick up their parent's policy changes late,
+only when their configuration is next rebuilt or they reconnect. A root can be
+deleted while it still has children; those children are stopped when they
+next reconnect. Delete children before you turn the setting off.
 
 `experimental_max_concurrent_children` limits how many children one parent may have at
 once. Every existing child counts, whatever its state, until it is deleted.
