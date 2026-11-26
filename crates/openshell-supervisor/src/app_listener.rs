@@ -3,6 +3,8 @@
 
 //! Opt-in application ingress, separate from the gateway control transport.
 
+mod tls_files;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,13 +18,14 @@ use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
 use hyper::rt::Executor as _;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::grpc_client::SettingsPollResult;
 use openshell_core::proto::{SandboxServiceRoute, ServiceBackendHttpVersion};
 use openshell_isolation_interface::contract::{BoundaryDuplexStream, LoopbackTarget};
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DispositionId,
-    HttpActivityBuilder, HttpResponse, NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
+    HttpActivityBuilder, HttpResponse, NetworkActivityBuilder, SeverityId, StateId, StatusId,
+    ocsf_emit,
 };
 use openshell_sandbox_backend::BoundaryLoopbackConnector;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -32,8 +35,11 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
+use self::tls_files::{TlsFiles, TlsPem};
+
 const FRESHNESS: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INSTANCE_CONNECTIONS: usize = 64;
 const MAX_HTTP2_STREAMS: u32 = 16;
@@ -128,25 +134,222 @@ impl Config {
     }
 
     pub fn bind(self) -> Result<BoundListener> {
-        let certificates = CertificateDer::pem_file_iter(self.certificate)
-            .into_diagnostic()?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .into_diagnostic()?;
-        let key = PrivateKeyDer::from_pem_file(self.key).into_diagnostic()?;
-        let mut tls = openshell_crypto::tls::try_server_builder()
-            .into_diagnostic()?
-            .with_no_client_auth()
-            .with_single_cert(certificates, key)
-            .into_diagnostic()?;
-        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let tls_files = Arc::new(TlsFiles::new(self.certificate, self.key));
+        let pem = tls_files.read_initial()?;
+        let fingerprint = pem.fingerprint()?;
+        let (certificates, key) = pem.credentials()?;
+        let acceptor = tls_acceptor(certificates.clone(), key)
+            .into_diagnostic()
+            .wrap_err("invalid certificate chain or private key")?;
+        let reload = TlsReload {
+            generation: pem.generation,
+            observed: fingerprint,
+            active: fingerprint,
+            certificates: certificates.into(),
+        };
         let socket = std::net::TcpListener::bind(self.address).into_diagnostic()?;
         socket.set_nonblocking(true).into_diagnostic()?;
+        let address = socket.local_addr().into_diagnostic()?;
         let listener = tokio::net::TcpListener::from_std(socket).into_diagnostic()?;
         Ok(BoundListener {
             listener,
-            acceptor: TlsAcceptor::from(Arc::new(tls)),
+            address,
+            acceptor,
+            tls_files,
+            reload,
             domain: self.domain,
         })
+    }
+}
+
+type TlsFingerprint = ([u8; 32], [u8; 32]);
+
+impl TlsPem {
+    fn fingerprint(&self) -> Result<TlsFingerprint> {
+        Ok((
+            openshell_crypto::sha256(&self.certificate).into_diagnostic()?,
+            openshell_crypto::sha256(&self.key).into_diagnostic()?,
+        ))
+    }
+
+    fn credentials(&self) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+        let certificates = CertificateDer::pem_slice_iter(&self.certificate)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .into_diagnostic()
+            .wrap_err("cannot parse certificate PEM")?;
+        let key = PrivateKeyDer::from_pem_slice(&self.key)
+            .into_diagnostic()
+            .wrap_err("cannot parse private key PEM")?;
+        Ok((certificates, key))
+    }
+}
+
+fn tls_acceptor(
+    certificates: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> std::result::Result<TlsAcceptor, rustls::Error> {
+    let mut tls = openshell_crypto::tls::try_server_builder()?
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)?;
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(tls)))
+}
+
+#[derive(Clone)]
+struct TlsReload {
+    generation: Option<PathBuf>,
+    observed: TlsFingerprint,
+    active: TlsFingerprint,
+    certificates: Arc<[CertificateDer<'static>]>,
+}
+
+enum TlsUpdate {
+    Unchanged,
+    Accepted(TlsAcceptor),
+    Rejected(miette::Report),
+}
+
+impl TlsReload {
+    fn poll(&mut self, files: &TlsFiles) -> Result<TlsUpdate> {
+        let Some(pem) = files.read(self.generation.as_deref())? else {
+            return Ok(TlsUpdate::Unchanged);
+        };
+        let fingerprint = pem.fingerprint()?;
+        let update = if fingerprint == self.observed || fingerprint == self.active {
+            TlsUpdate::Unchanged
+        } else {
+            self.validate(&pem, fingerprint)?
+        };
+        self.generation = pem.generation;
+        self.observed = fingerprint;
+        Ok(update)
+    }
+
+    fn validate(&mut self, pem: &TlsPem, fingerprint: TlsFingerprint) -> Result<TlsUpdate> {
+        use rustls::CertificateError::{NotValidYet, NotValidYetContext};
+
+        let (certificates, key) = match pem.credentials() {
+            Ok(credentials) => credentials,
+            Err(error) => return Ok(TlsUpdate::Rejected(error)),
+        };
+        let acceptor = match tls_acceptor(certificates.clone(), key) {
+            Ok(acceptor) => acceptor,
+            Err(error @ rustls::Error::Other(_)) => {
+                return Err(miette::miette!(
+                    "cannot load application TLS identity ({error})"
+                ));
+            }
+            Err(_) => {
+                return Ok(TlsUpdate::Rejected(miette::miette!(
+                    "invalid certificate chain or private key"
+                )));
+            }
+        };
+        match openshell_crypto::tls::check_server_chain_replacement(
+            &certificates,
+            &self.certificates,
+        ) {
+            Ok(()) => {}
+            Err(rustls::Error::InvalidCertificate(NotValidYet | NotValidYetContext { .. })) => {
+                // Recheck these same files as their validity window opens.
+                return Err(miette::miette!(
+                    "application certificate chain is not valid yet"
+                ));
+            }
+            Err(error) => {
+                return Ok(TlsUpdate::Rejected(miette::miette!(
+                    "invalid application certificate chain ({error})"
+                )));
+            }
+        }
+        self.active = fingerprint;
+        self.certificates = certificates.into();
+        Ok(TlsUpdate::Accepted(acceptor))
+    }
+}
+
+async fn reload_tls(
+    files: Arc<TlsFiles>,
+    mut reload: TlsReload,
+    acceptors: watch::Sender<TlsAcceptor>,
+    address: SocketAddr,
+) {
+    let mut ticks =
+        tokio::time::interval_at(Instant::now() + TLS_RELOAD_INTERVAL, TLS_RELOAD_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_error = None;
+    loop {
+        ticks.tick().await;
+        let files = files.clone();
+        let mut candidate = reload.clone();
+        let pending = tokio::task::spawn_blocking(move || {
+            let update = candidate.poll(&files);
+            (candidate, update)
+        })
+        .await;
+        let update = match pending {
+            Ok((candidate, update)) => {
+                reload = candidate;
+                update
+            }
+            Err(_) => Err(miette::miette!("TLS certificate reload task failed")),
+        };
+
+        let failure = match update {
+            Ok(TlsUpdate::Accepted(acceptor)) => {
+                acceptors.send_replace(acceptor);
+                last_error = None;
+                None
+            }
+            Ok(TlsUpdate::Unchanged) => {
+                last_error = None;
+                continue;
+            }
+            Ok(TlsUpdate::Rejected(error)) => {
+                last_error = None;
+                Some(error.to_string())
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                if last_error.as_ref() == Some(&reason) {
+                    continue;
+                }
+                last_error = Some(reason.clone());
+                Some(reason)
+            }
+        };
+        let (status, severity, state, outcome) = failure.map_or_else(
+            || {
+                (
+                    StatusId::Success,
+                    SeverityId::Informational,
+                    "reloaded",
+                    "succeeded".to_owned(),
+                )
+            },
+            |reason| {
+                tracing::warn!(
+                    %address,
+                    %reason,
+                    "Application listener TLS certificate reload failed, keeping active certificate"
+                );
+                (
+                    StatusId::Failure,
+                    SeverityId::Low,
+                    "reload_failed",
+                    format!("failed, keeping active certificate ({reason})"),
+                )
+            },
+        );
+        let event = ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+            .severity(severity)
+            .status(status)
+            .state(StateId::Enabled, state)
+            .message(format!(
+                "Application listener {address} TLS certificate reload {outcome}"
+            ))
+            .build();
+        ocsf_emit!(event);
     }
 }
 
@@ -502,7 +705,10 @@ impl Routes {
 
 pub struct BoundListener {
     listener: tokio::net::TcpListener,
+    address: SocketAddr,
     acceptor: TlsAcceptor,
+    tls_files: Arc<TlsFiles>,
+    reload: TlsReload,
     domain: String,
 }
 
@@ -715,18 +921,25 @@ impl BoundListener {
         let dispatch = router.clone();
         let task = tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(1024));
-            let mut connections = JoinSet::new();
+            let mut tasks = JoinSet::new();
+            let (acceptors, active) = watch::channel(self.acceptor);
+            tasks.spawn(reload_tls(
+                self.tls_files,
+                self.reload,
+                acceptors,
+                self.address,
+            ));
             loop {
                 tokio::select! {
-                    Some(_) = connections.join_next(), if !connections.is_empty() => {},
+                    Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                     accepted = self.listener.accept() => {
                         let Ok((stream, _)) = accepted else { break; };
                         let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                         openshell_core::net::set_tcp_nodelay_best_effort(&stream);
-                        let acceptor = self.acceptor.clone();
+                        let acceptor = active.borrow().clone();
                         let domain = self.domain.clone();
                         let dispatch = dispatch.clone();
-                        connections.spawn(async move {
+                        tasks.spawn(async move {
                             let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await else { return; };
                             let Some(sni) = tls.get_ref().1.server_name() else { return; };
                             let Some(label) = sni.strip_suffix(&format!(".{domain}")) else { return; };
@@ -1196,6 +1409,8 @@ async fn proxy_http2(
 #[cfg(test)]
 mod tests {
     mod http2;
+    #[cfg(unix)]
+    mod tls_reload;
 
     use super::*;
     use futures::{SinkExt as _, StreamExt as _};
@@ -1525,8 +1740,10 @@ mod tests {
         assert_eq!(events[2]["status_id"], StatusId::Failure as u8);
     }
 
+    #[derive(Default)]
     struct Connector {
         calls: AtomicUsize,
+        stream_resume: std::sync::OnceLock<Arc<Notify>>,
     }
 
     #[tonic::async_trait]
@@ -1538,7 +1755,9 @@ mod tests {
             assert_eq!(target.port(), 8080);
             let (client, server) = tokio::io::duplex(8192);
             self.calls.fetch_add(1, Ordering::SeqCst);
+            let stream_resume = self.stream_resume.get().cloned();
             tokio::spawn(async move {
+                let stream_resume = stream_resume.as_ref();
                 let service = hyper::service::service_fn(|mut req: Request<Incoming>| async move {
                     if let Some(key) = req.headers().get("sec-websocket-key") {
                         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(
@@ -1589,6 +1808,20 @@ mod tests {
                             .unwrap());
                     }
                     if req.uri().path() == "/stream" {
+                        if let Some(resume) = stream_resume {
+                            let resume = resume.clone();
+                            let chunks =
+                                futures::stream::iter([Ok::<_, std::convert::Infallible>(
+                                    hyper::body::Bytes::from_static(b"before rotation"),
+                                )])
+                                .chain(futures::stream::once(
+                                    async move {
+                                        resume.notified().await;
+                                        Ok(hyper::body::Bytes::from_static(b"after rotation"))
+                                    },
+                                ));
+                            return Ok(Response::new(Body::from_stream(chunks)));
+                        }
                         return Ok(Response::new(Body::from_stream(
                             futures::stream::pending::<
                                 Result<hyper::body::Bytes, std::convert::Infallible>,
@@ -1647,15 +1880,21 @@ mod tests {
             certificate: cert_path,
             key: key_path,
         };
-        let bound = config.bind().unwrap();
-        let address = bound.listener.local_addr().unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
-        let tls = Arc::new(
-            openshell_crypto::tls::client_builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        );
+        let tls = openshell_crypto::tls::client_builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        start_fixture(directory, config, tls)
+    }
+
+    fn start_fixture(
+        directory: tempfile::TempDir,
+        config: Config,
+        tls: rustls::ClientConfig,
+    ) -> Fixture {
+        let bound = config.bind().unwrap();
+        let address = bound.listener.local_addr().unwrap();
         let host = bound.start();
         let instance = host.router().instance("sandbox-a").unwrap();
         let routes = instance.routes.clone();
@@ -1669,15 +1908,13 @@ mod tests {
             backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
-        let connector = Arc::new(Connector {
-            calls: AtomicUsize::new(0),
-        });
+        let connector = Arc::new(Connector::default());
         let handle = instance.start(rpc_test::loopback(connector.clone()));
         Fixture {
             directory,
             handle,
             address,
-            tls,
+            tls: Arc::new(tls),
             routes,
             connector,
             route,
@@ -1837,9 +2074,7 @@ mod tests {
 
         let second = f.host.router().instance("sandbox-b").unwrap();
         let second_routes = second.routes.clone();
-        let connector = Arc::new(Connector {
-            calls: AtomicUsize::new(0),
-        });
+        let connector = Arc::new(Connector::default());
         let handle = second.start(rpc_test::loopback(connector.clone()));
         // A canonical hostname collision cannot steal another instance's mapping.
         second_routes.install(&installed(vec![first.clone()]));
@@ -1887,9 +2122,7 @@ mod tests {
         let f = fixture();
         let second = f.host.router().instance("sandbox-b").unwrap();
         let second_routes = second.routes.clone();
-        let second_connector = Arc::new(Connector {
-            calls: AtomicUsize::new(0),
-        });
+        let second_connector = Arc::new(Connector::default());
         let second_handle = second.start(rpc_test::loopback(second_connector.clone()));
         second_routes.install(&installed(vec![SandboxServiceRoute {
             endpoint_id: "endpoint-b".into(),
@@ -2256,9 +2489,7 @@ mod tests {
             endpoint_id: "endpoint-b".into(),
             ..f.route.clone()
         }]));
-        let second_connector = Arc::new(Connector {
-            calls: AtomicUsize::new(0),
-        });
+        let second_connector = Arc::new(Connector::default());
         let _second_handle = second.start(rpc_test::loopback(second_connector));
         let mut rejected_ws = websocket(&f, "web").await;
         let mut unaffected_ws = sandbox_websocket(&f, "sandbox-b", "web").await;
