@@ -2148,12 +2148,9 @@ impl PodmanComputeDriver {
                 // contains the authenticated channel and supervisor state, so
                 // restart it as-is rather than fabricating provisioning input.
                 self.client.verify_isolation_fence(&container_id).await?;
-                self.client.start_container(&container_id).await?;
-                if let Err(error) = self.client.start_container(&supervisor).await {
-                    let _ = self.client.stop_container(&container_id, 0).await;
-                    return Err(error.into());
-                }
-                return Ok(());
+                return self
+                    .start_stopped_pair(sandbox_id, &container_id, &supervisor)
+                    .await;
             }
             let archives =
                 crate::isolation::bootstrap_archives(crate::isolation::BootstrapArchivesInput {
@@ -2189,15 +2186,31 @@ impl PodmanComputeDriver {
                 .copy_to_container(&supervisor, "/", archives.supervisor)
                 .await?;
             self.client.verify_isolation_fence(&container_id).await?;
-            self.client.start_container(&container_id).await?;
-            if let Err(error) = self.client.start_container(&supervisor).await {
-                let _ = self.client.stop_container(&container_id, 0).await;
-                return Err(error.into());
-            }
-            Ok(())
+            self.start_stopped_pair(sandbox_id, &container_id, &supervisor)
+                .await
         }
         .await;
         span_status.finish(result)
+    }
+
+    /// Start a stopped workload and then its supervisor.
+    ///
+    /// The supervisor still reports the previous run's exit until its own
+    /// start returns. The pair-start guard keeps the watcher from treating
+    /// that window as a lost supervisor and killing the new workload.
+    async fn start_stopped_pair(
+        &self,
+        sandbox_id: &str,
+        container_id: &str,
+        supervisor: &str,
+    ) -> Result<(), ComputeDriverError> {
+        let _pair_start = self.lifecycle_event_fences.begin_pair_start(sandbox_id);
+        self.client.start_container(container_id).await?;
+        if let Err(error) = self.client.start_container(supervisor).await {
+            let _ = self.client.stop_container(container_id, 0).await;
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     /// Delete a sandbox container and its workspace volume.
@@ -2364,11 +2377,13 @@ impl PodmanComputeDriver {
             return Ok(None);
         };
         if entry.state == "running" {
-            Ok(watcher::inspect_workload(&self.client, &entry.id)
-                .await
-                .ok()
-                .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
-                .or_else(|| driver_sandbox_from_list_entry(entry)))
+            Ok(
+                watcher::inspect_workload(&self.client, &entry.id, &self.lifecycle_event_fences)
+                    .await
+                    .ok()
+                    .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
+                    .or_else(|| driver_sandbox_from_list_entry(entry)),
+            )
         } else {
             Ok(driver_sandbox_from_list_entry(entry))
         }
@@ -2389,7 +2404,13 @@ impl PodmanComputeDriver {
         for entry in &entries {
             if entry.state == "running" {
                 // Running containers need inspect for health check status.
-                match watcher::inspect_workload(&self.client, &entry.id).await {
+                match watcher::inspect_workload(
+                    &self.client,
+                    &entry.id,
+                    &self.lifecycle_event_fences,
+                )
+                .await
+                {
                     Ok(inspect) => {
                         if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
                             sandboxes.push(sandbox);
