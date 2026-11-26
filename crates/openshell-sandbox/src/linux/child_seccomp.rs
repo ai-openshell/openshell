@@ -223,6 +223,9 @@ fn build(sandbox_tgid: u32, mediation: Mediation) -> io::Result<ChildHardeningPr
         libc::SYS_setgroups,
         libc::SYS_sethostname,
         libc::SYS_setdomainname,
+        libc::SYS_keyctl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
         libc::SYS_ioprio_set,
     ] {
         append_unconditional_deny(&mut instructions, syscall)?;

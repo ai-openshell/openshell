@@ -256,6 +256,12 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
     // default seccomp profile.
     rules.entry(libc::SYS_userfaultfd).or_default();
     rules.entry(libc::SYS_perf_event_open).or_default();
+    // Kernel keyrings are shared with the boundary process at the same UID, and
+    // request_key(2) can trigger the root-owned /sbin/request-key upcall — an
+    // unsandboxed, unlogged privileged helper invocation.
+    rules.entry(libc::SYS_keyctl).or_default();
+    rules.entry(libc::SYS_add_key).or_default();
+    rules.entry(libc::SYS_request_key).or_default();
 
     // --- Conditional syscall blocks ---
 
@@ -457,6 +463,9 @@ mod tests {
             libc::SYS_pivot_root,
             libc::SYS_userfaultfd,
             libc::SYS_perf_event_open,
+            libc::SYS_keyctl,
+            libc::SYS_add_key,
+            libc::SYS_request_key,
         ];
 
         for syscall in expected {
