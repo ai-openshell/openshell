@@ -80,6 +80,8 @@ pub struct VmComputeConfig {
 
     /// Bootstrap image used to boot and prepare VM sandbox target images.
     pub bootstrap_image: String,
+    /// Per-image byte limit for host extraction of registry bootstrap layers.
+    pub bootstrap_extraction_max_bytes: Option<std::num::NonZeroU64>,
 
     /// libkrun log level used by the VM driver helper.
     pub krun_log_level: u32,
@@ -112,6 +114,11 @@ pub struct VmComputeConfig {
     /// preserves the shared local-driver TOML field names.
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
+
+    /// Policy DNS IPv6 egress mode and NAT64 prefixes passed to the VM
+    /// driver for its host-side supervisors.
+    #[serde(flatten)]
+    pub ipv6_egress: openshell_core::SupervisorIpv6EgressConfig,
 
     /// Path on the gateway host to a PEM CA bundle trusted for the corporate
     /// proxy and for server certificates re-signed by a TLS-intercepting proxy.
@@ -208,6 +215,7 @@ impl VmComputeConfig {
 
     fn validate_proxy_config(&self) -> Result<()> {
         self.upstream_proxy.validate().map_err(Error::config)?;
+        self.ipv6_egress.validate().map_err(Error::config)?;
         if let Some(path) = self.proxy_ca_bundle.as_ref() {
             if path.as_os_str().is_empty() {
                 return Err(Error::config("proxy_ca_bundle must not be empty when set"));
@@ -245,6 +253,7 @@ impl Default for VmComputeConfig {
             default_image: openshell_core::image::default_sandbox_image(),
             grpc_endpoint: String::new(),
             bootstrap_image: String::new(),
+            bootstrap_extraction_max_bytes: None,
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
@@ -255,6 +264,7 @@ impl Default for VmComputeConfig {
             rootfs_tar_max_bytes: None,
             guest_tls_ca: None,
             upstream_proxy: UpstreamProxyConfig::default(),
+            ipv6_egress: openshell_core::SupervisorIpv6EgressConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
@@ -540,7 +550,7 @@ pub async fn spawn(
         .arg("--overlay-disk-mib")
         .arg(vm_config.overlay_disk_mib.to_string());
     append_vm_identity_args(&mut command, vm_config);
-    append_vm_rootfs_tar_args(&mut command, vm_config);
+    append_vm_image_size_and_staging_args(&mut command, vm_config);
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
     }
@@ -595,7 +605,12 @@ fn append_vm_identity_args(command: &mut Command, config: &VmComputeConfig) {
 }
 
 #[cfg(unix)]
-fn append_vm_rootfs_tar_args(command: &mut Command, config: &VmComputeConfig) {
+fn append_vm_image_size_and_staging_args(command: &mut Command, config: &VmComputeConfig) {
+    if let Some(max_bytes) = config.bootstrap_extraction_max_bytes {
+        command
+            .arg("--bootstrap-extraction-max-bytes")
+            .arg(max_bytes.to_string());
+    }
     if let Some(path) = config.rootfs_tar_staging_dir.as_ref() {
         command.arg("--rootfs-tar-staging-dir").arg(path);
     }
@@ -646,6 +661,8 @@ fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConf
     if let Some(path) = config.proxy_ca_bundle.as_ref() {
         command.arg("--upstream-proxy-ca-bundle").arg(path);
     }
+    // The VM driver accepts the supervisor's flag names and forwards them.
+    command.args(config.ipv6_egress.supervisor_args());
     if let Some(endpoint) = config.provider_spiffe_workload_api_tcp_endpoint.as_ref() {
         command
             .arg("--provider-spiffe-workload-api-tcp-endpoint")
@@ -807,9 +824,10 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 mod tests {
     use super::{
         ComputeDriverSocketRoot, VmComputeConfig, append_otlp_args, append_vm_identity_args,
-        append_vm_network_trust_args, append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args,
-        compute_driver_guest_tls_paths, current_euid, prepare_vm_state_dir,
-        resolve_compute_driver_bin, resolve_driver_search_dirs, validate_vm_sandbox_identity,
+        append_vm_image_size_and_staging_args, append_vm_network_trust_args,
+        append_vm_proxy_and_spiffe_args, compute_driver_guest_tls_paths, current_euid,
+        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
+        validate_vm_sandbox_identity,
     };
     use openshell_core::sandbox_env::OtlpProtocol;
     use openshell_core::{NetworkSupervisorTrustBundle, UpstreamProxyConfig};
@@ -1078,6 +1096,33 @@ mod tests {
     }
 
     #[test]
+    fn vm_driver_command_forwards_ipv6_egress_settings() {
+        let config: VmComputeConfig = toml::from_str(
+            r#"
+policy_dns_ipv6_egress = "disabled"
+nat64_prefixes = ["2001:db8:64::/96"]
+"#,
+        )
+        .expect("VM driver config parses");
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_proxy_and_spiffe_args(&mut command, &config);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--policy-dns-ipv6-egress",
+                "disabled",
+                "--nat64-prefix",
+                "2001:db8:64::/96"
+            ]
+        );
+    }
+
+    #[test]
     fn vm_driver_command_forwards_corporate_proxy_settings() {
         let mut command = tokio::process::Command::new("openshell-driver-vm");
         append_vm_proxy_and_spiffe_args(
@@ -1217,11 +1262,12 @@ mod tests {
     }
 
     #[test]
-    fn vm_gateway_toml_forwards_rootfs_tar_settings() {
+    fn vm_gateway_toml_forwards_image_size_and_staging_settings() {
         let config: VmComputeConfig = toml::from_str(
             r#"
                 grpc_endpoint = "http://127.0.0.1:50051"
                 rootfs_tar_staging_dir = "/var/lib/openshell/rootfs-tar-staging"
+                bootstrap_extraction_max_bytes = 33554432
                 rootfs_tar_max_bytes = 1073741824
             "#,
         )
@@ -1231,7 +1277,7 @@ mod tests {
             .expect("rootfs tar settings must pass static validation");
 
         let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_vm_rootfs_tar_args(&mut command, &config);
+        append_vm_image_size_and_staging_args(&mut command, &config);
         let args = command
             .as_std()
             .get_args()
@@ -1241,6 +1287,8 @@ mod tests {
         assert_eq!(
             args,
             [
+                "--bootstrap-extraction-max-bytes",
+                "33554432",
                 "--rootfs-tar-staging-dir",
                 "/var/lib/openshell/rootfs-tar-staging",
                 "--rootfs-tar-max-bytes",

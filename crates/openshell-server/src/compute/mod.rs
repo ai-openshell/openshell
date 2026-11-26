@@ -50,6 +50,7 @@ use openshell_core::proto::{
     SandboxRestartPolicy, SandboxSpec, SandboxStatus, SandboxTemplate, SandboxWorkloadTemplate,
     ServiceEndpoint, SshSession,
 };
+use openshell_core::rpc_error::{is_mutation_lock_timeout, rebuild_with_message};
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace, SetResourceVersion};
 use prost::Message;
@@ -1968,8 +1969,8 @@ impl ComputeRuntime {
         )
         .await
         .unwrap_or_else(|_| {
-            Status::new(
-                fallback.code(),
+            rebuild_with_message(
+                &fallback,
                 format!(
                     "{}; failed-create cleanup worker failed",
                     fallback.message()
@@ -1993,28 +1994,61 @@ impl ComputeRuntime {
         {
             Ok(BeginDelete::Started(transition)) => *transition,
             Ok(BeginDelete::AlreadyDeleting) => {
-                return Status::new(
-                    original.code(),
+                return rebuild_with_message(
+                    &original,
                     format!(
                         "{}; cleanup after failed create was already claimed",
                         original.message()
                     ),
                 );
             }
-            Err(error)
-                if matches!(
-                    error.code(),
-                    Code::DeadlineExceeded | Code::Aborted | Code::FailedPrecondition
-                ) =>
-            {
+            Err(error) if error.code() == Code::DeadlineExceeded => {
+                // The preparation deadline expired while the driver call was in
+                // flight. That timeout diagnosis is the authoritative create
+                // outcome (the client and the create-retry layer key on it),
+                // so it replaces the driver's late error. A create that already
+                // lost the mutation lock keeps its retry contract instead: the
+                // deadline is the cleanup outcome, not the create failure, and
+                // the client must still see the lock-timeout details.
+                if is_mutation_lock_timeout(&original) {
+                    return rebuild_with_message(
+                        &original,
+                        format!(
+                            "{}; cleanup after failed create hit the provisioning deadline: {}",
+                            original.message(),
+                            error.message()
+                        ),
+                    );
+                }
+                return error;
+            }
+            Err(error) if matches!(error.code(), Code::Aborted | Code::FailedPrecondition) => {
+                // A concurrent operation superseded this attempt. The
+                // begin-delete error is the authoritative outcome for every
+                // other original: `RESOURCE_VERSION_CONFLICT` tells the caller
+                // to read the resource again, so replacing it with the create
+                // failure would hide that contract. A create that lost the
+                // mutation lock keeps its retry contract instead, because the
+                // client keys on that reason, and the message reports the
+                // begin-delete outcome.
+                if is_mutation_lock_timeout(&original) {
+                    return rebuild_with_message(
+                        &original,
+                        format!(
+                            "{}; cleanup after failed create could not proceed: {}",
+                            original.message(),
+                            error.message()
+                        ),
+                    );
+                }
                 return error;
             }
             Err(error) => {
                 // A failed store read or CAS cannot establish cleanup
                 // ownership. Keep the record for authoritative cleanup; an
                 // unclaimed DELETE could destroy a newer same-ID runtime.
-                return Status::new(
-                    original.code(),
+                return rebuild_with_message(
+                    &original,
                     format!(
                         "{}; cleanup after failed create could not claim the sandbox record: {}",
                         original.message(),
@@ -2041,8 +2075,8 @@ impl ComputeRuntime {
                         .await
                     {
                         Ok(_) => original,
-                        Err(error) => Status::new(
-                            original.code(),
+                        Err(error) => rebuild_with_message(
+                            &original,
                             format!(
                                 "{}; cleanup after failed create remains pending: {}",
                                 original.message(),
@@ -2056,8 +2090,8 @@ impl ComputeRuntime {
                 {
                     original
                 } else {
-                    Status::new(
-                        original.code(),
+                    rebuild_with_message(
+                        &original,
                         format!(
                             "{}; cleanup after failed create remains pending",
                             original.message()
@@ -2069,8 +2103,8 @@ impl ComputeRuntime {
                 // This sandbox never finished creation. Unlike a user-requested
                 // delete, it must not recover back to its previous live phase.
                 // Keep Deleting and credential ownership for reconciliation.
-                Status::new(
-                    original.code(),
+                rebuild_with_message(
+                    &original,
                     format!(
                         "{}; cleanup after failed create remains pending: {}",
                         original.message(),
@@ -5029,7 +5063,8 @@ impl ComputeRuntime {
             if let Err(error) = self.recover_pending_sandbox_updates().await {
                 warn!(%error, "Sandbox update recovery sweep failed");
             }
-            if let Err(err) = self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD).await {
+            if let Err(err) = Box::pin(self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD)).await
+            {
                 warn!(error = %err, "Store reconciliation sweep failed");
             }
             tokio::select! {
@@ -5041,7 +5076,7 @@ impl ComputeRuntime {
 
     async fn restart_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
-            if let Err(err) = self.restart_due_sandboxes().await {
+            if let Err(err) = Box::pin(self.restart_due_sandboxes()).await {
                 warn!(error = %err, "Sandbox restart sweep failed");
             }
             tokio::select! {
@@ -5576,6 +5611,7 @@ impl ComputeRuntime {
                 continue;
             }
 
+            // Boxed so this sweep's future stays small for its callers.
             Box::pin(self.prune_missing_sandbox(record, sweep_started_at_ms, grace_ms))
                 .await
                 .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?;
@@ -5673,7 +5709,8 @@ impl ComputeRuntime {
         let stopped_bootstrap =
             existing_phase == SandboxPhase::Stopped && driver_snapshot_confirms_starting(&incoming);
         if existing_phase != SandboxPhase::Starting && !ready_container_exit && !stopped_bootstrap {
-            return self.apply_sandbox_update_locked(incoming, existing).await;
+            // Boxed so this update's future stays small for its callers.
+            return Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await;
         }
 
         // Any snapshot can already be queued when StartSandbox moves the
@@ -5727,7 +5764,7 @@ impl ComputeRuntime {
             Ok(Some(_) | None) | Err(_) => {}
         }
 
-        self.apply_sandbox_update_locked(incoming, existing).await
+        Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await
     }
 
     async fn apply_sandbox_update_locked(
@@ -8941,6 +8978,45 @@ mod tests {
     }
 
     #[test]
+    fn cedar_readiness_waits_for_supervisor_configuration_admission() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission,
+        };
+        for connected in [false, true] {
+            let mut sandbox = Sandbox::default();
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
+            sandbox.spec.get_or_insert_with(Default::default).policy = Some(PublicSandboxPolicy {
+                cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                    source: "permit(principal, action, resource);".to_string(),
+                }),
+                ..Default::default()
+            });
+            sandbox.status.as_mut().unwrap().configuration_admission =
+                Some(SandboxConfigurationAdmission {
+                    instance_id: "supervisor".to_string(),
+                    state: Admission::Pending.into(),
+                    ..Default::default()
+                });
+            let incoming = ready_driver_sandbox("sandbox", "sandbox");
+            apply_driver_snapshot(&mut sandbox, &incoming, connected, false);
+            assert_eq!(sandbox.phase(), SandboxPhase::Provisioning as i32);
+
+            if connected {
+                sandbox
+                    .status
+                    .as_mut()
+                    .unwrap()
+                    .configuration_admission
+                    .as_mut()
+                    .unwrap()
+                    .state = Admission::Accepted.into();
+                apply_driver_snapshot(&mut sandbox, &incoming, true, false);
+                assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
+            }
+        }
+    }
+
+    #[test]
     fn configuration_admission_preserves_starting_for_early_exit_reports() {
         use openshell_core::proto::{
             ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission,
@@ -9536,6 +9612,9 @@ mod tests {
     enum ControlledDeleteOutcome {
         Ok(bool),
         Error(&'static str),
+        /// Panic inside the driver call, so the compensation worker's
+        /// `JoinHandle` fails the way a panicking worker would.
+        Panic,
     }
 
     #[derive(Clone)]
@@ -10077,6 +10156,9 @@ mod tests {
                     Ok(tonic::Response::new(DeleteSandboxResponse { deleted }))
                 }
                 ControlledDeleteOutcome::Error(message) => Err(Status::internal(message)),
+                ControlledDeleteOutcome::Panic => {
+                    panic!("injected failed-create cleanup worker panic")
+                }
             }
         }
 
@@ -10513,8 +10595,7 @@ mod tests {
                 .unwrap();
             assert_eq!(retained.phase(), SandboxPhase::Deleting as i32);
             assert_eq!(credentials.stored_credential_count(), Some(1));
-            runtime
-                .reconcile_store_with_backend(Duration::ZERO)
+            Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
                 .await
                 .unwrap();
             assert!(
@@ -10612,8 +10693,7 @@ mod tests {
         assert_eq!(retained.phase(), SandboxPhase::Deleting as i32);
         assert_eq!(credentials.stored_credential_count(), Some(1));
         driver.set_get_outcome(ControlledGetOutcome::Missing);
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
         assert!(
@@ -11752,7 +11832,7 @@ mod tests {
         });
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.restart_due_sandboxes().await.unwrap();
+        Box::pin(runtime.restart_due_sandboxes()).await.unwrap();
 
         assert_eq!(driver.stop_calls(), 1);
         assert_eq!(driver.start_calls(), 1);
@@ -12382,6 +12462,7 @@ mod tests {
             target_port: 8080,
             domain: true,
             authorization_mode: ServiceAuthorizationMode::Strip as i32,
+            backend_http_version: 0,
         }
     }
 
@@ -16093,8 +16174,7 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -17545,8 +17625,7 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         register_test_supervisor_session(&runtime, "sb-1");
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -17678,8 +17757,7 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
 
         let traced = test_exporter::install_traced();
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -17757,8 +17835,7 @@ mod tests {
         }))
         .await;
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -17806,8 +17883,7 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         register_test_supervisor_session(&runtime, "sb-1");
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -17870,8 +17946,7 @@ mod tests {
 
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe(sandbox.object_id());
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -20479,6 +20554,8 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                 )
                 .await;
             if generation_changed {
+                // The begin-delete outcome stays authoritative for a create
+                // failure that is not a mutation lock timeout.
                 assert_eq!(error.code(), Code::Aborted);
             } else {
                 assert!(
@@ -20502,6 +20579,244 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                 retained
             );
         }
+    }
+
+    /// A create that lost the mutation lock budget, as the grpc layer reports
+    /// it: `UNAVAILABLE` with the shared reason and retry delay.
+    fn lock_timeout_status() -> Status {
+        openshell_core::rpc_error::unavailable(
+            openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT,
+            "create sandbox timed out waiting for a concurrent mutation; retry the request",
+            Duration::from_secs(1),
+        )
+    }
+
+    fn assert_retryable_lock_timeout(status: &Status, what: &str) {
+        assert_eq!(status.code(), Code::Unavailable, "{what}: {status:?}");
+        let details = openshell_core::rpc_error::decode_details(status)
+            .unwrap_or_else(|| panic!("{what}: details must survive: {status:?}"));
+        assert_eq!(
+            details.error_info().expect("error info").reason,
+            openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT,
+            "{what}"
+        );
+        assert_eq!(
+            details.retry_info().expect("retry info").retry_delay,
+            Some(Duration::from_secs(1)),
+            "{what}"
+        );
+    }
+
+    async fn compensate_lock_timeout(runtime: &ComputeRuntime, created: &Sandbox) -> Status {
+        let gate = runtime.lifecycle_gates.lock_for(created.object_id()).await;
+        let sandbox_guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
+        runtime
+            .compensate_failed_create(created, gate, Some(sandbox_guard), lock_timeout_status())
+            .await
+    }
+
+    /// Every branch that rebuilds a failed create's status keeps the retry
+    /// contract the create failure carried.
+    #[tokio::test]
+    async fn compensate_failed_create_keeps_lock_timeout_details() {
+        // Another request already claimed the cleanup.
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-lock-claimed", "lock-claimed", SandboxPhase::Deleting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let error = compensate_lock_timeout(&runtime, &sandbox).await;
+        assert!(
+            error.message().contains("was already claimed"),
+            "{}",
+            error.message()
+        );
+        assert_retryable_lock_timeout(&error, "already claimed");
+        assert_eq!(driver.delete_calls(), 0);
+
+        // A concurrent operation replaced the attempt, so begin-delete fails.
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-lock-replaced",
+            "lock-replaced",
+            SandboxPhase::Provisioning,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let owned = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox.object_id(),
+                sandbox_resource_version(&owned),
+                |current| {
+                    current.metadata.as_mut().unwrap().annotations.insert(
+                        crate::auth::sandbox_session::RUNTIME_GENERATION_ANNOTATION.into(),
+                        "replacement-generation".into(),
+                    );
+                },
+            )
+            .await
+            .unwrap();
+        let error = compensate_lock_timeout(&runtime, &owned).await;
+        assert!(
+            error.message().contains("could not proceed"),
+            "{}",
+            error.message()
+        );
+        assert_retryable_lock_timeout(&error, "superseded");
+        assert_eq!(driver.delete_calls(), 0);
+
+        // The store rejects the claim to Deleting.
+        let driver = ControlledDriver::new();
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.store = Arc::new(Store::connect(&database_url).await.unwrap());
+        let pool = sqlx::SqlitePool::connect(&database_url).await.unwrap();
+        let sandbox = sandbox_record(
+            "sb-lock-unclaimed",
+            "lock-unclaimed",
+            SandboxPhase::Provisioning,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let owned = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("CREATE TRIGGER reject_cleanup_claim BEFORE UPDATE ON objects BEGIN SELECT RAISE(ABORT, 'transient store failure'); END").execute(&pool).await.unwrap();
+        let error = compensate_lock_timeout(&runtime, &owned).await;
+        assert!(
+            error
+                .message()
+                .contains("could not claim the sandbox record"),
+            "{}",
+            error.message()
+        );
+        assert_retryable_lock_timeout(&error, "unclaimed");
+
+        // The driver rejects the backend deletion.
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("driver delete failed"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-lock-pending",
+            "lock-pending",
+            SandboxPhase::Provisioning,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let error = compensate_lock_timeout(&runtime, &sandbox).await;
+        assert!(
+            error
+                .message()
+                .contains("remains pending: driver delete failed"),
+            "{}",
+            error.message()
+        );
+        assert_retryable_lock_timeout(&error, "pending delete");
+        assert_eq!(driver.delete_calls(), 1);
+
+        // Compensation that changes nothing returns the create failure as is.
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-lock-absent", "lock-absent", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let error = compensate_lock_timeout(&runtime, &sandbox).await;
+        assert_eq!(error.message(), lock_timeout_status().message());
+        assert_retryable_lock_timeout(&error, "unchanged");
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A compensation worker that panics never returns a status of its own, so
+    /// the fallback must rebuild the create failure instead of replacing it.
+    /// Losing the details here would silently disable client retry.
+    #[tokio::test]
+    async fn compensate_failed_create_worker_panic_keeps_lock_timeout_details() {
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Panic);
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-lock-worker-panic",
+            "lock-worker-panic",
+            SandboxPhase::Provisioning,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let error = compensate_lock_timeout(&runtime, &sandbox).await;
+        assert!(
+            error
+                .message()
+                .contains("failed-create cleanup worker failed"),
+            "{}",
+            error.message()
+        );
+        assert_retryable_lock_timeout(&error, "worker panic");
+        assert_eq!(driver.delete_calls(), 1);
+    }
+
+    /// A create that lost the mutation lock and whose compensation then hits
+    /// the provisioning deadline must still surface the lock-timeout retry
+    /// signal: the deadline is the cleanup outcome, not the create failure.
+    #[tokio::test]
+    async fn compensate_failed_create_keeps_lock_timeout_details_on_cleanup_deadline() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let now = openshell_core::time::now_ms();
+        let mut sandbox = sandbox_record(
+            "sb-lock-cleanup-deadline",
+            "lock-cleanup-deadline",
+            SandboxPhase::Provisioning,
+        );
+        sandbox.status.as_mut().unwrap().provisioning = Some(
+            provisioning_deadline::new_preparation_record(now, 300, 300_000),
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let owned = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox.object_id(),
+                sandbox_resource_version(&owned),
+                |current| {
+                    current
+                        .status
+                        .as_mut()
+                        .unwrap()
+                        .provisioning
+                        .as_mut()
+                        .unwrap()
+                        .timeout_time =
+                        openshell_core::time::timestamp_from_millis(now + 1_000).ok();
+                },
+            )
+            .await
+            .unwrap();
+        let error = compensate_lock_timeout(&runtime, &owned).await;
+        assert!(
+            error.message().contains("provisioning deadline expired"),
+            "{}",
+            error.message()
+        );
+        assert_retryable_lock_timeout(&error, "cleanup deadline");
+        assert_eq!(driver.delete_calls(), 0);
     }
 
     #[tokio::test]

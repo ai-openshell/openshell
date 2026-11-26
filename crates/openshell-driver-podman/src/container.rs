@@ -127,7 +127,7 @@ impl PodmanSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        serde_json::from_value(proto_struct::struct_to_json_value(config)).map_err(|err| {
+        proto_struct::from_struct(config).map_err(|err| {
             ComputeDriverError::InvalidArgument(format!("invalid podman driver_config: {err}"))
         })
     }
@@ -1047,8 +1047,7 @@ fn podman_driver_config(
     let Some(config) = template.driver_config.as_ref() else {
         return Ok(PodmanSandboxDriverConfig::default());
     };
-    let json = Value::Object(proto_struct::struct_to_json_object(config));
-    let config: PodmanSandboxDriverConfig = serde_json::from_value(json)
+    let config: PodmanSandboxDriverConfig = proto_struct::from_struct(config)
         .map_err(|err| format!("invalid podman driver_config: {err}"))?;
     validate_podman_driver_mounts(&config.mounts, enable_bind_mounts)?;
     Ok(config)
@@ -1335,6 +1334,7 @@ fn build_base_spec(
     image_volumes.extend(user_mounts.image_volumes);
     let mut command = vec!["--workdir".to_string(), image.workspace_root.clone()];
     command.extend(upstream_proxy_cli_args(config));
+    command.extend(config.ipv6_egress_config().supervisor_args());
 
     let container_spec = ContainerSpec {
         name,
@@ -3120,6 +3120,36 @@ mod tests {
                 "{key} must not be populated from operator proxy config"
             );
         }
+    }
+
+    #[test]
+    fn container_spec_passes_ipv6_egress_settings_on_supervisor_argv() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        let command = spec_command(&build_container_spec(&sandbox, &config));
+        assert!(
+            !command
+                .iter()
+                .any(|a| a == "--policy-dns-ipv6-egress" || a == "--nat64-prefix"),
+            "no IPv6 egress flags without operator config: {command:?}"
+        );
+
+        config.policy_dns_ipv6_egress = Some(openshell_core::PolicyDnsIpv6Egress::Disabled);
+        config.nat64_prefixes = vec!["64:ff9b:1::/96".to_string()];
+        let command = spec_command(&build_container_spec(&sandbox, &config));
+        let idx = command
+            .iter()
+            .position(|a| a == "--policy-dns-ipv6-egress")
+            .expect("IPv6 egress flag present");
+        assert_eq!(command.get(idx + 1).map(String::as_str), Some("disabled"));
+        let idx = command
+            .iter()
+            .position(|a| a == "--nat64-prefix")
+            .expect("NAT64 prefix flag present");
+        assert_eq!(
+            command.get(idx + 1).map(String::as_str),
+            Some("64:ff9b:1::/96")
+        );
     }
 
     #[test]
