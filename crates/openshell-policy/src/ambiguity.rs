@@ -320,12 +320,14 @@ fn websocket_graphql_policy(endpoint: &NetworkEndpoint) -> bool {
             !allow.operation_type.is_empty()
                 || !allow.operation_name.is_empty()
                 || !allow.fields.is_empty()
+                || !allow.field_rules.is_empty()
         })
     });
     let deny_rule_has_graphql_fields = endpoint.deny_rules.iter().any(|deny| {
         !deny.operation_type.is_empty()
             || !deny.operation_name.is_empty()
             || !deny.fields.is_empty()
+            || !deny.field_rules.is_empty()
     });
 
     !endpoint.graphql_persisted_queries.is_empty()
@@ -356,7 +358,10 @@ fn normalized_tls(value: i32) -> i32 {
 }
 
 fn normalized_enforcement(value: i32) -> i32 {
-    if value == NetworkEnforcementMode::Enforce as i32 {
+    if matches!(
+        NetworkEnforcementMode::try_from(value),
+        Ok(NetworkEnforcementMode::Enforce | NetworkEnforcementMode::GraphqlFieldRulesEnforce)
+    ) {
         NetworkEnforcementMode::Enforce as i32
     } else if NetworkEnforcementMode::try_from(value).is_ok() {
         NetworkEnforcementMode::Audit as i32

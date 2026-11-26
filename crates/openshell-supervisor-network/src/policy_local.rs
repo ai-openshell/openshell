@@ -1285,6 +1285,7 @@ fn network_endpoint_from_json(
                 operation_type: String::new(),
                 operation_name: String::new(),
                 fields: Vec::new(),
+                field_rules: Vec::new(),
                 params: HashMap::new(),
             }),
         })
@@ -1300,6 +1301,7 @@ fn network_endpoint_from_json(
             operation_type: String::new(),
             operation_name: String::new(),
             fields: Vec::new(),
+            field_rules: Vec::new(),
             params: HashMap::new(),
         })
         .collect();

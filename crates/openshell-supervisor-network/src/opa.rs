@@ -4785,6 +4785,51 @@ network_policies:
         access: read-only
     binaries:
       - { path: /usr/bin/curl }
+  graphql_scoped:
+    name: graphql_scoped
+    endpoints:
+      - host: scoped.graphql.com
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        persisted_queries: allow_registered
+        graphql_persisted_queries:
+          scoped-hash:
+            operation_type: query
+            fields: [repository]
+        rules:
+          - allow:
+              operation_type: query
+              field_rules:
+                - path: repository
+                  arguments:
+                    owner: { exact: acme }
+                    name: { exact: project }
+                - path: repository
+                  arguments:
+                    owner: { exact: other }
+                    name: { exact: second }
+                - path: repository.name
+                - path: repository.description
+                - path: repository.issues
+          - allow:
+              operation_type: mutation
+              field_rules:
+                - path: createPullRequest
+                  arguments:
+                    input.repositoryId: { exact: R_APPROVED }
+                - path: createPullRequest.pullRequest
+                - path: createPullRequest.pullRequest.url
+        deny_rules:
+          - operation_type: query
+            field_rules:
+              - path: repository.description
+              - path: repository.issues
+                arguments:
+                  state: { exact: blocked }
+                  label: { exact: forbidden }
+    binaries:
+      - { path: /usr/bin/curl }
   graphql_ws:
     name: graphql_ws
     endpoints:
@@ -5242,6 +5287,7 @@ process:
                             operation_type: String::new(),
                             operation_name: String::new(),
                             fields: Vec::new(),
+                            field_rules: Vec::new(),
                             params: std::collections::HashMap::new(),
                         }),
                     }],
@@ -5377,6 +5423,99 @@ process:
             }]),
         );
         assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_field_occurrences_are_scoped_and_correlated() {
+        let engine = l7_engine();
+        let query = |occurrences: serde_json::Value| {
+            l7_graphql_input(
+                "scoped.graphql.com",
+                serde_json::json!([{
+                    "operation_type": "query",
+                    "fields": ["repository"],
+                    "field_occurrences": occurrences
+                }]),
+            )
+        };
+        let approved = serde_json::json!([
+            {"path":"repository","arguments":{"owner":"acme","name":"project"}},
+            {"path":"repository.name","arguments":{}}
+        ]);
+        assert!(eval_l7(&engine, &query(approved.clone())));
+
+        // The owner and name must match one field rule together.
+        let mismatched_pair = serde_json::json!([
+            {"path":"repository","arguments":{"owner":"acme","name":"second"}},
+            {"path":"repository.name","arguments":{}}
+        ]);
+        assert!(!eval_l7(&engine, &query(mismatched_pair)));
+
+        // Repeating the root via an alias cannot use the first occurrence's arguments.
+        let mut repeated = approved.clone();
+        repeated.as_array_mut().unwrap().push(serde_json::json!({
+            "path":"repository","arguments":{"owner":"foreign","name":"project"}
+        }));
+        assert!(!eval_l7(&engine, &query(repeated)));
+
+        let mut forbidden = approved.clone();
+        forbidden.as_array_mut().unwrap().push(serde_json::json!({
+            "path":"repository.description","arguments":{}
+        }));
+        assert!(!eval_l7(&engine, &query(forbidden)));
+
+        let constrained_deny = |arguments| {
+            let mut occurrences = approved.clone();
+            occurrences.as_array_mut().unwrap().push(serde_json::json!({
+                "path":"repository.issues","arguments":arguments
+            }));
+            query(occurrences)
+        };
+        assert!(eval_l7(
+            &engine,
+            &constrained_deny(serde_json::json!({"state":"open"}))
+        ));
+        assert!(!eval_l7(
+            &engine,
+            &constrained_deny(serde_json::json!({"state":"blocked"}))
+        ));
+
+        let mut unlisted = approved;
+        unlisted.as_array_mut().unwrap().push(serde_json::json!({
+            "path":"repository.parent","arguments":{}
+        }));
+        assert!(!eval_l7(&engine, &query(unlisted)));
+    }
+
+    #[test]
+    fn l7_graphql_mutation_matches_resolved_nested_argument_and_rejects_hash_only() {
+        let engine = l7_engine();
+        let mutation = |repository_id: &str| {
+            l7_graphql_input(
+                "scoped.graphql.com",
+                serde_json::json!([{
+                    "operation_type":"mutation",
+                    "fields":["createPullRequest"],
+                    "field_occurrences":[
+                        {"path":"createPullRequest","arguments":{"input":{"repositoryId":repository_id}}},
+                        {"path":"createPullRequest.pullRequest","arguments":{}},
+                        {"path":"createPullRequest.pullRequest.url","arguments":{}}
+                    ]
+                }]),
+            )
+        };
+        assert!(eval_l7(&engine, &mutation("R_APPROVED")));
+        assert!(!eval_l7(&engine, &mutation("R_FOREIGN")));
+        let persisted = l7_graphql_input(
+            "scoped.graphql.com",
+            serde_json::json!([{
+                "operation_type":"",
+                "fields":[],
+                "persisted_query":true,
+                "persisted_query_hash":"scoped-hash"
+            }]),
+        );
+        assert!(!eval_l7(&engine, &persisted));
     }
 
     #[test]
@@ -5868,6 +6007,7 @@ network_policies:
                             operation_type: String::new(),
                             operation_name: String::new(),
                             fields: Vec::new(),
+                            field_rules: Vec::new(),
                             params: std::collections::HashMap::new(),
                         }),
                     }],
@@ -5942,6 +6082,7 @@ network_policies:
                             operation_type: String::new(),
                             operation_name: String::new(),
                             fields: Vec::new(),
+                            field_rules: Vec::new(),
                             params: std::collections::HashMap::new(),
                         }),
                     }],
@@ -6021,6 +6162,7 @@ network_policies:
                             operation_type: String::new(),
                             operation_name: String::new(),
                             fields: Vec::new(),
+                            field_rules: Vec::new(),
                             params,
                         }),
                     }],

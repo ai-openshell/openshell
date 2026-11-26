@@ -104,6 +104,8 @@ pub struct RuleMatcher {
     pub operation_name: Option<String>,
     /// GraphQL root field globs.
     pub fields: Vec<String>,
+    /// Fine-grained GraphQL field and argument rules are present.
+    pub has_field_rules: bool,
     /// Query parameter matchers by key.
     pub query: BTreeMap<String, ValueMatcher>,
     /// JSON-RPC params matchers by key.
@@ -1269,10 +1271,18 @@ fn graphql_cond(scope: &mut Scope, rule: &RuleMatcher, allow: bool) -> Cond {
         None | Some("") => Cond::TRUE,
         Some(name) => scope.glob("context.graphql_operation_name", name, '.'),
     };
+    // Cedar's HttpRequest context currently contains root fields only. A
+    // credential permit must not discard a nested or argument restriction.
+    let field_rules = if rule.has_field_rules {
+        scope.unsupported("GraphQL field and argument rules are unavailable in Cedar")
+    } else {
+        Cond::TRUE
+    };
     Cond::all([
         operation_type,
         name,
         fields_cond(scope, &rule.fields, allow),
+        field_rules,
     ])
 }
 
@@ -1818,6 +1828,44 @@ mod tests {
                 &[rest("POST", "/graphql"), operation("query", "", &["a"])]
             ),
             ["r"]
+        );
+    }
+
+    #[test]
+    fn graphql_field_rules_never_widen_cedar_token_authority() {
+        let constrained = RuleMatcher {
+            operation_type: Some("query".to_string()),
+            has_field_rules: true,
+            ..Default::default()
+        };
+        let rules = compile(&[policy(
+            "p",
+            vec![endpoint("g", "graphql", vec![constrained.clone()])],
+        )]);
+        assert!(owners(&rules, &[operation("query", "", &["repository"])]).is_empty());
+        assert!(
+            rules
+                .untranslated()
+                .iter()
+                .any(|item| item.handling == Handling::PermitDropped)
+        );
+
+        let mut endpoint = endpoint(
+            "g",
+            "graphql",
+            vec![RuleMatcher {
+                operation_type: Some("query".to_string()),
+                ..Default::default()
+            }],
+        );
+        endpoint.deny_rules.push(constrained);
+        let rules = compile(&[policy("p", vec![endpoint])]);
+        assert!(owners(&rules, &[operation("query", "", &["repository"])]).is_empty());
+        assert!(
+            rules
+                .untranslated()
+                .iter()
+                .any(|item| item.handling == Handling::ForbidWidened)
         );
     }
 

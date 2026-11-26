@@ -2812,30 +2812,27 @@ pub(super) async fn handle_get_sandbox_config(
     request: Request<GetSandboxConfigRequest>,
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let sandbox_name = request.get_ref().name.clone();
-    let workspace = match (&principal, request.get_ref().workspace_scope.as_ref()) {
-        (Principal::Sandbox(_), None) => String::new(),
-        (_, selector) => selected_workspace_name(selector)?.to_string(),
+    let req = request.into_inner();
+    let workspace = match &principal {
+        Principal::Sandbox(_) if req.workspace_scope.is_none() => "",
+        _ => selected_workspace_name(req.workspace_scope.as_ref())?,
     };
-    let result = handle_get_sandbox_config_inner(state, request).await;
-    match result {
-        Err(error)
-            if matches!(principal, Principal::Sandbox(_)) && is_configuration_rejection(&error) =>
-        {
-            let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
-                state,
-                &principal,
-                &sandbox_name,
-                &workspace,
-                MinWorkspaceRole::User,
-            )
-            .await?;
-            Ok(Response::new(sandbox_config_response(
-                unadmitted_sandbox_config(state, &sandbox, &error),
-            )))
-        }
-        result => result,
-    }
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.name,
+        workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let config = if matches!(principal, Principal::Sandbox(_)) {
+        let config = load_supervisor_sandbox_config(state, &sandbox).await?;
+        require_policy_capabilities(req.supported_capabilities, config.policy.as_ref())?;
+        config
+    } else {
+        load_sandbox_config(state, &sandbox).await?
+    };
+    Ok(Response::new(config))
 }
 
 /// Whether a configuration build failed on the stored configuration itself,
@@ -2875,34 +2872,26 @@ pub fn unadmitted_sandbox_config(
     }
 }
 
-async fn handle_get_sandbox_config_inner(
+/// Resolve an authorized sandbox's configuration with the supervisor's
+/// redacted rejection response. Configuration delivery checks the peer's
+/// capabilities separately.
+pub(super) async fn load_supervisor_sandbox_config(
     state: &Arc<ServerState>,
-    request: Request<GetSandboxConfigRequest>,
-) -> Result<Response<GetSandboxConfigResponse>, Status> {
-    let principal = super::extract_principal(&request)?;
-    let req = request.into_inner();
-    let workspace = match &principal {
-        Principal::Sandbox(_) if req.workspace_scope.is_none() => "",
-        _ => selected_workspace_name(req.workspace_scope.as_ref())?,
-    };
-    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
-        state,
-        &principal,
-        &req.name,
-        workspace,
-        MinWorkspaceRole::User,
-    )
-    .await?;
-    let config = load_sandbox_config(state, &sandbox).await?;
-    if matches!(principal, Principal::Sandbox(_)) {
-        require_policy_capabilities(req.supported_capabilities, config.policy.as_ref())?;
+    sandbox: &Sandbox,
+) -> Result<GetSandboxConfigResponse, Status> {
+    match load_sandbox_config(state, sandbox).await {
+        Err(error) if is_configuration_rejection(&error) => Ok(sandbox_config_response(
+            unadmitted_sandbox_config(state, sandbox, &error),
+        )),
+        result => result,
     }
-    Ok(Response::new(config))
 }
 
 const CEDAR_SUPPORT_REQUIRED: &str = "Cedar policy requires a supervisor with Cedar support";
+const GRAPHQL_FIELD_RULES_SUPPORT_REQUIRED: &str =
+    "GraphQL field rules require a supervisor with GraphQL field-rule support";
 
-/// Refuses a Cedar policy to a supervisor that did not report Cedar support.
+/// Refuses a policy to a supervisor that did not report the required support.
 ///
 /// Callers must not answer with an empty compatibility configuration
 /// instead: an older supervisor might treat it as a usable YAML
@@ -2919,7 +2908,24 @@ pub fn require_policy_capabilities(
     {
         return Err(Status::unimplemented(CEDAR_SUPPORT_REQUIRED));
     }
+    if policy.is_some_and(uses_graphql_field_rules)
+        && !openshell_core::extension_protocol::has_capability(
+            &supported_capabilities,
+            openshell_core::extension_protocol::POLICY_GRAPHQL_FIELD_RULES_V1,
+        )
+    {
+        return Err(Status::unimplemented(GRAPHQL_FIELD_RULES_SUPPORT_REQUIRED));
+    }
     Ok(())
+}
+
+fn uses_graphql_field_rules(policy: &ProtoSandboxPolicy) -> bool {
+    policy
+        .network_policies
+        .values()
+        .chain(policy.provider_credential_rules.values())
+        .flat_map(|rule| &rule.endpoints)
+        .any(openshell_core::policy_l7::has_graphql_field_rules)
 }
 
 /// Resolve the same effective configuration for authenticated RPCs and trusted
@@ -5117,6 +5123,9 @@ fn configuration_failure_diagnostic(error: &Status) -> &'static str {
     let message = error.message();
     if error.code() == Code::Unimplemented && message == CEDAR_SUPPORT_REQUIRED {
         "Effective policy is a Cedar policy, which this supervisor cannot enforce; run the sandbox with a supervisor built with Cedar support or set a YAML policy"
+    } else if error.code() == Code::Unimplemented && message == GRAPHQL_FIELD_RULES_SUPPORT_REQUIRED
+    {
+        "Effective policy needs GraphQL field-rule enforcement; use a supervisor that supports GraphQL field rules"
     } else if message.contains("middleware") {
         "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
     } else if message.contains("credential") || message.contains("provider") {
@@ -5179,8 +5188,6 @@ pub(super) async fn handle_report_sandbox_configuration(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_name = sandbox.object_name().to_string();
-    let workspace = sandbox.object_workspace().to_string();
     crate::compute::provisioning_deadline::refresh_configuration(
         &state.store,
         &mut sandbox,
@@ -5215,17 +5222,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         ));
     }
     if reported == ConfigurationAdmissionState::Accepted {
-        let mut config_request = Request::new(GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-            ],
-            name: sandbox_name.clone(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
-        });
-        *config_request.extensions_mut() = request.extensions().clone();
-        let config = handle_get_sandbox_config(state, config_request)
-            .await?
-            .into_inner();
+        let config = load_supervisor_sandbox_config(state, &sandbox).await?;
         if !config.configuration_admitted || !configuration_generation_matches(&admission, &config)
         {
             return Err(Status::aborted(
@@ -5236,19 +5233,11 @@ pub(super) async fn handle_report_sandbox_configuration(
     } else if reported == ConfigurationAdmissionState::Rejected {
         // Runtime error strings may contain parser payloads. Only gateway-authored
         // diagnostics may be exposed verbatim through public sandbox status.
-        let mut config_request = Request::new(GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-            ],
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
-            name: sandbox_name,
-        });
-        *config_request.extensions_mut() = request.extensions().clone();
-        admission.error = match handle_get_sandbox_config(state, config_request).await {
-            Ok(config) if !configuration_generation_matches(&admission, config.get_ref()) => {
+        admission.error = match load_supervisor_sandbox_config(state, &sandbox).await {
+            Ok(config) if !configuration_generation_matches(&admission, &config) => {
                 return Err(Status::aborted("rejected configuration generation has changed"));
             }
-            Ok(config) if !config.get_ref().configuration_error.is_empty() => config.into_inner().configuration_error,
+            Ok(config) if !config.configuration_error.is_empty() => config.configuration_error,
             _ => "Effective configuration could not be activated; replace the policy or repair attached providers".to_string(),
         };
         if let Some(current) = current
@@ -8482,6 +8471,59 @@ mod tests {
     use crate::auth::principal::{Principal, UserPrincipal};
     use crate::grpc::test_support::{authed_request, test_server_state};
 
+    #[test]
+    fn graphql_field_rules_require_supervisor_support() {
+        use openshell_core::proto::{GraphqlFieldRule, L7Allow, NetworkEnforcementMode};
+
+        let selected = GraphqlFieldRule {
+            path: "repository".to_string(),
+            ..Default::default()
+        };
+        let allow = NetworkEndpoint {
+            protocol: "graphql".to_string(),
+            enforcement: NetworkEnforcementMode::GraphqlFieldRulesEnforce as i32,
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    field_rules: vec![selected.clone()],
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let deny = NetworkEndpoint {
+            protocol: "graphql".to_string(),
+            enforcement: NetworkEnforcementMode::GraphqlFieldRulesEnforce as i32,
+            deny_rules: vec![L7DenyRule {
+                field_rules: vec![selected],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (endpoint, provider_rule) in [(allow, false), (deny, true)] {
+            let rule = NetworkPolicyRule {
+                endpoints: vec![endpoint],
+                ..Default::default()
+            };
+            let mut policy = ProtoSandboxPolicy::default();
+            if provider_rule {
+                policy
+                    .provider_credential_rules
+                    .insert("provider".into(), rule);
+            } else {
+                policy.network_policies.insert("network".into(), rule);
+            }
+            let error = require_policy_capabilities(Vec::new(), Some(&policy)).unwrap_err();
+            assert_eq!(error.code(), Code::Unimplemented);
+            assert_eq!(error.message(), GRAPHQL_FIELD_RULES_SUPPORT_REQUIRED);
+            require_policy_capabilities(
+                vec![openshell_core::extension_protocol::POLICY_GRAPHQL_FIELD_RULES_V1.into()],
+                Some(&policy),
+            )
+            .unwrap();
+        }
+        require_policy_capabilities(Vec::new(), Some(&ProtoSandboxPolicy::default())).unwrap();
+    }
+
     /// An in-memory store with the example profiles imported at platform scope.
     ///
     /// Provider profiles are import-only, so a gateway resolves only what an
@@ -9363,14 +9405,27 @@ mod tests {
         };
         let state = test_server_state().await;
         let sandbox_id = "sb-admission";
+        let policy = openshell_policy::parse_sandbox_policy(
+            r"version: 1
+network_policies:
+  graphql:
+    name: graphql
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        rules:
+          - allow:
+              operation_type: query
+              field_rules: [{path: viewer}, {path: viewer.id}]
+    binaries: [{path: /usr/bin/curl}]
+",
+        )
+        .unwrap();
         state
             .store
-            .put_message(&test_sandbox(
-                sandbox_id,
-                "admission",
-                openshell_policy::restrictive_default_policy(),
-                Vec::new(),
-            ))
+            .put_message(&test_sandbox(sandbox_id, "admission", policy, Vec::new()))
             .await
             .unwrap();
         let instance_id = uuid::Uuid::new_v4().to_string();
@@ -9394,18 +9449,26 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut config_request = GetSandboxConfigRequest {
+            name: "admission".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            ..Default::default()
+        };
+        let error = handle_get_sandbox_config(
+            &state,
+            with_sandbox(Request::new(config_request.clone()), sandbox_id),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::Unimplemented);
+        config_request
+            .supported_capabilities
+            .push(openshell_core::extension_protocol::POLICY_GRAPHQL_FIELD_RULES_V1.to_string());
         let config = handle_get_sandbox_config(
             &state,
-            with_sandbox(
-                Request::new(GetSandboxConfigRequest {
-                    name: "admission".to_string(),
-                    workspace_scope: Some(openshell_core::proto::workspace_selector(
-                        "default".to_string(),
-                    )),
-                    ..Default::default()
-                }),
-                sandbox_id,
-            ),
+            with_sandbox(Request::new(config_request), sandbox_id),
         )
         .await
         .unwrap()
@@ -9872,35 +9935,31 @@ mod tests {
 
         for (case, policy) in cases {
             let sandbox_id = format!("stored-invalid-{case}");
+            let sandbox = test_sandbox(&sandbox_id, &sandbox_id, policy, Vec::new());
             state
                 .store
-                .put_message(&test_sandbox(
-                    &sandbox_id,
-                    &format!("stored-invalid-{case}"),
-                    policy,
-                    Vec::new(),
-                ))
+                .put_message(&sandbox)
                 .await
                 .expect("store legacy sandbox spec");
 
-            let error = handle_get_sandbox_config_inner(
-                &state,
-                with_sandbox(
-                    Request::new(GetSandboxConfigRequest {
-                        name: sandbox_id.clone(),
-                        workspace_scope: None,
-                        ..Default::default()
-                    }),
-                    &sandbox_id,
-                ),
-            )
-            .await
-            .expect_err("invalid stored spec must fail before history backfill");
+            let error = load_sandbox_config(&state, &sandbox)
+                .await
+                .expect_err("invalid stored spec must fail before history backfill");
 
             assert_eq!(error.code(), Code::FailedPrecondition, "{case}");
             assert!(
                 error.message().contains(STORED_POLICY_SOURCE_SPEC),
                 "{case}"
+            );
+            let rejected = load_supervisor_sandbox_config(&state, &sandbox)
+                .await
+                .unwrap();
+            assert!(!rejected.configuration_admitted);
+            assert!(rejected.policy.is_none());
+            assert!(
+                !rejected
+                    .configuration_error
+                    .contains(STORED_POLICY_SOURCE_SPEC)
             );
             assert!(
                 state
@@ -22675,6 +22734,7 @@ mod tests {
                     operation_type: String::new(),
                     operation_name: String::new(),
                     fields: Vec::new(),
+                    field_rules: Vec::new(),
                     params: HashMap::default(),
                 }),
             }],
@@ -23075,6 +23135,7 @@ mod tests {
                     operation_type: String::new(),
                     operation_name: String::new(),
                     fields: Vec::new(),
+                    field_rules: Vec::new(),
                     params: HashMap::default(),
                 }),
             }],
@@ -23256,6 +23317,7 @@ mod tests {
                     operation_type: String::new(),
                     operation_name: String::new(),
                     fields: Vec::new(),
+                    field_rules: Vec::new(),
                     params: HashMap::default(),
                 }),
             }],

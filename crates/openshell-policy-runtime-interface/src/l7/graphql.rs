@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::Serialize;
+use serde_json::{Map, Value};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 
@@ -18,9 +19,19 @@ pub struct GraphqlOperationInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation_name: Option<String>,
     pub fields: Vec<String>,
+    /// Selected schema fields, retaining each occurrence and its own resolved arguments.
+    /// Unavailable for hash-only requests or an envelope that cannot be resolved safely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_occurrences: Option<Vec<GraphqlFieldOccurrence>>,
     pub persisted_query: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persisted_query_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persisted_query_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GraphqlFieldOccurrence {
+    pub path: String,
+    pub arguments: Map<String, Value>,
 }

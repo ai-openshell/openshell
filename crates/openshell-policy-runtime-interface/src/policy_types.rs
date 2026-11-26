@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use miette::Result;
-use openshell_core::policy_l7::L7Protocol;
+use openshell_core::policy_l7::{GraphqlFieldRule, L7Protocol};
 use serde::Deserialize;
 use tokio::sync::watch;
 
@@ -176,6 +176,7 @@ pub struct GraphqlRuleSelectors {
     pub operation_type: String,
     pub operation_name: String,
     pub fields: Vec<String>,
+    pub field_rules: Vec<GraphqlFieldRule>,
 }
 
 impl GraphqlRuleSelectors {
@@ -184,6 +185,7 @@ impl GraphqlRuleSelectors {
         !self.operation_type.is_empty()
             || !self.operation_name.is_empty()
             || !self.fields.is_empty()
+            || !self.field_rules.is_empty()
     }
 }
 

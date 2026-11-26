@@ -105,6 +105,16 @@ pub fn endpoint_policy_value(
                     if !a.fields.is_empty() {
                         allow.insert("fields".to_string(), a.fields.clone().into());
                     }
+                    if !a.field_rules.is_empty() {
+                        allow.insert(
+                            "field_rules".to_string(),
+                            serde_json::json!(
+                                openshell_core::policy_l7::graphql_field_rules_from_proto(
+                                    &a.field_rules
+                                )
+                            ),
+                        );
+                    }
                 }
                 let query = a.map_or_else(serde_json::Map::new, |allow| {
                     l7_matchers_to_json(&allow.query)
@@ -152,6 +162,11 @@ pub fn endpoint_policy_value(
                 }
                 if !d.fields.is_empty() {
                     deny["fields"] = d.fields.clone().into();
+                }
+                if !d.field_rules.is_empty() {
+                    deny["field_rules"] = serde_json::json!(
+                        openshell_core::policy_l7::graphql_field_rules_from_proto(&d.field_rules)
+                    );
                 }
                 let query = l7_matchers_to_json(&d.query);
                 if !query.is_empty() {

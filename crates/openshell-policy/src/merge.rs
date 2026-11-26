@@ -946,10 +946,16 @@ fn protocols_match(left: &str, right: &str) -> bool {
 }
 
 fn effective_enforcement(value: i32) -> i32 {
-    if value == NetworkEnforcementMode::Unspecified as i32 {
-        NetworkEnforcementMode::Audit as i32
-    } else {
-        value
+    match NetworkEnforcementMode::try_from(value) {
+        Ok(
+            NetworkEnforcementMode::Unspecified
+            | NetworkEnforcementMode::Audit
+            | NetworkEnforcementMode::GraphqlFieldRulesAudit,
+        ) => NetworkEnforcementMode::Audit as i32,
+        Ok(NetworkEnforcementMode::Enforce | NetworkEnforcementMode::GraphqlFieldRulesEnforce) => {
+            NetworkEnforcementMode::Enforce as i32
+        }
+        Err(_) => value,
     }
 }
 
@@ -1612,17 +1618,22 @@ fn merge_endpoint(
         existing.json_rpc_max_body_bytes = incoming.json_rpc_max_body_bytes;
     }
     let existing_enforcement = existing.enforcement;
-    merge_enum_field(
-        &mut existing.enforcement,
-        incoming.enforcement,
-        PolicyMergeWarning::ExistingEnforcementRetained {
-            host: host.clone(),
-            port,
-            existing: enforcement_label(existing_enforcement),
-            incoming: enforcement_label(incoming.enforcement),
-        },
-        warnings,
-    );
+    if existing.enforcement == NetworkEnforcementMode::Unspecified as i32
+        || effective_enforcement(existing.enforcement)
+            != effective_enforcement(incoming.enforcement)
+    {
+        merge_enum_field(
+            &mut existing.enforcement,
+            incoming.enforcement,
+            PolicyMergeWarning::ExistingEnforcementRetained {
+                host: host.clone(),
+                port,
+                existing: enforcement_label(existing_enforcement),
+                incoming: enforcement_label(incoming.enforcement),
+            },
+            warnings,
+        );
+    }
     let existing_tls = existing.tls;
     merge_enum_field(
         &mut existing.tls,
@@ -2267,6 +2278,7 @@ fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
                     operation_type: String::new(),
                     operation_name: String::new(),
                     fields: Vec::new(),
+                    field_rules: Vec::new(),
                     params: HashMap::default(),
                 }),
             })
@@ -2324,6 +2336,10 @@ fn normalize_endpoint(endpoint: &mut NetworkEndpoint) {
     dedup_strings(&mut endpoint.allowed_ips);
     dedup_l7_rules(&mut endpoint.rules);
     dedup_deny_rules(&mut endpoint.deny_rules);
+    endpoint.enforcement = openshell_core::policy_l7::graphql_field_rules_enforcement(
+        endpoint.enforcement,
+        openshell_core::policy_l7::has_graphql_field_rules(endpoint),
+    );
     if let Some(options) = endpoint.mcp.as_mut() {
         canonicalize_mcp_options(options);
     }
@@ -2454,6 +2470,7 @@ mod tests {
                 operation_type: String::new(),
                 operation_name: String::new(),
                 fields: Vec::new(),
+                field_rules: Vec::new(),
                 params: HashMap::default(),
             }),
         }
