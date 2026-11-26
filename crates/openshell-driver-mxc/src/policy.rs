@@ -46,6 +46,10 @@ pub struct MapCtx {
     /// Sandbox ID (gateway-assigned). Used as the MXC `containerId` and to
     /// correlate diagnostics.
     pub sandbox_id: String,
+    /// MXC backend selected for this sandbox. Determines the containment
+    /// string handed to the policy mapper: `isolation_session` is grant-only
+    /// (no deny primitive) while `processcontainer` is genuinely default-deny.
+    pub backend: crate::driver::MxcBackend,
     /// Pattern-C governed-egress redirect address. When set, the embedded
     /// mapper uses `split_policy`; otherwise it uses the coarse MXC map.
     pub egress: Option<SocketAddr>,
@@ -139,12 +143,18 @@ impl PolicyMapper for EmbeddedPolicyMapper {
                 Some(addr),
             )
         } else {
-            // Map directly off the typed proto. The default MXC driver path runs
-            // an isolation session, so use that containment: its network branch
-            // yields an `error` loss for any host allowlist, which rejects
-            // network policy below.
+            // Map directly off the typed proto. Containment must reflect the
+            // configured backend: `isolation_session` is grant-only (no deny
+            // primitive) while `processcontainer` is genuinely default-deny.
+            // The isolation_session network branch yields an `error` loss for
+            // any host allowlist, which rejects network policy below; its
+            // filesystem policy likewise fails closed via an error loss.
+            let containment = match ctx.backend {
+                crate::driver::MxcBackend::IsolationSession => "isolation_session",
+                crate::driver::MxcBackend::ProcessContainer => "processcontainer",
+            };
             let opts = crate::policy_map::MxcMappingOptions {
-                containment: "isolation_session".to_owned(),
+                containment: containment.to_owned(),
                 container_id: ctx.sandbox_id.clone(),
                 ..Default::default()
             };
@@ -196,6 +206,7 @@ mod tests {
     fn demo_ctx() -> MapCtx {
         MapCtx {
             sandbox_id: "sb-test".into(),
+            backend: crate::driver::MxcBackend::ProcessContainer,
             egress: None,
         }
     }
@@ -238,7 +249,9 @@ mod tests {
     fn embedded_rejects_network_policy_on_isolation_session() {
         use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
         let mapper = EmbeddedPolicyMapper;
-        let mut policy = fs_policy(&["C:/work/demo"], &[]);
+        // No filesystem policy: the filesystem error loss would mask the
+        // network rejection this test targets.
+        let mut policy = SandboxPolicy::default();
         policy.network_policies.insert(
             "api".to_string(),
             NetworkPolicyRule {
@@ -250,9 +263,27 @@ mod tests {
                 binaries: Vec::new(),
             },
         );
-        let ctx = demo_ctx();
+        let mut ctx = demo_ctx();
+        ctx.backend = crate::driver::MxcBackend::IsolationSession;
         let err = mapper.map(Some(&policy), &ctx).unwrap_err();
         assert!(matches!(err, MapError::Unsupported(_)));
+    }
+
+    #[test]
+    fn embedded_rejects_filesystem_policy_on_isolation_session() {
+        let mapper = EmbeddedPolicyMapper;
+        let policy = fs_policy(&["C:/work/demo"], &[]);
+        let mut ctx = demo_ctx();
+        ctx.backend = crate::driver::MxcBackend::IsolationSession;
+        let err = mapper.map(Some(&policy), &ctx).unwrap_err();
+        let MapError::Unsupported(loss) = err else {
+            panic!("expected unsupported filesystem error");
+        };
+        assert!(
+            loss.iter()
+                .any(|item| item.rule_kind == "filesystem_policy" && item.severity == "error"),
+            "expected an error-severity filesystem_policy loss, got {loss:?}"
+        );
     }
 
     #[test]
@@ -279,7 +310,7 @@ mod tests {
         let proxy_addr = "127.0.0.1:18080".parse().unwrap();
         let ctx = MapCtx {
             sandbox_id: "sb-egress".into(),
-
+            backend: crate::driver::MxcBackend::ProcessContainer,
             egress: Some(proxy_addr),
         };
 
@@ -312,6 +343,7 @@ mod tests {
         );
         let ctx = MapCtx {
             sandbox_id: "sb-egress-middleware".into(),
+            backend: crate::driver::MxcBackend::ProcessContainer,
             egress: Some("127.0.0.1:18080".parse().unwrap()),
         };
 

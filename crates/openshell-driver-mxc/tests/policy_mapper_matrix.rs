@@ -930,6 +930,7 @@ fn b_seam_returns_unsupported_on_error_field() {
     );
     let ctx = MapCtx {
         sandbox_id: "sb-test".into(),
+        backend: openshell_driver_mxc::MxcBackend::IsolationSession,
         egress: None, // coarse path → isolation_session → network policy errors
     };
     let err = mapper.map(Some(&policy), &ctx).unwrap_err();

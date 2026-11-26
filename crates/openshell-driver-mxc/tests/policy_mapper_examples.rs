@@ -395,13 +395,20 @@ fn split_policy_rejects_proxy_redirect_on_isolation_session() {
         .iter()
         .filter(|i| i.severity == "error")
         .collect();
+    // Two error losses are expected: the proxy redirect is unsupported on
+    // isolation_session, and its grant-only filesystem cannot honor the
+    // authored filesystem_policy's default-deny semantics.
     assert_eq!(
         errors.len(),
-        1,
-        "expected one containment error: {errors:?}"
+        2,
+        "expected containment + filesystem errors: {errors:?}"
     );
-    assert_eq!(errors[0].path, "containment");
-    assert!(errors[0].message.contains("MXC M1"));
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.path == "containment" && e.message.contains("MXC M1"))
+    );
+    assert!(errors.iter().any(|e| e.path == "filesystem_policy"));
     assert!(result.mxc_config["network"].get("proxy").is_none());
 }
 

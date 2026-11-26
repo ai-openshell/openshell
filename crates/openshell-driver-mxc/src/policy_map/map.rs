@@ -646,6 +646,20 @@ fn add_static_policy_loss(
     opts: &MxcMappingOptions,
     items: &mut Vec<LossItem>,
 ) {
+    // isolation_session filesystem grants are additive only — the backend has
+    // no deny primitive, so any authored filesystem policy would silently lose
+    // OpenShell's default-deny semantics. Fail closed instead of downgrading.
+    if opts.containment == "isolation_session" && policy.filesystem.is_some() {
+        add_loss(
+            items,
+            "filesystem_policy",
+            "error",
+            "isolation_session cannot enforce OpenShell filesystem policy: it is grant-only with no default-deny primitive.",
+            "OpenShell Landlock/default-deny filesystem model",
+            "Sandbox creation is rejected; select the processcontainer backend for filesystem enforcement.",
+        );
+    }
+
     if policy.landlock.is_some() {
         add_loss(
             items,
