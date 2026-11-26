@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
@@ -22,9 +22,6 @@ use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::{
     GpuResourceRequirements, ServiceAuthorizationMode, ServiceBackendHttpVersion,
-};
-use openshell_core::ssh_host_key::{
-    HostKeyCheck, HostKeyExpectation, KnownHostsPin, permit_unverified,
 };
 
 /// Resolved gateway context: name + gateway endpoint.
@@ -50,19 +47,25 @@ impl From<GpuCliRequest> for GpuResourceRequirements {
     }
 }
 
-/// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
-///
-/// Resolution priority:
-/// 1. `--gateway-endpoint` flag (direct URL, preserving metadata when available)
-/// 2. `--gateway` flag (explicit name)
-/// 3. `OPENSHELL_GATEWAY` environment variable
-/// 4. Active gateway from `~/.config/openshell/active_gateway`
-///
-/// When `--gateway-endpoint` is provided, it is used directly as the endpoint.
-/// If stored metadata can still identify the gateway, the stored gateway name
-/// is preserved so auth and TLS materials continue to resolve correctly.
-fn normalize_gateway_endpoint(endpoint: &str) -> &str {
-    endpoint.trim_end_matches('/')
+fn normalize_gateway_endpoint(endpoint: &str) -> String {
+    let endpoint = if endpoint.contains(['?', '#']) {
+        endpoint
+    } else {
+        endpoint.trim_end_matches('/')
+    };
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_owned();
+    };
+    let (authority, route) = rest.split_at(rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len()));
+    let (userinfo, host_port) = authority.split_at(authority.rfind('@').map_or(0, |i| i + 1));
+    if host_port.starts_with('[') {
+        return endpoint.to_owned();
+    }
+    let (host, port) = host_port.split_at(host_port.find(':').unwrap_or(host_port.len()));
+    format!(
+        "{scheme}://{userinfo}{}{port}{route}",
+        host.to_ascii_lowercase()
+    )
 }
 
 fn find_gateway_by_endpoint(endpoint: &str) -> Option<String> {
@@ -81,18 +84,33 @@ fn find_gateway_by_endpoint(endpoint: &str) -> Option<String> {
     })
 }
 
+/// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
+///
+/// Resolution priority:
+/// 1. `--gateway-endpoint` flag (direct URL, preserving metadata when available)
+/// 2. `--gateway` flag (explicit name)
+/// 3. `OPENSHELL_GATEWAY` environment variable
+/// 4. Active gateway from `~/.config/openshell/active_gateway`
+///
+/// When `--gateway-endpoint` is provided, it is used directly as the endpoint.
+/// If stored metadata can still identify the gateway, the stored gateway name
+/// is preserved so auth and TLS materials continue to resolve correctly.
 fn resolve_gateway(
     gateway_flag: &Option<String>,
     gateway_endpoint: &Option<String>,
+    allow_endpoint_override: bool,
 ) -> Result<GatewayContext> {
     if let Some(endpoint) = gateway_endpoint {
-        // When a gateway name is explicitly provided (via flag or env var),
-        // trust it directly — don't require metadata to exist yet. This
-        // avoids a race condition where mTLS certs are stored under the
-        // real gateway name but the CLI falls back to using the raw
-        // endpoint URL (producing a mangled path like `https___...`).
         let name = gateway_flag
-            .clone()
+            .as_ref()
+            .filter(|name| {
+                allow_endpoint_override
+                    || get_gateway_metadata(name).is_some_and(|metadata| {
+                        normalize_gateway_endpoint(&metadata.gateway_endpoint)
+                            == normalize_gateway_endpoint(endpoint)
+                    })
+            })
+            .cloned()
             .or_else(|| find_gateway_by_endpoint(endpoint))
             .unwrap_or_else(|| endpoint.clone());
         return Ok(GatewayContext {
@@ -680,54 +698,29 @@ enum Commands {
         shell: CompletionShell,
     },
 
-    /// SSH proxy (used by `ProxyCommand`).
-    ///
-    /// Two mutually exclusive modes:
-    ///
-    /// **Token mode** (used internally by `sandbox connect`):
-    ///   `openshell ssh-proxy --gateway <url> --sandbox <name> --token <token>
-    ///   --host-key <fingerprint> --known-hosts <file>`
-    ///
-    /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>
-    ///   --known-hosts <file>`
+    /// Mint an SSH session and relay SSH over the selected gateway.
     #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     SshProxy {
-        /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
-        /// Required in token mode. In name mode, can be a gateway name.
-        #[arg(long, short = 'g')]
-        gateway: Option<String>,
-
-        /// Sandbox name. Required in token mode.
-        #[arg(long)]
-        sandbox: Option<String>,
-
-        /// SSH session token. Required in token mode.
-        #[arg(long)]
-        token: Option<String>,
-
-        /// Gateway endpoint URL. Used in name mode. Deprecated: prefer --gateway.
+        /// Gateway endpoint override.
         #[arg(long)]
         server: Option<String>,
 
-        /// Gateway name. Used with --name to resolve gateway from metadata.
+        /// One-use local relay grant prepared by the parent.
+        #[arg(long, conflicts_with_all = ["server", "gateway_name"])]
+        handoff: Option<String>,
+
+        /// Registered gateway to use for credentials and endpoint discovery.
         #[arg(long)]
         gateway_name: Option<String>,
 
-        /// Sandbox name. Used in name mode.
-        #[arg(long)]
-        name: Option<String>,
+        /// Sandbox to connect to.
+        #[arg(long, alias = "sandbox")]
+        name: String,
 
-        /// SSH host key the sandbox must present: the fingerprint the gateway
-        /// published, or `unverified`. Token mode only; name mode asks the
-        /// gateway instead.
-        #[arg(long, requires = "known_hosts", conflicts_with = "name")]
-        host_key: Option<HostKeyExpectation>,
-
-        /// Known-hosts file in which the verified host key is pinned for `ssh`.
-        /// Without it the host key is not verified, and the connection is
-        /// refused by default.
-        #[arg(long)]
+        /// Known-hosts file of a saved SSH profile, in which the verified host
+        /// key is pinned for `ssh`. Without it the host key is not verified,
+        /// and the connection is refused by default.
+        #[arg(long, conflicts_with = "handoff")]
         known_hosts: Option<PathBuf>,
     },
 }
@@ -2855,7 +2848,25 @@ fn run_main() -> Result<()> {
 async fn run_async() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
-    let cli = Cli::parse();
+    let (cli, explicit_gateway, explicit_endpoint) = {
+        let mut args = Cli::command().get_matches();
+        let explicit_gateway =
+            args.value_source("gateway") == Some(clap::parser::ValueSource::CommandLine);
+        let explicit_endpoint =
+            args.value_source("gateway_endpoint") == Some(clap::parser::ValueSource::CommandLine);
+        (
+            Cli::from_arg_matches_mut(&mut args).unwrap_or_else(|err| err.exit()),
+            explicit_gateway,
+            explicit_endpoint,
+        )
+    };
+    let current_gateway = || {
+        resolve_gateway(
+            &cli.gateway,
+            &cli.gateway_endpoint,
+            explicit_gateway == explicit_endpoint,
+        )
+    };
 
     // Resolve colorization before anything is printed, so no command can emit
     // escape sequences into a pipe.
@@ -2960,7 +2971,7 @@ async fn run_async() -> Result<()> {
                 run::gateway_select(name.as_deref(), &cli.gateway)?;
             }
             GatewayCommands::Info { output } => {
-                if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                if let Ok(ctx) = current_gateway() {
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
                     run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
@@ -2996,7 +3007,7 @@ async fn run_async() -> Result<()> {
         // -----------------------------------------------------------
         Some(Commands::Status { output }) => {
             // A gateway named on the command line must be registered.
-            let resolved = match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+            let resolved = match current_gateway() {
                 Err(err) if cli.gateway.is_some() => return Err(err),
                 resolved => resolved,
             };
@@ -3033,7 +3044,7 @@ async fn run_async() -> Result<()> {
         // Top-level current identity
         // -----------------------------------------------------------
         Some(Commands::Whoami { output }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             run::whoami(&ctx.endpoint, &tls, output.as_str()).await?;
@@ -3149,7 +3160,7 @@ async fn run_async() -> Result<()> {
                 target_host,
                 local,
             } => {
-                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let ctx = current_gateway()?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3171,7 +3182,7 @@ async fn run_async() -> Result<()> {
                 background,
             } => {
                 let spec = openshell_core::forward::ForwardSpec::parse(&port)?;
-                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let ctx = current_gateway()?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3202,7 +3213,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Service {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match command {
@@ -3268,7 +3279,7 @@ async fn run_async() -> Result<()> {
             source,
             level,
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3295,7 +3306,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match policy_cmd {
@@ -3457,7 +3468,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Settings {
             command: Some(settings_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
 
@@ -3536,7 +3547,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Rule {
             command: Some(draft_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match draft_cmd {
@@ -3706,7 +3717,7 @@ async fn run_async() -> Result<()> {
                         || expose.is_some();
                     let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
@@ -3757,7 +3768,7 @@ async fn run_async() -> Result<()> {
                     dest,
                     no_git_ignore,
                 } => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
                     let local = std::path::Path::new(&local_path);
@@ -3777,7 +3788,7 @@ async fn run_async() -> Result<()> {
                     sandbox_path,
                     dest,
                 } => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
                     let local_dest = dest.as_deref().unwrap_or(".");
@@ -3794,7 +3805,7 @@ async fn run_async() -> Result<()> {
                     eprintln!("{} Download complete", "✓".green().bold());
                 }
                 other => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
@@ -4097,7 +4108,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Workspace {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
@@ -4167,7 +4178,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Provider {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
@@ -4361,14 +4372,14 @@ async fn run_async() -> Result<()> {
         Some(Commands::Profile {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             command.run(endpoint, &cli.workspace, &tls).await?;
         }
         Some(Commands::Term { theme }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
@@ -4376,13 +4387,14 @@ async fn run_async() -> Result<()> {
                 tls.oidc_token.as_deref(),
                 tls.edge_token.as_deref(),
             )?;
-            openshell_tui::run(
+            openshell_tui::run_with_gateway_insecure(
                 channel,
                 interceptor,
                 &ctx.name,
                 &ctx.endpoint,
                 &cli.workspace,
                 theme,
+                tls.gateway_insecure,
             )
             .await?;
         }
@@ -4399,101 +4411,39 @@ async fn run_async() -> Result<()> {
                 .map_err(|e| miette::miette!("failed to write completions: {e}"))?;
         }
         Some(Commands::SshProxy {
-            gateway,
-            sandbox,
-            token,
             server,
             gateway_name,
             name,
-            host_key,
+            handoff,
             known_hosts,
         }) => {
-            match (gateway, sandbox, token, server, gateway_name, name) {
-                // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sandbox), Some(tok), _, gateway_name_opt, _) => {
-                    let host_key = match (host_key, known_hosts) {
-                        (Some(expectation), Some(known_hosts)) => Some(
-                            KnownHostsPin::at(known_hosts, &sandbox, &cli.workspace)
-                                .and_then(|pin| HostKeyCheck::for_relay(expectation, pin))
-                                .map_err(|err| miette::miette!("{err}"))?,
-                        ),
-                        // An older client starts the proxy this way, and its `ssh`
-                        // accepts any host key.
-                        (None, None) => {
-                            eprintln!(
-                                "openshell: warning: ssh-proxy was started without --host-key and --known-hosts, so the SSH host key is NOT verified.\n\
-                                 If an OpenShell client that predates host-key verification started it, restart that client (the openshell command or openshell term)."
-                            );
-                            permit_unverified().map_err(|err| miette::miette!("{err}"))?;
-                            None
-                        }
-                        // Nothing would pin a key for the `ssh` that reads the file.
-                        _ => {
-                            return Err(miette::miette!(
-                                "--known-hosts requires --host-key when --token is given"
-                            ));
-                        }
-                    };
-                    let mut effective_tls = match gateway_name_opt {
-                        Some(ref g) => tls.with_gateway_name(g),
-                        None => tls,
-                    };
-                    if let Some(ref g) = gateway_name_opt {
-                        apply_auth(&mut effective_tls, g)?;
-                    }
-                    run::sandbox_ssh_proxy(
-                        &gw,
-                        &sandbox,
-                        &cli.workspace,
-                        &tok,
-                        &effective_tls,
-                        host_key,
-                    )
+            if let Some(handle) = handoff {
+                let (grant, peer) = openshell_core::ssh_handoff::receive(&handle).await?;
+                let mut tls = tls.with_gateway_name(&grant.gateway_name);
+                apply_auth(&mut tls, &grant.gateway_name)?;
+                openshell_cli::ssh::relay_prepared_ssh(grant, peer, &name, &cli.workspace, &tls)
                     .await?;
-                }
-                // Name mode with --gateway-name: resolve endpoint from metadata.
-                (_, _, _, server_override, Some(g), Some(n)) => {
-                    let endpoint = if let Some(srv) = server_override {
-                        srv
-                    } else {
-                        let meta = load_gateway_metadata(&g).map_err(|_| {
-                            miette::miette!(
-                                "Unknown gateway '{g}'.\n\
-                                  Register it first: openshell gateway add <endpoint> --name {g}\n\
-                                  Or list available gateways: openshell gateway select"
-                            )
-                        })?;
-                        meta.gateway_endpoint
-                    };
-                    let mut tls = tls.with_gateway_name(&g);
-                    apply_auth(&mut tls, &g)?;
-                    run::sandbox_ssh_proxy_by_name(
-                        &endpoint,
-                        Some(&g),
-                        &n,
-                        &tls,
-                        &cli.workspace,
-                        known_hosts,
-                    )
-                    .await?;
-                }
-                // Legacy name mode with --server only (no --gateway-name).
-                (_, _, _, Some(srv), None, Some(n)) => {
-                    run::sandbox_ssh_proxy_by_name(
-                        &srv,
-                        None,
-                        &n,
-                        &tls,
-                        &cli.workspace,
-                        known_hosts,
-                    )
-                    .await?;
-                }
-                _ => {
-                    return Err(miette::miette!(
-                        "provide either --gateway/--sandbox/--token or --gateway-name/--name (or --server/--name)"
-                    ));
-                }
+            } else {
+                // A saved profile resolves its own endpoint. A local --server
+                // can explicitly pair an endpoint with the chosen profile.
+                let use_global_endpoint =
+                    gateway_name.is_none() && (!explicit_gateway || explicit_endpoint);
+                let endpoint =
+                    server.or_else(|| cli.gateway_endpoint.filter(|_| use_global_endpoint));
+                let allow_endpoint_override = gateway_name.is_some() || explicit_gateway;
+                let profile = gateway_name.or(cli.gateway);
+                let ctx = resolve_gateway(&profile, &endpoint, allow_endpoint_override)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
+                run::sandbox_ssh_proxy_by_name(
+                    &ctx.endpoint,
+                    &ctx.name,
+                    &name,
+                    &tls,
+                    &cli.workspace,
+                    known_hosts,
+                )
+                .await?;
             }
         }
 
@@ -4536,7 +4486,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Secret {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
@@ -5392,10 +5342,35 @@ mod tests {
             )
             .unwrap();
 
-            let ctx = resolve_gateway(&None, &Some("https://gw.example.com/".to_string())).unwrap();
+            let ctx = resolve_gateway(&None, &Some("https://GW.example.com/".to_string()), false)
+                .unwrap();
             assert_eq!(ctx.name, "edge-gateway");
-            assert_eq!(ctx.endpoint, "https://gw.example.com/");
+            assert_eq!(ctx.endpoint, "https://GW.example.com/");
         });
+    }
+
+    #[test]
+    fn endpoint_matching_preserves_userinfo_port_and_route() {
+        let endpoint = "https://User:Password@GW.example:8443/Tenant?k=Token/#Section";
+        let normalized = normalize_gateway_endpoint(endpoint);
+        assert_eq!(normalized, endpoint.replace("GW", "gw"));
+        for (from, to) in [
+            ("User", "user"),
+            ("Password", "password"),
+            ("8443", "443"),
+            ("Tenant", "tenant"),
+            ("Token", "token"),
+            ("Section", "section"),
+        ] {
+            assert_ne!(
+                normalized,
+                normalize_gateway_endpoint(&endpoint.replace(from, to))
+            );
+        }
+        assert_ne!(
+            normalize_gateway_endpoint("https://gw/?key=token/"),
+            normalize_gateway_endpoint("https://gw/?key=token")
+        );
     }
 
     #[test]
@@ -5411,6 +5386,7 @@ mod tests {
             let ctx = resolve_gateway(
                 &Some("named-gateway".to_string()),
                 &Some("https://override.example.com".to_string()),
+                true,
             )
             .unwrap();
 
@@ -5477,52 +5453,52 @@ mod tests {
         });
     }
 
-    /// Verify the flag names the TUI uses to build its `ProxyCommand` are
-    /// accepted by the `SshProxy` subcommand and land in the right fields.
-    /// This catches drift when CLI flags are renamed or restructured.
     #[test]
-    fn ssh_proxy_token_mode_flags_match_tui_proxy_command() {
-        // This is the exact flag pattern constructed by the TUI in lib.rs
-        // (handle_shell_connect, handle_exec, handle_port_forward).
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "ssh-proxy",
-            "--gateway",
-            "https://gw.example.com:8080/proxy/connect",
-            "--sandbox",
-            "my-box",
-            "--workspace",
-            "team-a",
-            "--token",
-            "tok-abc",
-            "--gateway-name",
-            "my-gateway",
-            "--host-key",
-            "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA",
-            "--known-hosts",
-            "/home/u/.config/openshell/known_hosts/my-gateway/openshell-my-box.team-a",
-        ])
-        .expect("TUI proxy command flags must be accepted by the CLI");
-        assert_eq!(cli.workspace, "team-a");
+    fn ssh_proxy_rejects_tokens_in_arguments() {
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "ssh-proxy",
+                "--gateway",
+                "gw",
+                "--sandbox",
+                "demo",
+                "--token",
+                "test-token",
+            ])
+            .is_err()
+        );
+    }
 
-        match cli.command {
-            Some(Commands::SshProxy {
-                gateway,
-                sandbox,
-                token,
+    #[test]
+    fn ssh_proxy_accepts_generated_and_saved_commands() {
+        for name_flag in ["--sandbox", "--name"] {
+            let cli = Cli::try_parse_from([
+                "openshell",
+                "ssh-proxy",
+                "--gateway-name",
+                "my-gateway",
+                name_flag,
+                "my-box",
+                "--workspace",
+                "team-a",
+                "--known-hosts",
+                "/home/u/.config/openshell/known_hosts/my-gateway/openshell-my-box.team-a",
+            ])
+            .unwrap();
+            assert_eq!(cli.workspace, "team-a");
+            let Some(Commands::SshProxy {
                 gateway_name,
+                name,
+                known_hosts,
                 ..
-            }) => {
-                assert_eq!(
-                    gateway.as_deref(),
-                    Some("https://gw.example.com:8080/proxy/connect"),
-                    "gateway URL must land in SshProxy.gateway, not the global flag"
-                );
-                assert_eq!(sandbox.as_deref(), Some("my-box"));
-                assert_eq!(token.as_deref(), Some("tok-abc"));
-                assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
-            }
-            other => panic!("expected SshProxy, got: {other:?}"),
+            }) = cli.command
+            else {
+                panic!("expected ssh-proxy")
+            };
+            assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
+            assert_eq!(name, "my-box");
+            assert!(known_hosts.is_some());
         }
     }
 

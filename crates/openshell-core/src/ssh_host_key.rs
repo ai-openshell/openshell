@@ -7,7 +7,7 @@
 //! `known_hosts` file is a cache that must hash to that fingerprint, and `ssh`
 //! enforces it with `StrictHostKeyChecking=yes`. This module owns the
 //! fingerprint format, the pin location and file format, the `ssh` options,
-//! the `ssh-proxy` flags, and the scan of the server's key exchange reply.
+//! and the scan of the server's key exchange reply.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -21,8 +21,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 
 use crate::forward::shell_escape;
-use crate::proto::CreateSshSessionResponse;
 use crate::settings::parse_bool_like;
+use crate::ssh_handoff::HostKeyHandoff;
 
 /// An SSH connection whose host key is not verified is refused. Set to a value
 /// that reads as "no", such a connection goes ahead with a warning.
@@ -227,8 +227,8 @@ impl KnownHostsPin {
         Self::under(&std::path::absolute(config_dir)?, target)
     }
 
-    /// The `ssh-proxy` side: the path the `ssh` invocation or config block
-    /// handed over.
+    /// The `ssh-proxy` side: the path the client or the config block handed
+    /// over.
     pub fn at(path: PathBuf, sandbox: &str, workspace: &str) -> Result<Self, HostKeyError> {
         // `ssh` expands `${VAR}` in UserKnownHostsFile and has no escape for
         // it, a quote or newline would end the value early, and a backslash
@@ -402,14 +402,33 @@ pub struct HostKeyCheck {
 }
 
 impl HostKeyCheck {
-    /// For the CLI and TUI, before `ssh` is spawned. Leaves the pin holding
-    /// nothing `ssh` could trust except the key the gateway published.
-    pub fn for_session(
-        session: &CreateSshSessionResponse,
+    /// For the CLI and TUI, before `ssh` is spawned. `published` is the
+    /// fingerprint field of the sandbox. Leaves the pin holding nothing `ssh`
+    /// could trust except the key the gateway published.
+    pub fn for_target(
+        published: &str,
         target: &SandboxSshTarget<'_>,
     ) -> Result<Self, HostKeyError> {
-        let expectation = HostKeyExpectation::from_published(&session.host_key_fingerprint)?;
+        let expectation = HostKeyExpectation::from_published(published)?;
         Self::for_relay(expectation, KnownHostsPin::for_target(target)?)
+    }
+
+    /// For the `ssh-proxy` a client started, from what the client handed over.
+    pub fn from_handoff(
+        handoff: HostKeyHandoff,
+        sandbox: &str,
+        workspace: &str,
+    ) -> Result<Self, HostKeyError> {
+        let pin = KnownHostsPin::at(handoff.known_hosts.into(), sandbox, workspace)?;
+        Self::for_relay(handoff.expectation.parse()?, pin)
+    }
+
+    /// The same check, for the `ssh-proxy` this client starts.
+    pub(crate) fn handoff(&self) -> HostKeyHandoff {
+        HostKeyHandoff {
+            expectation: self.expectation.to_string(),
+            known_hosts: self.pin.path.display().to_string(),
+        }
     }
 
     /// For `ssh-proxy`, before the first byte is relayed.
@@ -439,28 +458,18 @@ impl HostKeyCheck {
     }
 
     #[must_use]
-    pub fn unverified_warning(&self, sandbox: &str) -> Option<String> {
+    pub fn unverified_warning(&self) -> Option<String> {
         matches!(self.expectation, HostKeyExpectation::AcceptAny).then(|| {
             format!(
-                "warning: SSH host key of sandbox '{sandbox}' is NOT verified: the gateway published no fingerprint. \
-                 Upgrade a gateway that predates sandbox SSH identities; otherwise stop and start the sandbox."
+                "warning: SSH host key of sandbox '{}' is NOT verified: the gateway published no fingerprint. \
+                 Upgrade a gateway that predates sandbox SSH identities; otherwise stop and start the sandbox.",
+                self.pin.sandbox
             )
         })
     }
 
     pub(crate) fn ssh_options(&self) -> Vec<(&'static str, String)> {
         self.pin.ssh_options()
-    }
-
-    /// `["--host-key", <expectation>, "--known-hosts", <path>]`, for a
-    /// `ProxyCommand`.
-    pub(crate) fn proxy_flags(&self) -> [String; 4] {
-        [
-            "--host-key".to_string(),
-            self.expectation.to_string(),
-            "--known-hosts".to_string(),
-            self.pin.ssh_path(),
-        ]
     }
 
     pub fn into_gate(self) -> HostKeyGate {
@@ -671,13 +680,6 @@ mod tests {
 
     fn pin_file(key: &str) -> String {
         format!("{PIN_HEADER}openshell-my-sb.default ssh-ed25519 {key}\n")
-    }
-
-    fn published(fingerprint: &str) -> CreateSshSessionResponse {
-        CreateSshSessionResponse {
-            host_key_fingerprint: fingerprint.to_string(),
-            ..Default::default()
-        }
     }
 
     fn with_config_dir(assertions: impl FnOnce(&Path)) {
@@ -1006,7 +1008,7 @@ mod tests {
 
     /// Before `ssh` can read the pin, it holds the published key or no key.
     #[test]
-    fn check_for_session_keeps_only_the_published_key() {
+    fn check_for_target_keeps_only_the_published_key() {
         with_config_dir(|config_dir| {
             let pin = pin_in(config_dir);
             let path = pin.path().display().to_string();
@@ -1016,26 +1018,27 @@ mod tests {
             ] {
                 pin.store(&ed25519_blob(stored)).unwrap();
 
-                let check = HostKeyCheck::for_session(&published(FINGERPRINT_A), &TARGET).unwrap();
+                let check = HostKeyCheck::for_target(FINGERPRINT_A, &TARGET).unwrap();
 
                 assert_eq!(fs::read_to_string(pin.path()).unwrap(), kept);
-                assert_eq!(check.unverified_warning("my-sb"), None);
+                assert_eq!(check.unverified_warning(), None);
+                let handoff = check.handoff();
                 assert_eq!(
-                    check.proxy_flags(),
-                    ["--host-key", FINGERPRINT_A, "--known-hosts", path.as_str()]
+                    (handoff.expectation.as_str(), handoff.known_hosts.as_str()),
+                    (FINGERPRINT_A, path.as_str())
                 );
             }
         });
     }
 
     #[test]
-    fn check_for_session_never_trusts_a_cached_pin_when_unverified() {
+    fn check_for_target_never_trusts_a_cached_pin_when_unverified() {
         let by_default = Environment::new().remove(REQUIRE_HOST_KEY_ENV);
         with_config_dir_in(by_default, |config_dir| {
             let pin = pin_in(config_dir);
             pin.store(&ed25519_blob(KEY_A)).unwrap();
 
-            let refusal = HostKeyCheck::for_session(&published(""), &TARGET).unwrap_err();
+            let refusal = HostKeyCheck::for_target("", &TARGET).unwrap_err();
 
             assert!(
                 matches!(refusal, HostKeyError::Unpublished { .. }),
@@ -1048,15 +1051,15 @@ mod tests {
             let pin = pin_in(config_dir);
             pin.store(&ed25519_blob(KEY_A)).unwrap();
 
-            let check = HostKeyCheck::for_session(&published(""), &TARGET).unwrap();
+            let check = HostKeyCheck::for_target("", &TARGET).unwrap();
 
             assert_eq!(fs::read_to_string(pin.path()).unwrap(), PIN_HEADER);
             assert_eq!(
-                check.unverified_warning("my-sb").unwrap(),
+                check.unverified_warning().unwrap(),
                 "warning: SSH host key of sandbox 'my-sb' is NOT verified: the gateway published no fingerprint. \
                  Upgrade a gateway that predates sandbox SSH identities; otherwise stop and start the sandbox."
             );
-            assert_eq!(check.proxy_flags()[..2], ["--host-key", "unverified"]);
+            assert_eq!(check.handoff().expectation, "unverified");
         });
     }
 

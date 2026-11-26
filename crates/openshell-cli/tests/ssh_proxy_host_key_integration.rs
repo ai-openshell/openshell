@@ -1,13 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod helpers;
+
 use bytes::Bytes;
+use helpers::{Environment, tempdir};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
-    CreateSshSessionResponse, Sandbox, SandboxResponse, TcpForwardFrame, tcp_forward_frame,
+    CreateSshSessionResponse, RevokeSshSessionResponse, Sandbox, SandboxResponse, TcpForwardFrame,
+    tcp_forward_frame,
 };
 use openshell_core::ssh_host_key::REQUIRE_HOST_KEY_ENV;
 use prost::Message;
@@ -23,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio_stream::wrappers::ReceiverStream;
 
 const SANDBOX: &str = "my-sb";
+const SANDBOX_ID: &str = "sandbox-1";
 const WORKSPACE: &str = "team-a";
 const PIN_HEADER: &str =
     "# Managed by OpenShell. Rewritten from the gateway-published fingerprint; do not edit.\n";
@@ -55,6 +61,8 @@ fn pin_content(key: Option<&PrivateKey>) -> String {
 /// relays every SSH connection to `sandbox`.
 struct Gateway {
     published: String,
+    /// Whether it admits the caller without a session token.
+    direct: bool,
     sandbox: Box<dyn Fn(DuplexStream) + Send + Sync>,
 }
 
@@ -87,25 +95,36 @@ impl Gateway {
         address: SocketAddr,
     ) -> hyper::Response<GrpcBody> {
         let (frames, body) = tokio::sync::mpsc::channel(16);
+        let advertises_direct =
+            self.direct && request.uri().path() == "/openshell.v1.OpenShell/GetSandbox";
         match request.uri().path() {
             "/openshell.v1.OpenShell/GetSandbox" => {
                 let found = SandboxResponse {
-                    sandbox: Some(Sandbox::default()),
+                    sandbox: Some(Sandbox {
+                        metadata: Some(ObjectMeta {
+                            id: SANDBOX_ID.to_string(),
+                            ..Default::default()
+                        }),
+                        host_key_fingerprint: self.published.clone(),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 };
                 respond_once(&frames, &found).await;
             }
             "/openshell.v1.OpenShell/CreateSshSession" => {
                 let session = CreateSshSessionResponse {
-                    sandbox_id: "sandbox-1".to_string(),
+                    sandbox_id: SANDBOX_ID.to_string(),
                     token: "test-token".to_string(),
                     gateway_host: address.ip().to_string(),
                     gateway_port: u32::from(address.port()),
                     gateway_scheme: "http".to_string(),
-                    host_key_fingerprint: self.published.clone(),
                     ..Default::default()
                 };
                 respond_once(&frames, &session).await;
+            }
+            "/openshell.v1.OpenShell/RevokeSshSession" => {
+                respond_once(&frames, &RevokeSshSessionResponse::default()).await;
             }
             "/openshell.v1.OpenShell/ForwardTcp" => {
                 let (relay_end, sandbox_end) = tokio::io::duplex(64 * 1024);
@@ -118,6 +137,12 @@ impl Gateway {
         response
             .headers_mut()
             .insert("content-type", "application/grpc".parse().unwrap());
+        if advertises_direct {
+            response.headers_mut().insert(
+                openshell_core::forward::DIRECT_SSH_HEADER,
+                "1".parse().unwrap(),
+            );
+        }
         response
     }
 }
@@ -273,25 +298,28 @@ async fn name_mode_proxy_withholds_a_key_the_gateway_did_not_publish() {
     let published = host_key(1);
     let presented = host_key(2);
     let [before_reply, reply_onward] = handshake(&presented);
-    let gateway = Gateway {
-        published: fingerprint(&published),
-        sandbox: sending([before_reply.clone(), reply_onward].concat()),
+    for direct in [false, true] {
+        let gateway = Gateway {
+            published: fingerprint(&published),
+            direct,
+            sandbox: sending([before_reply.clone(), reply_onward.clone()].concat()),
+        }
+        .serve()
+        .await;
+        let scratch = tempfile::tempdir().unwrap();
+        let pin = scratch.path().join("known_hosts/pin");
+
+        let proxy = openshell(&name_mode(gateway, &pin), scratch.path(), false).await;
+
+        let stderr = String::from_utf8_lossy(&proxy.stderr);
+        assert_eq!(proxy.status.code(), Some(1), "{stderr}");
+        assert!(
+            before_reply.starts_with(&proxy.stdout),
+            "no byte of the key exchange reply may reach ssh"
+        );
+        assert_mismatch_reported(&stderr, &published, &presented);
+        assert_eq!(std::fs::read_to_string(&pin).unwrap(), pin_content(None));
     }
-    .serve()
-    .await;
-    let scratch = tempfile::tempdir().unwrap();
-    let pin = scratch.path().join("known_hosts/pin");
-
-    let proxy = openshell(&name_mode(gateway, &pin), scratch.path(), false).await;
-
-    let stderr = String::from_utf8_lossy(&proxy.stderr);
-    assert_eq!(proxy.status.code(), Some(1), "{stderr}");
-    assert!(
-        before_reply.starts_with(&proxy.stdout),
-        "no byte of the key exchange reply may reach ssh"
-    );
-    assert_mismatch_reported(&stderr, &published, &presented);
-    assert_eq!(std::fs::read_to_string(&pin).unwrap(), pin_content(None));
 }
 
 /// A gateway that predates sandbox SSH identities publishes nothing.
@@ -301,6 +329,7 @@ async fn name_mode_proxy_refuses_a_sandbox_with_no_published_key_unless_allowed(
     let transcript = handshake(&key).concat();
     let gateway = Gateway {
         published: String::new(),
+        direct: false,
         sandbox: sending(transcript.clone()),
     }
     .serve()
@@ -333,49 +362,76 @@ async fn name_mode_proxy_refuses_a_sandbox_with_no_published_key_unless_allowed(
     assert_eq!(std::fs::read_to_string(&pin).unwrap(), pin_content(None));
 }
 
-/// An `ssh` started by a client or a config entry from before host-key
-/// verification accepts any key. It is refused, unless the user lets
-/// unverified connections go ahead.
+/// The `ssh` of a config entry from before host-key verification accepts any
+/// key. It is refused, unless the user lets unverified connections go ahead.
 #[tokio::test]
-async fn proxy_refuses_a_caller_that_predates_host_key_verification_unless_allowed() {
+async fn name_mode_proxy_refuses_an_entry_that_predates_host_key_verification_unless_allowed() {
     let transcript = handshake(&host_key(2)).concat();
     let gateway = Gateway {
         published: fingerprint(&host_key(1)),
+        direct: false,
         sandbox: sending(transcript.clone()),
     }
     .serve()
     .await;
     let scratch = tempfile::tempdir().unwrap();
-    let old_client = format!(
-        "ssh-proxy --gateway http://{gateway}/proxy/connect --sandbox {SANDBOX} --workspace {WORKSPACE} --token test-token"
+    let args = old_name_mode(gateway);
+    let caller = "SSH config entry for sandbox 'my-sb'";
+
+    let proxy = openshell(&args, scratch.path(), false).await;
+
+    let stderr = String::from_utf8_lossy(&proxy.stderr);
+    assert!(proxy.status.success(), "{stderr}");
+    assert_eq!(proxy.stdout, transcript);
+    assert!(stderr.contains(caller), "{stderr}");
+    assert!(
+        stderr.contains("the SSH host key is NOT verified"),
+        "{stderr}"
     );
 
-    for (args, caller) in [
-        (old_client, "started without --host-key and --known-hosts"),
-        (
-            old_name_mode(gateway),
-            "SSH config entry for sandbox 'my-sb'",
-        ),
-    ] {
-        let proxy = openshell(&args, scratch.path(), false).await;
+    let refused = openshell(&args, scratch.path(), true).await;
 
-        let stderr = String::from_utf8_lossy(&proxy.stderr);
-        assert!(proxy.status.success(), "{stderr}");
-        assert_eq!(proxy.stdout, transcript);
-        assert!(stderr.contains(caller), "{stderr}");
-        assert!(
-            stderr.contains("the SSH host key is NOT verified"),
-            "{stderr}"
-        );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{stderr}");
+    assert_eq!(refused.stdout, b"");
+    assert!(stderr.contains(caller), "{stderr}");
+    assert!(stderr.contains(REQUIRE_HOST_KEY_ENV), "{stderr}");
+}
 
-        let refused = openshell(&args, scratch.path(), true).await;
+/// The `ssh` of a client from before host-key verification accepts any key,
+/// and its handoff names none.
+#[tokio::test]
+async fn proxy_refuses_the_handoff_of_a_client_that_predates_host_key_verification() {
+    Environment::new()
+        .remove(REQUIRE_HOST_KEY_ENV)
+        .run_async(async {
+            let grant = openshell_core::ssh_handoff::RelayGrant {
+                authorization: Some(openshell_core::ssh_handoff::RelayAuthorization::Session(
+                    CreateSshSessionResponse::default(),
+                )),
+                endpoint: "http://127.0.0.1:0".to_string(),
+                gateway_name: "test".to_string(),
+                replica: None,
+                host_key: None,
+            };
+            let (_issuer, peer) = tokio::io::duplex(8);
 
-        let stderr = String::from_utf8_lossy(&refused.stderr);
-        assert!(!refused.status.success(), "{stderr}");
-        assert_eq!(refused.stdout, b"");
-        assert!(stderr.contains(caller), "{stderr}");
-        assert!(stderr.contains(REQUIRE_HOST_KEY_ENV), "{stderr}");
-    }
+            let refusal = openshell_cli::ssh::relay_prepared_ssh(
+                grant,
+                peer,
+                SANDBOX,
+                WORKSPACE,
+                &openshell_cli::tls::TlsOptions::default(),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                refusal.to_string().contains(REQUIRE_HOST_KEY_ENV),
+                "{refusal}"
+            );
+        })
+        .await;
 }
 
 /// The real `ssh` client against a real SSH server, with `ssh-proxy` as its
@@ -383,10 +439,12 @@ async fn proxy_refuses_a_caller_that_predates_host_key_verification_unless_allow
 #[cfg(unix)]
 mod openssh {
     use super::*;
-    use openshell_core::forward::{sandbox_proxy_command, sandbox_ssh_args};
-    use openshell_core::ssh_host_key::{HostKeyCheck, KnownHostsPin, SandboxSshTarget};
+    use openshell_core::forward::{sandbox_ssh_args, shell_escape};
+    use openshell_core::proto::open_shell_client::OpenShellClient;
+    use openshell_core::ssh_handoff::SshTarget;
     use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
     use russh::{Channel, ChannelId};
+    use std::path::PathBuf;
 
     const COMMAND: &str = "report-ready";
     const COMMAND_OUTPUT: &str = "ready\n";
@@ -434,13 +492,24 @@ mod openssh {
 
     /// The gateway in front of a sandbox whose SSH server presents `key`.
     async fn sandbox_presenting(key: &PrivateKey) -> SocketAddr {
+        gateway_publishing(key, key, false).await
+    }
+
+    /// The same, where the gateway publishes the fingerprint of `published`
+    /// and `direct` says whether it admits the caller without a session token.
+    async fn gateway_publishing(
+        published: &PrivateKey,
+        key: &PrivateKey,
+        direct: bool,
+    ) -> SocketAddr {
         // The supervisor's server also keeps the default algorithms.
         let config = Arc::new(russh::server::Config {
             keys: vec![key.clone()],
             ..Default::default()
         });
         Gateway {
-            published: fingerprint(key),
+            published: fingerprint(published),
+            direct,
             sandbox: Box::new(move |stream| {
                 let config = config.clone();
                 tokio::spawn(async move {
@@ -454,36 +523,52 @@ mod openssh {
         .await
     }
 
-    /// Runs [`COMMAND`] with the `ssh` arguments the CLI and TUI build for
-    /// a session whose published fingerprint is `published`. `ssh` takes
-    /// the first value of an option, so `overrides` win.
-    async fn ssh_as_client(
-        gateway: SocketAddr,
-        published: &str,
-        pin: &Path,
-        config: &Path,
-        overrides: &[String],
-    ) -> Output {
-        let target = SandboxSshTarget {
-            gateway: GATEWAY,
-            workspace: WORKSPACE,
-            sandbox: SANDBOX,
-        };
-        let pin = KnownHostsPin::at(pin.to_path_buf(), SANDBOX, WORKSPACE).unwrap();
-        let host_key = HostKeyCheck::for_relay(published.parse().unwrap(), pin).unwrap();
-        let proxy_command = sandbox_proxy_command(
-            env!("CARGO_BIN_EXE_openshell"),
-            &format!("http://{gateway}"),
-            &target,
-            "test-token",
-            host_key,
-        );
+    /// The environment of a client whose config directory is `config`.
+    fn client(config: &Path) -> Environment {
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config)
+            .remove(REQUIRE_HOST_KEY_ENV)
+    }
+
+    /// The file in which that client pins the sandbox's host key.
+    fn client_pin(config: &Path) -> PathBuf {
+        config
+            .join("openshell/known_hosts")
+            .join(GATEWAY)
+            .join(format!("openshell-{SANDBOX}.{WORKSPACE}"))
+    }
+
+    /// Runs [`COMMAND`] the way the CLI and TUI do: through the proxy they
+    /// prepare for the sandbox, with the `ssh` arguments built from it. `ssh`
+    /// takes the first value of an option, so `overrides` win.
+    async fn ssh_as_client(gateway: SocketAddr, config: &Path, overrides: &[String]) -> Output {
+        let endpoint = format!("http://{gateway}");
+        let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = OpenShellClient::with_interceptor(channel, |request: tonic::Request<()>| {
+            Ok::<_, tonic::Status>(request)
+        });
+        let target = SshTarget::new(&endpoint, GATEWAY, SANDBOX, WORKSPACE, SANDBOX_ID);
+        let proxy = target.prepare(client, None).await.unwrap();
+        // The client is this test, so its proxy command names the test binary.
+        let this_test = std::env::current_exe().unwrap();
+        let this_test = shell_escape(&this_test.to_string_lossy()).replace('%', "%%");
+        let openshell = shell_escape(env!("CARGO_BIN_EXE_openshell")).replace('%', "%%");
+        let arguments = sandbox_ssh_args(proxy.command(), "ERROR")
+            .into_iter()
+            .map(|argument| argument.replace(&this_test, &openshell));
         let mut ssh = tokio::process::Command::new("ssh");
         ssh.args(["-F", "/dev/null", "-o", "BatchMode=yes"])
             .args(overrides.iter().flat_map(|option| ["-o", option]))
-            .args(sandbox_ssh_args(&proxy_command, "ERROR"))
+            .args(arguments)
             .args(["sandbox", COMMAND]);
-        finished(ssh, config, true).await
+        proxy
+            .run(async { Ok(finished(ssh, config, true).await) })
+            .await
+            .unwrap()
     }
 
     /// Runs [`COMMAND`] through the config entry `sandbox ssh-config`
@@ -523,33 +608,35 @@ mod openssh {
     /// own strict check against a file the proxy does not write.
     #[tokio::test]
     async fn ssh_refuses_a_key_missing_from_its_own_known_hosts_file() {
-        let key = host_key(1);
-        let gateway = sandbox_presenting(&key).await;
-        let scratch = tempfile::tempdir().unwrap();
-        let proxy_pin = scratch.path().join("known_hosts/proxy");
-        let ssh_pin = scratch.path().join("known_hosts/ssh");
-        let another_key = pin_content(Some(&host_key(2)));
-        write_pin(&ssh_pin, &another_key);
+        let scratch = tempdir().unwrap();
+        client(scratch.path())
+            .run_async(async {
+                let key = host_key(1);
+                let gateway = sandbox_presenting(&key).await;
+                let proxy_pin = client_pin(scratch.path());
+                let ssh_pin = scratch.path().join("known_hosts/ssh");
+                let another_key = pin_content(Some(&host_key(2)));
+                write_pin(&ssh_pin, &another_key);
 
-        let ssh = ssh_as_client(
-            gateway,
-            &fingerprint(&key),
-            &proxy_pin,
-            scratch.path(),
-            &[format!("UserKnownHostsFile=\"{}\"", ssh_pin.display())],
-        )
-        .await;
+                let ssh = ssh_as_client(
+                    gateway,
+                    scratch.path(),
+                    &[format!("UserKnownHostsFile=\"{}\"", ssh_pin.display())],
+                )
+                .await;
 
-        let stderr = String::from_utf8_lossy(&ssh.stderr);
-        assert_eq!(ssh.status.code(), Some(255), "{stderr}");
-        assert!(stderr.contains("Host key verification failed"), "{stderr}");
-        assert_eq!(ssh.stdout, b"");
-        assert_eq!(
-            std::fs::read_to_string(&proxy_pin).unwrap(),
-            pin_content(Some(&key)),
-            "the proxy forwarded the key exchange reply"
-        );
-        assert_eq!(std::fs::read_to_string(&ssh_pin).unwrap(), another_key);
+                let stderr = String::from_utf8_lossy(&ssh.stderr);
+                assert_eq!(ssh.status.code(), Some(255), "{stderr}");
+                assert!(stderr.contains("Host key verification failed"), "{stderr}");
+                assert_eq!(ssh.stdout, b"");
+                assert_eq!(
+                    std::fs::read_to_string(&proxy_pin).unwrap(),
+                    pin_content(Some(&key)),
+                    "the proxy forwarded the key exchange reply"
+                );
+                assert_eq!(std::fs::read_to_string(&ssh_pin).unwrap(), another_key);
+            })
+            .await;
     }
 
     /// `ssh` is already running when the proxy pins the key, so this holds
@@ -558,37 +645,52 @@ mod openssh {
     /// The `%` is one `ssh` would expand in the path it is given.
     #[tokio::test]
     async fn ssh_with_the_client_arguments_reaches_the_published_sandbox() {
-        let key = host_key(1);
-        let gateway = sandbox_presenting(&key).await;
-        let scratch = tempfile::tempdir().unwrap();
-        let pin = scratch.path().join("100% known_hosts/pin");
+        let scratch = tempdir().unwrap();
+        let config = scratch.path().join("100% config");
+        client(&config)
+            .run_async(async {
+                let key = host_key(1);
+                for direct in [false, true] {
+                    let gateway = gateway_publishing(&key, &key, direct).await;
 
-        let ssh = ssh_as_client(gateway, &fingerprint(&key), &pin, scratch.path(), &[]).await;
+                    let ssh = ssh_as_client(gateway, &config, &[]).await;
 
-        let stderr = String::from_utf8_lossy(&ssh.stderr);
-        assert!(ssh.status.success(), "{stderr}");
-        assert_eq!(String::from_utf8_lossy(&ssh.stdout), COMMAND_OUTPUT);
-        assert_eq!(
-            std::fs::read_to_string(&pin).unwrap(),
-            pin_content(Some(&key))
-        );
+                    let stderr = String::from_utf8_lossy(&ssh.stderr);
+                    assert!(ssh.status.success(), "{stderr}");
+                    assert_eq!(String::from_utf8_lossy(&ssh.stdout), COMMAND_OUTPUT);
+                    assert_eq!(
+                        std::fs::read_to_string(client_pin(&config)).unwrap(),
+                        pin_content(Some(&key))
+                    );
+                    std::fs::remove_file(client_pin(&config)).unwrap();
+                }
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn ssh_with_the_client_arguments_never_reaches_another_server() {
-        let presented = host_key(1);
-        let published = host_key(2);
-        let gateway = sandbox_presenting(&presented).await;
-        let scratch = tempfile::tempdir().unwrap();
-        let pin = scratch.path().join("known_hosts/pin");
+        let scratch = tempdir().unwrap();
+        client(scratch.path())
+            .run_async(async {
+                let presented = host_key(1);
+                let published = host_key(2);
+                for direct in [false, true] {
+                    let gateway = gateway_publishing(&published, &presented, direct).await;
 
-        let ssh = ssh_as_client(gateway, &fingerprint(&published), &pin, scratch.path(), &[]).await;
+                    let ssh = ssh_as_client(gateway, scratch.path(), &[]).await;
 
-        let stderr = String::from_utf8_lossy(&ssh.stderr);
-        assert_eq!(ssh.status.code(), Some(255), "{stderr}");
-        assert_mismatch_reported(&stderr, &published, &presented);
-        assert_eq!(ssh.stdout, b"");
-        assert_eq!(std::fs::read_to_string(&pin).unwrap(), pin_content(None));
+                    let stderr = String::from_utf8_lossy(&ssh.stderr);
+                    assert_eq!(ssh.status.code(), Some(255), "{stderr}");
+                    assert_mismatch_reported(&stderr, &published, &presented);
+                    assert_eq!(ssh.stdout, b"");
+                    assert_eq!(
+                        std::fs::read_to_string(client_pin(scratch.path())).unwrap(),
+                        pin_content(None)
+                    );
+                }
+            })
+            .await;
     }
 
     /// The pin still holds the stale key when `ssh` starts, so this holds only
