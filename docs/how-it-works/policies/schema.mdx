@@ -228,7 +228,10 @@ OpenShell rejects an endpoint that breaks these rules:
   through wildcards, must use the same `tls` and `allowed_ips` values.
   Inspected endpoints that can match the same request must also agree on
   `protocol`, `enforcement`, and credential settings. Exact matching endpoints
-  can bind different providers when each uses `enforce-credential-bound`. See
+  can bind different providers when each uses `enforce-credential-bound` and
+  the providers have distinct credential environment keys. Such requests must
+  select exactly one authorized placeholder. Conflicting request policies for
+  the same provider and endpoint are rejected. See
   [Independent Accounts on One Endpoint](/how-it-works/providers/profiles#independent-accounts-on-one-endpoint).
 
 Without `protocol`, `access` and `rules` have no effect.
@@ -359,7 +362,10 @@ matcher fields in one rule.
   Method globs and `mcp.allow_all_known_mcp_methods` do not. An extension
   method is one that no supported MCP revision defines.
 
-Under the 2025 revisions, a client sends `initialize` and `notifications/initialized` before calling tools. When `mcp.allow_all_known_mcp_methods` is omitted or `false`, allow both explicitly:
+Under the 2025 revisions, a client sends `initialize` and
+`notifications/initialized` before discovering tools with `tools/list` or
+calling them with `tools/call`. When `mcp.allow_all_known_mcp_methods` is
+omitted or `false`, allow each required method explicitly:
 
 ```yaml showLineNumbers={false}
 rules:
@@ -367,6 +373,8 @@ rules:
       method: initialize
   - allow:
       method: notifications/initialized
+  - allow:
+      method: tools/list
   - allow:
       method: tools/call
       tool:

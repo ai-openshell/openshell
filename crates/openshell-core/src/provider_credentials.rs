@@ -802,7 +802,7 @@ impl ProviderCredentialState {
         Option<Arc<crate::secrets::body::BodyCredentialClassifier>>,
         u64,
     ) {
-        self.resolver_and_body_classifier_for_endpoint_with_owners(host, port, path, None)
+        self.resolver_and_body_classifier_for_endpoint_with_owners(host, port, path, None, false)
     }
 
     /// Resolve only static credentials whose own request policy admitted the request.
@@ -813,6 +813,7 @@ impl ProviderCredentialState {
         port: u16,
         path: &str,
         admitted_owners: Option<&HashSet<String>>,
+        require_credential_selection: bool,
     ) -> (
         Option<Arc<SecretResolver>>,
         Option<Arc<crate::secrets::body::BodyCredentialClassifier>>,
@@ -873,37 +874,62 @@ impl ProviderCredentialState {
                     .collect(),
             ))
         });
-        let resolver = inner.combined_resolver.as_ref().map(|resolver| {
-            let revision_fallback_allowed_revisions = inner
-                .static_credential_identity_epochs
-                .iter()
-                .filter(|(key, epoch)| {
-                    allowed.contains(*key)
-                        && inner
-                            .static_credential_bindings
-                            .get(*key)
-                            .is_some_and(|binding| binding.credential_identity == epoch.identity)
-                })
-                .map(|(key, epoch)| (key.clone(), epoch.revisions.clone()))
-                .collect();
-            let scoped = resolver
-                .as_ref()
-                .clone()
-                .with_placements(
+        let resolver = inner
+            .combined_resolver
+            .as_ref()
+            .map(|resolver| {
+                let revision_fallback_allowed_revisions =
                     inner
-                        .static_credential_bindings
+                        .static_credential_identity_epochs
                         .iter()
-                        .map(|(key, binding)| (key.clone(), binding.placement.clone()))
-                        .collect(),
-                )
-                .scoped_to_env_keys(
-                    &inner.known_static_credential_keys,
-                    &allowed,
-                    revision_fallback_allowed_revisions,
-                );
-            // Attributed to the same snapshot as `revision` above.
-            Arc::new(self.track_resolver(scoped, &inner))
-        });
+                        .filter(|(key, epoch)| {
+                            allowed.contains(*key)
+                                && inner.static_credential_bindings.get(*key).is_some_and(
+                                    |binding| binding.credential_identity == epoch.identity,
+                                )
+                        })
+                        .map(|(key, epoch)| (key.clone(), epoch.revisions.clone()))
+                        .collect();
+                let scoped = resolver
+                    .as_ref()
+                    .clone()
+                    .with_placements(
+                        inner
+                            .static_credential_bindings
+                            .iter()
+                            .map(|(key, binding)| (key.clone(), binding.placement.clone()))
+                            .collect(),
+                    )
+                    .scoped_to_env_keys(
+                        &inner.known_static_credential_keys,
+                        &allowed,
+                        revision_fallback_allowed_revisions,
+                    );
+                // Attributed to the same snapshot as `revision` above.
+                let scoped = self.track_resolver(scoped, &inner);
+                Arc::new(if require_credential_selection {
+                    let admitted_bound_keys = allowed
+                        .iter()
+                        .filter(|key| {
+                            inner
+                                .static_credential_bindings
+                                .get(*key)
+                                .is_some_and(|binding| !binding.request_policy_owners.is_empty())
+                        })
+                        .cloned()
+                        .collect();
+                    scoped.requiring_credential_selection(admitted_bound_keys)
+                } else {
+                    scoped
+                })
+            })
+            .or_else(|| {
+                require_credential_selection.then(|| {
+                    Arc::new(
+                        SecretResolver::default().requiring_credential_selection(HashSet::new()),
+                    )
+                })
+            });
         (resolver, classifier, revision)
     }
 

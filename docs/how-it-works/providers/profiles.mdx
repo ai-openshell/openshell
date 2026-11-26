@@ -252,9 +252,13 @@ Later access-token rotations do not require workload restarts.
 
 Use `enforcement: enforce-credential-bound` when two attached providers need
 different permissions at the same inspected endpoint. Each provider must use an
-endpointless profile and a distinct credential environment key. The caller
-chooses an account by sending its placeholder. OpenShell checks that account's
-own rule before resolving the placeholder.
+endpointless profile and a distinct credential environment key, such as
+`ACCOUNT_A_TOKEN` and `ACCOUNT_B_TOKEN`. Do not reuse an environment key across
+providers, even if one credential has expired or is temporarily unavailable.
+The client must send exactly one authorized account placeholder in the
+credential's declared location. OpenShell rejects requests with no selected
+account, multiple account placeholders, or a placeholder that is not authorized
+for the endpoint before forwarding them.
 
 For example, `account-a` can search, while `account-b` can search and send:
 
@@ -288,6 +292,10 @@ network_policies:
 
 An attempt to call `send` with account A's placeholder is rejected before
 forwarding. Account B's permission cannot authorize account A's credential.
+`allow_all_known_mcp_methods` permits the ordinary MCP lifecycle, including
+`initialize`, `notifications/initialized`, and `tools/list`; the explicit tool
+rules still limit `tools/call`. Without that option, add allow rules for those
+lifecycle methods as well as each permitted `tools/call`.
 Explicit deny rules still take precedence across matching endpoints. Keep the
 mode on account A if account B is removed.
 
@@ -297,6 +305,8 @@ Cedar policy. All endpoints bound to the same provider must use the same mode;
 signing, body rewriting, and WebSocket rewriting are unsupported. Overlapping
 account bindings must have the same exact destination and compatible inspection
 settings; an ordinary credential binding cannot overlap them.
+Two rules for the same provider and exact endpoint cannot disagree on allowed
+operations, deny rules, or binaries.
 
 ## Roadmap
 

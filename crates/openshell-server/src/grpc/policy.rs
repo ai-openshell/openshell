@@ -4090,6 +4090,29 @@ pub async fn build_provider_environment_snapshot_from_inputs(
     let provider_names = &spec.providers;
     let provider_profile_catalog = &inputs.catalog;
     let provider_records = &inputs.provider_records;
+    let mut request_policy_owners = HashMap::<String, Vec<String>>::new();
+    for endpoint in effective_policy
+        .network_policies
+        .values()
+        .flat_map(|rule| &rule.endpoints)
+    {
+        if endpoint.enforcement
+            != openshell_core::proto::NetworkEnforcementMode::EnforceCredentialBound as i32
+            || endpoint.token_grant_owner.is_empty()
+        {
+            continue;
+        }
+        if let Some(binding) = &endpoint.credential_binding {
+            request_policy_owners
+                .entry(binding.provider.clone())
+                .or_default()
+                .push(endpoint.token_grant_owner.clone());
+        }
+    }
+    for owners in request_policy_owners.values_mut() {
+        owners.sort();
+        owners.dedup();
+    }
     let mut provider_environment =
         super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
             provider_profile_catalog,
@@ -4097,6 +4120,7 @@ pub async fn build_provider_environment_snapshot_from_inputs(
             &policy_credential_bindings,
             &state.credentials,
             Some(&sandbox_id),
+            &request_policy_owners,
         )
         .await?;
 
@@ -4198,40 +4222,6 @@ pub async fn build_provider_environment_snapshot_from_inputs(
     provider_environment
         .dynamic_credentials
         .extend(static_request_metadata);
-
-    for record in provider_records {
-        let mut owners: Vec<_> = effective_policy
-            .network_policies
-            .values()
-            .flat_map(|rule| &rule.endpoints)
-            .filter(|endpoint| {
-                endpoint.enforcement
-                    == openshell_core::proto::NetworkEnforcementMode::EnforceCredentialBound as i32
-                    && endpoint
-                        .credential_binding
-                        .as_ref()
-                        .is_some_and(|binding| binding.provider == record.name)
-            })
-            .map(|endpoint| endpoint.token_grant_owner.clone())
-            .filter(|owner| !owner.is_empty())
-            .collect();
-        owners.sort();
-        owners.dedup();
-        if owners.is_empty() {
-            continue;
-        }
-        for key in record
-            .provider
-            .credentials
-            .keys()
-            .chain(record.provider.credential_handles.keys())
-        {
-            if let Some(binding) = provider_environment.static_credential_bindings.get_mut(key) {
-                binding.request_policy_owners.clone_from(&owners);
-                binding.request_policy_provider.clone_from(&record.name);
-            }
-        }
-    }
 
     info!(
         sandbox_id = %sandbox_id,

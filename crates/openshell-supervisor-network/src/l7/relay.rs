@@ -141,13 +141,14 @@ fn scoped_context_for_request(
     ctx: &L7EvalContext,
     request: &crate::l7::provider::L7Request,
 ) -> Option<L7EvalContext> {
-    scoped_context_for_request_with_owners(ctx, request, None)
+    scoped_context_for_request_with_owners(ctx, request, None, false)
 }
 
 fn scoped_context_for_request_with_owners(
     ctx: &L7EvalContext,
     request: &crate::l7::provider::L7Request,
     admitted_owners: Option<&HashSet<String>>,
+    require_credential_selection: bool,
 ) -> Option<L7EvalContext> {
     let mut scoped = ctx.clone();
     if matches!(
@@ -174,6 +175,7 @@ fn scoped_context_for_request_with_owners(
             ctx.port,
             &request.target,
             admitted_owners,
+            require_credential_selection,
         );
     scoped.secret_resolver = resolver;
     scoped.body_classifier = classifier;
@@ -224,7 +226,8 @@ pub(crate) async fn prepare_inspected_request(
             .values()
             .any(|credential| credential.token_grant.is_some())
     });
-    let needs_owners = grant_snapshot.is_some()
+    let needs_owners = config.require_credential_selection
+        || grant_snapshot.is_some()
         || scoped
             .provider_credentials
             .as_ref()
@@ -296,8 +299,18 @@ pub(crate) async fn prepare_inspected_request(
     if let Some(guard) = credential_generation_guard(&scoped) {
         guard.ensure_current()?;
     }
-    let scoped =
-        scoped_context_for_request_with_owners(&scoped, &req, owners.as_ref()).unwrap_or(scoped);
+    let mut scoped = scoped_context_for_request_with_owners(
+        &scoped,
+        &req,
+        owners.as_ref(),
+        config.require_credential_selection,
+    )
+    .unwrap_or(scoped);
+    if config.require_credential_selection && scoped.secret_resolver.is_none() {
+        scoped.secret_resolver = Some(Arc::new(
+            SecretResolver::default().requiring_credential_selection(HashSet::new()),
+        ));
+    }
     Ok((req, scoped, injected))
 }
 
@@ -728,12 +741,15 @@ where
 {
     let endpoint_mismatch = error.is_endpoint_mismatch();
     let placement_mismatch = error.is_placement_mismatch();
-    let status = if endpoint_mismatch || placement_mismatch {
+    let selection_required = error.is_selection_required();
+    let status = if endpoint_mismatch || placement_mismatch || selection_required {
         "403 Forbidden"
     } else {
         "500 Internal Server Error"
     };
-    let body = if placement_mismatch {
+    let body = if selection_required {
+        serde_json::json!({"error": "credential_selection_required", "message": "Select exactly one authorized account credential placeholder"})
+    } else if placement_mismatch {
         serde_json::json!({
             "error": "credential_placement_mismatch",
             "message": "Credential is not authorized for this request location",
@@ -750,15 +766,17 @@ where
         })
     };
     if let Some(correlation) = correlation {
-        let (response_code, outcome) = if endpoint_mismatch || placement_mismatch {
-            (403, HttpOutcome::Denied)
-        } else {
-            (500, HttpOutcome::PlatformError)
-        };
+        let (response_code, outcome) =
+            if endpoint_mismatch || placement_mismatch || selection_required {
+                (403, HttpOutcome::Denied)
+            } else {
+                (500, HttpOutcome::PlatformError)
+            };
         correlation.record_rejection(
             response_code,
             outcome,
-            (!endpoint_mismatch && !placement_mismatch).then_some("credential_resolution_failed"),
+            (!endpoint_mismatch && !placement_mismatch && !selection_required)
+                .then_some("credential_resolution_failed"),
         );
         crate::l7::rest::send_json_response_with_request_id(
             &ctx.policy_name,
@@ -771,7 +789,23 @@ where
     } else {
         crate::l7::rest::send_json_response(&ctx.policy_name, body, client, status).await?;
     }
-    let mut events = if placement_mismatch {
+    let mut events = if selection_required {
+        vec![
+            HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::for_http_method(method))
+                .http_request(method_only_request(method))
+                .http_response(openshell_ocsf::HttpResponse { code: 403 })
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::High)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .firewall_rule(&ctx.policy_name, "credential-binding")
+                .message("Account credential selection required; request denied")
+                .status_detail("credential_selection_required")
+                .build(),
+        ]
+    } else if placement_mismatch {
         vec![
             HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::for_http_method(method))
@@ -1199,7 +1233,9 @@ where
             } else if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>()
             {
                 if let Some(observer) = observer {
-                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                    observer.observe_credential_failure(
+                        error.is_endpoint_mismatch() || error.is_selection_required(),
+                    );
                 }
                 reject_credential_resolution(client, ctx, &request.action, error, correlation)
                     .await?;
@@ -11352,6 +11388,7 @@ network_policies:
             path: path.into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
+            require_credential_selection: false,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
@@ -11831,6 +11868,7 @@ network_policies:
             path: "/ws".into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
+            require_credential_selection: false,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
@@ -12038,6 +12076,7 @@ network_policies:
             path: "/ws".into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
+            require_credential_selection: false,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
@@ -12167,6 +12206,7 @@ network_policies:
             path: "/graphql".into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
+            require_credential_selection: false,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,

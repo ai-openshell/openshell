@@ -385,6 +385,32 @@ async fn two_static_provider_bindings_activate_with_distinct_policy_owners() {
             },
         );
     }
+    // A single account cannot gain the union of two conflicting policies on the same route.
+    let mut conflicting = policy.clone();
+    let mut same_account = conflicting.network_policies["static-a"].clone();
+    same_account.name = "static-a-expanded".into();
+    same_account.endpoints[0].rules = conflicting.network_policies["static-b"].endpoints[0]
+        .rules
+        .clone();
+    conflicting
+        .network_policies
+        .insert(same_account.name.clone(), same_account);
+    let err = handle_update_config(
+        &state,
+        authed_request(UpdateConfigRequest {
+            sandbox: "static-accounts".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            policy: Some(conflicting),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.message()
+            .contains("one credential cannot have conflicting request policies")
+    );
+
     handle_update_config(
         &state,
         authed_request(UpdateConfigRequest {
@@ -486,6 +512,31 @@ async fn two_static_provider_bindings_activate_with_distinct_policy_owners() {
         .is_err(),
         "stripped metadata must not activate"
     );
+    // Previously admitted state can contain an expired provider sharing A's key. Refuse
+    // the whole snapshot before either credential can inherit the other's policy owner.
+    let original_b = state
+        .store
+        .get_message_by_name::<openshell_core::proto::Provider>("default", "static-b")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut expired_b = original_b.clone();
+    expired_b.r#type = "static-a-profile".into();
+    expired_b.credentials = HashMap::from([("ACCOUNT_A".into(), "expired-token-b".into())]);
+    expired_b.credential_expiration_times = HashMap::from([(
+        "ACCOUNT_A".into(),
+        openshell_core::time::timestamp_from_millis(1).unwrap(),
+    )]);
+    state.store.put_message(&expired_b).await.unwrap();
+    let collision = build_provider_environment_snapshot(&state, &sandbox, true, true)
+        .await
+        .unwrap_err();
+    assert_eq!(collision.code(), tonic::Code::FailedPrecondition);
+    assert!(collision.message().contains("ACCOUNT_A"));
+    assert!(collision.message().contains("static-a"));
+    assert!(collision.message().contains("static-b"));
+    state.store.put_message(&original_b).await.unwrap();
+
     let mut remaining = policy.clone();
     remaining
         .network_policies
