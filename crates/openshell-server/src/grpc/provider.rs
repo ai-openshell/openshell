@@ -1807,6 +1807,8 @@ fn static_credential_binding(
         format!("refresh:{workload_credential_handle}")
     };
     StaticCredentialBinding {
+        request_policy_provider: String::new(),
+        request_policy_owners: Vec::new(),
         endpoints: endpoints.to_vec(),
         credential_identity,
         workload_credential_handle,

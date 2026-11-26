@@ -165,7 +165,9 @@ pub fn parse_l7_config(config: &EndpointConfig) -> Option<L7EndpointConfig> {
     };
 
     let enforcement = match config.enforcement {
-        EnforcementSetting::Enforce => EnforcementMode::Enforce,
+        EnforcementSetting::Enforce | EnforcementSetting::EnforceCredentialBound => {
+            EnforcementMode::Enforce
+        }
         EnforcementSetting::Default | EnforcementSetting::Audit => EnforcementMode::Audit,
         EnforcementSetting::Unknown => unreachable!("endpoint modes were validated above"),
     };

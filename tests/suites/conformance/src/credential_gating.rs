@@ -346,6 +346,159 @@ async fn profile_endpoints_bind_static_credentials(cx: &mut Context) -> testkit:
     Ok(())
 }
 
+/// Two accounts at one inspected MCP endpoint keep their own tool rules and
+/// bearer values, including after one account is withdrawn.
+#[testkit::test]
+async fn account_bound_mcp_tool_policies_are_isolated(cx: &mut Context) -> testkit::Result {
+    const ENV_A: &str = "E2E_MCP_ACCOUNT_A";
+    const ENV_B: &str = "E2E_MCP_ACCOUNT_B";
+    const SECRET_A: &str = "e2e-mcp-account-a";
+    const SECRET_B: &str = "e2e-mcp-account-b";
+
+    let server = HttpRecorder::serve(|_| {
+        Response::json(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"content": [{"type": "text", "text": "ok"}]},
+        }))
+    })
+    .await?;
+    let mut providers = Vec::new();
+    for (suffix, env, secret) in [("accta", ENV_A, SECRET_A), ("acctb", ENV_B, SECRET_B)] {
+        let name = cx.name(suffix);
+        let profile = Profile::new(&name)
+            .display_name("E2E MCP account")
+            .credential(bearer_credential("token", env))
+            .binaries(PYTHON_BINARIES.iter().copied())
+            .to_yaml()?;
+        cx.install_provider(&name, &profile, &[(env, secret)])
+            .await?;
+        providers.push(name);
+    }
+
+    let binaries: Vec<_> = PYTHON_BINARIES
+        .iter()
+        .map(|path| json!({"path": path}))
+        .collect();
+    let account_rule = |name: &str, provider: &str, tools: &[&str]| {
+        let rules: Vec<_> = tools
+            .iter()
+            .map(|tool| json!({"allow": {"method": "tools/call", "tool": tool}}))
+            .collect();
+        json!({
+            "name": name,
+            "endpoints": [{
+                "host": TEST_HOST,
+                "port": server.port,
+                "path": "/mcp",
+                "protocol": "mcp",
+                "enforcement": "enforce-credential-bound",
+                "mcp": {"versions": ["2025-11-25"]},
+                "rules": rules,
+                "credential_binding": {"provider": provider},
+            }],
+            "binaries": binaries,
+        })
+    };
+    let rules = json!({
+        "account_a": account_rule("account_a", &providers[0], &["search"]),
+        "account_b": account_rule("account_b", &providers[1], &["search", "send"]),
+    });
+    let policy = policy::base_with(&format!("network_policies: {rules}\n"))?;
+    let sandbox = cx
+        .python_sandbox("multi", policy.clone())
+        .providers(providers.iter().map(String::as_str))
+        .create_ready()
+        .await?;
+    let placeholder_a = sandbox.exec(["printenv", ENV_A]).await?.success()?.stdout;
+    let placeholder_b = sandbox.exec(["printenv", ENV_B]).await?.success()?.stdout;
+    let placeholder_a = placeholder_a.trim();
+    let placeholder_b = placeholder_b.trim();
+    testkit::ensure!(
+        placeholder_a.starts_with(PLACEHOLDER_PREFIX)
+            && placeholder_b.starts_with(PLACEHOLDER_PREFIX)
+            && placeholder_a != placeholder_b,
+        "each account must receive its own nonsecret placeholder"
+    );
+
+    async fn call(
+        sandbox: &Sandbox,
+        port: u16,
+        placeholder: &str,
+        tool: &str,
+    ) -> Result<clients::Http> {
+        http(
+            sandbox,
+            TEST_HOST,
+            port,
+            &clients::Request::new("POST", "/mcp")
+                .header("Authorization", format!("Bearer {placeholder}"))
+                .header("Content-Type", "application/json")
+                .header("MCP-Protocol-Version", "2025-11-25")
+                .body(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {}}}).to_string()),
+        )
+        .await
+    }
+
+    for (placeholder, tool, secret) in [
+        (placeholder_a, "search", SECRET_A),
+        (placeholder_b, "search", SECRET_B),
+        (placeholder_b, "send", SECRET_B),
+    ] {
+        let reply = call(&sandbox, server.port, placeholder, tool).await?;
+        testkit::ensure!(reply.status() == Some(200), "{tool} should be permitted");
+        let requests = server.requests();
+        let request = requests
+            .last()
+            .ok_or_else(|| Error::msg("allowed call did not reach upstream"))?;
+        testkit::ensure!(
+            request.header("authorization").as_deref() == Some(format!("Bearer {secret}").as_str())
+                && serde_json::from_str::<serde_json::Value>(&request.body)?["params"]["name"]
+                    == tool,
+            "the recipient must see the chosen account's bearer and tool"
+        );
+    }
+    let before_denied = server.requests().len();
+    testkit::ensure!(
+        before_denied == 3,
+        "exactly three allowed calls must reach upstream"
+    );
+    let reply = call(&sandbox, server.port, placeholder_a, "send").await?;
+    testkit::ensure!(reply.status() == Some(403), "account A cannot send");
+    testkit::ensure!(
+        server.requests().len() == before_denied,
+        "account A's disabled tool must not reach upstream"
+    );
+
+    let mut withdrawn = policy;
+    withdrawn.network_policies.remove("account_a");
+    policy::set(&sandbox, &withdrawn).await?;
+    let reply = call(&sandbox, server.port, placeholder_a, "search").await?;
+    testkit::ensure!(
+        reply.status() == Some(403),
+        "withdrawn account A cannot search"
+    );
+    testkit::ensure!(
+        server.requests().len() == before_denied,
+        "withdrawn account A must not reach upstream"
+    );
+    let reply = call(&sandbox, server.port, placeholder_b, "send").await?;
+    testkit::ensure!(
+        reply.status() == Some(200),
+        "account B must remain available"
+    );
+    let requests = server.requests();
+    testkit::ensure!(
+        requests.len() == before_denied + 1
+            && requests
+                .last()
+                .and_then(|request| request.header("authorization"))
+                .as_deref()
+                == Some(format!("Bearer {SECRET_B}").as_str()),
+        "account B must keep its bearer after account A is withdrawn"
+    );
+    Ok(())
+}
+
 /// Run [`scripts::WEBSOCKET_BINARY_CLIENT`] against `server` in a sandbox with `providers`,
 /// and return whether its binary frame reached `server`.
 async fn send_binary_frame(

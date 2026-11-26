@@ -141,6 +141,14 @@ fn scoped_context_for_request(
     ctx: &L7EvalContext,
     request: &crate::l7::provider::L7Request,
 ) -> Option<L7EvalContext> {
+    scoped_context_for_request_with_owners(ctx, request, None)
+}
+
+fn scoped_context_for_request_with_owners(
+    ctx: &L7EvalContext,
+    request: &crate::l7::provider::L7Request,
+    admitted_owners: Option<&HashSet<String>>,
+) -> Option<L7EvalContext> {
     let mut scoped = ctx.clone();
     if matches!(
         crate::l7::rest::request_authority(&request.raw_header, request_default_port(ctx)),
@@ -160,8 +168,13 @@ fn scoped_context_for_request(
         return Some(scoped);
     }
     let credentials = ctx.provider_credentials.as_ref()?;
-    let (resolver, classifier, revision) =
-        credentials.resolver_and_body_classifier_for_endpoint(&ctx.host, ctx.port, &request.target);
+    let (resolver, classifier, revision) = credentials
+        .resolver_and_body_classifier_for_endpoint_with_owners(
+            &ctx.host,
+            ctx.port,
+            &request.target,
+            admitted_owners,
+        );
     scoped.secret_resolver = resolver;
     scoped.body_classifier = classifier;
     scoped.provider_credential_revision = Some(revision);
@@ -211,7 +224,18 @@ pub(crate) async fn prepare_inspected_request(
             .values()
             .any(|credential| credential.token_grant.is_some())
     });
-    let (req, injected) = if let Some(snapshot) = grant_snapshot {
+    let needs_owners = grant_snapshot.is_some()
+        || scoped
+            .provider_credentials
+            .as_ref()
+            .is_some_and(|credentials| {
+                credentials.has_request_policy_bound_credentials_for_endpoint(
+                    &scoped.host,
+                    scoped.port,
+                    &req.target,
+                )
+            });
+    let owners = if needs_owners {
         // Middleware can replace an inspected body. Recompute owner admission for
         // the body that will be sent, even when another endpoint allowed both the
         // original and transformed requests. Request method/path/query are immutable.
@@ -241,12 +265,16 @@ pub(crate) async fn prepare_inspected_request(
             }
             L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => {}
         }
-        let owners = admitted_token_grant_owners(engine, &scoped, &current_info)?;
+        Some(admitted_token_grant_owners(engine, &scoped, &current_info)?)
+    } else {
+        None
+    };
+    let (req, injected) = if let Some(snapshot) = grant_snapshot {
         crate::l7::token_grant_injection::inject_for_admitted_owners_correlated(
             req,
             &scoped,
             snapshot,
-            &owners,
+            owners.as_ref().expect("grant request has admitted owners"),
             request_id,
             observation_context.filter(|context| {
                 let policy_hash =
@@ -268,7 +296,8 @@ pub(crate) async fn prepare_inspected_request(
     if let Some(guard) = credential_generation_guard(&scoped) {
         guard.ensure_current()?;
     }
-    let scoped = scoped_context_for_request(&scoped, &req).unwrap_or(scoped);
+    let scoped =
+        scoped_context_for_request_with_owners(&scoped, &req, owners.as_ref()).unwrap_or(scoped);
     Ok((req, scoped, injected))
 }
 
@@ -5150,6 +5179,8 @@ mod tests {
 
     fn endpoint_binding(identity: &str) -> StaticCredentialBinding {
         StaticCredentialBinding {
+            request_policy_provider: String::new(),
+            request_policy_owners: Vec::new(),
             endpoints: vec![StaticCredentialEndpointBinding {
                 host: "allowed.example.test".to_string(),
                 port: 443,
@@ -7869,6 +7900,8 @@ network_policies:
             TestHashMap::from([(
                 "API_TOKEN".to_string(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
                         host: "api.example.test".to_string(),
                         port: 8080,
@@ -7973,6 +8006,8 @@ network_policies:
             TestHashMap::from([(
                 "API_TOKEN".to_string(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
                         host: "api.example.test".to_string(),
                         port: u32::from(port),
@@ -8628,6 +8663,8 @@ network_policies:
             TestHashMap::from([(
                 "API_TOKEN".to_string(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
                         host: "api.example.test".to_string(),
                         port: 443,
@@ -9848,6 +9885,8 @@ network_policies:
                 TestHashMap::from([(
                     "API_TOKEN".into(),
                     StaticCredentialBinding {
+                        request_policy_provider: String::new(),
+                        request_policy_owners: Vec::new(),
                         endpoints: vec![StaticCredentialEndpointBinding {
                             host: "api.example.test".into(),
                             port: 8080,
@@ -11881,6 +11920,8 @@ network_policies:
             TestHashMap::from([(
                 "API_TOKEN".to_string(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
                         host: "allowed.example.test".to_string(),
                         port: 443,
@@ -15774,6 +15815,8 @@ network_policies:
                     TestHashMap::from([(
                         "API_TOKEN".into(),
                         StaticCredentialBinding {
+                            request_policy_provider: String::new(),
+                            request_policy_owners: Vec::new(),
                             endpoints: vec![StaticCredentialEndpointBinding {
                                 host: ctx.host.clone(),
                                 port: u32::from(ctx.port),

@@ -2283,6 +2283,8 @@ network_policies:
                 (
                     key.to_string(),
                     openshell_core::proto::StaticCredentialBinding {
+                        request_policy_provider: String::new(),
+                        request_policy_owners: Vec::new(),
                         endpoints: vec![openshell_core::proto::StaticCredentialEndpointBinding {
                             host: "example.com".to_string(),
                             port: 80,

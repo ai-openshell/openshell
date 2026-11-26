@@ -14009,6 +14009,8 @@ network_policies:
             TestHashMap::from([(
                 "API_TOKEN".to_string(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
                         host: "api.example.test".to_string(),
                         port: 80,
@@ -16440,6 +16442,8 @@ network_policies:
             TestHashMap::from([(
                 "API_TOKEN".to_string(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
                         host: "api.example.com".to_string(),
                         port: 80,
@@ -16485,6 +16489,8 @@ network_policies:
             TestHashMap::from([(
                 "API_TOKEN".to_string(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
                         host: "api.example.com".to_string(),
                         port: 80,
@@ -16531,6 +16537,8 @@ network_policies:
             TestHashMap::from([(
                 "API_TOKEN".to_string(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
                         host: "api.example.com".to_string(),
                         port: 80,
@@ -17233,6 +17241,8 @@ network_policies:
             TestHashMap::from([(
                 "BOT_TOKEN".into(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     credential_identity: "provider:BOT_TOKEN".into(),
                     workload_credential_handle: String::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
@@ -17295,6 +17305,8 @@ network_policies:
             TestHashMap::from([(
                 "API_KEY".into(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     credential_identity: "provider".into(),
                     workload_credential_handle: String::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
@@ -17442,6 +17454,8 @@ network_policies:
             TestHashMap::from([(
                 "API_TOKEN".to_string(),
                 StaticCredentialBinding {
+                    request_policy_provider: String::new(),
+                    request_policy_owners: Vec::new(),
                     endpoints: vec![StaticCredentialEndpointBinding {
                         host: "allowed.example.com".to_string(),
                         port: 80,
@@ -17534,6 +17548,8 @@ network_policies:
                 (
                     key.clone(),
                     StaticCredentialBinding {
+                        request_policy_provider: String::new(),
+                        request_policy_owners: Vec::new(),
                         endpoints: vec![StaticCredentialEndpointBinding {
                             host: "allowed.example.com".to_string(),
                             port: 80,
