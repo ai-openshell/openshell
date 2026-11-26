@@ -2903,6 +2903,19 @@ async fn handle_get_sandbox_config_inner(
 
 const CEDAR_SUPPORT_REQUIRED: &str = "Cedar policy requires a supervisor with Cedar support";
 
+/// Capabilities used when the Gateway revalidates its own configuration snapshot.
+/// Supervisor requests must still report their actual supported capabilities.
+pub(super) fn gateway_policy_capabilities() -> Vec<String> {
+    use openshell_core::extension_protocol::{
+        POLICY_CEDAR_V1, POLICY_REQUEST_BOUND_CREDENTIALS_V1,
+    };
+
+    vec![
+        POLICY_CEDAR_V1.to_string(),
+        POLICY_REQUEST_BOUND_CREDENTIALS_V1.to_string(),
+    ]
+}
+
 /// Refuses a Cedar policy to a supervisor that did not report Cedar support.
 ///
 /// Callers must not answer with an empty compatibility configuration
@@ -5313,10 +5326,7 @@ pub(super) async fn handle_report_sandbox_configuration(
     }
     if reported == ConfigurationAdmissionState::Accepted {
         let mut config_request = Request::new(GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                openshell_core::extension_protocol::POLICY_REQUEST_BOUND_CREDENTIALS_V1.to_string(),
-            ],
+            supported_capabilities: gateway_policy_capabilities(),
             name: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
         });
@@ -5335,10 +5345,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         // Runtime error strings may contain parser payloads. Only gateway-authored
         // diagnostics may be exposed verbatim through public sandbox status.
         let mut config_request = Request::new(GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                openshell_core::extension_protocol::POLICY_REQUEST_BOUND_CREDENTIALS_V1.to_string(),
-            ],
+            supported_capabilities: gateway_policy_capabilities(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             name: sandbox_name,
         });
