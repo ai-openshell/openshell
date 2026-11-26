@@ -712,6 +712,7 @@ graphql_allow_rule_matches_operation(op, rule, endpoint) if {
 	graphql_operation_type_matches(effective, rule)
 	graphql_operation_name_matches(effective, rule)
 	graphql_allow_fields_match(effective, rule)
+	graphql_allow_field_rules_match(effective, rule)
 }
 
 graphql_deny_rule_matches_operation(op, rule, endpoint) if {
@@ -719,6 +720,7 @@ graphql_deny_rule_matches_operation(op, rule, endpoint) if {
 	graphql_operation_type_matches(effective, rule)
 	graphql_operation_name_matches(effective, rule)
 	graphql_deny_fields_match(effective, rule)
+	graphql_deny_field_rules_match(effective, rule)
 }
 
 graphql_operation_type_matches(_, rule) if {
@@ -774,6 +776,78 @@ graphql_deny_fields_match(op, rule) if {
 graphql_field_matches_any(field, patterns) if {
 	pattern := patterns[_]
 	glob.match(pattern, [], field)
+}
+
+# Fine-grained rules retain each schema field occurrence and its arguments.
+# An allow rule must cover every selected path in that same rule; separate
+# occurrences cannot borrow allowed arguments from one another.
+graphql_allow_field_rules_match(_, rule) if {
+	count(object.get(rule, "field_rules", [])) == 0
+}
+
+graphql_allow_field_rules_match(op, rule) if {
+	count(object.get(rule, "field_rules", [])) > 0
+	occurrences := object.get(op, "field_occurrences", [])
+	is_array(occurrences)
+	count(occurrences) > 0
+	not graphql_has_unmatched_occurrence(occurrences, rule.field_rules)
+}
+
+graphql_has_unmatched_occurrence(occurrences, field_rules) if {
+	occurrence := occurrences[_]
+	not graphql_occurrence_matches_any(occurrence, field_rules)
+}
+
+graphql_occurrence_matches_any(occurrence, field_rules) if {
+	field_rule := field_rules[_]
+	graphql_occurrence_matches(occurrence, field_rule)
+}
+
+graphql_occurrence_matches(occurrence, field_rule) if {
+	occurrence.path == field_rule.path
+	not graphql_has_unmatched_argument(occurrence, field_rule)
+}
+
+graphql_has_unmatched_argument(occurrence, field_rule) if {
+	some path, matcher in object.get(field_rule, "arguments", {})
+	actual := object.get(object.get(occurrence, "arguments", {}), split(path, "."), null)
+	not graphql_exact_argument_matches(actual, matcher)
+}
+
+graphql_exact_argument_matches(actual, matcher) if {
+	is_string(actual)
+	actual == matcher.exact
+}
+
+graphql_deny_field_rules_match(_, rule) if {
+	count(object.get(rule, "field_rules", [])) == 0
+}
+
+graphql_deny_field_rules_match(op, rule) if {
+	count(object.get(rule, "field_rules", [])) > 0
+	occurrences := object.get(op, "field_occurrences", null)
+	# A hash-only registry entry supplies no trusted selection facts.
+	not is_array(occurrences)
+}
+
+graphql_deny_field_rules_match(op, rule) if {
+	occurrence := object.get(op, "field_occurrences", [])[_]
+	field_rule := rule.field_rules[_]
+	occurrence.path == field_rule.path
+	graphql_deny_occurrence_matches(occurrence, field_rule)
+}
+
+graphql_deny_occurrence_matches(occurrence, field_rule) if {
+	not graphql_deny_has_known_argument_mismatch(occurrence, field_rule)
+}
+
+# An unresolved deny argument remains potentially matching, but a different
+# argument conclusively mismatching the same occurrence rules it out.
+graphql_deny_has_known_argument_mismatch(occurrence, field_rule) if {
+	some path, matcher in object.get(field_rule, "arguments", {})
+	actual := object.get(object.get(occurrence, "arguments", {}), split(path, "."), null)
+	is_string(actual)
+	actual != matcher.exact
 }
 
 # Wildcard "*" matches any method; otherwise case-insensitive exact match.

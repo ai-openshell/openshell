@@ -363,6 +363,7 @@ fn operation(operation_type: &str, name: Option<&str>, fields: &[&str]) -> Graph
         operation_type: operation_type.to_string(),
         operation_name: name.map(str::to_string),
         fields: fields.iter().map(ToString::to_string).collect(),
+        field_occurrences: None,
         persisted_query: false,
         persisted_query_hash: None,
         persisted_query_id: None,

@@ -35,6 +35,11 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::mcp::{
     DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion, canonicalize_mcp_versions,
 };
+use openshell_core::policy_l7::{
+    graphql_field_rules_enforcement, graphql_field_rules_from_proto, graphql_field_rules_to_proto,
+    validate_authored_graphql_field_rules, validate_graphql_field_rules,
+    validate_graphql_field_rules_enforcement,
+};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
     LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
@@ -295,6 +300,7 @@ fn allow_def_to_proto(_protocol: &str, allow: L7AllowDef) -> L7Allow {
         command: allow.command,
         operation_type: allow.operation_type,
         operation_name: allow.operation_name,
+        field_rules: graphql_field_rules_to_proto(&allow.field_rules),
         fields: allow.fields,
         query: allow
             .query
@@ -316,6 +322,7 @@ fn deny_def_to_proto(_protocol: &str, deny: L7DenyRuleDef) -> L7DenyRule {
         command: deny.command,
         operation_type: deny.operation_type,
         operation_name: deny.operation_name,
+        field_rules: graphql_field_rules_to_proto(&deny.field_rules),
         fields: deny.fields,
         query: deny
             .query
@@ -422,6 +429,7 @@ fn allow_proto_to_def(
             .collect(),
         operation_type: allow.operation_type,
         operation_name: allow.operation_name,
+        field_rules: graphql_field_rules_from_proto(&allow.field_rules),
         fields: allow.fields,
         tool,
         params,
@@ -458,6 +466,7 @@ fn deny_proto_to_def(
         operation_type: deny.operation_type.clone(),
         operation_name: deny.operation_name.clone(),
         fields: deny.fields.clone(),
+        field_rules: graphql_field_rules_from_proto(&deny.field_rules),
         tool,
         params,
     }
@@ -488,6 +497,10 @@ fn endpoint_def_to_proto(e: NetworkEndpointDef) -> NetworkEndpoint {
     let protocol = e.protocol;
     let allow_rules = e.rules;
     let deny_rules = e.deny_rules;
+    let has_field_rules = allow_rules
+        .iter()
+        .any(|rule| !rule.allow.field_rules.is_empty())
+        || deny_rules.iter().any(|rule| !rule.field_rules.is_empty());
     // Normalize port/ports: ports takes precedence, else
     // single port is promoted to ports array.
     let normalized_ports: Vec<u32> = if !e.ports.is_empty() {
@@ -504,8 +517,11 @@ fn endpoint_def_to_proto(e: NetworkEndpointDef) -> NetworkEndpoint {
         ports: normalized_ports,
         protocol: protocol.clone(),
         tls: network_tls_mode_from_str(&e.tls).expect("endpoint modes validated above") as i32,
-        enforcement: network_enforcement_mode_from_str(&e.enforcement)
-            .expect("endpoint modes validated above") as i32,
+        enforcement: graphql_field_rules_enforcement(
+            network_enforcement_mode_from_str(&e.enforcement)
+                .expect("endpoint modes validated above") as i32,
+            has_field_rules,
+        ),
         access: network_access_preset_from_str(&e.access).expect("endpoint modes validated above")
             as i32,
         rules: allow_rules
@@ -562,8 +578,30 @@ fn endpoint_def_to_proto(e: NetworkEndpointDef) -> NetworkEndpoint {
 fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
     for (policy_name, rule) in &raw.network_policies {
         for (endpoint_index, endpoint) in rule.endpoints.iter().enumerate() {
-            let errors =
+            let mut errors =
                 validate_endpoint_modes(&endpoint.tls, &endpoint.enforcement, &endpoint.access);
+            for (index, rule) in endpoint.rules.iter().enumerate() {
+                errors.extend(
+                    validate_authored_graphql_field_rules(
+                        &endpoint.protocol,
+                        &rule.allow.fields,
+                        &rule.allow.field_rules,
+                    )
+                    .into_iter()
+                    .map(|error| format!("rules[{index}].allow.{error}")),
+                );
+            }
+            for (index, rule) in endpoint.deny_rules.iter().enumerate() {
+                errors.extend(
+                    validate_authored_graphql_field_rules(
+                        &endpoint.protocol,
+                        &rule.fields,
+                        &rule.field_rules,
+                    )
+                    .into_iter()
+                    .map(|error| format!("deny_rules[{index}].{error}")),
+                );
+            }
             if !errors.is_empty() {
                 return Err(miette::miette!(
                     "network policy '{policy_name}': endpoint {endpoint_index}: {}",
@@ -707,6 +745,31 @@ fn endpoint_setting_proto_to_def(setting: &NetworkEndpoint) -> Result<NetworkEnd
 
 /// Converts a protobuf endpoint to its authored form.
 fn endpoint_proto_to_def(e: &NetworkEndpoint) -> Result<NetworkEndpointDef> {
+    let mut selector_errors = Vec::new();
+    selector_errors.extend(validate_graphql_field_rules_enforcement(e));
+    for rule in &e.rules {
+        if let Some(allow) = &rule.allow {
+            selector_errors.extend(validate_graphql_field_rules(
+                &e.protocol,
+                &allow.fields,
+                &allow.field_rules,
+            ));
+        }
+    }
+    for rule in &e.deny_rules {
+        selector_errors.extend(validate_graphql_field_rules(
+            &e.protocol,
+            &rule.fields,
+            &rule.field_rules,
+        ));
+    }
+    if !selector_errors.is_empty() {
+        return Err(miette::miette!(
+            "cannot serialize endpoint {}: {}",
+            e.host,
+            selector_errors.join("; ")
+        ));
+    }
     // Use compact form: if ports has exactly 1 element,
     // emit port (scalar). If >1, emit ports (array).
     // Proto uses u32; authored ports are u16. Reject an
@@ -1961,6 +2024,7 @@ fn validate_sandbox_policy_with_mcp_presence(
                             && allow.operation_type.is_empty()
                             && allow.operation_name.is_empty()
                             && allow.fields.is_empty()
+                            && allow.field_rules.is_empty()
                             && allow.params.is_empty()
                     })
                 });
@@ -1978,6 +2042,27 @@ fn validate_sandbox_policy_with_mcp_presence(
                     .unwrap_or(false),
             };
             let mut l7_errors = validate_l7_endpoint_semantics(&fields);
+            l7_errors.extend(validate_graphql_field_rules_enforcement(ep));
+            for (index, rule) in ep.rules.iter().enumerate() {
+                if let Some(allow) = &rule.allow {
+                    l7_errors.extend(
+                        validate_graphql_field_rules(
+                            &ep.protocol,
+                            &allow.fields,
+                            &allow.field_rules,
+                        )
+                        .into_iter()
+                        .map(|error| format!("rules[{index}].allow.{error}")),
+                    );
+                }
+            }
+            for (index, rule) in ep.deny_rules.iter().enumerate() {
+                l7_errors.extend(
+                    validate_graphql_field_rules(&ep.protocol, &rule.fields, &rule.field_rules)
+                        .into_iter()
+                        .map(|error| format!("deny_rules[{index}].{error}")),
+                );
+            }
             l7_errors.extend(validate_endpoint_mode_values(
                 ep.tls,
                 ep.enforcement,
@@ -2324,6 +2409,7 @@ fn validate_endpoint_settings(settings: &[NetworkEndpoint]) -> Vec<PolicyViolati
         if !setting.path.is_empty() && !setting.path.starts_with('/') && setting.path != "**" {
             reasons.push("path must start with '/' or be '**'".to_string());
         }
+        reasons.extend(validate_graphql_field_rules_enforcement(setting));
         reasons.extend(validate_endpoint_mode_values(
             setting.tls,
             setting.enforcement,
@@ -6273,9 +6359,22 @@ network_policies:
               operation_type: mutation
               operation_name: Issue*
               fields: [createIssue]
+          - allow:
+              operation_type: query
+              field_rules:
+                - path: repository
+                  arguments:
+                    owner: { exact: acme }
+                    name: { exact: '' }
+                - path: repository.name
         deny_rules:
           - operation_type: mutation
             fields: [deleteRepository]
+          - operation_type: mutation
+            field_rules:
+              - path: createIssue
+                arguments:
+                  input.repositoryId: { exact: R_123 }
     binaries:
       - path: /usr/bin/curl
 ";
@@ -6285,6 +6384,22 @@ network_policies:
 
         let ep = &proto2.network_policies["github_graphql"].endpoints[0];
         assert_eq!(ep.protocol, "graphql");
+        assert_eq!(
+            ep.enforcement,
+            openshell_core::proto::NetworkEnforcementMode::GraphqlFieldRulesEnforce as i32
+        );
+        assert_eq!(
+            ep.rules[2].allow.as_ref().unwrap().field_rules[0].arguments["name"]
+                .exact
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            ep.deny_rules[1].field_rules[0].arguments["input.repositoryId"]
+                .exact
+                .as_deref(),
+            Some("R_123")
+        );
         assert_eq!(ep.persisted_queries, "allow_registered");
         assert_eq!(ep.graphql_max_body_bytes, 131_072);
         assert_eq!(
@@ -6295,6 +6410,44 @@ network_policies:
         assert_eq!(ep.rules[1].allow.as_ref().unwrap().operation_name, "Issue*");
         assert_eq!(ep.deny_rules[0].operation_type, "mutation");
         assert_eq!(ep.deny_rules[0].fields, vec!["deleteRepository"]);
+    }
+
+    #[test]
+    fn graphql_field_rules_reject_unsafe_shapes_and_unmarked_wire_policies() {
+        let prefix = "version: 1\nnetwork_policies:\n  test:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: graphql\n        enforcement: enforce\n        rules:\n          - allow:\n              operation_type: query\n";
+        for invalid in [
+            "              field_rules: []\n",
+            "              field_rules: [{path: repository, arguments: {owner: {}}}]\n",
+            "              field_rules: [{path: repository, arguments: {owner: {exact: 42}}}]\n",
+            "              field_rules: [{path: 'repository.*'}]\n",
+            "              fields: [repository]\n              field_rules: [{path: repository}]\n",
+        ] {
+            assert!(
+                parse_sandbox_policy(&format!("{prefix}{invalid}")).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        let websocket = format!(
+            "{}              field_rules: [{{path: repository}}]\n",
+            prefix.replace("protocol: graphql", "protocol: websocket")
+        );
+        assert!(
+            parse_sandbox_policy(&websocket)
+                .unwrap_err()
+                .to_string()
+                .contains("only valid for protocol graphql")
+        );
+        let yaml = format!("{prefix}              field_rules: [{{path: repository}}]\n");
+        let mut policy = parse_sandbox_policy(&yaml).unwrap();
+        let endpoint = &mut policy.network_policies.get_mut("test").unwrap().endpoints[0];
+        endpoint.enforcement = openshell_core::proto::NetworkEnforcementMode::Enforce as i32;
+        assert!(
+            validate_sandbox_policy(&policy)
+                .unwrap_err()
+                .iter()
+                .any(|error| error.to_string().contains("scoped enforcement enum marker"))
+        );
+        assert!(serialize_sandbox_policy(&policy).is_err());
     }
 
     #[test]

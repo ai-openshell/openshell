@@ -15,6 +15,9 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// Policy format implemented by a peer's registered Cedar backend.
 pub const POLICY_CEDAR_V1: &str = "openshell.policy.cedar.v1";
 
+/// GraphQL selected-field and resolved-argument policy enforcement.
+pub const POLICY_GRAPHQL_FIELD_RULES_V1: &str = "openshell.policy.graphql-field-rules.v1";
+
 /// Whether a peer advertises the required versioned capability.
 #[must_use]
 pub fn has_capability(capabilities: &[String], required: &str) -> bool {

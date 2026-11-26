@@ -54,6 +54,102 @@ async fn profile_rest_endpoint_keeps_body_placeholder(cx: &mut Context) -> testk
     expect_placeholder_body(&server).await
 }
 
+/// A GraphQL credential is substituted only after the selected fields and
+/// resolved arguments match its inspected policy. Denied traffic never reaches
+/// the controlled recipient, even when another item in the batch is allowed.
+#[testkit::test]
+async fn graphql_field_rules_gate_credential_delivery(cx: &mut Context) -> Result {
+    let server = HttpRecorder::start("ok").await?;
+    let provider = install_gating_provider(cx, None).await?;
+    let policy = policy::base_with(&format!(
+        r"network_policies:
+  graphql:
+    name: graphql
+    endpoints:
+      - host: {TEST_HOST}
+        port: {port}
+        path: /graphql
+        protocol: graphql
+        enforcement: enforce
+        credential_binding:
+          provider: {provider}
+        rules:
+          - allow:
+              operation_type: query
+              field_rules:
+                - path: repository
+                  arguments:
+                    owner: {{exact: acme}}
+                    name: {{exact: approved}}
+                - path: repository.name
+          - allow:
+              operation_type: mutation
+              field_rules:
+                - path: createPullRequest
+                  arguments:
+                    input.repositoryId: {{exact: R_APPROVED}}
+                - path: createPullRequest.pullRequest
+                - path: createPullRequest.pullRequest.url
+    binaries: {binaries}
+",
+        port = server.port,
+        binaries = policy::binaries_yaml(PYTHON_BINARIES),
+    ))?;
+    let sandbox = create_sandbox(cx, "gqlcred", policy, &[&provider]).await?;
+    let token = provider_token(&sandbox).await?;
+    let inline = json!({"query": r#"{ repository(owner:"acme", name:"approved") { name } }"#});
+    let variables = json!({
+        "query": "query($o:String!,$n:String!){ repository(owner:$o,name:$n){ name } }",
+        "variables": {"o":"acme","n":"approved"}
+    });
+    let foreign = json!({"query": r#"{ repository(owner:"acme", name:"foreign") { name } }"#});
+    let mutation = |id: &str| {
+        json!({
+            "query": "mutation($in:CreatePullRequestInput!){ createPullRequest(input:$in){ pullRequest { url } } }",
+            "variables": {"in":{"repositoryId":id,"title":"test"}}
+        })
+    };
+    for (name, body, status) in [
+        ("inline query", inline.clone(), 200),
+        ("variable query", variables, 200),
+        ("foreign query", foreign.clone(), 403),
+        (
+            "extra field",
+            json!({"query": r#"{ repository(owner:"acme", name:"approved") { name secret } }"#}),
+            403,
+        ),
+        ("approved mutation", mutation("R_APPROVED"), 200),
+        ("foreign mutation", mutation("R_FOREIGN"), 403),
+        ("mixed batch", json!([inline, foreign]), 403),
+    ] {
+        let reply = http(
+            &sandbox,
+            TEST_HOST,
+            server.port,
+            &clients::Request::new("POST", "/graphql")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(body.to_string()),
+        )
+        .await?;
+        testkit::ensure!(reply.status() == Some(status), "{name}: got {reply:?}");
+    }
+    let requests = server.requests();
+    let expected = format!("Bearer {TEST_SECRET}");
+    testkit::ensure!(
+        requests.len() == 3,
+        "expected only the three admitted requests upstream, got {}",
+        requests.len()
+    );
+    testkit::ensure!(
+        requests
+            .iter()
+            .all(|request| request.header("authorization").as_deref() == Some(expected.as_str())),
+        "an admitted request lacked its bound credential"
+    );
+    Ok(())
+}
+
 /// A provider's WebSocket endpoint completes the handshake but doesn't
 /// forward a binary frame, which the supervisor can't inspect for the
 /// credential. The same client in a sandbox without the provider gets its

@@ -2240,11 +2240,14 @@ async fn flush_activity_to_gateway(
 // ============================================================================
 
 /// Versioned policy capabilities compiled into this supervisor.
-fn supported_policy_capabilities() -> Vec<String> {
-    openshell_core::extension_protocol::capabilities_if(
+pub fn supported_policy_capabilities() -> Vec<String> {
+    let mut capabilities =
+        vec![openshell_core::extension_protocol::POLICY_GRAPHQL_FIELD_RULES_V1.to_string()];
+    capabilities.extend(openshell_core::extension_protocol::capabilities_if(
         openshell_core::extension_protocol::POLICY_CEDAR_V1,
         cfg!(feature = "experimental"),
-    )
+    ));
+    capabilities
 }
 
 /// Minimum read-only paths required for a proxy-mode sandbox child process to

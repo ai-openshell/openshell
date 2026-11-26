@@ -21,8 +21,8 @@ use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use openshell_core::proto::{
     ExtensionServiceCredential, GetCurrentUserRequest, GetCurrentUserResponse,
-    GetSandboxConfigRequest, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, Sandbox,
+    IssueSandboxTokenRequest, IssueSandboxTokenResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, Sandbox,
 };
 use openshell_extension_core::{ExtensionAudience, ExtensionCallerKind, MAX_EXTENSION_TOKEN_TTL};
 use std::collections::{HashMap, HashSet};
@@ -347,22 +347,8 @@ pub async fn handle_refresh_sandbox_token(
             "extension credential minting rate limit exceeded for this sandbox",
         ));
     } else {
-        let mut config_request = Request::new(GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-            ],
-            name: sandbox_record
-                .metadata
-                .as_ref()
-                .map_or_else(String::new, |metadata| metadata.name.clone()),
-            workspace_scope: None,
-        });
-        config_request
-            .extensions_mut()
-            .insert(Principal::Sandbox(sandbox.clone()));
-        let available = super::policy::handle_get_sandbox_config(state, config_request)
+        let available = super::policy::load_supervisor_sandbox_config(state, &sandbox_record)
             .await?
-            .into_inner()
             .supervisor_middleware_services;
         mint_extension_credentials(
             issuer,

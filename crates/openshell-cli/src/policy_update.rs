@@ -312,6 +312,7 @@ fn group_allow_rules(specs: &[String]) -> Result<GroupedL7Rules<L7Rule>> {
                     operation_type: String::new(),
                     operation_name: String::new(),
                     fields: Vec::new(),
+                    field_rules: Vec::new(),
                     params: HashMap::default(),
                 }),
             });
@@ -334,6 +335,7 @@ fn group_deny_rules(specs: &[String]) -> Result<GroupedL7Rules<L7DenyRule>> {
                 operation_type: String::new(),
                 operation_name: String::new(),
                 fields: Vec::new(),
+                field_rules: Vec::new(),
                 params: HashMap::default(),
             });
     }

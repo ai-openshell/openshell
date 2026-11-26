@@ -7,6 +7,11 @@ use openshell_core::mcp::{
     DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion, ParseMcpVersionsError,
     canonicalize_mcp_versions, parse_mcp_versions,
 };
+use openshell_core::policy_l7::{
+    GraphqlFieldRule, deserialize_field_rules, graphql_field_rules_enforcement,
+    graphql_field_rules_from_proto, graphql_field_rules_to_proto,
+    validate_authored_graphql_field_rules,
+};
 use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
@@ -585,6 +590,12 @@ pub struct L7AllowProfile {
     pub operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_field_rules",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub field_rules: Vec<GraphqlFieldRule>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub params: HashMap<String, L7QueryMatcherProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -602,6 +613,7 @@ impl L7AllowProfile {
             && self.command.is_empty()
             && self.operation_type.is_empty()
             && self.operation_name.is_empty()
+            && self.field_rules.is_empty()
             && !self.has_tool_selector()
     }
 }
@@ -622,6 +634,12 @@ pub struct L7DenyRuleProfile {
     pub operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_field_rules",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub field_rules: Vec<GraphqlFieldRule>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub params: HashMap<String, L7QueryMatcherProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1049,6 +1067,13 @@ impl ProviderTypeProfile {
         let mut diagnostics = Vec::new();
         for (index, endpoint) in self.endpoints.iter().enumerate() {
             collect_mcp_profile_diagnostics(source, &self.id, index, endpoint, &mut diagnostics);
+            collect_graphql_profile_diagnostics(
+                source,
+                &self.id,
+                index,
+                endpoint,
+                &mut diagnostics,
+            );
             if endpoint.rules.as_ref().is_some_and(Vec::is_empty) {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
@@ -1657,8 +1682,26 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         port: endpoint.port,
         protocol: endpoint.protocol.clone(),
         tls: network_tls_mode_from_str(&endpoint.tls).map_or(-1, |value| value as i32),
-        enforcement: network_enforcement_mode_from_str(&endpoint.enforcement)
-            .map_or(-1, |value| value as i32),
+        enforcement: graphql_field_rules_enforcement(
+            network_enforcement_mode_from_str(&endpoint.enforcement)
+                .map_or(-1, |value| value as i32),
+            endpoint
+                .rules
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|rule| {
+                    rule.allow
+                        .as_ref()
+                        .is_some_and(|allow| !allow.field_rules.is_empty())
+                })
+                || endpoint
+                    .deny_rules
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|rule| !rule.field_rules.is_empty()),
+        ),
         access: network_access_preset_from_str(&endpoint.access).map_or(-1, |value| value as i32),
         rules: endpoint
             .rules
@@ -1888,6 +1931,7 @@ fn allow_to_proto(allow: &L7AllowProfile) -> L7Allow {
         operation_type: allow.operation_type.clone(),
         operation_name: allow.operation_name.clone(),
         fields: allow.fields.clone(),
+        field_rules: graphql_field_rules_to_proto(&allow.field_rules),
         params,
     }
 }
@@ -1905,6 +1949,7 @@ fn allow_from_proto(allow: &L7Allow) -> L7AllowProfile {
         operation_type: allow.operation_type.clone(),
         operation_name: allow.operation_name.clone(),
         fields: allow.fields.clone(),
+        field_rules: graphql_field_rules_from_proto(&allow.field_rules),
         params: allow
             .params
             .iter()
@@ -1937,6 +1982,7 @@ fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
         operation_type: rule.operation_type.clone(),
         operation_name: rule.operation_name.clone(),
         fields: rule.fields.clone(),
+        field_rules: graphql_field_rules_to_proto(&rule.field_rules),
         params,
     }
 }
@@ -1954,6 +2000,7 @@ fn deny_rule_from_proto(rule: &L7DenyRule) -> L7DenyRuleProfile {
         operation_type: rule.operation_type.clone(),
         operation_name: rule.operation_name.clone(),
         fields: rule.fields.clone(),
+        field_rules: graphql_field_rules_from_proto(&rule.field_rules),
         params: rule
             .params
             .iter()
@@ -2014,9 +2061,11 @@ pub fn parse_profile_yaml(input: &str) -> Result<ProviderTypeProfile, ProfileErr
             "endpoints.*.rules.*",
             "endpoints.*.rules.*.allow.query",
             "endpoints.*.rules.*.allow.params",
+            "endpoints.*.rules.*.allow.field_rules.*.arguments",
             "endpoints.*.deny_rules.*",
             "endpoints.*.deny_rules.*.query",
             "endpoints.*.deny_rules.*.params",
+            "endpoints.*.deny_rules.*.field_rules.*.arguments",
         ],
     )?)
 }
@@ -2819,6 +2868,13 @@ pub fn validate_catalog_profiles(
                 ));
             }
             collect_mcp_profile_diagnostics(source, profile_id, index, endpoint, &mut diagnostics);
+            collect_graphql_profile_diagnostics(
+                source,
+                profile_id,
+                index,
+                endpoint,
+                &mut diagnostics,
+            );
 
             if endpoint.rules.as_ref().is_some_and(Vec::is_empty) {
                 diagnostics.push(ProfileValidationDiagnostic::error(
@@ -3293,6 +3349,57 @@ fn collect_mcp_profile_diagnostics(
 // cannot disagree about whether the MCP options are required or misplaced.
 fn is_mcp_protocol(protocol: &str) -> bool {
     matches!(L7Protocol::parse(protocol), Some(L7Protocol::Mcp))
+}
+
+fn collect_graphql_profile_diagnostics(
+    source: &str,
+    profile_id: &str,
+    index: usize,
+    endpoint: &EndpointProfile,
+    diagnostics: &mut Vec<ProfileValidationDiagnostic>,
+) {
+    for (rule_idx, rule) in endpoint
+        .rules
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        if let Some(allow) = &rule.allow {
+            for error in validate_authored_graphql_field_rules(
+                &endpoint.protocol,
+                &allow.fields,
+                &allow.field_rules,
+            ) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}].rules[{rule_idx}].allow"),
+                    error,
+                ));
+            }
+        }
+    }
+    for (rule_idx, rule) in endpoint
+        .deny_rules
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        for error in validate_authored_graphql_field_rules(
+            &endpoint.protocol,
+            &rule.fields,
+            &rule.field_rules,
+        ) {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                format!("endpoints[{index}].deny_rules[{rule_idx}]"),
+                error,
+            ));
+        }
+    }
 }
 
 fn endpoint_is_valid(endpoint: &EndpointProfile) -> bool {
@@ -7735,6 +7842,7 @@ binaries:
             operation_type: String::new(),
             operation_name: String::new(),
             fields: vec![],
+            field_rules: vec![],
             params: HashMap::new(),
             tool: Some(L7QueryMatcherProfile {
                 glob: "read_*".to_string(),

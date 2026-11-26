@@ -156,6 +156,11 @@ enum NetworkEnforcementMode {
   NETWORK_ENFORCEMENT_MODE_ENFORCE = 1;
   // Log policy violations and allow the traffic.
   NETWORK_ENFORCEMENT_MODE_AUDIT = 2;
+  // Same behavior as ENFORCE, but required when field_rules is present. An
+  // older gateway rejects this unknown enum instead of dropping field_rules.
+  NETWORK_ENFORCEMENT_MODE_GRAPHQL_FIELD_RULES_ENFORCE = 3;
+  // Same behavior as AUDIT, with the same downgrade guard.
+  NETWORK_ENFORCEMENT_MODE_GRAPHQL_FIELD_RULES_AUDIT = 4;
 }
 
 // Shorthand access policy for an inspected network endpoint.
@@ -316,6 +321,18 @@ message GraphqlOperation {
   repeated string fields = 3;
 }
 
+// One exact schema field path and the argument values that occurrence must carry.
+message GraphqlFieldRule {
+  string path = 1;
+  map<string, GraphqlArgumentMatcher> arguments = 2;
+}
+
+// Exact match for a resolved string argument. Presence distinguishes an empty
+// string match from an omitted matcher.
+message GraphqlArgumentMatcher {
+  optional string exact = 1;
+}
+
 // An L7 deny rule that blocks specific requests.
 // Mirrors L7Allow — same fields, same matching semantics, inverted effect.
 // Deny rules are evaluated after allow rules and take precedence.
@@ -341,6 +358,8 @@ message L7DenyRule {
   // MCP params matcher map. Currently only params.name is supported for
   // tools/call filtering. Generic protocol "json-rpc" rejects params matchers.
   map<string, L7QueryMatcher> params = 9;
+  // Match any selected field occurrence with this exact schema path and arguments.
+  repeated GraphqlFieldRule field_rules = 10;
 }
 
 // An L7 policy rule (allow-only).
@@ -372,6 +391,8 @@ message L7Allow {
   // MCP params matcher map. Currently only params.name is supported for
   // tools/call filtering. Generic protocol "json-rpc" rejects params matchers.
   map<string, L7QueryMatcher> params = 9;
+  // Every selected field occurrence must match one complete field rule.
+  repeated GraphqlFieldRule field_rules = 10;
 }
 
 // Query value matcher for one query parameter key.

@@ -192,6 +192,13 @@ selection using the published policy workflow; do not add
 
 Follow this decision tree based on the detail tier and user intent:
 
+For GraphQL argument or nested-field restrictions, use `protocol: graphql`
+with the published schema's `field_rules` contract. Admit every selected schema
+path and keep each field's argument constraints in the same rule. Do not claim
+repository isolation from root arguments alone: bound nested selections and use
+trusted repository node IDs for ID-based operations. Requests with persisted-query
+markers cannot satisfy these restrictions, even when they also carry query text.
+
 ```
 Is L7 inspection needed?
 ├─ No (user wants pass-through / "just allow it")

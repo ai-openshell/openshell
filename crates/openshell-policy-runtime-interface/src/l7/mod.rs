@@ -499,6 +499,28 @@ pub fn validate_graphql_rule(
         warnings.push(format!("{loc}.operation_name: {warning}"));
     }
     validate_graphql_fields(errors, warnings, loc, rule.get("fields"));
+    if let Some(value) = rule.get("field_rules") {
+        if rule.get("fields").is_some() {
+            errors.push(format!("{loc}: fields and field_rules cannot be combined"));
+        }
+        match serde_json::from_value::<Vec<openshell_core::policy_l7::GraphqlFieldRule>>(
+            value.clone(),
+        ) {
+            Ok(rules) if rules.is_empty() => {
+                errors.push(format!("{loc}.field_rules must not be empty"))
+            }
+            Ok(rules) => errors.extend(
+                openshell_core::policy_l7::validate_authored_graphql_field_rules(
+                    "graphql",
+                    &[],
+                    &rules,
+                )
+                .into_iter()
+                .map(|error| format!("{loc}.{error}")),
+            ),
+            Err(error) => errors.push(format!("{loc}.field_rules: {error}")),
+        }
+    }
 }
 
 // Validate a matcher map when it exists. Null is treated like omission because
@@ -838,6 +860,7 @@ pub fn json_rule_has_graphql_fields(rule: &serde_json::Value) -> bool {
             .and_then(|v| v.as_str())
             .is_some_and(|v| !v.is_empty())
         || rule.get("fields").is_some()
+        || rule.get("field_rules").is_some()
 }
 
 pub fn json_rule_has_transport_fields(rule: &serde_json::Value) -> bool {
@@ -1213,6 +1236,9 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 for (key, op) in registry {
                     let registry_loc = format!("{loc}.graphql_persisted_queries[{key}]");
                     validate_graphql_rule(&mut errors, &mut warnings, &registry_loc, op, true);
+                    if op.get("field_rules").is_some() {
+                        errors.push(format!("{registry_loc}: field_rules cannot be stored in a persisted operation summary"));
+                    }
                 }
             }
 
@@ -1312,6 +1338,11 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                             ));
                         }
 
+                        if protocol != "graphql" && deny_rule.get("field_rules").is_some() {
+                            errors.push(format!(
+                                "{deny_loc}: field_rules is only valid for protocol graphql"
+                            ));
+                        }
                         if protocol == "graphql" || (protocol == "websocket" && deny_has_graphql) {
                             validate_graphql_rule(
                                 &mut errors,
@@ -1320,7 +1351,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                                 deny_rule,
                                 true,
                             );
-                        } else if deny_has_graphql {
+                        } else if deny_has_graphql && deny_rule.get("field_rules").is_none() {
                             warnings.push(format!(
                                 "{deny_loc}: GraphQL rule fields are ignored unless protocol is graphql or websocket"
                             ));
@@ -1436,9 +1467,14 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                             "{rule_loc}: WebSocket GraphQL allow rules must not combine method/path/query with operation_type/operation_name/fields"
                         ));
                     }
+                    if protocol != "graphql" && allow.get("field_rules").is_some() {
+                        errors.push(format!(
+                            "{rule_loc}: field_rules is only valid for protocol graphql"
+                        ));
+                    }
                     if protocol == "graphql" || (protocol == "websocket" && allow_has_graphql) {
                         validate_graphql_rule(&mut errors, &mut warnings, &rule_loc, allow, true);
-                    } else if allow_has_graphql {
+                    } else if allow_has_graphql && allow.get("field_rules").is_none() {
                         warnings.push(format!(
                             "{rule_loc}: GraphQL rule fields are ignored unless protocol is graphql or websocket"
                         ));

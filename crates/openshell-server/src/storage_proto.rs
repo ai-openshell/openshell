@@ -251,14 +251,16 @@ mod tests {
     // and the public/durable overlap remain unchanged.
     // The service backend HTTP version is part of both schemas. Legacy
     // endpoint records omit it and continue to use HTTP/1.1.
+    // GraphQL field rules extend the shared allow and deny messages. Stored
+    // policies without field rules keep their original enforcement modes.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3c1c932ec40e0c29a8c844f84d936178c19aec8f233ae0fcb2f7980dc13a70a0";
+        "36abc4eb59c001455d0c5b347c1b6b562237edccf5d68745659dfd9416686c6a";
     // The storage.v2 refresh root adds retired handles and the first mint's
     // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
-        "ca31950286327bc385fae933bbb9e34d3c9191214f9b549c558bba40957fcc65";
+        "a14f90f45e66ae916d58db18cc5f5bc089bd725e55fee679e4b7328089532738";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "d0eead2cd403f6f52ecd9b7df73ca7db15e84dd847e11bc9d50469970204e589";
+        "5aad4db170c491f9543db1492efd68ff1f46c5e0dc36ae75c3724eaf2636427a";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -802,9 +804,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (369, 32),
-                (104, 23),
-                (88, 23),
+                (372, 32),
+                (107, 23),
+                (91, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

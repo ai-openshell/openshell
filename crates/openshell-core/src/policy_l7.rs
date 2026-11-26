@@ -10,6 +10,114 @@
 //! and runtime checks.
 
 use crate::proto::{NetworkAccessPreset, NetworkEnforcementMode, NetworkTlsMode};
+pub use openshell_policy_schema::{
+    GraphqlArgumentMatcher, GraphqlFieldRule, deserialize_field_rules, valid_graphql_path,
+};
+
+/// Convert the canonical authored GraphQL selectors to their protobuf form.
+pub fn graphql_field_rules_to_proto(
+    rules: &[GraphqlFieldRule],
+) -> Vec<crate::proto::GraphqlFieldRule> {
+    rules
+        .iter()
+        .map(|rule| crate::proto::GraphqlFieldRule {
+            path: rule.path.clone(),
+            arguments: rule
+                .arguments
+                .iter()
+                .map(|(path, matcher)| {
+                    (
+                        path.clone(),
+                        crate::proto::GraphqlArgumentMatcher {
+                            exact: matcher.exact.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Preserve malformed missing matchers so validation can reject them instead
+/// of silently turning them into a different, potentially broader selector.
+pub fn graphql_field_rules_from_proto(
+    rules: &[crate::proto::GraphqlFieldRule],
+) -> Vec<GraphqlFieldRule> {
+    rules
+        .iter()
+        .map(|rule| GraphqlFieldRule {
+            path: rule.path.clone(),
+            arguments: rule
+                .arguments
+                .iter()
+                .map(|(path, matcher)| {
+                    (
+                        path.clone(),
+                        GraphqlArgumentMatcher {
+                            exact: matcher.exact.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn validate_graphql_field_rules_context(
+    protocol: &str,
+    fields: &[String],
+    has_rules: bool,
+) -> Vec<String> {
+    if !has_rules {
+        return Vec::new();
+    }
+    let mut errors = Vec::new();
+    if !protocol.eq_ignore_ascii_case("graphql") {
+        errors.push("field_rules is only valid for protocol graphql".to_string());
+    }
+    if !fields.is_empty() {
+        errors.push("fields and field_rules cannot be combined".to_string());
+    }
+    errors
+}
+
+/// Validate the security-sensitive field selectors on one protobuf L7 rule.
+pub fn validate_graphql_field_rules(
+    protocol: &str,
+    fields: &[String],
+    rules: &[crate::proto::GraphqlFieldRule],
+) -> Vec<String> {
+    let mut errors = validate_graphql_field_rules_context(protocol, fields, !rules.is_empty());
+    for (index, rule) in rules.iter().enumerate() {
+        errors.extend(openshell_policy_schema::validate_graphql_field_rule(
+            index,
+            &rule.path,
+            rule.arguments
+                .iter()
+                .map(|(path, matcher)| (path.as_str(), matcher.exact.is_some())),
+        ));
+    }
+    errors
+}
+
+/// Validate authored selectors directly without constructing protobuf copies.
+pub fn validate_authored_graphql_field_rules(
+    protocol: &str,
+    fields: &[String],
+    rules: &[GraphqlFieldRule],
+) -> Vec<String> {
+    let mut errors = validate_graphql_field_rules_context(protocol, fields, !rules.is_empty());
+    for (index, rule) in rules.iter().enumerate() {
+        errors.extend(openshell_policy_schema::validate_graphql_field_rule(
+            index,
+            &rule.path,
+            rule.arguments
+                .iter()
+                .map(|(path, matcher)| (path.as_str(), matcher.exact.is_some())),
+        ));
+    }
+    errors
+}
 
 #[allow(deprecated)]
 pub fn network_tls_mode_from_str(value: &str) -> Option<NetworkTlsMode> {
@@ -44,8 +152,59 @@ pub fn network_enforcement_mode_from_str(value: &str) -> Option<NetworkEnforceme
 pub fn network_enforcement_mode_to_str(value: i32) -> Option<&'static str> {
     match NetworkEnforcementMode::try_from(value).ok()? {
         NetworkEnforcementMode::Unspecified => Some(""),
-        NetworkEnforcementMode::Enforce => Some("enforce"),
-        NetworkEnforcementMode::Audit => Some("audit"),
+        NetworkEnforcementMode::Enforce | NetworkEnforcementMode::GraphqlFieldRulesEnforce => {
+            Some("enforce")
+        }
+        NetworkEnforcementMode::Audit | NetworkEnforcementMode::GraphqlFieldRulesAudit => {
+            Some("audit")
+        }
+    }
+}
+
+/// Mark field-rule policies so older gateways fail before ignoring unknown
+/// protobuf selectors. The unspecified mode has always meant audit.
+pub fn graphql_field_rules_enforcement(mode: i32, has_field_rules: bool) -> i32 {
+    if !has_field_rules {
+        return mode;
+    }
+    match NetworkEnforcementMode::try_from(mode) {
+        Ok(NetworkEnforcementMode::Enforce | NetworkEnforcementMode::GraphqlFieldRulesEnforce) => {
+            NetworkEnforcementMode::GraphqlFieldRulesEnforce as i32
+        }
+        Ok(
+            NetworkEnforcementMode::Unspecified
+            | NetworkEnforcementMode::Audit
+            | NetworkEnforcementMode::GraphqlFieldRulesAudit,
+        ) => NetworkEnforcementMode::GraphqlFieldRulesAudit as i32,
+        Err(_) => mode,
+    }
+}
+
+pub fn has_graphql_field_rules(endpoint: &crate::proto::NetworkEndpoint) -> bool {
+    endpoint.rules.iter().any(|rule| {
+        rule.allow
+            .as_ref()
+            .is_some_and(|allow| !allow.field_rules.is_empty())
+    }) || endpoint
+        .deny_rules
+        .iter()
+        .any(|rule| !rule.field_rules.is_empty())
+}
+
+pub fn validate_graphql_field_rules_enforcement(
+    endpoint: &crate::proto::NetworkEndpoint,
+) -> Option<String> {
+    let marked = matches!(
+        NetworkEnforcementMode::try_from(endpoint.enforcement),
+        Ok(NetworkEnforcementMode::GraphqlFieldRulesEnforce
+            | NetworkEnforcementMode::GraphqlFieldRulesAudit)
+    );
+    match (has_graphql_field_rules(endpoint), marked) {
+        (true, false) => {
+            Some("field_rules requires its scoped enforcement enum marker".to_string())
+        }
+        (false, true) => Some("scoped enforcement enum marker requires field_rules".to_string()),
+        _ => None,
     }
 }
 

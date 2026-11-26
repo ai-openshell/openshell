@@ -316,10 +316,45 @@ deny_rules:
 | `operation_type` | string | Yes | `query`, `mutation`, or `subscription`. To allow every operation type, use `access: full`. |
 | `operation_name` | string | No | Operation name glob. |
 | `fields` | list of strings | No | Top-level field globs. |
+| `field_rules` | nonempty list of objects | No | Exact selected schema paths and optional exact string argument matchers. Cannot be combined with `fields`. |
 
 In an allow rule, every top-level field must match. In a deny rule, one matching
 field is enough, and omitting `fields` denies every matching operation. One
 denied operation denies an entire batched request.
+
+Use `field_rules` with `protocol: graphql` when a policy must restrict arguments or nested selections. WebSocket rules do not support `field_rules`.
+Each object has a dotted schema field `path` and an optional `arguments` map.
+Argument keys are dotted paths into that field's resolved arguments; each
+matcher is `{ exact: "value" }`. Inline arguments, variables, and variable
+defaults are resolved before matching. Inline enum literals cannot satisfy a
+string matcher. An allow rule must admit every selected
+field occurrence, including its nested fields. Its argument matchers must all
+match the same occurrence. A deny rule blocks an operation when any occurrence
+matches one of its field rules. Aliases do not change schema paths; fragments
+and batches receive the same checks.
+
+```yaml showLineNumbers={false}
+rules:
+  - allow:
+      operation_type: query
+      field_rules:
+        - path: repository
+          arguments:
+            owner: { exact: acme }
+            name: { exact: widgets }
+        - path: repository.name
+```
+
+Root arguments alone do not establish repository isolation. Admit only bounded
+nested selections, and match repository node IDs against a trusted mapping when
+a mutation or another root field identifies a repository by ID. Requests with
+persisted-query markers cannot satisfy `field_rules`, even when they also carry
+query text, and are denied. Direct
+protobuf clients must use `NETWORK_ENFORCEMENT_MODE_GRAPHQL_FIELD_RULES_ENFORCE`
+or `NETWORK_ENFORCEMENT_MODE_GRAPHQL_FIELD_RULES_AUDIT` as the endpoint enforcement mode when they send
+`field_rules`; older gateways reject these values instead of silently dropping
+the selectors. YAML and JSON authors continue to use `enforcement: enforce` or
+`enforcement: audit`.
 
 ```yaml showLineNumbers={false}
 rules:

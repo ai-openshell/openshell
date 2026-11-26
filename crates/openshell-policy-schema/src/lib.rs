@@ -385,6 +385,81 @@ pub struct GraphqlOperation {
     pub fields: Vec<String>,
 }
 
+/// An exact selected schema field path and the resolved argument values required
+/// for that occurrence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphqlFieldRule {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub arguments: BTreeMap<String, GraphqlArgumentMatcher>,
+}
+
+/// Exact string match for a resolved GraphQL argument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphqlArgumentMatcher {
+    #[serde(deserialize_with = "deserialize_exact_string")]
+    pub exact: Option<String>,
+}
+
+fn deserialize_exact_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
+/// Check a dotted GraphQL schema-name or argument-object path.
+#[must_use]
+pub fn valid_graphql_path(path: &str) -> bool {
+    path.split('.').all(|segment| {
+        let mut bytes = segment.bytes();
+        matches!(bytes.next(), Some(b'_' | b'a'..=b'z' | b'A'..=b'Z'))
+            && bytes.all(|byte| matches!(byte, b'_' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'))
+    })
+}
+
+/// Validate one selected field and its borrowed argument matcher entries.
+pub fn validate_graphql_field_rule<'a>(
+    index: usize,
+    path: &str,
+    arguments: impl IntoIterator<Item = (&'a str, bool)>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if !valid_graphql_path(path) {
+        errors.push(format!(
+            "field_rules[{index}].path must be a dotted GraphQL schema field path"
+        ));
+    }
+    for (argument_path, has_exact) in arguments {
+        if !valid_graphql_path(argument_path) {
+            errors.push(format!("field_rules[{index}].arguments[{argument_path}] must be a dotted GraphQL argument path"));
+        }
+        if !has_exact {
+            errors.push(format!(
+                "field_rules[{index}].arguments[{argument_path}].exact is required"
+            ));
+        }
+    }
+    errors
+}
+
+pub fn deserialize_field_rules<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<GraphqlFieldRule>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let rules = Vec::<GraphqlFieldRule>::deserialize(deserializer)?;
+    if rules.is_empty() {
+        return Err(serde::de::Error::custom("field_rules must not be empty"));
+    }
+    Ok(rules)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct L7Rule {
@@ -408,6 +483,12 @@ pub struct L7Allow {
     pub operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_field_rules",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub field_rules: Vec<GraphqlFieldRule>,
     #[serde(
         default,
         deserialize_with = "deserialize_non_null_optional_field",
@@ -460,6 +541,12 @@ pub struct L7DenyRule {
     pub operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_field_rules",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub field_rules: Vec<GraphqlFieldRule>,
     #[serde(
         default,
         deserialize_with = "deserialize_non_null_optional_field",
@@ -906,6 +993,7 @@ fn inspect_allow(value: Option<&serde_yml::Value>, path: &str) -> InspectionResu
         "operation_type",
         "operation_name",
         "fields",
+        "field_rules",
         "tool",
         "params",
     ];
@@ -915,6 +1003,18 @@ fn inspect_allow(value: Option<&serde_yml::Value>, path: &str) -> InspectionResu
     };
     for (name, matcher) in open_map(rule.get("query")) {
         inspect_matcher(matcher, &join(&join(path, "query"), name))?;
+    }
+    for (index, field_rule) in sequence(rule.get("field_rules")).iter().enumerate() {
+        let field_path = join(path, &format!("field_rules[{index}]"));
+        if let Some(field_rule) = inspect_closed(field_rule, &field_path, &["path", "arguments"])? {
+            for (name, matcher) in open_map(field_rule.get("arguments")) {
+                inspect_closed(
+                    matcher,
+                    &join(&join(&field_path, "arguments"), name),
+                    &["exact"],
+                )?;
+            }
+        }
     }
     if let Some(matcher) = rule.get("tool") {
         inspect_matcher(matcher, &join(path, "tool"))?;

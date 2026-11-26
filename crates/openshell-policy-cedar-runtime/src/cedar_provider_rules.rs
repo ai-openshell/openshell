@@ -262,6 +262,7 @@ fn rule_matcher(rule: &Value) -> RuleMatcher {
         operation_type: selector("operation_type"),
         operation_name: selector("operation_name"),
         fields: strings(&rule["fields"], Value::as_str),
+        has_field_rules: rule.get("field_rules").is_some(),
         query: value_matchers(&rule["query"]),
         params: value_matchers(&rule["params"]),
     }
@@ -295,6 +296,15 @@ mod tests {
         L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary, NetworkEndpoint,
     };
     use openshell_policy_cedar::{ProviderEndpoint, ProviderPolicy, RuleMatcher, ValueMatcher};
+
+    #[test]
+    fn graphql_field_rules_survive_provider_rule_conversion() {
+        let matcher = super::rule_matcher(&serde_json::json!({
+            "operation_type": "query",
+            "field_rules": [{"path": "repository", "arguments": {"owner": {"exact": "acme"}}}]
+        }));
+        assert!(matcher.has_field_rules);
+    }
 
     #[test]
     fn normalized_rules_round_trip_through_the_provider_compiler() {
