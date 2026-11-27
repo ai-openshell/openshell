@@ -16,7 +16,7 @@ use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox, DriverSandboxStatus, WatchSandboxesDeletedEvent,
     WatchSandboxesEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -35,15 +35,36 @@ use openshell_core::driver_utils::{
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, ComputeDriverError>> + Send>>;
 
-/// Per-sandbox container exit timestamps that fence state changes from an earlier run.
+/// Per-sandbox lifecycle state that fences state changes from an earlier run.
 ///
 /// Podman can deliver a container's `die` or `stop` event after the stop API
 /// has returned. If a restart is already in progress, inspecting the container
 /// for that delayed event can report the previous exit and incorrectly regress
 /// the sandbox from `Starting` to `Error`.
+///
+/// A restart also starts the workload before its supervisor. Until the
+/// supervisor start returns, the supervisor still reports the exit from the
+/// previous run, which must not be mistaken for a lost supervisor.
 #[derive(Clone, Debug, Default)]
 pub struct LifecycleEventFences {
     previous_finished_at: Arc<Mutex<HashMap<String, String>>>,
+    starting_pairs: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Marks a sandbox's workload and supervisor start as in progress until dropped.
+#[must_use = "the start window closes when the guard is dropped"]
+pub struct PairStartGuard {
+    starting_pairs: Arc<Mutex<HashSet<String>>>,
+    sandbox_id: String,
+}
+
+impl Drop for PairStartGuard {
+    fn drop(&mut self) {
+        self.starting_pairs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.sandbox_id);
+    }
 }
 
 impl LifecycleEventFences {
@@ -69,15 +90,41 @@ impl LifecycleEventFences {
             .remove(sandbox_id);
     }
 
+    /// Mark the window in which this driver has started, or is about to
+    /// start, a restarted workload before its supervisor. While the guard is
+    /// held, a running workload whose supervisor is not yet running reports
+    /// as starting instead of being contained.
+    pub fn begin_pair_start(&self, sandbox_id: &str) -> PairStartGuard {
+        self.starting_pairs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(sandbox_id.to_string());
+        PairStartGuard {
+            starting_pairs: Arc::clone(&self.starting_pairs),
+            sandbox_id: sandbox_id.to_string(),
+        }
+    }
+
+    fn pair_start_in_progress(&self, sandbox_id: &str) -> bool {
+        self.starting_pairs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(sandbox_id)
+    }
+
     fn matches_previous_exit(
         &self,
         event: &PodmanEvent,
         sandbox_id: &str,
         state: &ContainerState,
     ) -> bool {
-        if !matches!(event.action.as_str(), "die" | "stop")
-            || !matches!(state.status.as_str(), "exited" | "stopped")
-        {
+        matches!(event.action.as_str(), "die" | "stop") && self.is_previous_exit(sandbox_id, state)
+    }
+
+    /// Whether `state` is the recorded exit of the run before the latest
+    /// sandbox stop or start.
+    fn is_previous_exit(&self, sandbox_id: &str, state: &ContainerState) -> bool {
+        if !matches!(state.status.as_str(), "exited" | "stopped") {
             return false;
         }
 
@@ -149,7 +196,7 @@ pub async fn start_watch(
         // health check status — matching the same condition derivation used
         // for live events.
         if entry.state == "running" {
-            match inspect_workload(&client, &entry.id).await {
+            match inspect_workload(&client, &entry.id, &lifecycle_event_fences).await {
                 Ok(inspect) => {
                     if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
                         if tx.send(Ok(sandbox_event(sandbox))).await.is_err() {
@@ -265,18 +312,30 @@ async fn map_podman_event(
             .await
             .ok()?;
         let workload = workloads.first()?;
-        return inspect_workload(client, &workload.id)
+        let inspect = inspect_workload(client, &workload.id, lifecycle_event_fences)
             .await
-            .ok()
-            .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
-            .map(sandbox_event);
+            .ok()?;
+        // A supervisor event can be delivered after the sandbox was stopped
+        // and a restart has begun. The workload snapshot it triggers then
+        // still shows the previous run's exit, which would regress the new
+        // run from Starting to Error.
+        if lifecycle_event_fences.is_previous_exit(&sandbox_id, &inspect.state) {
+            debug!(
+                sandbox_id,
+                container_id = %container_id,
+                action = %event.action,
+                "Ignoring supervisor event that reports the workload exit from before the latest sandbox start"
+            );
+            return None;
+        }
+        return driver_sandbox_from_inspect(&inspect).map(sandbox_event);
     }
 
     match event.action.as_str() {
         "remove" => Some(deleted_event(sandbox_id.clone())),
         "create" | "start" | "stop" | "die" | "health_status" => {
             // Inspect the container to get current state.
-            match inspect_workload(client, container_id).await {
+            match inspect_workload(client, container_id, lifecycle_event_fences).await {
                 Ok(inspect) => {
                     if lifecycle_event_fences.matches_previous_exit(
                         event,
@@ -359,6 +418,7 @@ async fn map_podman_event(
 pub async fn inspect_workload(
     client: &PodmanClient,
     id: &str,
+    lifecycle_event_fences: &LifecycleEventFences,
 ) -> Result<ContainerInspect, PodmanApiError> {
     let mut workload = client.inspect_container(id).await?;
     if workload
@@ -388,6 +448,15 @@ pub async fn inspect_workload(
                 if supervisor.state.status == "configured"
                     || supervisor.state.status == "created" =>
             {
+                workload.state.health = Some(HealthState {
+                    status: "starting".into(),
+                });
+            }
+            // A restart starts the workload before the supervisor, which
+            // still reports the previous run's exit until its own start
+            // returns. The driver contains the workload itself if that start
+            // fails.
+            Ok(_) if lifecycle_event_fences.pair_start_in_progress(sandbox_id) => {
                 workload.state.health = Some(HealthState {
                     status: "starting".into(),
                 });
@@ -641,7 +710,9 @@ mod tests {
             ],
         );
         let client = PodmanClient::new(path.clone());
-        let inspected = inspect_workload(&client, "workload").await.unwrap();
+        let inspected = inspect_workload(&client, "workload", &LifecycleEventFences::default())
+            .await
+            .unwrap();
         assert!(!inspected.state.running);
         handle.await.unwrap();
         assert!(
@@ -672,11 +743,110 @@ mod tests {
             ],
         );
         let client = PodmanClient::new(path.clone());
-        let inspected = inspect_workload(&client, "workload").await.unwrap();
+        let inspected = inspect_workload(&client, "workload", &LifecycleEventFences::default())
+            .await
+            .unwrap();
         assert!(inspected.state.running);
         assert_eq!(inspected.state.health.unwrap().status, "starting");
         handle.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    const RUNNING_WORKLOAD: &str = r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true,"StartedAt":"2026-11-26T00:32:12.5Z"},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#;
+    const PREVIOUS_RUN_SUPERVISOR: &str = r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"exited","Running":false,"ExitCode":0,"FinishedAt":"2026-11-26T00:32:12.2Z"},"Config":{}}"#;
+
+    #[tokio::test]
+    async fn restarted_workload_is_not_contained_before_supervisor_start() {
+        use crate::test_utils::{StubResponse, spawn_podman_stub};
+        use hyper::StatusCode;
+        let (path, requests, handle) = spawn_podman_stub(
+            "restart-window",
+            vec![
+                StubResponse::new(StatusCode::OK, RUNNING_WORKLOAD),
+                StubResponse::new(StatusCode::OK, PREVIOUS_RUN_SUPERVISOR),
+            ],
+        );
+        let client = PodmanClient::new(path.clone());
+        let fences = LifecycleEventFences::default();
+        let pair_start = fences.begin_pair_start("test");
+        let inspected = inspect_workload(&client, "workload", &fences)
+            .await
+            .unwrap();
+        assert!(inspected.state.running);
+        assert_eq!(inspected.state.health.unwrap().status, "starting");
+        handle.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        drop(pair_start);
+        assert!(!fences.pair_start_in_progress("test"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn exited_supervisor_outside_a_start_stops_workload() {
+        use crate::test_utils::{StubResponse, spawn_podman_stub};
+        use hyper::StatusCode;
+        let (path, requests, handle) = spawn_podman_stub(
+            "exited-supervisor",
+            vec![
+                StubResponse::new(StatusCode::OK, RUNNING_WORKLOAD),
+                StubResponse::new(StatusCode::OK, PREVIOUS_RUN_SUPERVISOR),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"exited","Running":false},"Config":{}}"#,
+                ),
+            ],
+        );
+        let client = PodmanClient::new(path.clone());
+        let fences = LifecycleEventFences::default();
+        // A start of another sandbox must not suppress containment here.
+        let _other_start = fences.begin_pair_start("other");
+        let inspected = inspect_workload(&client, "workload", &fences)
+            .await
+            .unwrap();
+        assert!(!inspected.state.running);
+        handle.await.unwrap();
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.ends_with("/libpod/containers/workload/stop?timeout=0"))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn delayed_supervisor_event_does_not_publish_previous_workload_exit() {
+        use crate::test_utils::{StubResponse, spawn_podman_stub};
+        use hyper::StatusCode;
+        let (path, _requests, handle) = spawn_podman_stub(
+            "delayed-supervisor-event",
+            vec![
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"[{"Id":"workload","Names":["workload"],"State":"exited","Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}]"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"exited","Running":false,"ExitCode":137,"FinishedAt":"2026-11-26T00:32:12.25Z"},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox","openshell.ai/sandbox-workspace":"default"}}}"#,
+                ),
+                StubResponse::new(StatusCode::OK, PREVIOUS_RUN_SUPERVISOR),
+                StubResponse::new(StatusCode::OK, ""),
+            ],
+        );
+        let client = PodmanClient::new(path.clone());
+        let fences = LifecycleEventFences::default();
+        fences.record_previous_exit("test", Some("2026-11-26T00:32:12.25Z"));
+        let mut event = podman_event_for_container("die", "test", "supervisor", 1);
+        event.actor.attributes.insert(
+            crate::isolation::LABEL_ROLE.to_string(),
+            "supervisor".to_string(),
+        );
+
+        assert!(map_podman_event(&event, &client, &fences).await.is_none());
+        handle.await.unwrap();
         let _ = std::fs::remove_file(path);
     }
 
