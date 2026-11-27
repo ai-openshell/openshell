@@ -81,6 +81,7 @@ openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = 
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
+rcgen = { workspace = true }
 tonic-prost = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 temp-env = "0.3"

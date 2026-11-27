@@ -2395,13 +2395,26 @@ rejection reason and configuration revision.
 On Kubernetes, provide a TLS Secret with `tls.crt` and `tls.key` matching
 `*.services.example.com` in each supervisor namespace, and allow your ingress
 clients to reach the app port through NetworkPolicy. The driver mounts the Secret
-only in supervisor containers. Restart supervisors after changing certificates.
+only in supervisor containers.
+
+To renew the certificate, update `tls.crt` and `tls.key` in the same Secret.
+Put the leaf certificate first in `tls.crt`, followed by the intermediate
+certificates your clients need. After the kubelet projects the update, the
+supervisor reads both files from the same generation. It checks the key and
+supplied certificate chain, including whether the update omits an intermediate
+known from the active chain. Clients verify the hostname and use their own
+trust roots.
+
+New TLS handshakes use the replacement certificate after it passes these checks.
+Existing connections continue. If the files are unreadable or validation fails,
+the supervisor logs a warning for the app listener and keeps the previous pair.
+
 Dedicated and shared supervisors expose the app listener directly on their Pod
 IPs. Route application traffic to the supervisor owning the sandbox, using the
 configured app port. The driver creates no Kubernetes Service for application
 traffic; ingress integrations manage any routing resources they need.
-Existing supervisor processes retain their startup listener configuration until
-restarted.
+Changes to listener settings such as the app port and base URL take effect after
+a supervisor restart.
 
 Expose services with the existing commands. For direct listener testing, an
 unnamed service on sandbox `demo` in workspace `default` uses SNI and Host

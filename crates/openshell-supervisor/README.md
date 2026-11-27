@@ -303,12 +303,19 @@ reason until installation succeeds. Normal shutdown does not emit a rejection.
 `OPENSHELL_APP_LISTENER_ENABLED=true` explicitly enables the process listener.
 `OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_BASE_URL`,
 `OPENSHELL_APP_TLS_CERT`, and `OPENSHELL_APP_TLS_KEY` are then required. The domain
-is derived from the HTTPS base URL; its public port does not change the listen
-address. Hosted
-instances receive the process router explicitly and never read another
-instance's configuration from process environment. TLS configuration uses
-`openshell-crypto`; certificates are read at process startup. Restart the
-supervisor to reload application certificates.
+comes from the HTTPS base URL. Its public port does not change the listen
+address. Hosted instances receive the process router explicitly and never read
+another instance's configuration from the process environment.
+
+The listener loads the TLS pair through `openshell-crypto` at startup. While
+serving, it polls for changes and reads both Kubernetes Secret files from the
+same projected generation. It checks that the key matches the leaf, verifies
+the supplied chain, and rejects a replacement that omits a known intermediate.
+Clients verify the hostname and use their own trust roots.
+
+A successful reload atomically replaces the configuration for new connections.
+Active connections continue on their negotiated TLS streams. A failed reload
+logs a warning and leaves the current pair active.
 
 This path uses application or trusted-edge authentication independently from
 gateway authentication. It validates Host against SNI, preserves public
