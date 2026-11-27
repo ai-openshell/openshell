@@ -720,6 +720,17 @@ helm install openshell ./openshell -n openshell \
   -f openshell/values-scale-10k.yaml --set server.externalDbSecret=<secret>
 ```
 
+To measure what a supervisor actually costs at a given sandbox count, run
+`tasks/scripts/supervisor-cost-census.sh` from a source checkout. The script
+deploys the chart on a local kind cluster with an overlay that raises
+`supervisor.pool.maxInstancesPerMember` to 256, creates
+`OPENSHELL_CENSUS_SANDBOXES` sandboxes (default 8), and writes a JSON census
+of the supervisor's threads, descriptors, sockets, and resident memory under
+`~/.cache/openshell/census/`. Each result records the count requested, the count
+created, and the node's CPU count, so runs on different machines can be
+compared. Use the numbers to size `supervisor.resources` before you raise
+`maxInstancesPerMember` in production.
+
 ## Next Steps
 
 - To expose the gateway through a highly available data path, refer to

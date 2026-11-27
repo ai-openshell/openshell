@@ -26,6 +26,8 @@ mod endpoint_status;
 mod mechanistic_mapper;
 mod otlp_relay;
 mod policy_runtime;
+#[cfg(all(test, target_os = "linux"))]
+mod proc_census;
 mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;

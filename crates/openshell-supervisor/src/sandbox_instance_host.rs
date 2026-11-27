@@ -900,11 +900,9 @@ mod tests {
         credentials: GatewayCredentials,
     }
 
-    fn start_instance(
-        host: &SandboxInstanceHost,
-        gateway_url: &str,
-        sandbox: &'static str,
-    ) -> Instance {
+    fn start_instance(host: &SandboxInstanceHost, gateway_url: &str, sandbox: &str) -> Instance {
+        let sandbox = sandbox.to_string();
+        let key = sandbox.clone();
         let credentials =
             GatewayCredentials::from_gateway_token(&format!("token-{sandbox}")).unwrap();
         let gateway = GatewayEndpoint::new(gateway_url, credentials.clone());
@@ -912,12 +910,12 @@ mod tests {
         let bindings = SandboxInstanceBindings {
             gateway_credentials: credentials.clone(),
             event_context: Arc::new(crate::sandbox_instance_event_context(
-                Some(sandbox),
-                Some(sandbox),
+                Some(&sandbox),
+                Some(&sandbox),
                 String::new(),
             )),
             ocsf_json: OcsfJsonSettings::default(),
-            log_sink: Some(LogSink::new(sandbox, log_tx)),
+            log_sink: Some(LogSink::new(sandbox.as_str(), log_tx)),
             denial_log: DenialLogSource::SandboxInstance(SandboxInstanceDenialLog::default()),
         };
         let (identity_tx, identity) = tokio::sync::oneshot::channel();
@@ -940,14 +938,15 @@ mod tests {
                 .unwrap();
                 let _ = identity_tx.send(observed);
                 let _ =
-                    openshell_core::grpc_client::fetch_settings_snapshot(&gateway, sandbox).await;
+                    openshell_core::grpc_client::fetch_settings_snapshot(&gateway, &sandbox).await;
                 let dispatch = tracing::Dispatch::new(
                     tracing_subscriber::registry()
                         .with(openshell_supervisor_process::log_push::LogPushLayer::thread_bound()),
                 );
+                let emitted = sandbox.clone();
                 tokio::spawn(async move {
                     tracing::dispatcher::with_default(&dispatch, || {
-                        tracing::info!(target: "instance_test", "emitted by {sandbox}");
+                        tracing::info!(target: "instance_test", "emitted by {emitted}");
                     });
                 })
                 .await
@@ -964,7 +963,7 @@ mod tests {
                         () = &mut shutdown => return Ok(0),
                         Some(()) = calls.recv() => {
                             let _ = openshell_core::grpc_client::fetch_settings_snapshot(
-                                &gateway, sandbox,
+                                &gateway, &sandbox,
                             )
                             .await;
                         }
@@ -973,7 +972,7 @@ mod tests {
             })
         });
         assert_eq!(
-            admit(host, sandbox, sandbox, 0, bindings, body),
+            admit(host, &key, &key, 0, bindings, body),
             Ok(SandboxInstanceAdmitted::Created)
         );
         Instance {
@@ -1410,5 +1409,89 @@ mod tests {
             stopped.map(|status| status.phase),
             Some(SandboxInstancePhaseReport::Exited { exit_code: 0 })
         );
+    }
+
+    /// Wait until the thread census is unchanged across two samples.
+    ///
+    /// Returns the last census and whether it stabilized within the sampling
+    /// budget. A sample that lost a tid to churn counts as movement even when
+    /// the surviving thread count is unchanged, and so does a replaced thread:
+    /// the census compares whole threads, not just how many there are.
+    #[cfg(target_os = "linux")]
+    async fn settled_threads() -> (crate::proc_census::ThreadCensus, bool) {
+        let mut previous = crate::proc_census::threads().expect("read /proc/self/task");
+        let mut stable = 0;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let current = crate::proc_census::threads().expect("read /proc/self/task");
+            if current.threads == previous.threads && current.skipped == 0 {
+                stable += 1;
+                if stable == 2 {
+                    return (current, true);
+                }
+            } else {
+                stable = 0;
+            }
+            previous = current;
+        }
+        (previous, false)
+    }
+
+    /// Measure the process cost of hosting N sandbox instances.
+    ///
+    /// Prints one JSON census line with the thread count and per-thread `comm`
+    /// names, descriptor and socket counts, and `VmRSS` for the whole test
+    /// process after the instances settle. It asserts nothing about the
+    /// counts: absolute values depend on the host and on everything else the
+    /// test process runs.
+    ///
+    /// Run with:
+    /// `cargo test -p openshell-supervisor --features experimental shared_supervisor_cost_baseline -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Set `OPENSHELL_TEST_INSTANCE_COUNT` to change N (default 8) and
+    /// `OPENSHELL_TEST_SETTLE_SECONDS` to change the fixed wait (default 5).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "manual shared-supervisor cost baseline; counts depend on the host"]
+    async fn shared_supervisor_cost_baseline() {
+        let count = std::env::var("OPENSHELL_TEST_INSTANCE_COUNT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(8);
+        let settle_seconds = std::env::var("OPENSHELL_TEST_SETTLE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(5);
+        let (gateway_url, _captured) = capture_gateway().await;
+        let (_root, host) = private_host();
+        for index in 0..count {
+            let sandbox = format!("sandbox-{index:04}");
+            // The test stub's receivers are unused; dropping them leaves the
+            // instance body running under the host's own records.
+            drop(start_instance(&host, &gateway_url, &sandbox));
+            wait_supervising(&host, &sandbox).await;
+        }
+        tokio::time::sleep(Duration::from_secs(settle_seconds)).await;
+        let (threads, settled) = settled_threads().await;
+        let thread_names: HashMap<_, _> = threads
+            .threads
+            .iter()
+            .map(|(tid, name)| (tid.to_string(), name.clone()))
+            .collect();
+        println!(
+            "shared_supervisor_cost_baseline {}",
+            serde_json::json!({
+                "instances": count,
+                "settle_seconds": settle_seconds,
+                "settled": settled,
+                "thread_count": threads.threads.len(),
+                "thread_names": thread_names,
+                "fd_count": crate::proc_census::fd_count().expect("read /proc/self/fd"),
+                "socket_count": crate::proc_census::socket_count().expect("read /proc/self/fd"),
+                "vm_rss_kib": crate::proc_census::vm_rss_kib().expect("read /proc/self/status"),
+            })
+        );
+        host.relinquish_all().await;
     }
 }

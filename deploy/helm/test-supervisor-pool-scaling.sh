@@ -122,6 +122,18 @@ yq ea -e 'select(.kind == "Deployment" and .metadata.name == "scaling-openshell-
   | .spec.template.spec.containers[0].env[] | select(.name == "OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES") | .value == "16"' \
   "${work_dir}/limits.yaml" >/dev/null || fail "maxInstancesPerMember does not reach the supervisor"
 
+# The cost census overlay raises the per-member cap to 256, the sandbox count a
+# census run creates. A mistyped value would pass lint and only surface as
+# `sandbox capacity reached` mid-run, so pin the overlay's rendered effect.
+render scale-overlay --values "${chart}/ci/values-supervisor-scale.yaml"
+yq ea -e -r 'select(.kind == "ConfigMap" and (.data | has("gateway.toml"))) | .data."gateway.toml"' \
+  "${work_dir}/scale-overlay.yaml" >"${work_dir}/scale-overlay.toml"
+grep -q '^max_instances_per_member = 256$' "${work_dir}/scale-overlay.toml" \
+  || fail "the census overlay does not raise maxInstancesPerMember to 256 in the gateway"
+yq ea -e 'select(.kind == "Deployment" and .metadata.name == "scaling-openshell-supervisor")
+  | .spec.template.spec.containers[0].env[] | select(.name == "OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES") | .value == "256"' \
+  "${work_dir}/scale-overlay.yaml" >/dev/null || fail "the census overlay does not reach the supervisor"
+
 # Out-of-range limits, and more supervisors than the gateways can serve, fail
 # the render.
 refused() {

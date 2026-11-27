@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Measurement overlay: raise the shared supervisor pool limit so a cost census
+# run can start more sandboxes than the chart default of 128. Layer it on
+# values-supervisor.yaml. The pool must be sized to the census count or the
+# gateway refuses creates with `sandbox capacity reached` before the run
+# reaches N.
+supervisor:
+  pool:
+    maxInstancesPerMember: 256
