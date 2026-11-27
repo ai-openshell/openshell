@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Provider profile for the Kilo example. See README.md in this directory for
+# how to import it, create the provider and run the smoke test, and for the
+# notes on the hosts it leaves blocked and on Kilo's own sandbox.
+
+id: kilo
+display_name: Kilo
+description: Kilo CLI with the Kilo Gateway
+category: agent
+inference_capable: true
+credentials:
+  - name: api_key
+    description: Kilo Gateway API key used by the Kilo CLI
+    env_vars: [KILO_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.kilo.ai
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: ai-gateway.kilo.ai
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: us.i.posthog.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/local/bin/kilo]
