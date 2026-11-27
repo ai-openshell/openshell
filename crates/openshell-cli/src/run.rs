@@ -6307,6 +6307,24 @@ pub async fn sandbox_setting_delete(
     Ok(())
 }
 
+/// Keeps the current policy's API-supplied configuration on a Cedar update.
+///
+/// A Cedar policy file holds only Cedar source. Landlock compatibility,
+/// process identity, middleware, and endpoint settings for a Cedar policy are
+/// set through the policy API, and an update replaces the whole policy, so
+/// without this an update from a file would silently remove them. Applies only
+/// when both policies are Cedar; a YAML file carries these sections itself,
+/// and the gateway rejects a change of format.
+fn keep_policy_api_configuration(policy: &mut SandboxPolicy, current: SandboxPolicy) {
+    if policy.cedar_policy.is_none() || current.cedar_policy.is_none() {
+        return;
+    }
+    policy.landlock = current.landlock;
+    policy.process = current.process;
+    policy.network_middlewares = current.network_middlewares;
+    policy.endpoint_settings = current.endpoint_settings;
+}
+
 pub async fn sandbox_policy_set(
     server: &str,
     name: &str,
@@ -6316,13 +6334,14 @@ pub async fn sandbox_policy_set(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let policy = load_sandbox_policy(Some(policy_path))?
+    let mut policy = load_sandbox_policy(Some(policy_path))?
         .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
 
     let mut client = grpc_client(server, tls).await?;
 
-    // Get current version so we can detect no-ops.
-    let current_version = client
+    // Get the current revision to detect no-ops and, for a Cedar file, to
+    // keep the configuration the file cannot carry.
+    let current = client
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
             sandbox: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -6331,10 +6350,25 @@ pub async fn sandbox_policy_set(
             version: 0,
             global: false,
         })
-        .await
-        .ok()
-        .and_then(|r| r.into_inner().revision)
-        .map_or(0, |r| r.version);
+        .await;
+    let current = match current {
+        Ok(response) => response.into_inner().revision,
+        // Without the current revision a Cedar update could silently drop its
+        // configuration, so the command fails instead. A missing sandbox, or a
+        // gateway without the RPC, has no configuration to keep, and the
+        // update reports the gateway's own error.
+        Err(status)
+            if policy.cedar_policy.is_some()
+                && !matches!(status.code(), Code::NotFound | Code::Unimplemented) =>
+        {
+            return Err(status).into_diagnostic();
+        }
+        Err(_) => None,
+    };
+    let current_version = current.as_ref().map_or(0, |r| r.version);
+    if let Some(current_policy) = current.and_then(|r| r.policy) {
+        keep_policy_api_configuration(&mut policy, current_policy);
+    }
 
     let response = client
         .update_config(UpdateConfigRequest {
@@ -7700,6 +7734,90 @@ mod tests {
         workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
+
+    /// A Cedar policy with every field the policy API sets alongside it.
+    fn configured_cedar_policy(source: &str) -> SandboxPolicy {
+        use openshell_core::proto::{
+            CedarPolicy, LandlockPolicy, NetworkEndpoint, NetworkMiddlewareConfig, ProcessPolicy,
+        };
+
+        SandboxPolicy {
+            version: 1,
+            cedar_policy: Some(CedarPolicy {
+                source: source.to_string(),
+            }),
+            landlock: Some(LandlockPolicy {
+                compatibility: "hard_requirement".to_string(),
+            }),
+            process: Some(ProcessPolicy {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_middlewares: [(
+                "redact".to_string(),
+                NetworkMiddlewareConfig {
+                    middleware: "openshell/regex".to_string(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            endpoint_settings: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cedar_policy_set_keeps_policy_api_configuration() {
+        use super::keep_policy_api_configuration;
+
+        let current = configured_cedar_policy("permit (principal, action, resource);");
+        let mut update = openshell_policy::cedar_sandbox_policy(
+            "forbid (principal, action, resource);".to_string(),
+        )
+        .expect("Cedar policy builds");
+        keep_policy_api_configuration(&mut update, current.clone());
+
+        assert_eq!(
+            update
+                .cedar_policy
+                .as_ref()
+                .map(|policy| policy.source.as_str()),
+            Some("forbid (principal, action, resource);"),
+            "the new source replaces the old"
+        );
+        assert_eq!(update.landlock, current.landlock);
+        assert_eq!(update.process, current.process);
+        assert_eq!(update.network_middlewares, current.network_middlewares);
+        assert_eq!(update.endpoint_settings, current.endpoint_settings);
+    }
+
+    #[test]
+    fn yaml_policy_set_replaces_the_whole_policy() {
+        use super::keep_policy_api_configuration;
+
+        // A YAML file carries these sections itself, so an update replaces
+        // them, and a Cedar update never takes them from a YAML policy.
+        let yaml = SandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        let mut update = yaml.clone();
+        keep_policy_api_configuration(
+            &mut update,
+            configured_cedar_policy("permit (principal, action, resource);"),
+        );
+        assert_eq!(update, yaml);
+
+        let mut update =
+            openshell_policy::cedar_sandbox_policy(String::new()).expect("Cedar policy builds");
+        let expected = update.clone();
+        keep_policy_api_configuration(&mut update, yaml);
+        assert_eq!(update, expected);
+    }
 
     #[test]
     fn lifecycle_wait_fails_fast_on_phases_that_block_the_target() {
