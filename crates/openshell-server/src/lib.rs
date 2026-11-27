@@ -470,6 +470,7 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
 }
 
 const METRICS_TLS_HANDSHAKE_WARNING_INTERVAL: Duration = Duration::from_mins(1);
+const CHILD_SANDBOX_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct MetricsTlsHandshakeLogState {
@@ -1339,13 +1340,28 @@ pub(crate) async fn run_server(
     }
 
     startup_tx.send_replace(true);
-    // Catch up children whose parent's policy sync was lost while the gateway
-    // was down.
-    {
+    // Bring children up to their roots now, for changes made while the
+    // gateway was down, and then every 30 seconds, for copies a failed or
+    // cancelled request or another replica left undone.
+    if config.enable_child_sandboxes {
         let state = state.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            if let Err(error) = grpc::sync_all_children(&state).await {
-                warn!(error = %error, "startup child sandbox policy sync failed");
+            let mut interval = tokio::time::interval(CHILD_SANDBOX_SYNC_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                if let Err(error) = grpc::sync_all_children(&state).await {
+                    warn!(error = %error, "child sandbox policy sync failed");
+                }
             }
         });
     }

@@ -1003,166 +1003,63 @@ async fn check_parent_has_room(
     Ok(())
 }
 
-/// Policy-revision provenance naming the parent a child's policy was copied
-/// from. Gateway-owned: the `internal.openshell.ai/` prefix is reserved.
-const COPIED_FROM_PARENT_ID: &str = "internal.openshell.ai/copied-from-parent-id";
-/// The parent policy version a child's policy revision was copied from.
-const COPIED_FROM_PARENT_VERSION: &str = "internal.openshell.ai/copied-from-parent-version";
-
-/// A parent's policy as copied into a child: the policy, cleaned exactly as a
-/// create cleans it, and the provenance naming the parent version.
+/// A root's policy revision as copied into a child: the policy, cleaned
+/// exactly as a create cleans it, and its hash.
 struct ParentPolicyCopy {
     policy: openshell_core::proto::SandboxPolicy,
-    provenance: HashMap<String, String>,
+    hash: String,
 }
 
 impl ParentPolicyCopy {
-    /// Copy one parent revision. Create and sync both copy through here, so a
-    /// child's first revision and its later copies of the same parent version
-    /// are identical.
-    fn of(record: &crate::persistence::PolicyRecord, parent_id: &str) -> Result<Self, Status> {
+    /// Create and sync both copy through here, so a child's first revision
+    /// and its later copies of the same root revision are identical.
+    fn of(record: &crate::persistence::PolicyRecord) -> Result<Self, Status> {
         let (mut policy, _) = super::policy::canonical_policy_record_identity(record)?;
         super::policy::clear_provider_credentialed_markers(&mut policy);
         validate_no_reserved_provider_policy_keys(&policy)?;
         let policy = validate_and_canonicalize_policy(policy)?;
-        let provenance = HashMap::from([
-            (COPIED_FROM_PARENT_ID.to_string(), parent_id.to_string()),
-            (
-                COPIED_FROM_PARENT_VERSION.to_string(),
-                record.version.to_string(),
-            ),
-        ]);
-        Ok(Self { policy, provenance })
-    }
-
-    fn parent_version(&self) -> i64 {
-        self.provenance
-            .get(COPIED_FROM_PARENT_VERSION)
-            .and_then(|version| version.parse().ok())
-            .unwrap_or(0)
+        let hash = openshell_core::policy_identity::deterministic_policy_hash(&policy);
+        Ok(Self { policy, hash })
     }
 }
 
-/// The revisions that decide what a parent enforces: the one at its
-/// `current_policy_version`, the last version it reported loaded, and under
-/// `fail_closed` a failed revision at or above it, which makes the parent
-/// deny all new egress. The newest revision with status "loaded" is not
-/// used: a newer revision marks it superseded before it loads, and a later
-/// failure of the same version, such as a re-apply, marks it failed.
-async fn parent_policy_revisions(
+/// The copy of a root's latest policy revision, or none when it has no
+/// policy yet. Children follow the latest revision whether or not the root
+/// has loaded it: each sandbox handles its own load result.
+async fn parent_policy_copy(
     state: &ServerState,
     parent_id: &str,
-) -> Result<
-    Option<(
-        crate::persistence::PolicyRecord,
-        Option<crate::persistence::PolicyRecord>,
-    )>,
-    Status,
-> {
-    let current = state
+) -> Result<Option<ParentPolicyCopy>, Status> {
+    state
         .store
-        .get_message::<Sandbox>(parent_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
-        .map_or(0, |parent| parent.current_policy_version());
-    if current == 0 {
-        return Ok(None);
-    }
-    let Some(enforced) = state
-        .store
-        .get_policy_by_version(parent_id, i64::from(current))
+        .get_latest_policy(parent_id)
         .await
         .map_err(|e| Status::internal(format!("fetch parent policy failed: {e}")))?
-    else {
-        return Ok(None);
-    };
-    let blocking = if state.config.policy_validation_failure_mode
-        == openshell_core::PolicyValidationFailureMode::FailClosed
-    {
-        failed_policy_at_or_above(state, parent_id, enforced.version).await?
-    } else {
-        None
-    };
-    Ok(Some((enforced, blocking)))
+        .map(|record| ParentPolicyCopy::of(&record))
+        .transpose()
 }
 
-/// Under the child-create lock, copy the policy the parent is enforcing: the
-/// revision at its current policy version, not a newer pending or failed one.
-/// A `fail_closed` parent that rejected a newer revision denies all new
-/// egress, so its enforced revision would give a new child more access than
-/// the parent has.
+/// Under the child-create lock, copy the root's latest policy revision.
 async fn copy_parent_policy(
     state: &ServerState,
     parent: &openshell_core::proto::SandboxParent,
 ) -> Result<ParentPolicyCopy, Status> {
-    match parent_policy_revisions(state, &parent.id).await? {
-        None => Err(Status::failed_precondition(format!(
+    parent_policy_copy(state, &parent.id).await?.ok_or_else(|| {
+        Status::failed_precondition(format!(
             "parent sandbox '{}' has no policy yet; try again once it is running",
             parent.name
-        ))),
-        Some((_, Some(_))) => Err(Status::failed_precondition(format!(
-            "parent sandbox '{}' rejected its latest policy; fix it before creating children",
-            parent.name
-        ))),
-        Some((loaded, None)) => ParentPolicyCopy::of(&loaded, &parent.id),
-    }
+        ))
+    })
 }
 
-/// The newest revision at or above the parent's enforced version that failed
-/// to load. At the enforced version itself, that is a failed re-apply.
-async fn failed_policy_at_or_above(
-    state: &ServerState,
-    parent_id: &str,
-    enforced_version: i64,
-) -> Result<Option<crate::persistence::PolicyRecord>, Status> {
-    const PAGE_SIZE: u32 = 100;
-    let mut before_version = None;
-    loop {
-        let page = state
-            .store
-            .list_policies_before(parent_id, PAGE_SIZE, before_version)
-            .await
-            .map_err(|e| Status::internal(format!("list parent policies failed: {e}")))?;
-        for record in &page {
-            if record.version < enforced_version {
-                return Ok(None);
-            }
-            if record.status == "failed" {
-                return Ok(Some(record.clone()));
-            }
-        }
-        match page.last() {
-            Some(last) if page.len() == PAGE_SIZE as usize => {
-                before_version = Some(last.version);
-            }
-            _ => return Ok(None),
-        }
-    }
-}
-
-/// The parent policy version a child's revision was copied from, or 0 when it
-/// was not copied from this parent.
-fn copied_parent_version(record: &crate::persistence::PolicyRecord, parent_id: &str) -> i64 {
-    if record
-        .provenance
-        .get(COPIED_FROM_PARENT_ID)
-        .map(String::as_str)
-        != Some(parent_id)
-    {
-        return 0;
-    }
-    record
-        .provenance
-        .get(COPIED_FROM_PARENT_VERSION)
-        .and_then(|version| version.parse().ok())
-        .unwrap_or(0)
-}
-
-/// Bring each live child of a root up to it, then push every child: remove
-/// providers the root no longer has, and copy the policy the root has loaded
-/// into a child that is behind. Safe to run again. A blocked root's revisions
-/// are not copied; its children are refused at delivery until it loads a fix.
+/// Bring each live child of a root up to it: detach providers the root no
+/// longer has, and copy the root's latest policy revision into a child whose
+/// policy differs. Safe to run again: the startup and periodic scans rerun
+/// it. One child's failure does not hold the change back from the others.
 pub(super) async fn sync_children(state: &Arc<ServerState>, parent_id: &str) -> Result<(), Status> {
+    if !state.config.enable_child_sandboxes {
+        return Ok(());
+    }
     let Some(parent) = state
         .store
         .get_message::<Sandbox>(parent_id)
@@ -1174,48 +1071,37 @@ pub(super) async fn sync_children(state: &Arc<ServerState>, parent_id: &str) -> 
     if parent.parent.is_some() {
         return Ok(());
     }
+    // A child created after this list copies the root's latest revision
+    // itself, under the root's lock.
     let workspace = parent.object_workspace().to_string();
+    let children: Vec<String> = state
+        .store
+        .collect_messages::<Sandbox>(ObjectListQuery::Workspace(&workspace))
+        .await
+        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+        .iter()
+        .filter(|sandbox| {
+            sandbox
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.id == parent_id)
+        })
+        .map(|sandbox| sandbox.object_id().to_string())
+        .collect();
 
-    // Read the parent's policy and list its children under the parent's lock,
-    // which every child create also holds: a create either finished before
-    // the list or reads the newer policy itself.
-    let (copy, children) = {
-        let _parent_guard = state
-            .compute
-            .mutation_guard(MutationScope::sandbox(&workspace, parent_id))
-            .await
-            .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
-        let copy = parent_policy_copy(state, parent_id).await?;
-        let children: Vec<String> = state
-            .store
-            .collect_messages::<Sandbox>(ObjectListQuery::Workspace(&workspace))
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
-            .iter()
-            .filter(|sandbox| {
-                sandbox
-                    .parent
-                    .as_ref()
-                    .is_some_and(|parent| parent.id == parent_id)
-            })
-            .map(|sandbox| sandbox.object_id().to_string())
-            .collect();
-        (copy, children)
-    };
-
-    // One child's failure must not hold the parent's change back from the
-    // others: log it, carry on, and report it at the end.
     let mut failed = 0_usize;
     for child_id in children {
-        if let Err(error) = sync_child(state, &workspace, parent_id, &child_id, copy.as_ref()).await
-        {
-            warn!(parent_id, child_id, error = %error, "failed to sync child sandbox");
-            failed += 1;
+        match Box::pin(sync_child(state, &workspace, parent_id, &child_id)).await {
+            Ok(true) => {
+                state.sandbox_watch_bus.notify(&child_id);
+                crate::config_delivery::publish_sandbox(state, &child_id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(parent_id, child_id, error = %error, "failed to sync child sandbox");
+                failed += 1;
+            }
         }
-        // Push every child, copied or not: the parent can become blocked or
-        // unblocked without a new copy, and the child must see that.
-        state.sandbox_watch_bus.notify(&child_id);
-        crate::config_delivery::publish_sandbox(state, &child_id);
     }
     if failed > 0 {
         return Err(Status::unavailable(format!(
@@ -1226,57 +1112,26 @@ pub(super) async fn sync_children(state: &Arc<ServerState>, parent_id: &str) -> 
     Ok(())
 }
 
-/// The copy of the policy a parent has loaded, or none when it has nothing
-/// loaded or is blocked: a blocked parent's children are refused at delivery.
-async fn parent_policy_copy(
-    state: &ServerState,
-    parent_id: &str,
-) -> Result<Option<ParentPolicyCopy>, Status> {
-    match parent_policy_revisions(state, parent_id).await? {
-        Some((loaded, None)) => ParentPolicyCopy::of(&loaded, parent_id).map(Some),
-        _ => Ok(None),
-    }
-}
-
-/// Bring every root's children up to the root, for syncs lost while the
-/// gateway was down or published by a replica the child is not on, and stop
-/// every child whose parent record is gone.
+/// Bring every root's children up to it: at gateway start, for changes made
+/// while it was down, and periodically, for copies a failed or cancelled
+/// request or another replica left undone.
 pub async fn sync_all_children(state: &Arc<ServerState>) -> Result<(), Status> {
     // The scan reads every sandbox in every workspace; with the feature off
     // there are no children to find.
     if !state.config.enable_child_sandboxes {
         return Ok(());
     }
-    let mut children_by_parent: std::collections::BTreeMap<String, Vec<Sandbox>> =
-        std::collections::BTreeMap::new();
-    for sandbox in state
+    let parent_ids: std::collections::BTreeSet<String> = state
         .store
         .collect_messages::<Sandbox>(ObjectListQuery::AllWorkspaces)
         .await
         .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
-    {
-        if let Some(parent_id) = sandbox.parent.as_ref().map(|parent| parent.id.clone()) {
-            children_by_parent
-                .entry(parent_id)
-                .or_default()
-                .push(sandbox);
-        }
-    }
+        .into_iter()
+        .filter_map(|sandbox| sandbox.parent.map(|parent| parent.id))
+        .collect();
     let mut failed = 0_usize;
-    for (parent_id, children) in children_by_parent {
-        // Only a parent read as not found makes orphans: a store error means
-        // the scan cannot tell, so it leaves these children alone.
-        let result = match parent_is_missing(state, &parent_id).await {
-            Ok(true) => {
-                for child in &children {
-                    stop_orphaned_child(state, child).await;
-                }
-                Ok(())
-            }
-            Ok(false) => sync_children(state, &parent_id).await,
-            Err(error) => Err(error),
-        };
-        if let Err(error) = result {
+    for parent_id in parent_ids {
+        if let Err(error) = sync_children(state, &parent_id).await {
             warn!(parent_id, error = %error, "failed to sync child sandboxes");
             failed += 1;
         }
@@ -1289,63 +1144,29 @@ pub async fn sync_all_children(state: &Arc<ServerState>) -> Result<(), Status> {
     Ok(())
 }
 
-/// Whether a child's parent record is gone. Read by id, so a root created
-/// later under the same name is never taken for it. A store error is
-/// returned, never taken as missing.
-pub(super) async fn parent_is_missing(
-    state: &ServerState,
-    parent_id: &str,
-) -> Result<bool, Status> {
-    Ok(state
-        .store
-        .get_message::<Sandbox>(parent_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
-        .is_none())
-}
-
-/// Before a child's configuration is built, check it against its parent's
-/// live record: refuse it while the parent is missing or blocked, and keep
-/// only the providers the parent still has, in the child's order. Returns the
-/// parent's loaded revision, which the child's copy must have reached. A root
-/// passes unchanged.
-pub(super) async fn admit_child(
+/// Before a child's configuration is built, keep only the providers its
+/// parent still has, in the child's order. A child whose parent record is
+/// gone keeps none. A root passes unchanged.
+pub(super) async fn keep_parent_providers(
     state: &ServerState,
     child: &mut Sandbox,
-) -> Result<Option<crate::persistence::PolicyRecord>, Status> {
-    let Some(parent_ref) = child.parent.clone() else {
-        return Ok(None);
+) -> Result<(), Status> {
+    let Some(parent_ref) = child.parent.as_ref() else {
+        return Ok(());
     };
-    let Some(parent) = state
+    let parent_providers = state
         .store
         .get_message::<Sandbox>(&parent_ref.id)
         .await
         .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
-    else {
-        return Err(child_refusal::status(
-            child_refusal::PARENT_MISSING,
-            crate::compute::orphaned_child_message(&parent_ref),
-        ));
-    };
-    let loaded = match parent_policy_revisions(state, &parent_ref.id).await? {
-        Some((_, Some(_))) => {
-            return Err(child_refusal::status(
-                child_refusal::PARENT_POLICY_REJECTED,
-                format!(
-                    "parent sandbox '{}' rejected its latest policy",
-                    parent_ref.name
-                ),
-            ));
-        }
-        Some((loaded, None)) => Some(loaded),
-        None => None,
-    };
-    let parent_providers = parent.spec.map(|spec| spec.providers).unwrap_or_default();
+        .and_then(|parent| parent.spec)
+        .map(|spec| spec.providers)
+        .unwrap_or_default();
     if let Some(spec) = child.spec.as_mut() {
         spec.providers
             .retain(|name| parent_providers.contains(name));
     }
-    Ok(loaded)
+    Ok(())
 }
 
 /// Whether `provider` is attached to `sandbox` as delivery sees it: for a
@@ -1375,244 +1196,16 @@ pub(super) async fn provider_attached_for_delivery(
         .is_some_and(|parent| attached(&parent)))
 }
 
-/// Reasons a child is refused configuration or a start, carried as an
-/// `ErrorInfo` alongside the message so callers never match its wording.
-pub mod child_refusal {
-    use openshell_core::rpc_error;
-    use tonic::Status;
-
-    pub const PARENT_MISSING: &str = "PARENT_SANDBOX_MISSING";
-    pub const PARENT_POLICY_REJECTED: &str = "PARENT_POLICY_REJECTED";
-    pub const PARENT_POLICY_NOT_COPIED: &str = "PARENT_POLICY_NOT_COPIED";
-    pub const PARENT_POLICY_UNCOPYABLE: &str = "PARENT_POLICY_UNCOPYABLE";
-
-    pub fn status(reason: &str, message: impl Into<String>) -> Status {
-        rpc_error::failed_precondition(reason, message)
-    }
-
-    /// The gateway's reason on `status`, if it set one.
-    pub fn reason(status: &Status) -> Option<String> {
-        rpc_error::decode_details(status)?
-            .error_info()
-            .filter(|info| info.domain == rpc_error::ERROR_DOMAIN)
-            .map(|info| info.reason.clone())
-    }
-}
-
-/// Refuse a child whose policy copy is older than the policy its parent has
-/// loaded, so a missed or failed sync fails closed. Starts a sync, which
-/// publishes the child once its copy lands.
-pub(super) fn refuse_child_behind_parent(
-    state: &Arc<ServerState>,
-    child: &Sandbox,
-    parent_loaded: &crate::persistence::PolicyRecord,
-    child_latest: Option<&crate::persistence::PolicyRecord>,
-) -> Result<(), Status> {
-    let Some(parent) = child.parent.as_ref() else {
-        return Ok(());
-    };
-    let copied = child_latest.map_or(0, |record| copied_parent_version(record, &parent.id));
-    if copied >= parent_loaded.version {
-        return Ok(());
-    }
-    // A copy that can never succeed would refuse the child for good; say why
-    // once per parent version instead of retrying every rebuild.
-    if let Err(reason) = ParentPolicyCopy::of(parent_loaded, &parent.id) {
-        warn_uncopyable_parent_policy_once(&parent.id, parent_loaded.version, &reason);
-        return Err(child_refusal::status(
-            child_refusal::PARENT_POLICY_UNCOPYABLE,
-            format!(
-                "parent sandbox '{}' policy version {} cannot be copied to its children",
-                parent.name, parent_loaded.version
-            ),
-        ));
-    }
-    spawn_child_sync(state, child);
-    Err(child_refusal::status(
-        child_refusal::PARENT_POLICY_NOT_COPIED,
-        format!(
-            "parent sandbox '{}' policy version {} is not yet copied to this child",
-            parent.name, parent_loaded.version
-        ),
-    ))
-}
-
-fn warn_uncopyable_parent_policy_once(parent_id: &str, version: i64, reason: &Status) {
-    static WARNED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, i64>>> =
-        std::sync::LazyLock::new(Default::default);
-    let mut warned = WARNED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if warned.insert(parent_id.to_string(), version) != Some(version) {
-        warn!(
-            parent_id,
-            version,
-            reason = %reason.message(),
-            "parent sandbox policy cannot be copied to its children; they are refused configuration"
-        );
-    }
-}
-
-/// The children with a background sync running on this replica.
-static CHILD_SYNCS_IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// A child's entry in [`CHILD_SYNCS_IN_FLIGHT`]. Dropping it clears the entry
-/// on every exit, a panic included, so one failed sync never blocks the
-/// child's later ones.
-struct InFlightChildSync(String);
-
-impl InFlightChildSync {
-    fn claim(child_id: &str) -> Option<Self> {
-        Self::syncs()
-            .insert(child_id.to_string())
-            .then(|| Self(child_id.to_string()))
-    }
-
-    fn syncs() -> std::sync::MutexGuard<'static, HashSet<String>> {
-        CHILD_SYNCS_IN_FLIGHT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-impl Drop for InFlightChildSync {
-    fn drop(&mut self) {
-        Self::syncs().remove(&self.0);
-    }
-}
-
-/// Bring one child up to its parent in the background, at most one sync per
-/// child on this replica at a time. Stops the child if its parent is gone.
-pub fn spawn_child_sync(state: &Arc<ServerState>, child: &Sandbox) {
-    let child_id = child.object_id().to_string();
-    let Some(entry) = InFlightChildSync::claim(&child_id) else {
-        return;
-    };
-    let state = Arc::clone(state);
-    let child = child.clone();
-    tokio::spawn(async move {
-        let _entry = entry;
-        match sync_one_child(&state, &child).await {
-            Ok(ChildSync::Done) => {
-                state.sandbox_watch_bus.notify(&child_id);
-                crate::config_delivery::publish_sandbox(&state, &child_id);
-            }
-            // Stopping waits on the child's session, so it runs here, apart
-            // from any build. Delivery refuses the orphan meanwhile.
-            Ok(ChildSync::Orphaned) => stop_orphaned_child(&state, &child).await,
-            Err(error) => warn!(child_id, error = %error, "child sandbox sync failed"),
-        }
-    });
-}
-
-/// Stop a child whose parent record is gone. Delivery already refuses it
-/// configuration, which ends new egress; stopping it ends the connections
-/// its supervisor still holds open. Its record and files are kept for
-/// inspection and deletion, and it cannot be started again.
-pub async fn stop_orphaned_child(state: &Arc<ServerState>, child: &Sandbox) {
-    let child_id = child.object_id();
-    // Stop works by name: skip if the orphan was deleted and the name reused.
-    let current = state
-        .store
-        .get_message_by_name::<Sandbox>(child.object_workspace(), child.object_name())
-        .await;
-    if !matches!(&current, Ok(Some(sandbox)) if sandbox.object_id() == child_id) {
-        warn!(
-            child_id,
-            "not stopping orphaned child sandbox: its record is gone, replaced or unreadable"
-        );
-        return;
-    }
-    match state
-        .compute
-        .stop_sandbox(child.object_workspace(), child.object_name())
-        .await
-    {
-        Ok(_) => warn!(
-            child_id,
-            parent_id = child
-                .parent
-                .as_ref()
-                .map_or("", |parent| parent.id.as_str()),
-            "stopped child sandbox whose parent no longer exists"
-        ),
-        Err(error) => warn!(
-            child_id,
-            error = %error,
-            "failed to stop child sandbox whose parent no longer exists"
-        ),
-    }
-}
-
-/// Refuse to start or resume a child whose parent record is gone. A parent
-/// is never recreated under the same id, so no lock is needed.
-async fn refuse_orphaned_child(state: &ServerState, sandbox: &Sandbox) -> Result<(), Status> {
-    if let Some(parent) = sandbox.parent.as_ref()
-        && parent_is_missing(state, &parent.id).await?
-    {
-        return Err(child_refusal::status(
-            child_refusal::PARENT_MISSING,
-            crate::compute::orphaned_child_message(parent),
-        ));
-    }
-    Ok(())
-}
-
-/// What a connecting child's sync found.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ChildSync {
-    /// Not a child, or brought up to its parent.
-    Done,
-    /// The parent record is gone; the caller stops the child.
-    Orphaned,
-}
-
-/// Bring one child up to its parent, for a child that may have missed a
-/// sync. The child-sandbox lock set includes the parent, so the parent is
-/// read and the child written under one guard.
-pub async fn sync_one_child(
-    state: &Arc<ServerState>,
-    child: &Sandbox,
-) -> Result<ChildSync, Status> {
-    let Some(parent) = child.parent.as_ref() else {
-        return Ok(ChildSync::Done);
-    };
-    let workspace = child.object_workspace();
-    let _guard = state
-        .compute
-        .mutation_guard(MutationScope::ChildSandbox {
-            workspace,
-            sandbox_id: child.object_id(),
-            parent_id: &parent.id,
-        })
-        .await
-        .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
-    if parent_is_missing(state, &parent.id).await? {
-        return Ok(ChildSync::Orphaned);
-    }
-    let copy = parent_policy_copy(state, &parent.id).await?;
-    sync_child_locked(
-        state,
-        workspace,
-        &parent.id,
-        child.object_id(),
-        copy.as_ref(),
-    )
-    .await?;
-    Ok(ChildSync::Done)
-}
-
-/// Bring one child up to its parent. Takes the same lock set as a provider
-/// attach on that child, so the parent's lock is never held while waiting
-/// for a child's.
+/// Bring one child up to its parent under the child-sandbox lock set, which
+/// includes the parent: the root's latest revision and providers read here
+/// are current, and a root commit waits for this copy or lands before it.
+/// Returns whether the child changed.
 async fn sync_child(
     state: &Arc<ServerState>,
     workspace: &str,
     parent_id: &str,
     child_id: &str,
-    copy: Option<&ParentPolicyCopy>,
-) -> Result<(), Status> {
+) -> Result<bool, Status> {
     let _guard = state
         .compute
         .mutation_guard(MutationScope::ChildSandbox {
@@ -1622,71 +1215,58 @@ async fn sync_child(
         })
         .await
         .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
-    sync_child_locked(state, workspace, parent_id, child_id, copy).await
-}
-
-/// Detach from a live child every provider its parent no longer has, then
-/// write `copy` as its next revision unless it already holds this parent
-/// version or a newer one. Providers are removed whatever the parent's
-/// policy state: losing one is a revocation. The caller holds the
-/// child-sandbox lock set, so the parent's providers read here are current.
-async fn sync_child_locked(
-    state: &Arc<ServerState>,
-    workspace: &str,
-    parent_id: &str,
-    child_id: &str,
-    copy: Option<&ParentPolicyCopy>,
-) -> Result<(), Status> {
     let Some(child) = state
         .store
         .get_message::<Sandbox>(child_id)
         .await
         .map_err(|e| Status::internal(format!("fetch child sandbox failed: {e}")))?
     else {
-        return Ok(());
+        return Ok(false);
     };
     if crate::compute::is_being_deleted(&child) {
-        return Ok(());
+        return Ok(false);
     }
-    let parent_providers = state
+    let Some(parent) = state
         .store
         .get_message::<Sandbox>(parent_id)
         .await
         .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
-        .and_then(|parent| parent.spec.map(|spec| spec.providers));
-    if let Some(parent_providers) = parent_providers {
-        let lost: Vec<String> = child
-            .spec
-            .as_ref()
-            .map(|spec| spec.providers.as_slice())
-            .unwrap_or_default()
-            .iter()
-            .filter(|name| !parent_providers.contains(name))
-            .cloned()
-            .collect();
-        for provider in lost {
-            detach_provider_locked(state, child_id, 0, &provider).await?;
-            info!(
-                parent_id,
-                child_id, provider, "detached a provider its parent lost from child sandbox"
-            );
-        }
+    else {
+        return Ok(false);
+    };
+
+    // Losing a provider is a revocation: detach it before the policy copy,
+    // which can fail.
+    let parent_providers = parent.spec.map(|spec| spec.providers).unwrap_or_default();
+    let lost: Vec<String> = child
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|name| !parent_providers.contains(name))
+        .cloned()
+        .collect();
+    for provider in &lost {
+        detach_provider_locked(state, child_id, 0, provider).await?;
+        info!(
+            parent_id,
+            child_id, provider, "detached a provider its parent lost from child sandbox"
+        );
     }
 
-    let Some(copy) = copy else {
-        return Ok(());
+    let Some(copy) = parent_policy_copy(state, parent_id).await? else {
+        return Ok(!lost.is_empty());
     };
-    let parent_version = copy.parent_version();
     let latest = state
         .store
         .get_latest_policy(child_id)
         .await
         .map_err(|e| Status::internal(format!("fetch child policy failed: {e}")))?;
-    if latest
-        .as_ref()
-        .is_some_and(|record| copied_parent_version(record, parent_id) >= parent_version)
-    {
-        return Ok(());
+    if latest.as_ref().is_some_and(|record| {
+        super::policy::canonical_policy_record_matches_for_deduplication(record, &copy.hash)
+    }) {
+        return Ok(!lost.is_empty());
     }
     let write = crate::policy_store::AtomicPolicyRevisionWrite {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1694,8 +1274,8 @@ async fn sync_child_locked(
         workspace: workspace.to_string(),
         version: latest.as_ref().map_or(1, |record| record.version + 1),
         policy_payload: copy.policy.encode_to_vec(),
-        policy_hash: openshell_core::policy_identity::deterministic_policy_hash(&copy.policy),
-        provenance: copy.provenance.clone(),
+        policy_hash: copy.hash,
+        provenance: HashMap::new(),
         expected_resource_version: 0,
         annotations: HashMap::new(),
         backfill_policy: None,
@@ -1708,11 +1288,10 @@ async fn sync_child_locked(
     info!(
         parent_id,
         child_id,
-        parent_version,
         version = write.version,
         "copied parent policy into child sandbox"
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Under the parent's lock, check that a provider being attached to a child is
@@ -1873,14 +1452,10 @@ async fn handle_create_sandbox_inner(
     };
     let (sandbox_lifecycle_guard, mutation_guard) = guards
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
-    let initial_policy_provenance = if let Some(parent) = &parent {
+    if let Some(parent) = &parent {
         check_parent_has_room(state, &workspace, parent, &spec.providers).await?;
-        let copy = copy_parent_policy(state, parent).await?;
-        spec.policy = Some(copy.policy);
-        copy.provenance
-    } else {
-        HashMap::new()
-    };
+        spec.policy = Some(copy_parent_policy(state, parent).await?.policy);
+    }
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
@@ -2018,7 +1593,6 @@ async fn handle_create_sandbox_inner(
     // their revisions cannot change before the sandbox's launch is committed.
     let mut runtime_inputs =
         super::policy::resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox).await?;
-    runtime_inputs.initial_policy_provenance = initial_policy_provenance;
 
     state
         .compute
@@ -3186,7 +2760,13 @@ pub(super) async fn handle_detach_sandbox_provider(
         if detached {
             crate::config_delivery::publish_provider(state, &workspace, &request.provider);
         }
-        super::policy::spawn_child_policy_sync(state, &sandbox_id);
+        let state = Arc::clone(state);
+        let parent_id = sandbox_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = sync_children(&state, &parent_id).await {
+                warn!(parent_id, error = %error, "failed to sync child sandboxes");
+            }
+        });
     }
 
     Ok(Response::new(DetachSandboxProviderResponse {
@@ -3488,7 +3068,6 @@ async fn handle_start_sandbox_inner(
     if let Some(policy) = resolved.spec.as_ref().and_then(|spec| spec.policy.as_ref()) {
         require_gateway_cedar_support(policy)?;
     }
-    refuse_orphaned_child(state, &resolved).await?;
     let workspace = resolved.object_workspace().to_string();
     let name = resolved.object_name().to_string();
     let mut sandbox = state
@@ -3592,7 +3171,6 @@ async fn handle_resume_sandbox_inner(
     if let Some(policy) = resolved.spec.as_ref().and_then(|spec| spec.policy.as_ref()) {
         require_gateway_cedar_support(policy)?;
     }
-    refuse_orphaned_child(state, &resolved).await?;
     let workspace = resolved.object_workspace().to_string();
     let name = resolved.object_name().to_string();
     let mut sandbox = state
@@ -9436,7 +9014,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_copies_the_policy_its_parent_enforces() {
+    async fn child_of_a_root_whose_policy_is_still_pending_copies_it() {
         let state = child_sandboxes_state().await;
         let lead = handle_create_sandbox(
             &state,
@@ -9454,95 +9032,50 @@ mod tests {
         .into_inner()
         .sandbox
         .expect("created sandbox");
-        let lead_id = lead.object_id().to_string();
-        super::super::policy::record_policy_apply_result(&state, &lead_id, 1, true, None, "test")
-            .await
-            .unwrap();
+        let lead_record = latest_policy(&state, lead.object_id()).await;
+        assert_ne!(lead_record.status, "loaded");
 
         let child = create_child(&state, "worker1", "lead").await;
 
-        let lead_record = latest_policy(&state, &lead_id).await;
         let child_record = latest_policy(&state, child.object_id()).await;
         assert_eq!(child_record.version, 1);
         assert_eq!(
             super::super::policy::canonical_policy_record_identity(&child_record).unwrap(),
             super::super::policy::canonical_policy_record_identity(&lead_record).unwrap(),
         );
-        assert_eq!(
-            child_record.provenance.get(COPIED_FROM_PARENT_ID),
-            Some(&lead_id)
-        );
-        assert_eq!(
-            child_record.provenance.get(COPIED_FROM_PARENT_VERSION),
-            Some(&"1".to_string())
-        );
     }
 
     #[tokio::test]
-    async fn child_copies_the_parent_loaded_revision_not_a_newer_one() {
-        let mut state = child_sandboxes_state().await;
-        Arc::get_mut(&mut state)
-            .unwrap()
-            .config
-            .policy_validation_failure_mode =
-            openshell_core::PolicyValidationFailureMode::RetainLastValid;
-        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
-        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
-        put_policy_revision_with_status(&state, &lead_id, 3, &lead_policy(false), "pending").await;
-
-        let child = create_child(&state, "worker1", "lead").await;
-
-        let child_record = latest_policy(&state, child.object_id()).await;
-        let (child_policy, _) =
-            super::super::policy::canonical_policy_record_identity(&child_record).unwrap();
-        assert!(
-            child_policy.network_policies.is_empty(),
-            "the child must not get the failed or pending revision"
-        );
-        assert_eq!(
-            child_record.provenance.get(COPIED_FROM_PARENT_VERSION),
-            Some(&"1".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn child_of_a_fail_closed_parent_that_rejected_its_policy_is_refused() {
+    async fn child_copies_the_root_latest_revision_even_if_it_failed_or_is_pending() {
         let state = child_sandboxes_state().await;
         let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
         put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
-        put_policy_revision_with_status(&state, &lead_id, 3, &lead_policy(false), "pending").await;
 
-        let err = handle_create_sandbox(
-            &state,
-            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(
-            err.message()
-                .contains("parent sandbox 'lead' rejected its latest policy"),
-            "{}",
-            err.message()
-        );
+        let failed_copy = create_child(&state, "worker1", "lead").await;
+        assert!(holds_parent_latest(&state, failed_copy.object_id(), &lead_id).await);
+
+        put_policy_revision_with_status(&state, &lead_id, 3, &lead_policy(true), "pending").await;
+        let pending_copy = create_child(&state, "worker2", "lead").await;
+        assert!(holds_parent_latest(&state, pending_copy.object_id(), &lead_id).await);
     }
 
     #[tokio::test]
-    async fn child_of_a_parent_with_no_loaded_policy_is_refused() {
+    async fn child_of_a_root_with_no_policy_revision_is_refused() {
         let state = child_sandboxes_state().await;
-        handle_create_sandbox(
-            &state,
-            authed_request(child_request(
-                "lead",
-                "",
-                SandboxSpec {
-                    policy: Some(lead_policy(false)),
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: "lead".to_string(),
+                    workspace: "default".to_string(),
                     ..Default::default()
-                },
-            )),
-        )
-        .await
-        .expect("root sandbox is created");
+                }),
+                spec: Some(SandboxSpec::default()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         let err = handle_create_sandbox(
             &state,
@@ -9572,10 +9105,6 @@ mod tests {
         let (child_policy, _) =
             super::super::policy::canonical_policy_record_identity(&child_record).unwrap();
         assert!(child_policy.network_policies["api"].endpoints[0].advisor_proposed);
-        assert_eq!(
-            child_record.provenance.get(COPIED_FROM_PARENT_VERSION),
-            Some(&"2".to_string())
-        );
     }
 
     fn delete_request(name: &str) -> DeleteSandboxRequest {
@@ -9646,47 +9175,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_child_sandboxes_off_a_policy_load_starts_no_child_sync() {
+    async fn with_child_sandboxes_off_no_sync_copies_the_root_policy() {
         let (state, lead_id, worker_id) = lead_and_worker_with_children_off().await;
         put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
 
-        assert!(super::super::policy::spawn_child_policy_sync(&state, &lead_id).is_none());
-        assert_ne!(
-            copied_version(&latest_policy(&state, &worker_id).await),
-            Some("2")
-        );
-    }
-
-    #[tokio::test]
-    async fn with_child_sandboxes_off_the_startup_scan_does_nothing() {
-        let (state, lead_id, worker_id) = lead_and_worker_with_children_off().await;
-        state
-            .store
-            .delete(Sandbox::object_type(), &lead_id)
-            .await
-            .unwrap();
-        let mut worker = state
-            .store
-            .get_message::<Sandbox>(&worker_id)
-            .await
-            .unwrap()
-            .unwrap();
-        worker.set_phase(SandboxPhase::Ready as i32);
-        state.store.put_message(&worker).await.unwrap();
-
+        sync_children(&state, &lead_id).await.unwrap();
         sync_all_children(&state).await.unwrap();
 
-        let worker = state
-            .store
-            .get_message::<Sandbox>(&worker_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            SandboxPhase::try_from(worker.phase()).unwrap(),
-            SandboxPhase::Ready,
-            "the scan must not run, so it cannot stop the orphan"
-        );
+        assert_eq!(latest_policy(&state, &worker_id).await.version, 1);
+        assert!(!holds_parent_latest(&state, &worker_id, &lead_id).await);
     }
 
     #[tokio::test]
@@ -9771,11 +9268,11 @@ mod tests {
         assert!(response.detached);
     }
 
-    /// A root `lead` with a child `worker1` whose `lead` record is then
-    /// removed, as a downgraded gateway or a stalled delete can leave it.
-    /// Returns both ids.
+    /// A root `lead` with a child `worker1` sharing provider `work-github`,
+    /// whose `lead` record is then removed, as a downgraded gateway or a
+    /// stalled delete can leave it. Returns both ids.
     async fn orphaned_child(state: &Arc<ServerState>) -> (String, String) {
-        let (lead_id, worker_id) = lead_with_copied_child(state).await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(state).await;
         state
             .store
             .delete(Sandbox::object_type(), &lead_id)
@@ -9785,82 +9282,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_orphaned_child_is_refused_configuration() {
+    async fn an_orphaned_child_is_served_configuration_without_providers() {
         let state = child_sandboxes_state().await;
         let (_, worker_id) = orphaned_child(&state).await;
+        let worker = sandbox_record(&state, &worker_id).await;
 
+        let inputs = super::super::policy::load_sandbox_config_inputs(&state, worker.clone())
+            .await
+            .unwrap();
+        assert!(inputs.sandbox().spec.as_ref().unwrap().providers.is_empty());
+        assert!(delivered_variables(&state, &worker).await.is_empty());
         let config = child_config(&state, &worker_id).await;
-        assert!(!config.configuration_admitted);
         assert!(
-            config
-                .configuration_error
-                .contains("parent sandbox no longer exists"),
+            config.configuration_admitted,
             "{}",
             config.configuration_error
         );
-        assert_eq!(config.policy_validation_failure_mode, "fail_closed");
     }
 
     #[tokio::test]
-    async fn an_orphaned_child_cannot_be_started_or_resumed() {
-        let state = child_sandboxes_state().await;
-        let (lead_id, _) = orphaned_child(&state).await;
-
-        let start = handle_start_sandbox(
-            &state,
-            authed_request(StartSandboxRequest {
-                request_id: String::new(),
-                name: "worker1".to_string(),
-                workspace_scope: Some(default_scope()),
-            }),
-        )
-        .await
-        .unwrap_err();
-        let resume = handle_resume_sandbox(
-            &state,
-            authed_request(ResumeSandboxRequest {
-                name: "worker1".to_string(),
-                workspace_scope: Some(default_scope()),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap_err();
-        for err in [start, resume] {
-            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-            assert!(
-                err.message().contains(&lead_id)
-                    && err.message().contains("delete this child sandbox"),
-                "{}",
-                err.message()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn the_startup_scan_stops_an_orphaned_child_and_keeps_it() {
+    async fn the_scan_leaves_an_orphaned_child_running() {
         let state = child_sandboxes_state().await;
         let (_, worker_id) = orphaned_child(&state).await;
-        let mut running = state
-            .store
-            .get_message::<Sandbox>(&worker_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let mut running = sandbox_record(&state, &worker_id).await;
         running.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&running).await.unwrap();
+        let before = latest_policy(&state, &worker_id).await;
 
         sync_all_children(&state).await.unwrap();
 
-        let worker = state
-            .store
-            .get_message::<Sandbox>(&worker_id)
-            .await
-            .unwrap()
-            .expect("the orphan's record is kept");
+        let worker = sandbox_record(&state, &worker_id).await;
         assert_eq!(
             SandboxPhase::try_from(worker.phase()).unwrap(),
-            SandboxPhase::Stopped
+            SandboxPhase::Ready
+        );
+        assert_eq!(
+            latest_policy(&state, &worker_id).await.version,
+            before.version
         );
     }
 
@@ -9872,26 +9330,12 @@ mod tests {
         let new_lead_id = put_parent_record(&state, "lead", &[], None, false).await;
         put_policy_revision_with_status(&state, &new_lead_id, 2, &lead_policy(false), "loaded")
             .await;
-        let worker = state
-            .store
-            .get_message::<Sandbox>(&worker_id)
-            .await
-            .unwrap()
-            .unwrap();
 
-        assert_eq!(
-            sync_one_child(&state, &worker).await.unwrap(),
-            ChildSync::Orphaned
-        );
+        sync_children(&state, &new_lead_id).await.unwrap();
         sync_all_children(&state).await.unwrap();
 
         let after = latest_policy(&state, &worker_id).await;
         assert_eq!(after.version, before.version, "nothing is copied");
-        assert!(
-            !child_config(&state, &worker_id)
-                .await
-                .configuration_admitted
-        );
     }
 
     fn list_children_request(
@@ -11446,37 +10890,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_blocked_parents_children_still_lose_its_lost_provider() {
+    async fn the_scan_detaches_a_provider_a_child_missed_losing() {
         let state = child_sandboxes_state().await;
         let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
-        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+        lead_loses_providers_without_a_sync(&state, &lead_id).await;
 
-        detach_from_lead(&state, "work-github").await;
-
-        eventually(|| async { sandbox_spec(&state, &worker_id).await.providers.is_empty() }).await;
-    }
-
-    #[tokio::test]
-    async fn a_child_that_missed_a_provider_detach_loses_it_on_its_own() {
-        let state = child_sandboxes_state().await;
-        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
-        // The lead lost the provider, but the sync that would follow was lost.
-        let mut lead = state
-            .store
-            .get_message::<Sandbox>(&lead_id)
-            .await
-            .unwrap()
-            .unwrap();
-        lead.spec.as_mut().unwrap().providers.clear();
-        state.store.put_message(&lead).await.unwrap();
-        let worker = state
-            .store
-            .get_message::<Sandbox>(&worker_id)
-            .await
-            .unwrap()
-            .unwrap();
-
-        sync_one_child(&state, &worker).await.unwrap();
+        sync_all_children(&state).await.unwrap();
 
         assert!(sandbox_spec(&state, &worker_id).await.providers.is_empty());
     }
@@ -11618,9 +11037,8 @@ mod tests {
             .unwrap();
 
         // Acknowledge each update, as a supervisor does, until one without
-        // the credential arrives. The sync started on connect may push one
-        // first. Well under the 30 s re-check, so only the detach's own
-        // notification can explain it.
+        // the credential arrives. Well under the 30 s re-check, so only the
+        // detach's own notification can explain it.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let message = harness.inbound.message().await.unwrap().unwrap();
@@ -11683,72 +11101,110 @@ mod tests {
         );
     }
 
+    /// Replace the lead's policy through `UpdateConfig`, as a user does.
+    /// Returns the version written.
+    async fn update_lead_policy(
+        state: &Arc<ServerState>,
+        policy: openshell_core::proto::SandboxPolicy,
+    ) -> u32 {
+        super::super::policy::handle_update_config(
+            state,
+            authed_request(openshell_core::proto::UpdateConfigRequest {
+                sandbox: "lead".to_string(),
+                workspace_scope: Some(default_scope()),
+                policy: Some(policy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("the lead's policy is updated")
+        .into_inner()
+        .version
+    }
+
     #[tokio::test]
-    async fn a_child_behind_its_parent_is_refused_until_its_copy_lands() {
+    async fn a_root_policy_update_reaches_its_child_before_the_call_returns() {
         let state = child_sandboxes_state().await;
         let (lead_id, worker_id) = lead_with_copied_child(&state).await;
-        // The lead loads v2, and the sync that would copy it is lost.
-        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
+
+        update_lead_policy(&state, lead_policy(false)).await;
+
+        assert!(holds_parent_latest(&state, &worker_id, &lead_id).await);
+        let (child_policy, _) = super::super::policy::canonical_policy_record_identity(
+            &latest_policy(&state, &worker_id).await,
+        )
+        .unwrap();
+        assert!(child_policy.network_policies.contains_key("api"));
+    }
+
+    #[tokio::test]
+    async fn a_root_failing_to_load_its_policy_does_not_block_its_child() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        let version = update_lead_policy(&state, lead_policy(false)).await;
+
+        super::super::policy::record_policy_apply_result(
+            &state,
+            &lead_id,
+            version,
+            false,
+            Some("invalid"),
+            "test",
+        )
+        .await
+        .unwrap();
+
         let worker = sandbox_record(&state, &worker_id).await;
-        // Hold the lead's lock, which every child sync takes, so the sync the
-        // refusal starts cannot land before the checks below.
-        let guard = state
-            .compute
-            .mutation_guard(MutationScope::sandbox("default", &lead_id))
+        super::super::policy::load_sandbox_config_inputs(&state, worker.clone())
             .await
-            .unwrap();
-
+            .expect("the child's configuration builds");
         let config = child_config(&state, &worker_id).await;
-        assert!(!config.configuration_admitted);
-        assert_eq!(
-            config.configuration_error,
-            "Waiting for a copy of the parent sandbox's latest policy"
+        assert!(
+            config.configuration_admitted,
+            "{}",
+            config.configuration_error
         );
-        assert_eq!(
-            config.policy_validation_failure_mode,
-            openshell_core::PolicyValidationFailureMode::FailClosed.as_str()
-        );
-        let err =
-            super::super::policy::build_provider_environment_snapshot(&state, &worker, true, true)
+        assert!(config.policy.unwrap().network_policies.contains_key("api"));
+        assert!(holds_parent_latest(&state, &worker_id, &lead_id).await);
+        assert!(
+            delivered_variables(&state, &worker)
                 .await
-                .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(
-            copied_version(&latest_policy(&state, &worker_id).await),
-            Some("1")
+                .contains(&"GITHUB_TOKEN".to_string())
         );
+    }
 
-        // The refusal started a sync; once it lands, the child is admitted.
-        drop(guard);
-        eventually(|| async {
-            copied_version(&latest_policy(&state, &worker_id).await) == Some("2")
-        })
-        .await;
+    #[tokio::test]
+    async fn a_child_behind_its_root_is_served_and_the_scan_catches_it_up() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        // Written straight to the store, so no handler copies it.
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
+        // A nested wait on the lead's lock would time out and fail the scan.
+        state
+            .compute
+            .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
+
         let config = child_config(&state, &worker_id).await;
-        assert!(config.configuration_admitted);
+        assert!(
+            config.configuration_admitted,
+            "{}",
+            config.configuration_error
+        );
+        assert!(!config.policy.unwrap().network_policies.contains_key("api"));
+
+        sync_all_children(&state).await.unwrap();
+
+        let config = child_config(&state, &worker_id).await;
+        assert!(
+            config.configuration_admitted,
+            "{}",
+            config.configuration_error
+        );
         assert!(config.policy.unwrap().network_policies.contains_key("api"));
     }
 
     #[tokio::test]
-    async fn a_blocked_parents_child_is_refused_its_provider_environment() {
-        let state = child_sandboxes_state().await;
-        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
-        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
-        let worker = sandbox_record(&state, &worker_id).await;
-
-        let err =
-            super::super::policy::build_provider_environment_snapshot(&state, &worker, true, true)
-                .await
-                .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(
-            err.message(),
-            "parent sandbox 'lead' rejected its latest policy"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_parent_policy_that_cannot_be_copied_refuses_children_and_says_why() {
+    async fn a_root_policy_that_cannot_be_copied_leaves_children_on_their_last_copy() {
         let state = child_sandboxes_state().await;
         let (lead_id, worker_id) = lead_with_copied_child(&state).await;
         let mut uncopyable = lead_policy(false);
@@ -11757,27 +11213,15 @@ mod tests {
             .network_policies
             .insert("_provider_github".to_string(), rule);
         put_policy_revision_with_status(&state, &lead_id, 2, &uncopyable, "loaded").await;
-        let worker = sandbox_record(&state, &worker_id).await;
 
-        let err = super::super::policy::load_sandbox_config_inputs(&state, worker)
-            .await
-            .err()
-            .expect("refused");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(
-            err.message(),
-            "parent sandbox 'lead' policy version 2 cannot be copied to its children"
-        );
+        sync_children(&state, &lead_id).await.unwrap_err();
+
+        assert_eq!(latest_policy(&state, &worker_id).await.version, 1);
         let config = child_config(&state, &worker_id).await;
-        assert_eq!(
-            config.configuration_error,
-            "The parent sandbox's policy cannot be copied to children; fix the parent's policy"
-        );
-        // No sync is started for a copy that cannot succeed.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(
-            copied_version(&latest_policy(&state, &worker_id).await),
-            Some("1")
+        assert!(
+            config.configuration_admitted,
+            "{}",
+            config.configuration_error
         );
     }
 
@@ -11901,218 +11345,44 @@ mod tests {
     }
 
     /// A root `lead` with a child `worker1` created through the API, so the
-    /// child's v1 is tagged as copied from the lead's v1. Returns both ids.
+    /// child's v1 is a copy of the lead's v1. Returns both ids.
     async fn lead_with_copied_child(state: &Arc<ServerState>) -> (String, String) {
         let lead_id = put_parent_record(state, "lead", &[], None, false).await;
         let worker = create_child(state, "worker1", "lead").await;
         (lead_id, worker.object_id().to_string())
     }
 
-    fn copied_version(record: &crate::persistence::PolicyRecord) -> Option<&str> {
-        record
-            .provenance
-            .get(COPIED_FROM_PARENT_VERSION)
-            .map(String::as_str)
+    /// Whether a child's latest revision is a copy of its parent's latest.
+    async fn holds_parent_latest(state: &ServerState, child_id: &str, parent_id: &str) -> bool {
+        let parent = ParentPolicyCopy::of(&latest_policy(state, parent_id).await).unwrap();
+        let (_, child_hash) = super::super::policy::canonical_policy_record_identity(
+            &latest_policy(state, child_id).await,
+        )
+        .unwrap();
+        child_hash == parent.hash
     }
 
     #[tokio::test]
-    async fn sync_copies_the_parents_newly_loaded_policy() {
-        let state = child_sandboxes_state().await;
-        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
-        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
-
-        sync_children(&state, &lead_id).await.unwrap();
-
-        let parent_record = latest_policy(&state, &lead_id).await;
-        let (_, parent_hash) =
-            super::super::policy::canonical_policy_record_identity(&parent_record).unwrap();
-        let child_record = latest_policy(&state, &worker_id).await;
-        assert_eq!(child_record.version, 2);
-        assert_eq!(copied_version(&child_record), Some("2"));
-        assert_eq!(child_record.policy_hash, parent_hash);
-
-        sync_children(&state, &lead_id).await.unwrap();
-        assert_eq!(
-            latest_policy(&state, &worker_id).await.version,
-            2,
-            "a second sync writes nothing"
-        );
-    }
-
-    /// Give a child revision 2, tagged as a copy of parent version 5.
-    async fn put_newer_child_copy(state: &ServerState, child_id: &str, parent_id: &str) {
-        let provenance = HashMap::from([
-            (COPIED_FROM_PARENT_ID.to_string(), parent_id.to_string()),
-            (COPIED_FROM_PARENT_VERSION.to_string(), "5".to_string()),
-        ]);
-        let policy = openshell_policy::restrictive_default_policy();
-        state
-            .store
-            .put_policy_revision_atomic(&crate::policy_store::AtomicPolicyRevisionWrite {
-                id: uuid::Uuid::new_v4().to_string(),
-                sandbox_id: child_id.to_string(),
-                workspace: "default".to_string(),
-                version: 2,
-                policy_payload: policy.encode_to_vec(),
-                policy_hash: openshell_core::policy_identity::deterministic_policy_hash(&policy),
-                provenance,
-                expected_resource_version: 0,
-                annotations: HashMap::new(),
-                backfill_policy: None,
-            })
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn sync_never_replaces_a_newer_copy() {
-        let state = child_sandboxes_state().await;
-        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
-        // The child already holds a copy of a newer parent version than the
-        // one this sync reads, as when an earlier sync finishes last.
-        put_newer_child_copy(&state, &worker_id, &lead_id).await;
-        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
-
-        sync_children(&state, &lead_id).await.unwrap();
-
-        let child_record = latest_policy(&state, &worker_id).await;
-        assert_eq!(child_record.version, 2);
-        assert_eq!(copied_version(&child_record), Some("5"));
-    }
-
-    #[tokio::test]
-    async fn a_fail_closed_parents_rejected_policy_blocks_its_children_until_it_loads_a_fix() {
+    async fn sync_children_copies_the_root_latest_policy_once() {
         let state = child_sandboxes_state().await;
         let (lead_id, worker_id) = lead_with_copied_child(&state).await;
         put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "pending").await;
 
-        // The parent rejects v2; its failed report pushes the child.
-        let mut pushes = state.sandbox_watch_bus.subscribe(&worker_id);
-        super::super::policy::record_policy_apply_result(
-            &state,
-            &lead_id,
-            2,
-            false,
-            Some("invalid"),
-            "test",
-        )
-        .await
-        .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), pushes.recv())
-            .await
-            .expect("the child is pushed")
-            .unwrap();
-
-        let config = child_config(&state, &worker_id).await;
-        assert!(!config.configuration_admitted);
-        assert!(
-            config
-                .configuration_error
-                .contains("fix the parent's policy"),
-            "{}",
-            config.configuration_error
-        );
-        assert_eq!(config.policy_validation_failure_mode, "fail_closed");
-        assert_eq!(
-            latest_policy(&state, &worker_id).await.version,
-            1,
-            "nothing is copied"
-        );
-
-        // The parent loads a fixed v3; its report copies it into the child.
-        put_policy_revision_with_status(&state, &lead_id, 3, &lead_policy(false), "pending").await;
-        super::super::policy::record_policy_apply_result(&state, &lead_id, 3, true, None, "test")
-            .await
-            .unwrap();
-        wait_for_child_version(&state, &worker_id, 2).await;
-
-        assert_eq!(
-            copied_version(&latest_policy(&state, &worker_id).await),
-            Some("3")
-        );
-        assert!(
-            child_config(&state, &worker_id)
-                .await
-                .configuration_admitted
-        );
-    }
-
-    #[tokio::test]
-    async fn a_parent_unblocking_pushes_a_child_whose_copy_is_current() {
-        let state = child_sandboxes_state().await;
-        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
-        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
-        put_newer_child_copy(&state, &worker_id, &lead_id).await;
-        assert!(
-            !child_config(&state, &worker_id)
-                .await
-                .configuration_admitted
-        );
-
-        // A retry of v2 loads on the parent; the child needs no new copy.
-        let mut pushes = state.sandbox_watch_bus.subscribe(&worker_id);
-        super::super::policy::record_policy_apply_result(&state, &lead_id, 2, true, None, "test")
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), pushes.recv())
-            .await
-            .expect("the child is pushed")
-            .unwrap();
+        sync_children(&state, &lead_id).await.unwrap();
+        sync_children(&state, &lead_id).await.unwrap();
 
         assert_eq!(
             latest_policy(&state, &worker_id).await.version,
             2,
-            "nothing is copied"
+            "two syncs write one revision"
         );
-        assert!(
-            child_config(&state, &worker_id)
-                .await
-                .configuration_admitted
-        );
+        assert!(holds_parent_latest(&state, &worker_id, &lead_id).await);
     }
 
     #[tokio::test]
-    async fn a_child_that_missed_a_sync_catches_up_on_its_own() {
+    async fn the_scan_catches_up_the_children_of_every_root() {
         let state = child_sandboxes_state().await;
-        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
-        let worker = create_child(&state, "worker1", "lead").await;
-        let worker_id = worker.object_id().to_string();
-        // The parent loaded v2, but the sync that would copy it was lost.
-        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
-        // A nested wait on the parent's lock would time out and fail here.
-        state
-            .compute
-            .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
-
-        sync_one_child(&state, &worker).await.unwrap();
-
-        let child_record = latest_policy(&state, &worker_id).await;
-        assert_eq!(child_record.version, 2);
-        assert_eq!(copied_version(&child_record), Some("2"));
-        sync_one_child(&state, &worker).await.unwrap();
-        assert_eq!(
-            latest_policy(&state, &worker_id).await.version,
-            2,
-            "a second sync writes nothing"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_blocked_parents_child_copies_nothing_on_its_own() {
-        let state = child_sandboxes_state().await;
-        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
-        let worker = create_child(&state, "worker1", "lead").await;
-        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
-
-        sync_one_child(&state, &worker).await.unwrap();
-
-        assert_eq!(latest_policy(&state, worker.object_id()).await.version, 1);
-    }
-
-    #[tokio::test]
-    async fn startup_sync_catches_up_the_children_of_every_root() {
-        let state = child_sandboxes_state().await;
-        let mut children = Vec::new();
+        let mut pairs = Vec::new();
         for (lead, worker) in [("lead", "worker1"), ("lead2", "worker2")] {
             let lead_id = put_parent_record(&state, lead, &[], None, false).await;
             let worker_id = create_child(&state, worker, lead)
@@ -12121,16 +11391,13 @@ mod tests {
                 .to_string();
             put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded")
                 .await;
-            children.push(worker_id);
+            pairs.push((lead_id, worker_id));
         }
 
         sync_all_children(&state).await.unwrap();
 
-        for worker_id in children {
-            assert_eq!(
-                copied_version(&latest_policy(&state, &worker_id).await),
-                Some("2")
-            );
+        for (lead_id, worker_id) in pairs {
+            assert!(holds_parent_latest(&state, &worker_id, &lead_id).await);
         }
     }
 
@@ -12178,10 +11445,7 @@ mod tests {
         );
 
         assert_eq!(latest_policy(&state, &stuck_id).await.version, 1);
-        assert_eq!(
-            copied_version(&latest_policy(&state, &free_id).await),
-            Some("2")
-        );
+        assert!(holds_parent_latest(&state, &free_id, &lead_id).await);
     }
 
     #[tokio::test]
@@ -12207,8 +11471,8 @@ mod tests {
 
         let created = latest_policy(&state, &created_id).await;
         let synced = latest_policy(&state, &synced_id).await;
-        assert_eq!(copied_version(&created), Some("2"));
-        assert_eq!(copied_version(&synced), Some("2"));
+        assert_eq!(created.version, 1, "the sync leaves the current copy alone");
+        assert_eq!(synced.version, 2);
         assert_eq!(synced.policy_hash, created.policy_hash);
         assert_eq!(synced.policy_payload, created.policy_payload);
     }
@@ -12224,16 +11488,6 @@ mod tests {
             provider: "work-cloud".to_string(),
         });
         policy
-    }
-
-    /// Wait for the background sync to give a child this revision version.
-    async fn wait_for_child_version(state: &ServerState, child_id: &str, version: i64) {
-        for _ in 0..100 {
-            if latest_policy(state, child_id).await.version >= version {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
     }
 
     /// The configuration a child's own supervisor receives.
@@ -12257,223 +11511,7 @@ mod tests {
         .into_inner()
     }
 
-    #[tokio::test]
-    async fn a_parent_load_report_syncs_its_children() {
-        let state = child_sandboxes_state().await;
-        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
-        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "pending").await;
-
-        super::super::policy::record_policy_apply_result(&state, &lead_id, 2, true, None, "test")
-            .await
-            .unwrap();
-
-        wait_for_child_version(&state, &worker_id, 2).await;
-        let child_record = latest_policy(&state, &worker_id).await;
-        assert_eq!(copied_version(&child_record), Some("2"));
-    }
-
-    /// Load a pending parent revision through the real report handler and
-    /// wait for the sync to copy it into the child.
-    async fn parent_loads(
-        state: &Arc<ServerState>,
-        lead_id: &str,
-        worker_id: &str,
-        version: u32,
-        policy: &openshell_core::proto::SandboxPolicy,
-    ) {
-        put_policy_revision_with_status(state, lead_id, i64::from(version), policy, "pending")
-            .await;
-        super::super::policy::record_policy_apply_result(
-            state, lead_id, version, true, None, "test",
-        )
-        .await
-        .unwrap();
-        wait_for_child_version(state, worker_id, i64::from(version)).await;
-    }
-
-    async fn late_failure(state: &Arc<ServerState>, lead_id: &str, version: u32) {
-        super::super::policy::record_policy_apply_result(
-            state,
-            lead_id,
-            version,
-            false,
-            Some("late result"),
-            "test",
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn new_child_copy(state: &Arc<ServerState>, name: &str) -> Result<i64, Status> {
-        let child = handle_create_sandbox(
-            state,
-            authed_request(child_request(name, "lead", SandboxSpec::default())),
-        )
-        .await?
-        .into_inner()
-        .sandbox
-        .unwrap();
-        Ok(
-            copied_version(&latest_policy(state, child.object_id()).await)
-                .unwrap()
-                .parse()
-                .unwrap(),
-        )
-    }
-
-    fn state_in_mode(
-        mut state: Arc<ServerState>,
-        mode: openshell_core::PolicyValidationFailureMode,
-    ) -> Arc<ServerState> {
-        Arc::get_mut(&mut state)
-            .unwrap()
-            .config
-            .policy_validation_failure_mode = mode;
-        state
-    }
-
-    /// A "failed" report for a version that already loaded: a re-apply that
-    /// failed, or a late result from a replaced session. Upstream records it
-    /// as failed either way. Children follow the version the parent last
-    /// loaded: under `fail_closed` a failure of that version blocks them, as
-    /// it blocks the parent; under `retain_last_valid` they keep it.
-    #[tokio::test]
-    async fn a_failed_report_for_a_loaded_version_follows_the_parents_failure_mode() {
-        use openshell_core::PolicyValidationFailureMode::{FailClosed, RetainLastValid};
-        for mode in [FailClosed, RetainLastValid] {
-            for newer_loaded in [false, true] {
-                let state = state_in_mode(child_sandboxes_state().await, mode);
-                let (lead_id, worker_id) = lead_with_copied_child(&state).await;
-                parent_loads(&state, &lead_id, &worker_id, 2, &lead_policy(false)).await;
-                if newer_loaded {
-                    parent_loads(&state, &lead_id, &worker_id, 3, &lead_policy(false)).await;
-                }
-                let enforced = if newer_loaded { 3 } else { 2 };
-                let case = format!("{mode:?}, newer loaded: {newer_loaded}");
-
-                late_failure(&state, &lead_id, 2).await;
-
-                let config = child_config(&state, &worker_id).await;
-                let created = new_child_copy(&state, "worker2").await;
-                if mode == FailClosed && !newer_loaded {
-                    assert!(
-                        !config.configuration_admitted,
-                        "{case}: blocked with the parent"
-                    );
-                    assert_eq!(
-                        created.unwrap_err().code(),
-                        tonic::Code::FailedPrecondition,
-                        "{case}"
-                    );
-                } else {
-                    assert!(
-                        config.configuration_admitted,
-                        "{case}: {}",
-                        config.configuration_error
-                    );
-                    assert_eq!(
-                        created.unwrap_or_else(|error| panic!("{case}: {error}")),
-                        enforced,
-                        "{case}: a new child copies the version the parent enforces"
-                    );
-                }
-                assert_eq!(
-                    copied_version(&latest_policy(&state, &worker_id).await),
-                    Some(enforced.to_string().as_str()),
-                    "{case}"
-                );
-            }
-        }
-    }
-
-    /// v1 allows more than v2. After a failed report for v2, a parent that
-    /// retains the last valid policy still enforces v2, so a new child must
-    /// get v2, never the wider v1.
-    #[tokio::test]
-    async fn a_retained_parent_never_hands_children_an_older_wider_policy() {
-        let state = state_in_mode(
-            child_sandboxes_state().await,
-            openshell_core::PolicyValidationFailureMode::RetainLastValid,
-        );
-        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
-        // put_parent_record loaded v1 as the restrictive default; make v1 wide.
-        let wide = lead_policy(false);
-        put_policy_revision_with_status(&state, &lead_id, 2, &wide, "loaded").await;
-        let worker = create_child(&state, "worker1", "lead").await;
-        let narrow = openshell_policy::restrictive_default_policy();
-        parent_loads(&state, &lead_id, worker.object_id(), 3, &narrow).await;
-
-        late_failure(&state, &lead_id, 3).await;
-
-        let created = new_child_copy(&state, "worker2").await.unwrap();
-        assert_eq!(created, 3, "the new child copies v3, not the wider v2");
-        let child = state
-            .store
-            .get_message_by_name::<Sandbox>("default", "worker2")
-            .await
-            .unwrap()
-            .unwrap();
-        let (policy, _) = super::super::policy::canonical_policy_record_identity(
-            &latest_policy(&state, child.object_id()).await,
-        )
-        .unwrap();
-        assert!(!policy.network_policies.contains_key("api"));
-    }
-
-    /// Writing a new parent revision marks the loaded one superseded before
-    /// the new one loads. If the new one then fails under `fail_closed`, the
-    /// parent is blocked, and so must its children be.
-    #[tokio::test]
-    async fn a_parent_blocked_by_a_new_revision_blocks_its_children() {
-        let state = child_sandboxes_state().await;
-        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
-        // Written as the gateway writes it, which supersedes the loaded v1.
-        state
-            .store
-            .put_policy_revision_atomic(&crate::policy_store::AtomicPolicyRevisionWrite {
-                id: uuid::Uuid::new_v4().to_string(),
-                sandbox_id: lead_id.clone(),
-                workspace: "default".to_string(),
-                version: 2,
-                policy_payload: lead_policy(false).encode_to_vec(),
-                policy_hash: openshell_core::policy_identity::deterministic_policy_hash(
-                    &lead_policy(false),
-                ),
-                provenance: HashMap::new(),
-                expected_resource_version: 0,
-                annotations: HashMap::new(),
-                backfill_policy: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            state
-                .store
-                .get_policy_by_version(&lead_id, 1)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            "superseded"
-        );
-        // The parent still enforces v1, so a new child copies it.
-        assert_eq!(new_child_copy(&state, "worker2").await.unwrap(), 1);
-
-        late_failure(&state, &lead_id, 2).await;
-
-        let config = child_config(&state, &worker_id).await;
-        assert!(
-            !config.configuration_admitted,
-            "{}",
-            config.configuration_error
-        );
-        assert_eq!(
-            new_child_copy(&state, "worker3").await.unwrap_err().code(),
-            tonic::Code::FailedPrecondition
-        );
-    }
-
-    /// Children now read the parent's enforced revision by version, so a
+    /// A child copies its root's latest revision whatever its status, so a
     /// revision must keep its policy when it is superseded or fails.
     #[tokio::test]
     async fn a_superseded_or_failed_revision_keeps_its_policy() {
@@ -12495,7 +11533,7 @@ mod tests {
                 .unwrap();
             assert_eq!(record.status, status);
             assert!(
-                ParentPolicyCopy::of(&record, &lead_id).is_ok(),
+                ParentPolicyCopy::of(&record).is_ok(),
                 "v{version} still decodes"
             );
         }

@@ -1902,6 +1902,7 @@ async fn auto_approve_chunk(
         }
     };
     crate::config_delivery::publish_sandbox(state, sandbox_id);
+    sync_children_after_commit(state, sandbox_id).await;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -4713,7 +4714,7 @@ async fn handle_update_config_inner(
         ));
     }
 
-    let _mutation_guard = state
+    let mutation_guard = state
         .compute
         .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
         .await
@@ -4814,6 +4815,8 @@ async fn handle_update_config_inner(
         emit_config_update_policy_success(sandbox_caller);
 
         publish_sandbox_config_update(state, &sandbox_id);
+        drop(mutation_guard);
+        sync_children_after_commit(state, &sandbox_id).await;
 
         return Ok(update_config_response(
             u32::try_from(version).unwrap_or(0),
@@ -5009,6 +5012,8 @@ async fn handle_update_config_inner(
     );
     spawn_pending_chunk_refresh(state, &workspace, &sandbox);
     emit_full_policy_update_success(sandbox_caller, next_version);
+    drop(mutation_guard);
+    sync_children_after_commit(state, &sandbox_id).await;
 
     Ok(update_config_response(
         u32::try_from(next_version).unwrap_or(0),
@@ -5172,23 +5177,7 @@ fn bounded_configuration_diagnostic(message: &str) -> String {
 }
 
 fn configuration_failure_diagnostic(error: &Status) -> &'static str {
-    use super::sandbox::child_refusal;
     let message = error.message();
-    match child_refusal::reason(error).as_deref() {
-        Some(child_refusal::PARENT_MISSING) => {
-            return "The parent sandbox no longer exists; delete this child sandbox";
-        }
-        Some(child_refusal::PARENT_POLICY_NOT_COPIED) => {
-            return "Waiting for a copy of the parent sandbox's latest policy";
-        }
-        Some(child_refusal::PARENT_POLICY_UNCOPYABLE) => {
-            return "The parent sandbox's policy cannot be copied to children; fix the parent's policy";
-        }
-        Some(child_refusal::PARENT_POLICY_REJECTED) => {
-            return "The parent sandbox rejected its latest policy; fix the parent's policy";
-        }
-        _ => {}
-    }
     if error.code() == Code::Unimplemented && message == CEDAR_SUPPORT_REQUIRED {
         "Effective policy is a Cedar policy, which this supervisor cannot enforce; run the sandbox with a supervisor built with Cedar support or set a YAML policy"
     } else if message.contains("middleware") {
@@ -5439,23 +5428,17 @@ pub(super) async fn handle_report_policy_status(
     Ok(Response::new(ReportPolicyStatusResponse {}))
 }
 
-/// Sync a root's children in the background, so the root's report is not
-/// held up by them. Returns `None` when child sandboxes are off: the sync
-/// reads every sandbox in the workspace, and there are no children to find.
-pub(super) fn spawn_child_policy_sync(
-    state: &Arc<ServerState>,
-    sandbox_id: &str,
-) -> Option<tokio::task::JoinHandle<()>> {
-    if !state.config.enable_child_sandboxes {
-        return None;
+/// Copy a root's newly committed policy into its children, after the root's
+/// lock is released: each child copy takes the root's lock too. A copy this
+/// misses, such as on a cancelled request, is made by the next periodic scan.
+async fn sync_children_after_commit(state: &Arc<ServerState>, sandbox_id: &str) {
+    if let Err(error) = super::sandbox::sync_children(state, sandbox_id).await {
+        warn!(
+            parent_id = sandbox_id,
+            error = %error,
+            "failed to copy policy into child sandboxes"
+        );
     }
-    let state = Arc::clone(state);
-    let parent_id = sandbox_id.to_string();
-    Some(tokio::spawn(async move {
-        if let Err(error) = super::sandbox::sync_children(&state, &parent_id).await {
-            warn!(parent_id, error = %error, "failed to sync child sandbox policies");
-        }
-    }))
 }
 
 /// Persist the exact sandbox policy revision attempted by a supervisor.
@@ -5503,7 +5486,7 @@ pub async fn record_policy_apply_result(
         return Err(Status::not_found("policy revision not found"));
     }
     if loaded {
-        let (newest_loaded, is_root) = {
+        let newest_loaded = {
             let Some(_mutation_guard) = state
                 .compute
                 .sandbox_mutation_guard_by_id(sandbox_id)
@@ -5520,9 +5503,8 @@ pub async fn record_policy_apply_result(
                 .await
                 .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
-            let is_root = sandbox.parent.is_none();
             let current_version = sandbox.current_policy_version();
-            let newest_loaded = if current_version > version {
+            if current_version > version {
                 // A result can arrive after a newer revision loaded, such as
                 // one queued by a replaced supervisor session. The newer
                 // policy stays active, and so does its endpoint inventory.
@@ -5555,8 +5537,7 @@ pub async fn record_policy_apply_result(
                 state.sandbox_index.update_from_sandbox(&updated);
                 state.sandbox_watch_bus.notify(sandbox_id);
                 updated.current_policy_version()
-            };
-            (newest_loaded, is_root)
+            }
         };
         // Supersede below the newest loaded revision, after the current
         // version settles. Of two results racing, the one finishing last then
@@ -5566,17 +5547,6 @@ pub async fn record_policy_apply_result(
             .store
             .supersede_older_policies(sandbox_id, i64::from(newest_loaded))
             .await;
-        // A root now enforces a new policy: copy it into its children.
-        if is_root {
-            spawn_child_policy_sync(state, sandbox_id);
-        }
-    } else if state.config.policy_validation_failure_mode
-        == openshell_core::PolicyValidationFailureMode::FailClosed
-    {
-        // A root that rejects a revision under fail_closed denies all new
-        // egress; push its children so they are refused too. The sync ignores
-        // a child's own report.
-        spawn_child_policy_sync(state, sandbox_id);
     }
     info!(
         sandbox_id,
@@ -6509,6 +6479,7 @@ async fn handle_approve_draft_chunk_inner(
         }
     };
     crate::config_delivery::publish_sandbox(state, &sandbox_id);
+    sync_children_after_commit(state, &sandbox_id).await;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -6626,6 +6597,7 @@ async fn handle_reject_draft_chunk_inner(
         let (version, hash) =
             remove_chunk_from_policy(state, &sandbox_id, &workspace, &chunk).await?;
         crate::config_delivery::publish_sandbox(state, &sandbox_id);
+        sync_children_after_commit(state, &sandbox_id).await;
         emit_gateway_policy_audit_log(
             &sandbox_id,
             sandbox.object_name(),
@@ -6915,6 +6887,7 @@ async fn handle_approve_all_draft_chunks_inner(
 
     if !accepted.is_empty() {
         crate::config_delivery::publish_sandbox(state, &sandbox_id);
+        sync_children_after_commit(state, &sandbox_id).await;
     }
 
     for (chunk, _, chunk_summary) in &accepted {
@@ -7107,6 +7080,7 @@ async fn handle_undo_draft_chunk_inner(
 
     let (version, hash) = remove_chunk_from_policy(state, &sandbox_id, &workspace, &chunk).await?;
     crate::config_delivery::publish_sandbox(state, &sandbox_id);
+    sync_children_after_commit(state, &sandbox_id).await;
 
     // Clear any prior rejection_reason on the way back to "pending" so an
     // agent reading the chunk via policy.local cannot see a stale guidance
@@ -7278,7 +7252,7 @@ pub(super) fn canonical_policy_record_identity(
 /// policy. A full, already-validated replacement is different: treating an
 /// unreadable current row as non-matching lets the write path append a good
 /// revision instead of making the corrupt or legacy row permanently terminal.
-fn canonical_policy_record_matches_for_deduplication(
+pub(super) fn canonical_policy_record_matches_for_deduplication(
     record: &PolicyRecord,
     expected_hash: &str,
 ) -> bool {
@@ -8677,41 +8651,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// The child hints follow the refusal's reason, not its wording, and the
-    /// reason travels alongside the message without changing it.
-    #[test]
-    fn child_configuration_hints_follow_the_refusal_reason() {
-        for (reason, hint) in [
-            (
-                "PARENT_SANDBOX_MISSING",
-                "The parent sandbox no longer exists; delete this child sandbox",
-            ),
-            (
-                "PARENT_POLICY_NOT_COPIED",
-                "Waiting for a copy of the parent sandbox's latest policy",
-            ),
-            (
-                "PARENT_POLICY_UNCOPYABLE",
-                "The parent sandbox's policy cannot be copied to children; fix the parent's policy",
-            ),
-            (
-                "PARENT_POLICY_REJECTED",
-                "The parent sandbox rejected its latest policy; fix the parent's policy",
-            ),
-        ] {
-            let refusal = openshell_core::rpc_error::failed_precondition(reason, "reworded");
-            assert_eq!(refusal.message(), "reworded");
-            assert_eq!(configuration_failure_diagnostic(&refusal), hint, "{reason}");
-        }
-        // Wording alone no longer picks a child hint.
-        let unreasoned =
-            Status::failed_precondition("parent sandbox 'lead' rejected its latest policy");
-        assert_eq!(
-            configuration_failure_diagnostic(&unreasoned),
-            "Stored policy structure or safety validation failed; submit a complete valid replacement policy"
-        );
-    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise

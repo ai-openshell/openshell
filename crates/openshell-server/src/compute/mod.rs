@@ -8821,15 +8821,6 @@ pub async fn count_children(
     Ok(count)
 }
 
-/// Why an orphaned child is refused configuration and starts. Names the
-/// parent by id too: a root created later under the same name is not it.
-pub fn orphaned_child_message(parent: &openshell_core::proto::SandboxParent) -> String {
-    format!(
-        "parent sandbox '{}' (id {}) no longer exists; delete this child sandbox",
-        parent.name, parent.id
-    )
-}
-
 /// Phases for which a sandbox should have a running compute resource.
 /// Terminal and lifecycle-controller-owned phases are intentionally excluded:
 /// they must not be silently revived or bypass a persisted transition/backoff.

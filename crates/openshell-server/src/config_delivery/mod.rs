@@ -1569,8 +1569,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_child_behind_its_parent_is_pushed_not_admitted_until_its_copy_lands() {
-        let state = push_state().await;
+    async fn a_child_sync_pushes_the_new_copy_to_a_connected_child() {
+        let mut state = push_state().await;
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.enable_child_sandboxes = true;
+        inner.compute = inner.compute.clone().with_child_sandboxes(true);
         put_sandbox(&state, "lead", &[]).await;
         put_loaded_policy(&state, "lead", 1, "v1.example.com").await;
         let worker = Sandbox {
@@ -1588,49 +1591,25 @@ mod tests {
             ..Default::default()
         };
         state.store.put_message(&worker).await.unwrap();
-        // Every child sync takes the parent's lock; connecting does not.
-        let child_lock = || {
-            state
-                .compute
-                .mutation_guard(crate::compute::MutationScope::sandbox("default", "lead"))
+        let (mut harness, _) = accepted_session(&state, "worker").await;
+        let allows = |config: SandboxConfigSnapshot, host: &str| {
+            config.configuration_admitted
+                && config
+                    .policy
+                    .expect("policy")
+                    .network_policies
+                    .values()
+                    .any(|rule| rule.endpoints.iter().any(|e| e.host == host))
         };
 
-        // The child has no copy yet. Holding the parent's lock keeps the sync
-        // that connecting starts from landing before the bootstrap is built.
-        let guard = child_lock().await.unwrap();
-        let (mut harness, _, bootstrap) = accepted_session_with_bootstrap(&state, "worker").await;
-        let bootstrap = bootstrap.expect("push bootstrap");
-        let config = bootstrap.sandbox_config.expect("sandbox configuration");
-        assert!(!config.configuration_admitted, "the bootstrap refuses it");
-        assert!(
-            config.configuration_error.contains("Waiting for a copy"),
-            "{}",
-            config.configuration_error
-        );
+        crate::grpc::sync_all_children(&state).await.unwrap();
+        let first = next_applied_config(&mut harness, "update after the first copy").await;
+        assert!(allows(first, "v1.example.com"));
 
-        // Once the copy lands, the sync pushes an admitted configuration.
-        drop(guard);
-        let admitted = next_applied_config(&mut harness, "update after the copy").await;
-        assert!(admitted.configuration_admitted);
-
-        // The parent loads a new version that no sync has copied: a push
-        // republish refuses the child again.
-        let guard = child_lock().await.unwrap();
         put_loaded_policy(&state, "lead", 2, "v2.example.com").await;
-        publish_sandbox(&state, "worker");
-        let refused = next_applied_config(&mut harness, "update after the parent's change").await;
-        assert!(!refused.configuration_admitted);
-        drop(guard);
-        let admitted = next_applied_config(&mut harness, "update after the second copy").await;
-        assert!(admitted.configuration_admitted);
-        assert!(
-            admitted
-                .policy
-                .expect("policy")
-                .network_policies
-                .values()
-                .any(|rule| rule.endpoints.iter().any(|e| e.host == "v2.example.com"))
-        );
+        crate::grpc::sync_all_children(&state).await.unwrap();
+        let second = next_applied_config(&mut harness, "update after the second copy").await;
+        assert!(allows(second, "v2.example.com"));
     }
 
     #[tokio::test]

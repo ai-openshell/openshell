@@ -2649,12 +2649,6 @@ pub async fn handle_connect_supervisor(
             .and_then(|status| status.configuration_admission.clone()),
         supported_capabilities: hello.supported_capabilities.clone(),
     });
-    // A child that missed a sync of its parent catches up in the background.
-    // The bootstrap does not wait for it: delivery checks the live parent, so
-    // it refuses a child that is behind and never serves a lost provider.
-    if sandbox.parent.is_some() {
-        crate::grpc::spawn_child_sync(state, &sandbox);
-    }
     let bootstrap = if pushes_config {
         Some(
             config_session::build_session_bootstrap(state, &sandbox, hello.supported_capabilities)
