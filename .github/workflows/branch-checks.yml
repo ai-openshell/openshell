@@ -554,9 +554,8 @@ jobs:
         shell: nix develop -c bash -euo pipefail {0}
         run: |
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features driver-launcher
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
 
   rust-gateway-extended-features:
     name: Rust gateway extended features
@@ -578,9 +577,7 @@ jobs:
       - name: Verify extended gateway compute-driver feature sets
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
 
   python:
     name: Python (${{ matrix.runner }})

@@ -546,7 +546,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
             -LogName "test-$RustTarget-unsupported-$test.log"
     }
 
-    foreach ($features in @("", "compute-driver-mxc", "compute-driver-docker", "compute-driver-mxc,compute-driver-docker")) {
+    foreach ($features in @("", "compute-driver-mxc", "driver-launcher", "compute-driver-mxc,driver-launcher")) {
         $featureArgs = if ($features) { "--features $features" } else { "" }
         $variant = if ($features) { $features.Replace(",", "-") } else { "protocol-only" }
         Invoke-VsCargo `

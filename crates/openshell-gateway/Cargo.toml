@@ -43,18 +43,14 @@ default = ["telemetry", "in-tree-compute-drivers"]
 # Opt-in bundle for experimental features; stable builds leave it off.
 experimental = ["openshell-server/experimental"]
 in-tree-compute-drivers = [
-    "compute-driver-docker",
+    "driver-launcher",
     "compute-driver-kubernetes",
-    "compute-driver-podman",
-    "compute-driver-vm",
     "compute-driver-mxc",
 ]
 compute-driver-mxc = ["dep:openshell-driver-mxc"]
-compute-driver-docker = ["driver-launcher"]
 compute-driver-kubernetes = ["dep:openshell-driver-kubernetes", "dep:openshell-otel"]
-compute-driver-podman = ["driver-launcher"]
-compute-driver-vm = ["driver-launcher"]
-## Launch a compute driver as a subprocess with `serve` and `Configure`.
+## Launch the Docker, Podman and VM compute drivers as subprocesses with
+## `serve` and `Configure`.
 driver-launcher = [
     "dep:openshell-driver-launch",
     "dep:openshell-driver-sdk",
