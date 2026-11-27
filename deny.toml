@@ -14,11 +14,13 @@ yanked = "warn"
 unmaintained = "workspace"
 maximum-db-staleness = "P30D"
 ignore = [
-    # chrono 0.4.45 is unmaintained with no patched release. Migration requires
-    # changes to OpenShell's time and logging APIs and to dependencies including
-    # oauth2, oci-client, russh-sftp, and russh-util.
-    # https://github.com/chronotope/chrono/issues/1768
-    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; remove after first-party time APIs and all covered dependency graphs migrate to maintained alternatives and pass validation" },
+    # OpenShell uses Jiff for timestamps. oauth2 5.0.0 requires chrono ^0.4.31
+    # in the root and test workspaces. cedar-policy-core, oci-client, russh-sftp
+    # and russh-util also depend on chrono. Tests use quick-junit 0.8.0, which
+    # requires chrono ^0.4.45.
+    # The resolved chrono 0.4.45 is unmaintained and has no patched release.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0543.html
+    { id = "RUSTSEC-2026-0543", reason = "Remove when all covered workspaces resolve without an affected chrono version and pass validation" },
 ]
 
 # -- Licenses ------------------------------------------------------------------
