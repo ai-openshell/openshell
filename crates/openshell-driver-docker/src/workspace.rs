@@ -425,7 +425,7 @@ pub async fn remove(
         ));
     }
     // Docker refuses removal while another container still uses the volume.
-    remove_docker_volume(docker, &name).await
+    remove_docker_volume(docker, config, sandbox_id, &name).await
 }
 
 #[cfg(test)]
@@ -480,7 +480,7 @@ pub mod tests {
                 let fields = request_line.split_whitespace().collect::<Vec<_>>();
                 assert_eq!(fields[0], method);
                 assert!(
-                    fields[1].ends_with(&suffix),
+                    fields[1].contains(&suffix),
                     "unexpected path: {}",
                     fields[1]
                 );

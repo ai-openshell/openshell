@@ -2359,14 +2359,10 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, Status> {
-        let pending = self
+        let mut pending = self
             .remove_pending_sandbox(sandbox_id, sandbox_name)
             .await?;
-        if let Some(record) = pending.as_ref()
-            && let Some(task) = record.task.as_ref()
-        {
-            task.abort();
-        }
+        cancel_provisioning(pending.as_mut()).await;
         if let Some(record) = pending.as_ref() {
             self.stop_control_process(&record.sandbox.id).await;
             self.remove_auxiliary_containers_for_sandbox(&record.sandbox.id)
@@ -2477,10 +2473,7 @@ impl DockerComputeDriver {
         let mut pending = self
             .remove_pending_sandbox(sandbox_id, sandbox_name)
             .await?;
-        if let Some(task) = pending.as_mut().and_then(|record| record.task.take()) {
-            task.abort();
-            let _ = task.await;
-        }
+        cancel_provisioning(pending.as_mut()).await;
         let Some(container) = container else {
             if let Some(record) = pending {
                 self.stop_control_process(&record.sandbox.id).await;
@@ -4392,7 +4385,7 @@ async fn create_docker_channel_volume(
             create_docker_runtime_volume(docker, sandbox, config, name.clone(), create).await
         {
             for created in &names[..index] {
-                let _ = remove_docker_volume(docker, created).await;
+                let _ = remove_docker_volume(docker, config, &sandbox.id, created).await;
             }
             return Err(error);
         }
@@ -4466,33 +4459,109 @@ async fn remove_docker_channel_volume_by_id(
 ) -> Result<(), Status> {
     remove_docker_volume(
         docker,
+        config,
+        sandbox_id,
         &docker_channel_volume_name_by_id(sandbox_id, config),
     )
     .await?;
     remove_docker_volume(
         docker,
+        config,
+        sandbox_id,
         &docker_supervisor_volume_name_by_id(sandbox_id, config),
     )
     .await?;
     remove_docker_volume(
         docker,
+        config,
+        sandbox_id,
         &docker_control_volume_name_by_id(sandbox_id, config),
     )
     .await
 }
 
-async fn remove_docker_volume(docker: &Docker, name: &str) -> Result<(), Status> {
-    docker
-        .remove_volume(name, None::<bollard::query_parameters::RemoveVolumeOptions>)
-        .await
-        .or_else(|error| {
-            if is_not_found_error(&error) {
-                Ok(())
-            } else {
-                Err(error)
+/// Stops a pending provisioning task and waits until it is gone.
+async fn cancel_provisioning(pending: Option<&mut PendingSandboxRecord>) {
+    if let Some(task) = pending.and_then(|record| record.task.take()) {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+const VOLUME_REMOVE_ATTEMPTS: usize = 5;
+const VOLUME_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Removes a runtime volume. A container create that was already in flight
+/// when provisioning was cancelled can still mount it, so remove this
+/// sandbox's managed containers and retry while Docker reports it in use.
+async fn remove_docker_volume(
+    docker: &Docker,
+    config: &DockerDriverRuntimeConfig,
+    sandbox_id: &str,
+    name: &str,
+) -> Result<(), Status> {
+    let mut attempt = 1;
+    loop {
+        match docker
+            .remove_volume(name, None::<bollard::query_parameters::RemoveVolumeOptions>)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if is_not_found_error(&error) => return Ok(()),
+            Err(error) if is_volume_in_use_error(&error) && attempt < VOLUME_REMOVE_ATTEMPTS => {
+                attempt += 1;
+                remove_containers_using_volume(docker, config, sandbox_id, name).await?;
+                tokio::time::sleep(VOLUME_REMOVE_RETRY_DELAY).await;
             }
-        })
-        .map_err(|error| Status::internal(format!("remove Docker sandbox runtime volume: {error}")))
+            Err(error) => {
+                return Err(Status::internal(format!(
+                    "remove Docker sandbox runtime volume: {error}"
+                )));
+            }
+        }
+    }
+}
+
+async fn remove_containers_using_volume(
+    docker: &Docker,
+    config: &DockerDriverRuntimeConfig,
+    sandbox_id: &str,
+    volume: &str,
+) -> Result<(), Status> {
+    let mut filters = managed_resource_label_filters(
+        &config.sandbox_namespace,
+        [format!("{LABEL_SANDBOX_ID}={sandbox_id}")],
+    );
+    filters.insert("volume".to_string(), vec![volume.to_string()]);
+    let containers = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::default()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .map_err(|error| internal_status("list Docker containers using volume", error))?;
+    for container in containers {
+        let Some(target) = summary_container_target(&container) else {
+            continue;
+        };
+        docker
+            .remove_container(
+                &target,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await
+            .or_else(|error| {
+                if is_not_found_error(&error) || is_removal_in_progress_error(&error) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|error| internal_status("remove Docker container using volume", error))?;
+    }
+    Ok(())
 }
 
 fn sandbox_token_host_path(
@@ -7541,6 +7610,16 @@ fn is_removal_in_progress_error(err: &BollardError) -> bool {
             status_code: 409,
             message,
         } if message.contains("removal of container") && message.contains("is already in progress")
+    )
+}
+
+fn is_volume_in_use_error(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 409,
+            message,
+        } if message.contains("volume is in use")
     )
 }
 
