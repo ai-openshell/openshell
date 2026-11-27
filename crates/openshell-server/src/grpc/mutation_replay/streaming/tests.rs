@@ -5,13 +5,14 @@ use super::*;
 use crate::grpc::mutation_replay::tests::{reason, state_for};
 use crate::grpc::mutation_replay::{
     Admission, AuthorizationBarrier, Completion, OBJECT_TYPE, OriginalMutation, fingerprint,
-    replay_window_ms, run,
+    get_exec_sandbox_result, replay_window_ms, run,
 };
 use crate::grpc::test_support::authed_request;
 use crate::persistence::{ObjectType, WriteCondition, current_time_ms};
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
-    GatewayMessage, Sandbox, SandboxPhase, SandboxStatus, gateway_message,
+    GatewayMessage, GetExecSandboxResultRequest, Sandbox, SandboxPhase, SandboxStatus,
+    gateway_message,
 };
 use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
@@ -269,18 +270,181 @@ async fn confirmed_exit_including_nonzero_and_124_finalizes_before_output_delive
             Some(code)
         );
         assert_eq!(
-            reason(&run(&state, authed_request(req)).await.unwrap_err()),
+            reason(&run(&state, authed_request(req.clone())).await.unwrap_err()),
             "REQUEST_STREAM_UNAVAILABLE"
         );
+        let observed = get_exec_sandbox_result(
+            &state,
+            authed_request(GetExecSandboxResultRequest {
+                original_request: Some(req.clone()),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(observed.request_id, req.request_id);
+        assert_eq!(observed.exit_code, code);
+        assert_eq!(observed.method, "ExecSandbox");
+        assert!(!observed.claim_id.is_empty());
+        assert_eq!(observed.resource_version, 2);
+        assert_eq!(observed.format_version, 1);
+        assert_eq!(observed.original_scope, "default");
+        assert_eq!(
+            observed.original_workspace_id,
+            observed.effective_workspace_id
+        );
+        assert_eq!(observed.original_target_id, observed.effective_target_id);
+        assert_eq!(observed.original_target_id, sandbox_id(&state, &req).await);
+        assert!(!observed.original_payload_fingerprint.is_empty());
+        assert_eq!(
+            observed.original_payload_fingerprint,
+            observed.effective_payload_fingerprint
+        );
+        assert!(!observed.fingerprint_key_id.is_empty());
+        assert!(observed.admitted_at_ms <= observed.terminal_at_ms);
+        assert!(observed.terminal_at_ms < observed.expires_at_ms);
+        let (mut client, server) = wire_client(state.clone(), None, None).await;
+        let wire_result = client
+            .get_exec_sandbox_result(GetExecSandboxResultRequest {
+                original_request: Some(req.clone()),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(wire_result.claim_id, observed.claim_id);
+        assert_eq!(wire_result.exit_code, code);
+        server.abort();
+        let mut changed = req.clone();
+        changed.command.push("foreign-command".into());
         assert!(
-            owner.stream_terminal().await.is_err(),
+            get_exec_sandbox_result(
+                &state,
+                authed_request(GetExecSandboxResultRequest {
+                    original_request: Some(changed),
+                }),
+            )
+            .await
+            .is_err(),
+            "a changed command cannot adopt the original result"
+        );
+        assert!(
+            owner.stream_terminal(code).await.is_err(),
             "CAS rejects a second finalization"
         );
         let row = completion(&state).await;
         let admission: Admission = serde_json::from_slice(&row.admission).unwrap();
-        assert!(matches!(admission.success, Some(Success::StreamTerminal)));
+        assert!(matches!(
+            admission.success,
+            Some(Success::StreamTerminalResult { exit_code }) if exit_code == code
+        ));
         assert!(admission.completed_at_ms.is_some());
     }
+}
+
+#[tokio::test]
+async fn result_read_refuses_pending_legacy_and_foreign_claims_without_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = setup("sqlite::memory:", &directory).await;
+    let req = request(&state).await;
+    let mut messages = register(&state, &sandbox_id(&state, &req).await);
+    drop(run(&state, authed_request(req.clone())).await.unwrap());
+    receive_relay(&state, &mut messages).await;
+    let read = |original_request| {
+        authed_request(GetExecSandboxResultRequest {
+            original_request: Some(original_request),
+        })
+    };
+    assert!(
+        get_exec_sandbox_result(&state, read(req.clone()))
+            .await
+            .is_err(),
+        "a pending admission has no terminal result"
+    );
+    let mut foreign = req.clone();
+    foreign.request_id = uuid::Uuid::new_v4().to_string();
+    assert!(
+        get_exec_sandbox_result(&state, read(foreign))
+            .await
+            .is_err(),
+        "another request UUID cannot find this claim"
+    );
+    let owner = completion(&state).await;
+    owner.complete(Success::StreamTerminal).await.unwrap();
+    let before = state
+        .store
+        .get_by_name(OBJECT_TYPE, &owner.bucket, &owner.key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        get_exec_sandbox_result(&state, read(req)).await.is_err(),
+        "a legacy terminal marker has no observed SSH exit code"
+    );
+    let after = state
+        .store
+        .get_by_name(OBJECT_TYPE, &owner.bucket, &owner.key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.resource_version, after.resource_version);
+    assert_eq!(before.payload, after.payload);
+}
+
+#[tokio::test]
+async fn result_read_refuses_rotated_key_and_expired_claim_without_relaunch() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = setup("sqlite::memory:", &directory).await;
+    let req = request(&state).await;
+    let mut messages = register(&state, &sandbox_id(&state, &req).await);
+    drop(run(&state, authed_request(req.clone())).await.unwrap());
+    receive_relay(&state, &mut messages).await;
+    let owner = completion(&state).await;
+    owner.stream_terminal(7).await.unwrap();
+    let read = || {
+        authed_request(GetExecSandboxResultRequest {
+            original_request: Some(req.clone()),
+        })
+    };
+    let key_path = directory.path().join("key");
+    let original_key = std::fs::read(&key_path).unwrap();
+    std::fs::write(&key_path, b"rotated-test-key").unwrap();
+    assert!(get_exec_sandbox_result(&state, read()).await.is_err());
+    std::fs::write(&key_path, original_key).unwrap();
+    assert_eq!(
+        get_exec_sandbox_result(&state, read())
+            .await
+            .unwrap()
+            .into_inner()
+            .exit_code,
+        7
+    );
+    let row = state
+        .store
+        .get_by_name(OBJECT_TYPE, &owner.bucket, &owner.key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut admission: Admission = serde_json::from_slice(&row.payload).unwrap();
+    admission.completed_at_ms = Some(current_time_ms() - replay_window_ms(&state.config) - 1);
+    let payload = serde_json::to_vec(&admission).unwrap();
+    state
+        .store
+        .put_if(
+            OBJECT_TYPE,
+            &row.id,
+            &row.name,
+            &row.workspace,
+            &payload,
+            None,
+            WriteCondition::MatchResourceVersion(row.resource_version),
+        )
+        .await
+        .unwrap();
+    assert!(get_exec_sandbox_result(&state, read()).await.is_err());
+    assert!(
+        messages.try_recv().is_err(),
+        "a result read never opens a relay"
+    );
 }
 
 #[tokio::test]
@@ -414,7 +578,7 @@ async fn exec_restart_preserves_pending_and_terminal_fences_and_reauthorizes() {
         reason(&run(&state, authed_request(req.clone())).await.unwrap_err()),
         "REQUEST_OUTCOME_UNCERTAIN"
     );
-    completion(&state).await.stream_terminal().await.unwrap();
+    completion(&state).await.stream_terminal(0).await.unwrap();
     drop(state);
     let state = setup(&url, &directory).await;
     let mut sandbox: Sandbox = state
@@ -429,6 +593,19 @@ async fn exec_restart_preserves_pending_and_terminal_fences_and_reauthorizes() {
         reason(&run(&state, authed_request(req.clone())).await.unwrap_err()),
         "REQUEST_STREAM_UNAVAILABLE"
     );
+    assert_eq!(
+        get_exec_sandbox_result(
+            &state,
+            authed_request(GetExecSandboxResultRequest {
+                original_request: Some(req.clone()),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .exit_code,
+        0
+    );
     let mut unauthorized = authed_request(req.clone());
     if let Principal::User(user) = unauthorized
         .extensions_mut()
@@ -439,6 +616,23 @@ async fn exec_restart_preserves_pending_and_terminal_fences_and_reauthorizes() {
     }
     assert_eq!(
         run(&state, unauthorized).await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    let mut unauthorized_read = authed_request(GetExecSandboxResultRequest {
+        original_request: Some(req.clone()),
+    });
+    if let Principal::User(user) = unauthorized_read
+        .extensions_mut()
+        .get_mut::<Principal>()
+        .unwrap()
+    {
+        user.identity.roles.clear();
+    }
+    assert_eq!(
+        get_exec_sandbox_result(&state, unauthorized_read)
+            .await
+            .unwrap_err()
+            .code(),
         tonic::Code::NotFound
     );
     state
@@ -584,7 +778,7 @@ async fn replacement_cannot_reuse_an_exec_claim_or_receive_its_admitted_launch()
         let owner = completion(&state).await;
         owner.ensure_target(&id).unwrap();
         if terminal {
-            owner.stream_terminal().await.unwrap();
+            owner.stream_terminal(0).await.unwrap();
         }
         let mut replacement: Sandbox = state.store.get_message(&id).await.unwrap().unwrap();
         state
@@ -599,6 +793,17 @@ async fn replacement_cannot_reuse_an_exec_claim_or_receive_its_admitted_launch()
         assert_eq!(
             reason(&run(&state, authed_request(req.clone())).await.unwrap_err()),
             "REQUEST_REPLAY_UNAVAILABLE"
+        );
+        assert!(
+            get_exec_sandbox_result(
+                &state,
+                authed_request(GetExecSandboxResultRequest {
+                    original_request: Some(req.clone()),
+                }),
+            )
+            .await
+            .is_err(),
+            "a replacement cannot inherit the old terminal result"
         );
         // Simulate replacement after admission, before the owner resolves its
         // public name again. The original claim must not launch on the new ID.
@@ -669,7 +874,7 @@ async fn interactive_wire_start_is_admitted_under_its_own_method_namespace() {
         ),
         "REQUEST_OUTCOME_UNCERTAIN"
     );
-    owner.stream_terminal().await.unwrap();
+    owner.stream_terminal(0).await.unwrap();
     assert_eq!(
         reason(
             &client

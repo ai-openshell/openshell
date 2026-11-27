@@ -13,7 +13,14 @@ use tonic::transport::{Endpoint, Server};
 struct EmptyGateway;
 
 #[tonic::async_trait]
-impl OpenShell for EmptyGateway {}
+impl OpenShell for EmptyGateway {
+    async fn get_exec_sandbox_result(
+        &self,
+        _request: tonic::Request<proto::GetExecSandboxResultRequest>,
+    ) -> Result<tonic::Response<proto::GetExecSandboxResultResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used by this test server"))
+    }
+}
 
 #[tokio::test]
 async fn production_client_gets_unimplemented_for_every_unused_rpc_shape() {

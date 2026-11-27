@@ -154,6 +154,13 @@ async fn send_trailer_error(output: &mpsc::Sender<Result<proto::ExecSandboxEvent
 
 #[tonic::async_trait]
 impl OpenShell for MockGateway {
+    async fn get_exec_sandbox_result(
+        &self,
+        _request: Request<proto::GetExecSandboxResultRequest>,
+    ) -> Result<Response<proto::GetExecSandboxResultResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_sandbox(
         &self,
         _: Request<proto::GetSandboxRequest>,

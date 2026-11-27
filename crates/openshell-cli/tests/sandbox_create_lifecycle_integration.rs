@@ -159,6 +159,13 @@ enum GetSandboxOutcome {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_exec_sandbox_result(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetExecSandboxResultRequest>,
+    ) -> Result<Response<openshell_core::proto::GetExecSandboxResultResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     // The rejected-suspend test checks that this error preserves active forwards.
     async fn suspend_sandbox(
         &self,

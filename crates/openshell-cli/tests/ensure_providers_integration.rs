@@ -77,6 +77,13 @@ impl TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_exec_sandbox_result(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetExecSandboxResultRequest>,
+    ) -> Result<Response<openshell_core::proto::GetExecSandboxResultResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_endpoint_status(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
