@@ -105,6 +105,71 @@ fn status_with_unregistered_named_gateway_fails() {
 }
 
 #[test]
+fn term_connection_error_reports_gateway_and_endpoint_override() {
+    let config_dir = tempfile::tempdir().expect("create user config dir");
+    let system_dir = tempfile::tempdir().expect("create system config dir");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test endpoint");
+    let port = listener.local_addr().expect("local address").port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let endpoint_override = format!("{endpoint}/?token=test-secret");
+    drop(listener);
+    write_user_gateway_metadata(
+        config_dir.path(),
+        "offline",
+        "http://stored.example.com:17670",
+        17670,
+        false,
+        "plaintext",
+    );
+
+    let named = [
+        "--gateway",
+        "offline",
+        "--gateway-endpoint",
+        &endpoint_override,
+        "term",
+    ];
+    let direct = ["--gateway-endpoint", &endpoint_override, "term"];
+    for (args, gateway) in [
+        (named.as_slice(), "gateway 'offline'"),
+        (direct.as_slice(), "gateway"),
+    ] {
+        let output = run(config_dir.path(), system_dir.path(), args);
+        assert_ne!(output.code, 0, "{}", output.combined);
+        assert!(
+            output
+                .combined
+                .contains(&format!("{gateway} at {endpoint}")),
+            "{}",
+            output.combined
+        );
+        assert!(
+            output.combined.contains("openshell gateway list"),
+            "{}",
+            output.combined
+        );
+        assert!(
+            output
+                .combined
+                .to_ascii_lowercase()
+                .contains("connection refused"),
+            "{}",
+            output.combined
+        );
+        assert!(
+            !output.combined.contains("test-secret"),
+            "{}",
+            output.combined
+        );
+        assert!(
+            !output.combined.contains("stored.example.com"),
+            "{}",
+            output.combined
+        );
+    }
+}
+
+#[test]
 fn status_with_unregistered_environment_gateway_fails() {
     let config_dir = tempfile::tempdir().expect("create user config dir");
     let system_dir = tempfile::tempdir().expect("create system config dir");

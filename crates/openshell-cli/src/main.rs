@@ -8,7 +8,7 @@
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
-use miette::Result;
+use miette::{Result, WrapErr};
 use openshell_cli::color::{self, ColorChoice, Colorize};
 use std::io::Write;
 use std::path::PathBuf;
@@ -4382,7 +4382,27 @@ async fn run_async() -> Result<()> {
             let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
-            let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
+            let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls)
+                .await
+                .wrap_err_with(|| {
+                    let endpoint = url::Url::parse(&ctx.endpoint)
+                        .ok()
+                        .filter(|url| matches!(url.scheme(), "http" | "https"))
+                        .map_or_else(
+                            || "the configured endpoint".to_owned(),
+                            |url| url.origin().ascii_serialization(),
+                        );
+                    let gateway = if ctx.name == ctx.endpoint {
+                        "gateway".to_owned()
+                    } else {
+                        format!("gateway '{}'", ctx.name)
+                    };
+                    format!(
+                        "Could not connect to {gateway} at {endpoint}.\n\
+                         Check that the gateway service or tunnel is running and the endpoint is correct.\n\
+                         Inspect saved endpoints with: openshell gateway list"
+                    )
+                })?;
             let interceptor = openshell_core::auth::EdgeAuthInterceptor::new(
                 tls.oidc_token.as_deref(),
                 tls.edge_token.as_deref(),
