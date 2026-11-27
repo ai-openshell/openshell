@@ -216,17 +216,12 @@ impl EgressDecision {
         join_paths(&self.ancestors, " -> ")
     }
 
-    pub(super) fn cmdline_display(&self) -> String {
-        join_paths(&self.cmdline_paths, ", ")
-    }
-
     /// OCSF actor for the process that owns the connection.
     pub(super) fn actor_process(&self) -> Process {
         actor_process(
             &self.binary_display(),
             &self.pid_display(),
             &self.ancestors_display(),
-            &self.cmdline_display(),
             self.process,
         )
     }
@@ -236,10 +231,9 @@ pub(super) fn actor_process(
     binary: &str,
     pid: &str,
     ancestors: &str,
-    cmdline: &str,
     process: Option<ProcessInstance>,
 ) -> Process {
-    let mut actor = Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline);
+    let mut actor = Process::from_bypass(binary, pid, ancestors);
     let Some(process) = process else {
         return actor;
     };

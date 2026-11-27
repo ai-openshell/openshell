@@ -1156,8 +1156,8 @@ fn build_staged_transparent_denial_event(
     reason: &str,
     status_detail: &'static str,
 ) -> openshell_ocsf::OcsfEvent {
-    let (binary, ancestors, cmdline, process) = identity.as_ref().map_or_else(
-        |_| ("-".to_string(), "-".to_string(), "-".to_string(), None),
+    let (binary, ancestors, process) = identity.as_ref().map_or_else(
+        |_| ("-".to_string(), "-".to_string(), None),
         |identity| {
             (
                 identity.executable.path.display().to_string(),
@@ -1167,12 +1167,6 @@ fn build_staged_transparent_denial_event(
                     .map(|ancestor| ancestor.path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(" -> "),
-                identity
-                    .cmdline_paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
                 identity.process,
             )
         },
@@ -1185,9 +1179,7 @@ fn build_staged_transparent_denial_event(
         .severity(SeverityId::Medium)
         .status(StatusId::Failure)
         .dst_endpoint(transparent_destination_endpoint(destination, mapped_host))
-        .actor_process(egress::actor_process(
-            &binary, &pid, &ancestors, &cmdline, process,
-        ))
+        .actor_process(egress::actor_process(&binary, &pid, &ancestors, process))
         .message(format!("Transparent TCP denied before relay: {reason}"))
         .status_detail(status_detail)
         .build()
@@ -2512,7 +2504,6 @@ impl std::fmt::Display for DestinationCheckError {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_connect_destination_deny_ocsf_event(
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
@@ -8048,8 +8039,7 @@ process:
             parent_pid: 77,
             start_time_ms: 1,
         };
-        let actor =
-            egress::actor_process("/usr/bin/bash", "81", "/usr/bin/bash", "-", Some(process));
+        let actor = egress::actor_process("/usr/bin/bash", "81", "/usr/bin/bash", Some(process));
         let parent = actor.parent_process.expect("parent process");
         assert_eq!(parent.name, "/usr/bin/bash");
         assert_eq!(parent.pid, 77);
@@ -10136,6 +10126,39 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         );
     }
 
+    #[test]
+    fn network_events_do_not_present_cmdline_paths_as_cmd_line() {
+        let identity = Ok(ContractBinaryIdentity {
+            executable: ContractExecutableIdentity {
+                path: executable_path("/usr/bin/python3"),
+                digest: Some("44".repeat(32).parse().unwrap()),
+            },
+            ancestors: Vec::new(),
+            cmdline_paths: vec![PathBuf::from("/app/main.py")],
+            process: None,
+        });
+        let denied = build_staged_transparent_denial_event(
+            "203.0.113.7:443".parse().unwrap(),
+            None,
+            &identity,
+            "endpoint 203.0.113.7:443 is not allowed by any policy",
+            "transparent_tcp_policy_denied",
+        );
+        let allowed = build_connect_allow_ocsf_event(
+            "127.0.0.1:45123".parse().unwrap(),
+            "example.com",
+            443,
+            &Process::from_bypass("/usr/bin/python3", "42", "/usr/bin/bash"),
+            "allow_example",
+            false,
+        );
+        for event in [denied, allowed] {
+            let json = serde_json::to_value(event).unwrap();
+            assert!(json["actor"]["process"].get("cmd_line").is_none(), "{json}");
+            assert!(!json.to_string().contains("/app/main.py"), "{json}");
+        }
+    }
+
     #[tokio::test]
     async fn staged_policy_local_open_reaches_the_sandbox_scoped_api() {
         let addr = crate::policy_dns::POLICY_LOCAL_ADDRESS;
@@ -12066,9 +12089,9 @@ network_policies:
             record["actor"]["process"]["name"],
             binary.to_string_lossy().as_ref()
         );
-        assert_eq!(
-            record["actor"]["process"]["cmd_line"],
-            command.to_string_lossy().as_ref()
+        assert!(
+            record["actor"]["process"].get("cmd_line").is_none(),
+            "{record}"
         );
         assert!(
             record["message"]
@@ -13279,8 +13302,7 @@ network_policies:
             "api.example.com",
             80,
             "/v1/models",
-            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash")
-                .with_cmd_line("curl http://api.example.com/v1/models"),
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash"),
             reason,
             "opa",
         );
@@ -13299,8 +13321,7 @@ network_policies:
             "api.example.com",
             80,
             "/admin/x%2Fy",
-            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash")
-                .with_cmd_line("curl http://api.example.com/admin/x%2Fy"),
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash"),
             "allow_api",
             FORWARD_ENCODED_SLASH_REJECTION_DETAIL,
         );
@@ -13473,7 +13494,7 @@ network_policies:
             "api.example.com",
             80,
             &path,
-            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash").with_cmd_line("curl"),
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash"),
             "allow_api",
             "opa",
         )
@@ -13485,7 +13506,7 @@ network_policies:
             "api.example.com",
             80,
             &path,
-            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash").with_cmd_line("curl"),
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash"),
             "policy denied",
             "opa",
         )
@@ -13509,7 +13530,7 @@ network_policies:
             &host,
             port,
             &forward_telemetry_path(target),
-            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash").with_cmd_line("curl"),
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash"),
             "allow_api",
             "opa",
         )
