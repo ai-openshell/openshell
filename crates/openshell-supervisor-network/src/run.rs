@@ -807,14 +807,8 @@ mod transparent_runtime_tests {
 /// Register configured NAT64 prefixes and discover the network's prefix
 /// through the trusted resolver, then report the prefixes in effect.
 async fn configure_nat64(configured: Vec<Nat64Prefix>) {
-    let setup = match crate::policy_dns::trusted_resolver_from_resolv_conf() {
-        Ok(server) => {
-            crate::policy_dns::Nat64Setup::apply(
-                configured,
-                &crate::policy_dns::SocketTrustedResolver::new(server),
-            )
-            .await
-        }
+    let setup = match crate::policy_dns::trusted_resolver() {
+        Ok(resolver) => crate::policy_dns::Nat64Setup::apply(configured, &resolver).await,
         Err(error) => {
             for prefix in &configured {
                 openshell_core::net::nat64::register_network_prefix(*prefix);

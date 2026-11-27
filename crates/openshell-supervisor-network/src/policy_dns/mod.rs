@@ -28,9 +28,7 @@ pub(crate) use egress::{DefaultRoutes, Ipv6EgressDecision, Nat64Setup};
 pub(crate) use name::NormalizedName;
 pub(crate) use resolver::ResolveError as TrustedResolveError;
 pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, TrustedResolver};
-pub(crate) use runtime::{
-    PolicyDnsRuntime, PolicyDnsRuntimeConfig, trusted_resolver_from_resolv_conf,
-};
+pub(crate) use runtime::{PolicyDnsRuntime, PolicyDnsRuntimeConfig, trusted_resolver};
 pub(crate) use store::{
     MappingLookup, MappingLookupError, PolicyEndpointId, PublishError, PublishRequest,
     ResolvedEndpointRecord, ResolvedEndpointStore, StoreConfig, SyntheticPools,
