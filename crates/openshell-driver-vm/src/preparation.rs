@@ -442,7 +442,7 @@ pub(super) fn remove_staging_tree(path: &Path) -> io::Result<()> {
     fs::remove_dir_all(path)
 }
 
-fn lock(file: &File, nonblocking: bool) -> io::Result<bool> {
+pub(super) fn lock(file: &File, nonblocking: bool) -> io::Result<bool> {
     let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
     // SAFETY: flock receives a valid borrowed file descriptor and no pointers.
     if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
@@ -456,15 +456,19 @@ fn lock(file: &File, nonblocking: bool) -> io::Result<bool> {
     }
 }
 
-pub(super) fn cache_lock(cache_root: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
+pub(super) fn open_lock_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(cache_root.join("preparation.lock"))?;
+        .open(path)
+}
+
+pub(super) fn cache_lock(cache_root: &Path) -> io::Result<File> {
+    let file = open_lock_file(&cache_root.join("preparation.lock"))?;
     lock(&file, false)?;
     Ok(file)
 }

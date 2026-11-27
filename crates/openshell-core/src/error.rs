@@ -122,6 +122,9 @@ pub enum ComputeDriverError {
     /// A precondition for the operation was not met.
     #[error("{0}")]
     Precondition(String),
+    /// Communication ended before the backend operation outcome was known.
+    #[error("{0}")]
+    BackendUnavailable(String),
     /// Generic error message.
     #[error("{0}")]
     Message(String),
@@ -134,6 +137,7 @@ impl From<ComputeDriverError> for tonic::Status {
             ComputeDriverError::NotFound => Self::not_found("sandbox not found"),
             ComputeDriverError::InvalidArgument(m) => Self::invalid_argument(m),
             ComputeDriverError::Precondition(m) => Self::failed_precondition(m),
+            ComputeDriverError::BackendUnavailable(m) => Self::unavailable(m),
             ComputeDriverError::Message(m) => Self::internal(m),
         }
     }

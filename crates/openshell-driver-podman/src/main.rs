@@ -288,7 +288,7 @@ async fn main() -> Result<()> {
     .into_diagnostic()?;
 
     let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
-    if let Some(socket_path) = args.bind_socket {
+    let result = if let Some(socket_path) = args.bind_socket {
         let listener = openshell_core::external_driver_socket::bind_private(&socket_path)
             .map_err(|err| miette::miette!("{err}"))?;
         let _cleanup =
@@ -311,7 +311,9 @@ async fn main() -> Result<()> {
             .serve_with_shutdown(args.bind_address, shutdown_signal())
             .await
             .into_diagnostic()
-    }
+    };
+    openshell_driver_sdk::drain_provider_launches().await;
+    result
 }
 
 async fn select_shutdown_signal(

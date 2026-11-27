@@ -3141,6 +3141,7 @@ mod tests {
                 runtime_generation: SandboxGenerationId::parse(generation).unwrap(),
                 auth_epoch: CredentialEpoch::new(1).unwrap(),
                 gateway_token_id: Uuid::new_v4(),
+                provider_launch_id: None,
                 refresh_replay: None,
             };
             let mut metadata = ObjectMeta {

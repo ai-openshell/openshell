@@ -22,10 +22,13 @@ use serde::{Deserialize, Serialize};
 pub const LABEL_ROLE: &str = "openshell.ai/isolation-role";
 pub const WORKLOAD_FILTER: &str = "openshell.ai/isolation-role=sandbox";
 pub const CHANNEL_ROOT: &str = "/.openshell/channel";
+pub const CHANNEL_SANDBOX_DIR: &str = "/.openshell/channel/sandbox";
+pub const GATEWAY_CA_PATH: &str = "/.openshell/supervisor/gateway-ca.crt";
 pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
 pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";
 pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const RESTART_METADATA_PATH: &str = "/.openshell/supervisor/restart-metadata.json";
+pub const SUPERVISOR_HEALTH_SOCKET: &str = "/run/openshell/supervisor-health.sock";
 pub const CONTROL_ROOT: &str = "/.openshell/channel/control";
 const RUNTIME_INITIATED_SOCKET: &str = "/.openshell/channel/control/control.sock";
 const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
@@ -200,6 +203,7 @@ pub struct BootstrapArchivesInput<'a> {
     pub allow_extra_supplementary_groups: bool,
     pub child_env: HashMap<String, String>,
     pub launch_authentication: &'a openshell_core::jwt::SandboxLaunchAuthentication,
+    pub gateway_ca: Option<&'a [u8]>,
 }
 
 /// The shared volume contains only sandbox credentials. Supervisor credentials,
@@ -217,6 +221,7 @@ pub fn bootstrap_archives(
         allow_extra_supplementary_groups,
         child_env,
         launch_authentication,
+        gateway_ca,
     } = input;
     launch_authentication.validate().map_err(invalid)?;
     let session_id = launch_authentication.supervisor.session_id;
@@ -336,6 +341,9 @@ pub fn bootstrap_archives(
         AUTH_BUNDLE_PATH,
         &serde_json::to_vec(&launch_authentication.supervisor).map_err(invalid)?,
     )?;
+    if let Some(gateway_ca) = gateway_ca {
+        supervisor.file(GATEWAY_CA_PATH, gateway_ca)?;
+    }
     let restart_metadata = RestartMetadata {
         runtime_initiated,
         generation: generation.to_string(),
@@ -366,6 +374,35 @@ pub fn bootstrap_archives(
 
 pub fn restart_metadata_from_slice(bytes: &[u8]) -> Result<RestartMetadata, ComputeDriverError> {
     serde_json::from_slice(bytes).map_err(invalid)
+}
+
+pub(crate) fn channel_rollback_archive(snapshot: &[u8]) -> Result<Vec<u8>, ComputeDriverError> {
+    let mut archive = tar::Archive::new(snapshot);
+    let directory = archive
+        .entries()
+        .map_err(invalid)?
+        .next()
+        .ok_or_else(|| invalid("Podman workload channel archive is empty"))?
+        .map_err(invalid)?;
+    if !directory.header().entry_type().is_dir()
+        || directory.path().map_err(invalid)? != std::path::Path::new("sandbox")
+    {
+        return Err(invalid(
+            "Podman workload channel archive is missing its directory",
+        ));
+    }
+
+    // Libpod merges directories during extraction. Replacing the private
+    // subdirectory with a regular file first clears entries absent from the
+    // snapshot. The snapshot then recreates the directory in the same PUT.
+    // Libpod's noOverwriteDirNonDir defaults to false for both replacements.
+    let mut clear = tar::Header::new_ustar();
+    clear.set_path("sandbox").map_err(invalid)?;
+    clear.set_entry_type(tar::EntryType::Regular);
+    clear.set_mode(0o600);
+    clear.set_size(0);
+    clear.set_cksum();
+    Ok([clear.as_bytes().as_slice(), snapshot].concat())
 }
 
 struct Archive<'a> {
@@ -470,6 +507,8 @@ mod tests {
                 gateway_expires_at: i64::MAX,
                 sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
                 sandbox_expires_at: i64::MAX,
+                provider_spiffe_id: None,
+                provider_launch_spiffe_id: None,
                 ssh_host_private_key: None,
                 traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
@@ -563,10 +602,15 @@ mod tests {
             allow_extra_supplementary_groups: false,
             child_env: child_env.clone(),
             launch_authentication: &authentication,
+            gateway_ca: Some(b"gateway CA"),
         })
         .unwrap();
         let workload = files(&archives.channel);
         let supervisor = files(&archives.supervisor);
+        assert_eq!(
+            supervisor[&PathBuf::from(GATEWAY_CA_PATH.trim_start_matches('/'))],
+            b"gateway CA"
+        );
         let mut workspace = tar::Archive::new(archives.workspace.as_slice());
         let mut entries = workspace.entries().unwrap();
         let root = entries.next().unwrap().unwrap();
@@ -577,7 +621,7 @@ mod tests {
         assert_eq!(root.header().mode().unwrap(), 0o700);
         assert!(entries.next().is_none());
         assert_eq!(workload.len(), 3);
-        assert_eq!(supervisor.len(), 3);
+        assert_eq!(supervisor.len(), 4);
         assert!(workload.keys().all(|path| path.starts_with("sandbox")));
         assert!(
             supervisor

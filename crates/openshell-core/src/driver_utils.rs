@@ -5,8 +5,71 @@
 
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::proto::compute::v1::DriverSandbox;
+
+/// Time a managed driver defers an external stop signal while awaiting release.
+pub const EXTERNAL_STOP_GRACE: Duration = Duration::from_secs(30);
+
+/// Time a driver gives admitted provider launch work to record its outcome.
+pub const PROVIDER_LAUNCH_DRAIN_GRACE: Duration = Duration::from_mins(3);
+
+/// Bind an ordered start and its private credentials to one sandbox launch.
+#[cfg(feature = "jwt")]
+#[allow(clippy::result_large_err)]
+pub fn validate_ordered_start_authentication(
+    sandbox_id: &str,
+    generation_id: &str,
+    operation: &crate::proto::compute::v1::OrderedStart,
+    authentication: &crate::jwt::SandboxLaunchAuthentication,
+) -> Result<(), tonic::Status> {
+    let invalid =
+        || tonic::Status::invalid_argument("ordered start does not match launch identity");
+    let supervisor = &authentication.supervisor;
+    if supervisor.runtime_generation.as_str() != generation_id {
+        return Err(invalid());
+    }
+    let sandbox_path = format!(
+        "/gateway/{}/sandbox/{sandbox_id}",
+        authentication.gateway_id
+    );
+    let prefix = supervisor
+        .provider_spiffe_id
+        .as_deref()
+        .and_then(|id| id.strip_suffix(&sandbox_path))
+        .ok_or_else(invalid)?;
+    let prefix = openshell_spiffe::SandboxSpiffeIdPrefix::parse(prefix).map_err(|_| invalid())?;
+    let expected = prefix
+        .supervisor_launch_spiffe_id(
+            &authentication.gateway_id,
+            sandbox_id,
+            &operation.operation_id,
+        )
+        .map_err(|_| invalid())?;
+    if supervisor.provider_launch_spiffe_id.as_deref() != Some(expected.as_str()) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Gateway alias available inside a sandbox VM.
+pub const VM_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
+
+/// Gateway hostnames that VM host supervisors rewrite to numeric loopback.
+pub const VM_HOST_LOOPBACK_ALIASES: &[&str] = &[
+    VM_HOST_GATEWAY_ALIAS,
+    "host.containers.internal",
+    "host.docker.internal",
+];
+
+/// Supervisor command that succeeds when it supports provider launch identity.
+pub const PROVIDER_WORKLOAD_IDENTITY_PROBE: &str = "provider-workload-identity-probe";
+
+/// Exit statuses for the provider probe with a socket path argument.
+/// The legacy no-argument probe exits successfully with status zero.
+pub const PROVIDER_WORKLOAD_SOCKET_PROBE_PRESENT: i32 = 70;
+pub const PROVIDER_WORKLOAD_SOCKET_PROBE_UNAVAILABLE: i32 = 71;
 
 // ---------------------------------------------------------------------------
 // Sandbox container/pod label keys (openshell.ai/ namespace)
@@ -33,6 +96,9 @@ pub const LABEL_SANDBOX_WORKSPACE: &str = "openshell.ai/sandbox-workspace";
 
 /// Label carrying the gateway identity on managed namespaces.
 pub const LABEL_GATEWAY_ID: &str = "openshell.ai/gateway-id";
+
+/// SPIFFE ID registered for one driver-owned supervisor launch.
+pub const LABEL_PROVIDER_LAUNCH_SPIFFE_ID: &str = "openshell.ai/provider-launch-spiffe-id";
 
 /// Label selector that matches all OpenShell-managed resources which carry a
 /// sandbox ID label.  Used by list and watch operations to exclude foreign
@@ -743,6 +809,24 @@ pub fn validate_provider_spiffe_unix_socket(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Check that an absolute path resolves to a Unix socket in the current filesystem.
+pub fn provider_spiffe_socket_visible(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        path.is_absolute()
+            && path
+                .metadata()
+                .is_ok_and(|meta| meta.file_type().is_socket())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Return the guest/container path for a projected provider SPIFFE socket.
 pub fn projected_provider_spiffe_socket_path(path: &Path) -> Result<String, String> {
     validate_provider_spiffe_unix_socket(path)?;
@@ -1257,7 +1341,7 @@ mod tests {
         let err = read_upstream_proxy_credential_file(fifo.to_str().unwrap()).unwrap_err();
         assert!(err.contains("regular file"), "{err}");
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
+            start.elapsed() < Duration::from_secs(5),
             "reading a FIFO must not block"
         );
     }

@@ -918,6 +918,173 @@ async fn stopped_start_repairs_interrupted_launch_rotation_before_staging() {
 }
 
 #[tokio::test]
+async fn ordered_start_settles_missing_proxy_credentials_before_mutating_docker() {
+    for running in [false, true] {
+        assert_ordered_start_local_failure(
+            OrderedStartLocalFailure::MissingProxyCredentials,
+            running,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn ordered_start_settles_missing_supervisor_image_before_mutating_docker() {
+    for running in [false, true] {
+        assert_ordered_start_local_failure(
+            OrderedStartLocalFailure::MissingSupervisorImage,
+            running,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn ordered_start_settles_failed_auth_publication_before_mutating_docker() {
+    assert_ordered_start_local_failure(OrderedStartLocalFailure::PublicationRejected, true).await;
+}
+
+enum OrderedStartLocalFailure {
+    MissingProxyCredentials,
+    MissingSupervisorImage,
+    PublicationRejected,
+}
+
+async fn assert_ordered_start_local_failure(failure: OrderedStartLocalFailure, running: bool) {
+    let mut fixture = Fixture::new();
+    fixture
+        .call(fixture.apply_replies(), &fixture.request)
+        .await
+        .0
+        .unwrap();
+    for (name, contents) in [
+        (MAIN_PROCESS_SPEC_FILE, "{}"),
+        (WORKSPACE_ROOT_FILE, "/sandbox"),
+        (BOUNDARY_CERTIFICATE_FILE, "test certificate"),
+        (BOUNDARY_PRIVATE_KEY_FILE, "test key"),
+    ] {
+        durable_write(&fixture.directory.join(name), contents.as_bytes()).unwrap();
+    }
+    fixture.config.guest_tls = None;
+    fixture.config.provider_spiffe_workload_api_socket = Some("/run/spire/agent.sock".into());
+    fixture.config.provider_workload_identity_support = Ok(());
+    let mut replies = fixture.start_replies(running);
+    let image_path = format!("/images/{}/json", fixture.config.supervisor_image_id);
+    let auth_path = fixture.directory.join(SUPERVISOR_AUTH_BUNDLE_FILE);
+    let (expected_code, expected_message) = match failure {
+        OrderedStartLocalFailure::MissingProxyCredentials => {
+            fixture.config.upstream_proxy.https_proxy =
+                Some("http://proxy.example.test:3128".into());
+            fixture.config.upstream_proxy.proxy_auth_allow_insecure = Some(true);
+            fixture.config.upstream_proxy.proxy_auth_file =
+                Some(fixture.directory.join("missing-proxy-credential"));
+            (
+                tonic::Code::Internal,
+                "read Docker upstream proxy credential",
+            )
+        }
+        OrderedStartLocalFailure::MissingSupervisorImage => {
+            replies.push((
+                "GET",
+                image_path,
+                404,
+                serde_json::json!({"message": "configured supervisor image is gone"}),
+            ));
+            (
+                tonic::Code::FailedPrecondition,
+                "configured Docker supervisor image",
+            )
+        }
+        OrderedStartLocalFailure::PublicationRejected => {
+            // Docker preflight succeeds, but the final atomic rename cannot replace a directory.
+            std::fs::create_dir(&auth_path).unwrap();
+            replies.push(("GET", image_path, 200, serde_json::json!({})));
+            (tonic::Code::Internal, "publish Docker supervisor auth")
+        }
+    };
+
+    let operation = OrderedStart {
+        operation_id: fixture.p().operation_id.clone(),
+        revision: 2,
+    };
+    let mut authentication =
+        decode_docker_launch_authentication(&test_launch_authentication()).unwrap();
+    let stable = format!(
+        "spiffe://example.test/openshell/gateway/{}/sandbox/{}",
+        authentication.gateway_id,
+        fixture.p().sandbox_id,
+    );
+    authentication.supervisor.provider_spiffe_id = Some(stable.clone());
+    authentication.supervisor.provider_launch_spiffe_id =
+        Some(format!("{stable}/launch/{}", operation.operation_id));
+    let publication_rejected = matches!(failure, OrderedStartLocalFailure::PublicationRejected);
+    let previous_auth = if running && !publication_rejected {
+        let mut previous = authentication.supervisor.clone();
+        let launch_spiffe_id = format!(
+            "{stable}/launch/{}",
+            openshell_core::SandboxSessionId::new()
+        );
+        previous.provider_launch_spiffe_id = Some(launch_spiffe_id.clone());
+        let bytes = serde_json::to_vec(&previous).unwrap();
+        durable_write(&auth_path, &bytes).unwrap();
+        let supervisor_name = "previous-supervisor";
+        replies.push((
+            "GET",
+            format!("/containers/{supervisor_name}/json"),
+            404,
+            serde_json::json!({"message": "previous supervisor removed"}),
+        ));
+        Some((bytes, supervisor_name, launch_spiffe_id))
+    } else {
+        None
+    };
+    let request = StartSandboxRequest {
+        sandbox_id: fixture.p().sandbox_id.clone(),
+        name: fixture.p().name.clone(),
+        generation_id: authentication.supervisor.runtime_generation.to_string(),
+        launch_authentication: serde_json::to_vec(&authentication).unwrap(),
+        provider_launch_revision: operation.revision,
+        ordered_start: Some(operation.clone()),
+        ..Default::default()
+    };
+    let mutation = DockerProviderLaunchMutation::new(&fixture.directory, &operation);
+    let (docker, server) = docker_api(replies).await;
+    let mut driver = test_driver_with_config(fixture.config.clone());
+    driver.docker = Arc::new(docker);
+    let receipt = ComputeDriver::start_sandbox(&driver, Request::new(request))
+        .await
+        .expect("a local preparation failure has a terminal receipt")
+        .into_inner()
+        .ordered_start_result
+        .unwrap();
+    assert_eq!(receipt.operation, Some(operation));
+    assert_eq!(receipt.code, expected_code as i32);
+    assert!(receipt.message.contains(expected_message));
+    let recorded_workload = mutation.recorded_workload().await.unwrap();
+    if publication_rejected {
+        assert_eq!(recorded_workload.as_deref(), Some("container-B"));
+        assert!(auth_path.is_dir());
+    } else {
+        assert!(recorded_workload.is_none());
+    }
+    if let Some((bytes, supervisor_name, launch_spiffe_id)) = previous_auth {
+        assert_eq!(tokio::fs::read(&auth_path).await.unwrap(), bytes);
+        let owner = DockerProviderSupervisorMonitor {
+            journal_dir: fixture.directory.clone(),
+            supervisor_name: supervisor_name.into(),
+            launch_spiffe_id,
+        };
+        assert!(
+            lock_provider_supervisor_failure(&owner, &driver.docker, "previous-container-id")
+                .await
+                .is_some(),
+            "the previous monitor can still contain the workload if its supervisor disappears"
+        );
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn interrupted_launch_pair_requires_stopped_workload_and_fresh_authentication() {
     for (running, fresh_authentication, inspected_running) in [
         (true, true, true),
@@ -1079,16 +1246,31 @@ async fn startup_cleanup_and_stop_preserve_pending_update_without_a_workload() {
     let mut channel = fixture.volume.clone();
     channel.name = docker_channel_volume_name_by_id(&fixture.p().sandbox_id, &fixture.config);
     channel.labels.remove(workspace::ROLE_LABEL);
+    // A file in place of a journal directory makes the lock unavailable.
+    let journal = tempfile::NamedTempFile::new_in(fixture.directory.parent().unwrap()).unwrap();
+    let blocked_id = journal.path().file_name().unwrap().to_str().unwrap();
+    let mut blocked_channel = channel.clone();
+    blocked_channel.name = docker_channel_volume_name_by_id(blocked_id, &fixture.config);
+    blocked_channel
+        .labels
+        .insert(LABEL_SANDBOX_ID.into(), blocked_id.into());
+    let blocked_auxiliary = serde_json::json!([{
+        "Id": "blocked-auxiliary",
+        "Labels": {
+            (LABEL_SANDBOX_ID): blocked_id,
+            (LABEL_ISOLATION_ROLE): LABEL_ISOLATION_ROLE_STAGING
+        }
+    }]);
     // All three list operations are read-only. Any removal during startup or
     // Stop would fail the fixture's next expected method.
     let replies = vec![
         ("GET", String::new(), 200, serde_json::json!([])),
-        ("GET", String::new(), 200, serde_json::json!([])),
+        ("GET", String::new(), 200, blocked_auxiliary),
         (
             "GET",
             String::new(),
             200,
-            serde_json::json!({"Volumes":[fixture.volume, channel]}),
+            serde_json::json!({"Volumes":[fixture.volume, channel, blocked_channel]}),
         ),
         ("GET", String::new(), 200, serde_json::json!([])),
         ("GET", String::new(), 200, serde_json::json!([])),
@@ -1105,6 +1287,7 @@ async fn startup_cleanup_and_stop_preserve_pending_update_without_a_workload() {
         Request::new(StopSandboxRequest {
             sandbox_id: String::new(),
             name: fixture.p().name.clone(),
+            ..Default::default()
         }),
     )
     .await

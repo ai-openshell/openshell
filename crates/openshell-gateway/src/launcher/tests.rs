@@ -598,12 +598,21 @@ fn configure_carries_the_gateway_metadata_the_argv_used_to() {
         admission: Some(&admission),
         sandbox_runtime_image: Some("runtime:1".to_string()),
         supervisor_image: None,
+        required_features: vec![
+            openshell_core::extension_protocol::COMPUTE_PROVIDER_WORKLOAD_IDENTITY.into(),
+        ],
+        verified_provider_workload_identity: Some(true),
         configure_timeout: DEFAULT_CONFIGURE_TIMEOUT,
     };
 
     let request = inputs.request();
 
     assert_eq!(request.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(request.verified_provider_workload_identity, Some(true));
+    assert_eq!(
+        request.required_features,
+        [openshell_core::extension_protocol::COMPUTE_PROVIDER_WORKLOAD_IDENTITY]
+    );
     let gateway = request.gateway.unwrap();
     assert_eq!(gateway.gateway_port, 8080);
     assert_eq!(gateway.bind_address, "127.0.0.1:8080");
@@ -645,6 +654,8 @@ fn configure_omits_what_the_gateway_does_not_have() {
         admission: None,
         sandbox_runtime_image: None,
         supervisor_image: None,
+        required_features: Vec::new(),
+        verified_provider_workload_identity: None,
         configure_timeout: DEFAULT_CONFIGURE_TIMEOUT,
     };
 
@@ -654,6 +665,7 @@ fn configure_omits_what_the_gateway_does_not_have() {
     assert!(request.network_trust.is_none());
     assert!(request.telemetry.is_none());
     assert!(request.resource_admission_policy_json.is_empty());
+    assert_eq!(request.verified_provider_workload_identity, None);
 }
 
 #[tokio::test]

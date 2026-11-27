@@ -155,13 +155,11 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     #[cfg(target_os = "linux")]
     {
-        use nix::sys::signal::Signal;
         use std::os::unix::process::CommandExt as _;
+        let launcher_pid = nix::unistd::getpid();
+        // SAFETY: The callback only arms the signal and checks the parent PID.
         unsafe {
-            qemu_cmd.pre_exec(|| {
-                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
-                    .map_err(|err| std::io::Error::other(format!("pdeathsig: {err}")))
-            });
+            qemu_cmd.pre_exec(move || procguard::arm_linux_parent_death_signal(launcher_pid));
         }
     }
 
@@ -360,6 +358,8 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     let env = libkrun_guest_env(config);
     vm.set_exec(&config.exec_path, &config.args, &env)?;
 
+    #[cfg(target_os = "linux")]
+    let launcher_pid = nix::unistd::getpid();
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(format!("fork failed: {}", std::io::Error::last_os_error())),
@@ -371,9 +371,12 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             // `PR_SET_PDEATHSIG`; on macOS this spawns a kqueue
             // NOTE_EXIT watcher thread.
             //
-            // We also SIGKILL ourselves if arming fails — there's no
-            // safe way to continue if we can't guarantee cleanup.
-            if let Err(err) = procguard::die_with_parent() {
+            // Exit before entering the VM if the guard cannot be armed.
+            #[cfg(target_os = "linux")]
+            let parent_guard = procguard::arm_linux_parent_death_signal(launcher_pid);
+            #[cfg(not(target_os = "linux"))]
+            let parent_guard = procguard::die_with_parent();
+            if let Err(err) = parent_guard {
                 eprintln!("libkrun worker: procguard arm failed: {err}");
                 std::process::exit(1);
             }

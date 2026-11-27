@@ -544,7 +544,7 @@ impl ComputeDriver for FakeComputeDriver {
                 sandbox_name: request.name,
             });
         });
-        Ok(Response::new(StopSandboxResponse {}))
+        Ok(Response::new(StopSandboxResponse::default()))
     }
 
     async fn start_sandbox(

@@ -192,7 +192,7 @@ impl ComputeDriver for ComputeDriverService {
                     .map_err(|error| {
                         Status::from(openshell_core::ComputeDriverError::from(error))
                     })?;
-                Ok(Response::new(StopSandboxResponse {}))
+                Ok(Response::new(StopSandboxResponse::default()))
             })
             .await
     }
@@ -218,7 +218,10 @@ impl ComputeDriver for ComputeDriverService {
                     .map_err(|error| {
                         Status::from(openshell_core::ComputeDriverError::from(error))
                     })?;
-                    Ok(Response::new(StartSandboxResponse { runtime_identity }))
+                    Ok(Response::new(StartSandboxResponse {
+                        runtime_identity,
+                        ..Default::default()
+                    }))
                 }),
         )
         .await

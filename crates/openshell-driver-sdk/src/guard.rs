@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::sys::signal::kill;
 use nix::unistd::{Pid, getppid};
+use openshell_core::driver_utils::PROVIDER_LAUNCH_DRAIN_GRACE;
 use openshell_driver_launch::Shutdown;
+
+use crate::provider_launch::provider_launches_active;
 
 /// How often the guard checks that the parent still exists.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -18,8 +21,8 @@ const ORPHAN_EXIT_BACKSTOP: Duration = Duration::from_secs(10);
 ///
 /// A driver does not outlive the gateway that launched it. This works on
 /// every Unix, unlike `PR_SET_PDEATHSIG`. The driver then finishes the calls in
-/// flight and exits; if it has not stopped within a few seconds, the guard
-/// exits it.
+/// flight and exits. The guard gives tracked provider launches additional
+/// time to record an outcome even after their RPCs have disconnected.
 ///
 /// A process that no longer exists is not the only sign. When the gateway
 /// started this driver directly, the driver is reparented once the gateway
@@ -38,7 +41,12 @@ pub fn watch_parent(parent_pid: u32, shutdown: Shutdown) {
             if parent_is_gone(exists, direct_child, getppid(), pid) {
                 eprintln!("parent process {parent_pid} exited; stopping");
                 shutdown.request();
+                let start = Instant::now();
                 std::thread::sleep(ORPHAN_EXIT_BACKSTOP);
+                let deadline = start + ORPHAN_EXIT_BACKSTOP + PROVIDER_LAUNCH_DRAIN_GRACE;
+                while provider_launches_active() && Instant::now() < deadline {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
                 std::process::exit(1);
             }
         }

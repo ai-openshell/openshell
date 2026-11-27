@@ -182,10 +182,12 @@ fn driver(root: &Path) -> VmDriver {
         launcher_bin: root.join("unused-vm-launcher"),
         registry: Arc::new(Mutex::new(HashMap::new())),
         image_cache_lock: Arc::new(Mutex::new(())),
+        provider_supervisor_binary: Arc::default(),
         preparation_root: None,
         events: broadcast::channel(WATCH_BUFFER).0,
         gpu_inventory: None,
         lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+        state_owner: None,
     }
 }
 

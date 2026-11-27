@@ -12,11 +12,14 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use openshell_core::VERSION;
+use openshell_core::extension_protocol::{
+    COMPUTE_ORDERED_PROVIDER_START, COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+};
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_sdk::launch::{ConfigureRequest, Deferred, Launch, LaunchInfo};
 use openshell_driver_sdk::{GatewayContext, StartResult};
 use openshell_driver_vm::settings::{VmSettings, settings_with_environment};
-use openshell_driver_vm::{VmDriver, VmDriverConfig, procguard};
+use openshell_driver_vm::{VmDriver, VmDriverConfig};
 use tokio::net::UnixListener;
 use tonic::Status;
 use tracing::info;
@@ -103,18 +106,15 @@ async fn run(
         .map_err(|error| StartResult::error(format!("bind socket: {error}")))?;
     crate::listener::restrict_socket_permissions(&args.bind_socket).map_err(StartResult::error)?;
 
-    // Arm procguard so the driver dies with the gateway instead of orphaning
-    // its per-sandbox VM launchers.
-    if let Err(error) = procguard::die_with_parent() {
-        tracing::warn!(%error, "procguard arm failed; gateway crashes may orphan this driver");
-    }
-
     let log_level = args.log_level.clone();
     let launch = Launch::new(
         LaunchInfo {
             driver_name: "vm".to_string(),
             driver_version: VERSION.to_string(),
-            features: Vec::new(),
+            features: vec![
+                COMPUTE_PROVIDER_WORKLOAD_IDENTITY.to_string(),
+                COMPUTE_ORDERED_PROVIDER_START.to_string(),
+            ],
         },
         move |request| {
             let settings = settings.clone();
@@ -125,6 +125,8 @@ async fn run(
         },
     );
     let shutdown = launch.shutdown();
+    // Finish accepted provider operations if the gateway disappears.
+    openshell_driver_sdk::watch_parent(args.expected_peer_pid, shutdown.clone());
     let configured = launch.configured();
     let deferred = Deferred::new(configured.clone(), |driver: &VmDriver| {
         ComputeDriverServer::new(driver.clone())
@@ -144,6 +146,7 @@ async fn run(
             ),
         )
         .await;
+    openshell_driver_sdk::drain_provider_launches().await;
     let _ = std::fs::remove_file(&args.bind_socket);
     if let Some(driver) = configured.get() {
         driver.remove_socket_root();
@@ -171,7 +174,7 @@ async fn apply_configure(
     let supervisor_otlp = openshell_driver_sdk::supervisor_otlp(request.telemetry.as_ref())?;
     let admission =
         openshell_driver_sdk::admission_from_json(&request.resource_admission_policy_json)?;
-    let config = driver_config(
+    let mut config = driver_config(
         settings,
         &gateway,
         request.network_trust.as_ref(),
@@ -180,6 +183,11 @@ async fn apply_configure(
         log_level,
         gpu,
     )?;
+    config.provider_workload_identity_required =
+        Some(request.required_features.iter().any(|feature| {
+            feature == COMPUTE_PROVIDER_WORKLOAD_IDENTITY
+                || feature == COMPUTE_ORDERED_PROVIDER_START
+        }));
     VmDriver::new(config).await.map_err(Status::internal)
 }
 
@@ -242,6 +250,8 @@ fn driver_config(
         upstream_proxy: settings.upstream_proxy,
         proxy_ca_bundle: settings.proxy_ca_bundle,
         ipv6_egress: settings.ipv6_egress,
+        provider_spiffe_workload_api_socket: settings.provider_spiffe_workload_api_socket,
+        provider_workload_identity_required: None,
         provider_spiffe_workload_api_tcp_endpoint: settings
             .provider_spiffe_workload_api_tcp_endpoint,
         provider_spiffe_allow_guest_tcp: settings.provider_spiffe_allow_guest_tcp,
@@ -311,6 +321,24 @@ mod tests {
         assert_eq!(built.grpc_endpoint, "https://host.test:9");
         assert_eq!(built.guest_tls_ca, Some("/gateway-ca.pem".into()));
         assert_eq!(built.supervisor_gateway_name.as_deref(), Some("gw"));
+    }
+
+    #[test]
+    fn the_host_workload_api_socket_reaches_the_driver() {
+        let gateway = GatewayContext {
+            gateway_port: Some(8080),
+            ..Default::default()
+        };
+        let built = config(
+            "provider_spiffe_workload_api_socket = \"/run/spire/agent.sock\"",
+            &gateway,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            built.provider_spiffe_workload_api_socket,
+            Some("/run/spire/agent.sock".into())
+        );
     }
 
     #[test]

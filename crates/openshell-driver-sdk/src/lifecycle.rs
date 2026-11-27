@@ -6,6 +6,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+pub use openshell_core::driver_utils::EXTERNAL_STOP_GRACE;
 use openshell_driver_launch::Shutdown;
 
 use crate::start::StartResult;
@@ -33,11 +34,6 @@ pub async fn check_backend_within<E: std::fmt::Display>(
         ))),
     }
 }
-
-/// How long a stop signal from elsewhere defers to the gateway.
-///
-/// It is shorter than the 90 seconds a service manager gives a unit to stop.
-pub const EXTERNAL_STOP_GRACE: Duration = Duration::from_secs(30);
 
 /// The future a launched driver's server stops on.
 ///

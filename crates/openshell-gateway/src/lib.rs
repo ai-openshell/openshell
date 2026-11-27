@@ -423,7 +423,8 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
             context.otlp_config(),
             Some(&admission),
         )
-        .with_configure_timeout(context.image_preparation_timeout());
+        .with_configure_timeout(context.image_preparation_timeout())
+        .with_verified_provider_workload_identity(context.requires_provider_workload_identity());
         // Auto-detection already started the driver; configure that process.
         let detected = context.take_detected_driver::<launcher::Started>();
         let endpoint = docker::DOCKER
@@ -488,7 +489,8 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
             context.otlp_config(),
             Some(&admission),
         )
-        .with_configure_timeout(context.image_preparation_timeout());
+        .with_configure_timeout(context.image_preparation_timeout())
+        .with_verified_provider_workload_identity(context.requires_provider_workload_identity());
         let endpoint = podman::PODMAN
             .spawn(
                 &plan,
@@ -551,7 +553,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
         let plan = vm_launch_plan(context.config_context())?;
         require_guest_tls_for_local_driver(&context, "vm")?;
         let admission = self.admission_policy(context.config_context())?;
-        let inputs = launcher::ConfigureInputs::from_environment(
+        let mut inputs = launcher::ConfigureInputs::from_environment(
             context.gateway_bind_address(),
             context.guest_tls_ca(),
             context.gateway_name(),
@@ -560,6 +562,11 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             Some(&admission),
         )
         .with_configure_timeout(context.image_preparation_timeout());
+        if context.requires_provider_workload_identity() {
+            inputs.required_features.push(
+                openshell_core::extension_protocol::COMPUTE_PROVIDER_WORKLOAD_IDENTITY.to_string(),
+            );
+        }
         let endpoint = vm::spawn(&plan, context.gateway_log_level(), &inputs).await?;
         Ok(openshell_server::ComputeDriverInstance::ManagedRemote(
             endpoint,

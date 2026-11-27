@@ -472,6 +472,9 @@ fn prepare_server_config_with_drivers(
     }
     let legacy_compute_driver_env_seen = resolve_legacy_driver_selector_env(args)?;
     normalize_compute_driver_socket_args(args)?;
+    if let Some(file) = file.as_ref() {
+        validate_provider_workload_identity_selection(file, args)?;
+    }
     let compute_driver = compute_drivers
         .select_with_file(
             args.compute_driver.as_deref(),
@@ -480,6 +483,12 @@ fn prepare_server_config_with_drivers(
         )
         .map_err(|error| miette::miette!("{error}"))?;
     if let Some(file) = file.as_mut() {
+        validate_provider_workload_identity_driver(
+            file,
+            compute_drivers,
+            compute_driver.name(),
+            args,
+        )?;
         config_file::normalize_legacy_podman_ca_bundle(file, compute_driver.name())
             .map_err(|error| miette::miette!("{error}"))?;
     }
@@ -836,6 +845,9 @@ fn prepare_server_config_with_drivers(
     config.spiffe_broker = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.spiffe_broker.clone());
+    config.spiffe_workload_identity = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.spiffe_workload_identity.clone());
 
     if let Some(kubernetes) = file
         .as_ref()
@@ -1287,6 +1299,12 @@ fn run_effective_config_preflight(
         let mut selected_driver = None;
         if let Some(selection) = selection.as_ref() {
             validate_preflight_isolation_backend(semantic_file, selection.name())?;
+            validate_provider_workload_identity_driver(
+                semantic_file,
+                compute_drivers,
+                selection.name(),
+                &run,
+            )?;
             let driver = crate::validate_compute_driver_config(
                 compute_drivers,
                 selection.name(),
@@ -1357,6 +1375,13 @@ fn run_effective_config_preflight(
                 eprintln!("warning: {UNAUTHENTICATED_USERS_WARNING}");
             }
             Ok(driver)
+        }
+        (Err(error), Some(path)) if error.is::<ProviderWorkloadIdentityConfigError>() => {
+            Err(miette::miette!(
+                "gateway config preflight failed: path='{}' category=invalid_provider_workload_identity detected_version={}; the file was preserved unchanged; {error}",
+                path.display(),
+                config_file::SCHEMA_VERSION,
+            ))
         }
         (Err(_), Some(path)) => Err(miette::miette!(
             "{}",
@@ -1432,12 +1457,124 @@ fn validate_preflight_isolation_backend(file: &ConfigFile, driver_name: &str) ->
     Ok(())
 }
 
+// These diagnostics may reach package logs. Build them from fixed text and
+// first-party driver names only, with no configuration values attached.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("{0}")]
+struct ProviderWorkloadIdentityConfigError(String);
+
+fn validate_provider_workload_identity_selection(file: &ConfigFile, args: &RunArgs) -> Result<()> {
+    if file.openshell.gateway.spiffe_workload_identity.is_some() && args.compute_driver.is_none() {
+        return Err(ProviderWorkloadIdentityConfigError(
+            "spiffe_workload_identity requires an explicit compute driver; set openshell.gateway.compute_driver, OPENSHELL_COMPUTE_DRIVER, or --compute-driver".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_provider_workload_identity_driver(
+    file: &ConfigFile,
+    registry: &ComputeDriverRegistry,
+    name: &str,
+    args: &RunArgs,
+) -> Result<()> {
+    if file.openshell.gateway.spiffe_workload_identity.is_none()
+        || args.compute_driver_socket.is_some()
+        || registry.get(name).is_none()
+    {
+        return Ok(());
+    }
+
+    if name == "kubernetes" {
+        return Err(ProviderWorkloadIdentityConfigError(
+            "the Kubernetes compute driver does not support spiffe_workload_identity".into(),
+        )
+        .into());
+    }
+    if !matches!(name, "docker" | "podman" | "vm") {
+        return Ok(());
+    }
+
+    let table = file.openshell.drivers.get(name);
+    let socket = match table.and_then(|table| table.get("provider_spiffe_workload_api_socket")) {
+        Some(socket) => socket.as_str().map(PathBuf::from),
+        None if name == "vm" => std::env::var("OPENSHELL_VM_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")
+            .ok()
+            .map(PathBuf::from),
+        None => None,
+    };
+    if socket.as_deref().is_none_or(|socket| {
+        openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket).is_err()
+    }) {
+        return Err(ProviderWorkloadIdentityConfigError(format!(
+            "spiffe_workload_identity requires a Workload API Unix socket in [openshell.drivers.{name}].provider_spiffe_workload_api_socket"
+        ))
+        .into());
+    }
+
+    let endpoint = table
+        .and_then(|table| table.get("grpc_endpoint"))
+        .and_then(toml::Value::as_str)
+        .filter(|endpoint| !endpoint.trim().is_empty());
+    let docker_bridge = name == "docker"
+        && table
+            .and_then(|table| table.get("supervisor_network_mode"))
+            .and_then(toml::Value::as_str)
+            == Some("bridge");
+    let podman_machine = name == "podman" && cfg!(not(target_os = "linux"));
+    if endpoint.is_none() && args.disable_tls && (docker_bridge || podman_machine) {
+        return Err(ProviderWorkloadIdentityConfigError(format!(
+            "spiffe_workload_identity requires HTTPS for the default {name} supervisor gateway endpoint; enable gateway TLS"
+        ))
+        .into());
+    }
+    let Some(endpoint) = endpoint else {
+        return Ok(());
+    };
+    let endpoint = openshell_core::grpc_client::token_grant_gateway_endpoint(endpoint);
+    if docker_bridge
+        && endpoint.as_ref().is_ok_and(|url| match url.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(host)) => host.is_loopback() || host.is_unspecified(),
+            Some(url::Host::Ipv6(host)) => host.is_loopback() || host.is_unspecified(),
+            None => false,
+        })
+    {
+        return Err(ProviderWorkloadIdentityConfigError(
+            "Docker bridge supervisor grpc_endpoint must be reachable outside the gateway's loopback namespace".into(),
+        )
+        .into());
+    }
+    if !endpoint.is_ok_and(|url| {
+        openshell_core::grpc_client::validate_attested_token_grant_transport(&url).is_ok()
+            || (name == "vm"
+                && url.host_str().is_some_and(|host| {
+                    openshell_core::driver_utils::VM_HOST_LOOPBACK_ALIASES.contains(&host)
+                }))
+    }) {
+        return Err(ProviderWorkloadIdentityConfigError(format!(
+            "spiffe_workload_identity requires HTTPS or direct HTTP to a loopback IP for [openshell.drivers.{name}].grpc_endpoint"
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
 fn validate_preflight_semantics(
     args: &RunArgs,
     matches: &ArgMatches,
     file: &ConfigFile,
 ) -> Result<()> {
     let gateway = &file.openshell.gateway;
+    crate::spiffe_broker::SupervisorWorkloadIdentity::from_settings(
+        gateway.spiffe_workload_identity.as_ref(),
+        gateway.gateway_jwt.as_ref(),
+        gateway.spiffe_broker.is_some(),
+    )
+    .map_err(ProviderWorkloadIdentityConfigError)?;
+    validate_provider_workload_identity_selection(file, args)?;
     validate_grpc_rate_limit_args(
         args.grpc_rate_limit_requests,
         args.grpc_rate_limit_window_seconds,
@@ -2926,6 +3063,138 @@ mod tests {
     }
 
     #[test]
+    fn config_preflight_checks_provider_workload_identity_for_the_selected_driver() {
+        let config_home = tempfile::tempdir().unwrap();
+        let config = config_home.path().join("gateway.toml");
+        let workload_identity = r#"
+[openshell]
+version = 2
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/configured/signing.pem"
+public_key_path = "/configured/public.pem"
+kid_path = "/configured/kid"
+ttl_secs = 3600
+[openshell.gateway.spiffe_workload_identity]
+spiffe_id_prefix = "spiffe://example.org/openshell"
+workload_api_socket_path = "/run/spire/agent.sock"
+"#;
+        let cases = [
+            ("", "", Some("requires an explicit compute driver")),
+            ("kubernetes", "", Some("Kubernetes compute driver")),
+            ("docker", "", Some("provider_spiffe_workload_api_socket")),
+            (
+                "docker",
+                "provider_spiffe_workload_api_socket = '/run/spire/agent.sock'\nsupervisor_network_mode = 'bridge'",
+                Some("requires HTTPS for the default docker supervisor gateway endpoint"),
+            ),
+            (
+                "docker",
+                "provider_spiffe_workload_api_socket = '/run/spire/agent.sock'\nsupervisor_network_mode = 'bridge'\ngrpc_endpoint = 'https://127.0.0.1:8080'",
+                Some("Docker bridge supervisor grpc_endpoint must be reachable"),
+            ),
+            (
+                "podman",
+                "provider_spiffe_workload_api_socket = 'tcp:127.0.0.1:8081'",
+                Some("provider_spiffe_workload_api_socket"),
+            ),
+            (
+                "podman",
+                "provider_spiffe_workload_api_socket = '/run/spire/agent.sock'",
+                cfg!(not(target_os = "linux"))
+                    .then_some("requires HTTPS for the default podman supervisor gateway endpoint"),
+            ),
+            (
+                "podman",
+                "provider_spiffe_workload_api_socket = '/run/spire/agent.sock'\ngrpc_endpoint = 'http://127.0.0.1:8080'",
+                None,
+            ),
+            (
+                "podman",
+                "provider_spiffe_workload_api_socket = '/run/spire/agent.sock'\ngrpc_endpoint = 'http://secret-callback-marker.test:8080'",
+                Some("grpc_endpoint"),
+            ),
+            (
+                "vm",
+                "grpc_endpoint = 'http://host.openshell.internal:8080'",
+                None,
+            ),
+            ("external", "socket_path = '/run/external.sock'", None),
+        ];
+        Environment::new()
+            .remove("OPENSHELL_GATEWAY_CONFIG")
+            .remove("OPENSHELL_COMPUTE_DRIVER")
+            .remove("OPENSHELL_COMPUTE_DRIVER_SOCKET")
+            .remove("OPENSHELL_DRIVERS")
+            .set(
+                "OPENSHELL_VM_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET",
+                "/run/spire/agent.sock",
+            )
+            .run(|| {
+                for (driver, settings, expected_error) in cases {
+                    let mut content = workload_identity.to_owned();
+                    let mut args = vec!["openshell-gateway", "--disable-tls"];
+                    if !driver.is_empty() {
+                        use std::fmt::Write as _;
+                        writeln!(content, "\n[openshell.drivers.{driver}]\n{settings}").unwrap();
+                        args.extend(["--compute-driver", driver]);
+                    }
+                    std::fs::write(&config, content).unwrap();
+                    let registered_name = if matches!(driver, "" | "external") {
+                        "local"
+                    } else {
+                        driver
+                    };
+                    let mut registry = crate::ComputeDriverRegistry::new();
+                    registry
+                        .install(
+                            crate::ComputeDriverRegistration::new(
+                                registered_name,
+                                100,
+                                Some(|| panic!("preflight must not auto-detect a driver")),
+                                TestFactory,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    let (mut run, matches) = parse_with_args(&args);
+                    let result = super::run_config_preflight_with_drivers(
+                        super::ConfigPreflightArgs {
+                            path: Some(config.clone()),
+                            ..Default::default()
+                        },
+                        run.clone(),
+                        &matches,
+                        &registry,
+                    );
+                    if let Some(expected_error) = expected_error {
+                        let error =
+                            result.expect_err("preflight should reject the driver settings");
+                        let message = error.to_string();
+                        assert!(
+                            message.contains("category=invalid_provider_workload_identity"),
+                            "{message}"
+                        );
+                        assert!(message.contains(expected_error), "{message}");
+                        assert!(!format!("{error:?}").contains("secret-callback-marker"));
+                        assert!(!message.contains("secret-callback-marker"));
+
+                        run.config = Some(config.clone());
+                        let Err(error) = super::prepare_server_config_with_drivers(
+                            &mut run, &matches, &registry,
+                        ) else {
+                            panic!("daemon startup should reject the driver settings");
+                        };
+                        let message = error.to_string();
+                        assert!(message.contains(expected_error), "{message}");
+                        assert!(!message.contains("secret-callback-marker"));
+                    } else {
+                        assert!(result.is_ok(), "{driver} with {settings}: {result:?}");
+                    }
+                }
+            });
+    }
+
+    #[test]
     fn config_preflight_rejects_factory_without_side_effect_free_validation() {
         let config_home = tempfile::tempdir().unwrap();
 
@@ -3309,6 +3578,14 @@ mod tests {
                 "middleware",
                 "[openshell]\nversion = 2\n[[openshell.supervisor.middleware]]\nname = 'guard'\ngrpc_endpoint = 'http://127.0.0.1:50051'\nallow_insecure_transport = true\nmax_payload_bytes = 1024\ntimeout = 'invalid'\n",
             ),
+            (
+                "provider-workload-identity-without-expiring-session",
+                "[openshell]\nversion = 2\n[openshell.gateway.spiffe_workload_identity]\nspiffe_id_prefix = 'spiffe://example.org/openshell'\nworkload_api_socket_path = '/run/spire/agent.sock'\n",
+            ),
+            (
+                "provider-workload-identity-with-invalid-prefix",
+                "[openshell]\nversion = 2\n[openshell.gateway.gateway_jwt]\nsigning_key_path = '/jwt/signing.pem'\npublic_key_path = '/jwt/public.pem'\nkid_path = '/jwt/kid'\nttl_secs = 3600\n[openshell.gateway.spiffe_workload_identity]\nspiffe_id_prefix = 'secret-prefix-marker'\nworkload_api_socket_path = '/run/spire/agent.sock'\n",
+            ),
         ];
 
         for (name, contents) in cases {
@@ -3327,7 +3604,18 @@ mod tests {
             let Err(error) = result else {
                 panic!("{name}: invalid effective configuration passed preflight");
             };
-            assert!(error.to_string().contains("category=malformed"), "{name}");
+            if name.starts_with("provider-workload-identity") {
+                let message = error.to_string();
+                assert!(message.contains("category=invalid_provider_workload_identity"), "{name}");
+                let expected_field = if name.ends_with("expiring-session") {
+                    "gateway_jwt.ttl_secs"
+                } else {
+                    "spiffe_workload_identity.spiffe_id_prefix"
+                };
+                assert!(message.contains(expected_field), "{message}");
+            } else {
+                assert!(error.to_string().contains("category=malformed"), "{name}");
+            }
             assert!(error.to_string().contains("detected_version=2"), "{name}");
             assert!(!error.to_string().contains("secret-"));
             assert!(!format!("{error:?}").contains("secret-"));

@@ -1,7 +1,9 @@
 # Podman SPIFFE Token Exchange Demo
 
-This variant runs the SPIFFE token exchange demo with local Podman containers
-instead of Kubernetes workloads.
+This variant runs the dedicated supervisor's direct token exchange with
+local Podman containers. For gateway-mediated grants using
+`spiffe_workload_identity`, see
+[Sandbox identity through the Workload API](../../../docs/how-it-works/gateways/configuration.mdx#sandbox-identity-through-the-workload-api).
 
 The first version is intentionally single-sandbox. The script creates one
 concrete SPIRE registration entry for the sandbox after OpenShell creates it.

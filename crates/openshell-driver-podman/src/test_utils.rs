@@ -23,6 +23,10 @@ pub struct StubResponse {
     pub body: Bytes,
     pub delay: Duration,
     pub archive_members: Option<Vec<PathBuf>>,
+    container_image: Option<&'static str>,
+    container_secret: Option<String>,
+    container_spec_fields: Option<serde_json::Value>,
+    request_bytes: Option<Bytes>,
 }
 
 impl StubResponse {
@@ -32,6 +36,10 @@ impl StubResponse {
             body: body.into(),
             delay: Duration::ZERO,
             archive_members: None,
+            container_image: None,
+            container_secret: None,
+            container_spec_fields: None,
+            request_bytes: None,
         }
     }
 
@@ -42,6 +50,26 @@ impl StubResponse {
 
     pub fn with_archive_members(mut self, members: &[&str]) -> Self {
         self.archive_members = Some(members.iter().map(PathBuf::from).collect());
+        self
+    }
+
+    pub fn with_container_image(mut self, image: &'static str) -> Self {
+        self.container_image = Some(image);
+        self
+    }
+
+    pub fn with_container_secret(mut self, name: String) -> Self {
+        self.container_secret = Some(name);
+        self
+    }
+
+    pub fn with_container_spec_fields(mut self, fields: serde_json::Value) -> Self {
+        self.container_spec_fields = Some(fields);
+        self
+    }
+
+    pub fn with_request_bytes(mut self, body: &'static [u8]) -> Self {
+        self.request_bytes = Some(Bytes::from_static(body));
         self
     }
 }
@@ -111,7 +139,10 @@ pub fn spawn_podman_stub(
                                 .expect("response queue lock should not be poisoned")
                                 .pop_front()
                                 .expect("stub response should exist");
-                            if let Some(expected_members) = &response.archive_members {
+                            if let Some(expected_bytes) = &response.request_bytes {
+                                let body = req.into_body().collect().await.unwrap().to_bytes();
+                                assert_eq!(&body, expected_bytes);
+                            } else if let Some(expected_members) = &response.archive_members {
                                 assert_eq!(req.method(), hyper::Method::PUT);
                                 let body = req.into_body().collect().await.unwrap().to_bytes();
                                 let mut archive = tar::Archive::new(body.as_ref());
@@ -121,6 +152,29 @@ pub fn spawn_podman_stub(
                                     .map(|entry| entry.unwrap().path().unwrap().into_owned())
                                     .collect();
                                 assert_eq!(&members, expected_members);
+                            } else if response.container_image.is_some()
+                                || response.container_secret.is_some()
+                                || response.container_spec_fields.is_some()
+                            {
+                                assert_eq!(req.method(), hyper::Method::POST);
+                                assert!(req.uri().path().ends_with("/containers/create"));
+                                let body = req.into_body().collect().await.unwrap().to_bytes();
+                                let spec: serde_json::Value =
+                                    serde_json::from_slice(&body).unwrap();
+                                if let Some(expected_image) = response.container_image {
+                                    assert_eq!(spec["image"].as_str(), Some(expected_image));
+                                }
+                                if let Some(expected_secret) = &response.container_secret {
+                                    assert!(spec["secrets"].as_array().unwrap().iter().any(|mount| {
+                                        mount["source"].as_str() == Some(expected_secret.as_str())
+                                            && mount["target"].as_str() == Some(openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH)
+                                    }));
+                                }
+                                if let Some(fields) = &response.container_spec_fields {
+                                    for (field, value) in fields.as_object().unwrap() {
+                                        assert_eq!(spec.get(field), Some(value), "{field}");
+                                    }
+                                }
                             }
                             tokio::time::sleep(response.delay).await;
                             Ok::<_, Infallible>(

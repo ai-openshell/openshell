@@ -16,11 +16,15 @@ use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox, DriverSandboxStatus, WatchSandboxesDeletedEvent,
     WatchSandboxesEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
+use openshell_driver_sdk::{run_provider_containment, try_provider_launch_lock};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::Status;
 use tracing::{debug, info, warn};
 
 // Condition reason constants shared across event-building paths.
@@ -28,12 +32,93 @@ const CONDITION_RUNNING: &str = "ContainerRunning";
 const CONDITION_STARTING: &str = "ContainerStarting";
 use openshell_core::driver_utils::{
     CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_STOPPED,
-    CONDITION_WORKSPACE_VALIDATION_FAILED, SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
-    WORKSPACE_VALIDATION_FAILED_MESSAGE,
+    CONDITION_WORKSPACE_VALIDATION_FAILED, LABEL_PROVIDER_LAUNCH_SPIFFE_ID,
+    SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_FAILED_MESSAGE,
 };
 
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, ComputeDriverError>> + Send>>;
+
+#[derive(Default)]
+pub(crate) struct ProviderContainment {
+    pub(crate) state_root: Option<PathBuf>,
+    pub(crate) verified_supported: bool,
+}
+
+impl ProviderContainment {
+    pub(crate) async fn journal(
+        &self,
+        sandbox_id: &str,
+        verified_supervisor: bool,
+    ) -> Result<Option<PathBuf>, Status> {
+        let required = self.verified_supported || verified_supervisor;
+        let Some(root) = &self.state_root else {
+            return if required {
+                Err(Status::unavailable(
+                    "Podman provider launch state is unavailable",
+                ))
+            } else {
+                Ok(None)
+            };
+        };
+        crate::client::validate_name(sandbox_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let journal = root.join(sandbox_id);
+        if required {
+            return Ok(Some(journal));
+        }
+        // Keep fencing retained launches after socket qualification is lost.
+        match tokio::fs::symlink_metadata(&journal).await {
+            Ok(_) => Ok(Some(journal)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Status::unavailable(format!(
+                "inspect Podman provider launch state: {error}"
+            ))),
+        }
+    }
+}
+
+pub(crate) fn is_sandbox_member(inspect: &ContainerInspect, sandbox_id: &str, role: &str) -> bool {
+    let labels = &inspect.config.labels;
+    labels.get(LABEL_SANDBOX_ID).map(String::as_str) == Some(sandbox_id)
+        && labels.get(crate::isolation::LABEL_ROLE).map(String::as_str) == Some(role)
+}
+
+pub(crate) async fn stop_provider_container(
+    client: &PodmanClient,
+    id: &str,
+    grace_secs: u32,
+) -> bool {
+    let stop = async {
+        match client.stop_container(id, grace_secs).await {
+            Ok(()) => {}
+            Err(PodmanApiError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        // The stop response can precede the terminal state of this run.
+        loop {
+            match client.inspect_container(id).await {
+                Ok(inspect)
+                    if inspect.id == id
+                        && !inspect.state.running
+                        && matches!(inspect.state.status.as_str(), "exited" | "stopped") =>
+                {
+                    return Ok(());
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                Err(PodmanApiError::NotFound(_)) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(u64::from(grace_secs) + 10), stop).await {
+        Ok(Ok(())) => true,
+        result => {
+            warn!(container_id = %id, ?result, "Could not confirm Podman provider containment stop");
+            false
+        }
+    }
+}
 
 /// Per-sandbox container exit timestamps that fence state changes from an earlier run.
 ///
@@ -130,9 +215,10 @@ fn deleted_event(sandbox_id: String) -> WatchSandboxesEvent {
 /// **Do not add reconnection logic inside this function.**  A local reconnect
 /// would race with the consumer's retry and produce duplicate initial-sync
 /// events.
-pub async fn start_watch(
+pub(crate) async fn start_watch(
     client: PodmanClient,
     lifecycle_event_fences: LifecycleEventFences,
+    containment: ProviderContainment,
 ) -> Result<WatchStream, PodmanApiError> {
     let (tx, rx) = mpsc::channel::<Result<WatchSandboxesEvent, ComputeDriverError>>(256);
 
@@ -149,7 +235,7 @@ pub async fn start_watch(
         // health check status — matching the same condition derivation used
         // for live events.
         if entry.state == "running" {
-            match inspect_workload(&client, &entry.id).await {
+            match inspect_workload(&client, &entry.id, &containment).await {
                 Ok(inspect) => {
                     if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
                         if tx.send(Ok(sandbox_event(sandbox))).await.is_err() {
@@ -185,7 +271,8 @@ pub async fn start_watch(
             match result {
                 Ok(event) => {
                     if let Some(we) =
-                        map_podman_event(&event, &client, &lifecycle_event_fences).await
+                        map_podman_event(&event, &client, &lifecycle_event_fences, &containment)
+                            .await
                         && tx.send(Ok(we)).await.is_err()
                     {
                         return;
@@ -231,6 +318,7 @@ async fn map_podman_event(
     event: &PodmanEvent,
     client: &PodmanClient,
     lifecycle_event_fences: &LifecycleEventFences,
+    containment: &ProviderContainment,
 ) -> Option<WatchSandboxesEvent> {
     let container_id = &event.actor.id;
     let sandbox_id = event
@@ -265,7 +353,7 @@ async fn map_podman_event(
             .await
             .ok()?;
         let workload = workloads.first()?;
-        return inspect_workload(client, &workload.id)
+        return inspect_workload(client, &workload.id, containment)
             .await
             .ok()
             .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
@@ -276,7 +364,7 @@ async fn map_podman_event(
         "remove" => Some(deleted_event(sandbox_id.clone())),
         "create" | "start" | "stop" | "die" | "health_status" => {
             // Inspect the container to get current state.
-            match inspect_workload(client, container_id).await {
+            match inspect_workload(client, container_id, containment).await {
                 Ok(inspect) => {
                     if lifecycle_event_fences.matches_previous_exit(
                         event,
@@ -356,9 +444,10 @@ async fn map_podman_event(
 /// A workload is ready only when its independent supervisor is healthy. This
 /// check runs both on watch reconciliation and on events, and contains a lost
 /// supervisor even when the gateway missed the original exit event.
-pub async fn inspect_workload(
+pub(crate) async fn inspect_workload(
     client: &PodmanClient,
     id: &str,
+    containment: &ProviderContainment,
 ) -> Result<ContainerInspect, PodmanApiError> {
     let mut workload = client.inspect_container(id).await?;
     if workload
@@ -369,39 +458,85 @@ pub async fn inspect_workload(
     {
         return Ok(workload);
     }
-    let Some(sandbox_id) = workload.config.labels.get(LABEL_SANDBOX_ID) else {
+    let Some(sandbox_id) = workload.config.labels.get(LABEL_SANDBOX_ID).cloned() else {
         return Ok(workload);
     };
-    let supervisor = client
-        .inspect_container(&crate::isolation::supervisor_name(sandbox_id))
-        .await;
+    let supervisor_name = crate::isolation::supervisor_name(&sandbox_id);
+    let mut supervisor = client.inspect_container(&supervisor_name).await;
+    let was_running = workload.state.running;
+    if was_running && supervisor_lost(&supervisor) {
+        let verified = supervisor.as_ref().is_ok_and(|inspect| {
+            inspect
+                .config
+                .labels
+                .contains_key(LABEL_PROVIDER_LAUNCH_SPIFFE_ID)
+        });
+        match containment.journal(&sandbox_id, verified).await {
+            Ok(None) => {
+                client.stop_container(&workload.id, 0).await?;
+                workload = client.inspect_container(&workload.id).await?;
+            }
+            Ok(Some(journal)) => match try_provider_launch_lock(journal.clone()).await {
+                Ok(Some(lock)) => {
+                    // Podman keeps the workload ID across launches. Recheck the
+                    // run and the canonical companion after taking ownership.
+                    let current = client.inspect_container(&workload.id).await?;
+                    if current.id != workload.id
+                        || !is_sandbox_member(&current, &sandbox_id, "sandbox")
+                    {
+                        return Err(PodmanApiError::InvalidInput(
+                            "Podman workload identity changed during containment".into(),
+                        ));
+                    }
+                    let same_run = workload.state.started_at.as_deref().is_some_and(|started| {
+                        !started.is_empty() && current.state.started_at.as_deref() == Some(started)
+                    });
+                    workload = current;
+                    supervisor = client.inspect_container(&supervisor_name).await;
+                    if same_run && workload.state.running && supervisor_lost(&supervisor) {
+                        let owner = client.clone();
+                        let workload_id = workload.id.clone();
+                        match run_provider_containment(journal, lock, async move {
+                            stop_provider_container(&owner, &workload_id, 0).await
+                        })
+                        .await
+                        {
+                            Ok(true) => {
+                                workload = client.inspect_container(&workload.id).await?;
+                                if workload.state.running {
+                                    supervisor = client.inspect_container(&supervisor_name).await;
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                warn!(%sandbox_id, %error, "Could not contain Podman workload")
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => warn!(%sandbox_id, %error, "Could not lock Podman provider launch"),
+            },
+            Err(error) => warn!(%sandbox_id, %error, "Could not locate Podman provider launch"),
+        }
+    }
     let supervisor_exit_code = supervisor
         .as_ref()
         .ok()
         .and_then(|supervisor| exited_exit_code(&supervisor.state));
-    if workload.state.running {
+    if was_running && workload.state.running {
         match supervisor {
             Ok(supervisor) if supervisor.state.running => {
                 workload.state.health = supervisor.state.health;
             }
-            Ok(supervisor)
-                if supervisor.state.status == "configured"
-                    || supervisor.state.status == "created" =>
-            {
+            Ok(_) | Err(PodmanApiError::NotFound(_)) => {
                 workload.state.health = Some(HealthState {
                     status: "starting".into(),
                 });
             }
-            // Both containers exist before initial start. A missing or exited
-            // companion therefore requires containment, including after a
-            // gateway restart that missed the original Podman exit event.
-            Ok(_) | Err(PodmanApiError::NotFound(_)) => {
-                client.stop_container(&workload.id, 0).await?;
-                workload = client.inspect_container(&workload.id).await?;
-            }
             Err(error) => return Err(error),
         }
-    } else if matches!(workload.state.status.as_str(), "exited" | "stopped") {
+    } else if !was_running && matches!(workload.state.status.as_str(), "exited" | "stopped") {
         workload.state.startup_diagnostic = client
             .container_logs(&workload.id)
             .await
@@ -410,6 +545,17 @@ pub async fn inspect_workload(
     }
     workload.state.supervisor_exit_code = supervisor_exit_code;
     Ok(workload)
+}
+
+fn supervisor_lost(supervisor: &Result<ContainerInspect, PodmanApiError>) -> bool {
+    match supervisor {
+        Ok(inspect) => {
+            !inspect.state.running
+                && !matches!(inspect.state.status.as_str(), "configured" | "created")
+        }
+        Err(PodmanApiError::NotFound(_)) => true,
+        Err(_) => false,
+    }
 }
 
 fn exited_exit_code(state: &ContainerState) -> Option<i64> {
@@ -641,7 +787,9 @@ mod tests {
             ],
         );
         let client = PodmanClient::new(path.clone());
-        let inspected = inspect_workload(&client, "workload").await.unwrap();
+        let inspected = inspect_workload(&client, "workload", &ProviderContainment::default())
+            .await
+            .unwrap();
         assert!(!inspected.state.running);
         handle.await.unwrap();
         assert!(
@@ -652,6 +800,47 @@ mod tests {
                 .any(|request| request.ends_with("/libpod/containers/workload/stop?timeout=0"))
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn verified_containment_rechecks_the_companion_under_the_launch_lock() {
+        use crate::test_utils::{StubResponse, spawn_podman_stub};
+        use hyper::StatusCode;
+        let workload = StubResponse::new(
+            StatusCode::OK,
+            r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true,"StartedAt":"2026-08-12T16:39:13Z"},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#,
+        );
+        let (path, requests, handle) = spawn_podman_stub(
+            "verified-watch",
+            vec![
+                workload.clone(),
+                StubResponse::new(StatusCode::NOT_FOUND, "missing companion"),
+                workload,
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"replacement","Name":"supervisor","State":{"Status":"running","Running":true,"Health":{"Status":"healthy"}}}"#,
+                ),
+            ],
+        );
+        let state = tempfile::tempdir().unwrap();
+        let containment = ProviderContainment {
+            state_root: Some(state.path().to_owned()),
+            verified_supported: true,
+        };
+        let client = PodmanClient::new(path);
+        let inspected = inspect_workload(&client, "workload", &containment)
+            .await
+            .unwrap();
+        assert!(inspected.state.running);
+        assert_eq!(inspected.state.health.unwrap().status, "healthy");
+        handle.await.unwrap();
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.starts_with("GET "))
+        );
     }
 
     #[tokio::test]
@@ -672,7 +861,9 @@ mod tests {
             ],
         );
         let client = PodmanClient::new(path.clone());
-        let inspected = inspect_workload(&client, "workload").await.unwrap();
+        let inspected = inspect_workload(&client, "workload", &ProviderContainment::default())
+            .await
+            .unwrap();
         assert!(inspected.state.running);
         assert_eq!(inspected.state.health.unwrap().status, "starting");
         handle.await.unwrap();
@@ -710,6 +901,7 @@ mod tests {
             &podman_event_for_container("remove", "sandbox-1", "external-container", 2),
             &client,
             &fences,
+            &ProviderContainment::default(),
         )
         .await
         .expect("an unrelated remove must still delete the sandbox");

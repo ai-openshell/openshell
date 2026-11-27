@@ -765,6 +765,8 @@ pub struct ConfigureInputs<'a> {
     pub admission: Option<&'a openshell_core::resource_admission::DriverAdmissionConfig>,
     pub sandbox_runtime_image: Option<String>,
     pub supervisor_image: Option<String>,
+    pub required_features: Vec<String>,
+    verified_provider_workload_identity: Option<bool>,
     /// How long the driver has to answer `Configure`.
     pub configure_timeout: Duration,
 }
@@ -790,6 +792,8 @@ impl<'a> ConfigureInputs<'a> {
             sandbox_runtime_image: std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)
                 .ok(),
             supervisor_image: std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV).ok(),
+            required_features: Vec::new(),
+            verified_provider_workload_identity: None,
             configure_timeout: DEFAULT_CONFIGURE_TIMEOUT,
         }
     }
@@ -799,6 +803,13 @@ impl<'a> ConfigureInputs<'a> {
     #[must_use]
     pub fn with_configure_timeout(mut self, timeout: Duration) -> Self {
         self.configure_timeout = timeout;
+        self
+    }
+
+    #[cfg(any(feature = "compute-driver-docker", feature = "compute-driver-podman"))]
+    #[must_use]
+    pub fn with_verified_provider_workload_identity(mut self, enabled: bool) -> Self {
+        self.verified_provider_workload_identity = Some(enabled);
         self
     }
 
@@ -851,7 +862,7 @@ impl<'a> ConfigureInputs<'a> {
         });
         ConfigureRequest {
             protocol_version: PROTOCOL_VERSION,
-            required_features: Vec::new(),
+            required_features: self.required_features.clone(),
             gateway: Some(proto::GatewayContext {
                 gateway_port: u32::from(self.gateway_bind_address.port()),
                 bind_address: self.gateway_bind_address.to_string(),
@@ -872,6 +883,7 @@ impl<'a> ConfigureInputs<'a> {
                 .admission
                 .and_then(|policy| serde_json::to_string(policy).ok())
                 .unwrap_or_default(),
+            verified_provider_workload_identity: self.verified_provider_workload_identity,
         }
     }
 }

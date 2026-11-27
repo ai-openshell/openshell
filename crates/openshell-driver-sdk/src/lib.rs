@@ -13,6 +13,7 @@ mod gateway;
 #[cfg(unix)]
 mod guard;
 mod lifecycle;
+mod provider_launch;
 mod start;
 mod table;
 mod telemetry;
@@ -27,6 +28,13 @@ pub use lifecycle::{
     BACKEND_CHECK_TIMEOUT, EXTERNAL_STOP_GRACE, check_backend_within, stop_when_released,
 };
 pub use openshell_driver_launch as launch;
+pub use provider_launch::{
+    ProviderLaunchReplay, ProviderStopMutation, drain_provider_launches,
+    legacy_provider_launch_outcome, lock_existing_provider_launch, lookup_provider_launch_receipt,
+    ordered_provider_launch_operation, own_provider_launch_work, provider_launch_retired,
+    replay_provider_launch, replay_provider_stop, run_provider_containment,
+    try_provider_launch_lock,
+};
 pub use start::{EXIT_CONFIG, EXIT_UNAVAILABLE, StartKind, StartReport, StartResult};
 pub use table::{MAX_TABLE_BYTES, read_stdin_table, read_table};
 pub use telemetry::{deferred_export_config, supervisor_otlp};

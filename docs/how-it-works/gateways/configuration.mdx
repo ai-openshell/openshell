@@ -1571,7 +1571,17 @@ Set `driver_dir` in `[openshell.gateway]`. A `driver_dir` in a driver table is d
 
 When no driver is selected, the gateway tries Kubernetes, then Podman, then Docker. For Podman and Docker it starts the driver with the operator's table, so a configured `socket_path` is honored. The first driver that binds its socket is kept and configured, so detection never starts a driver it then stops. For Docker it does the same with the Docker table. A table that is invalid, or a socket that is not reachable, moves detection to the next candidate and logs the reason. A driver that crashes or times out stops startup. If a driver is selected by name, any such failure stops startup, except that Podman is started again a few times while its socket is unreachable, as the in-process driver retried.
 
-On shutdown, the gateway stops sandboxes through each launched driver and then releases the driver with the launch protocol's `Shutdown` call. A driver defers a `SIGTERM` or `SIGINT` that reaches it from elsewhere, such as the signal a service manager sends to every process of the gateway's unit, until the gateway releases it, the gateway exits, or 30 seconds pass. Sandboxes therefore stop even when the whole unit is signalled.
+On shutdown, the gateway normally stops sandboxes through the launched driver
+before releasing it with the launch protocol's `Shutdown` call. A driver defers
+a `SIGTERM` or `SIGINT` from elsewhere until the gateway releases it, the
+gateway exits, or 30 seconds pass.
+
+With verified provider workload identity, the gateway skips the shutdown stop
+sweep and reconciles retained sandboxes on startup. Compute may keep running
+after gateway shutdown. Stop those sandboxes explicitly before shutting down
+if they must exit. The gateway gives launched drivers time to finish accepted
+provider operations. A service manager can interrupt the drain if its own stop
+timeout expires.
 
 Each launch gets its own private socket directory, which goes away with the driver. If a launched driver exits while the gateway is running, the gateway logs an error and exits with a nonzero status. Running sandboxes continue.
 
@@ -1751,6 +1761,164 @@ into the gateway pod and sets `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`.
 The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
+
+### Sandbox identity through the Workload API
+
+Enable `spiffe_workload_identity` to give each sandbox a stable SPIFFE ID for
+provider grants. Docker, Podman, and MicroVM connect their dedicated
+supervisors to a Workload API Unix socket. The issuer must authorize each
+supervisor for both the stable sandbox ID and a separate launch ID.
+
+If the mode is already enabled, follow the disable procedure below before
+upgrading. Upgrade the gateway, selected driver, and supervisor image or
+binary with `spiffe_workload_identity` absent. Managed Docker and Podman
+enable verified identity checks when the gateway selects the mode explicitly.
+Once the components are on matching versions, configure both identities,
+enable the mode, and restart existing sandboxes to deliver the new launch
+bundle.
+
+```toml
+[openshell.gateway.spiffe_workload_identity]
+spiffe_id_prefix = "spiffe://example.org/openshell"
+workload_api_socket_path = "/run/spire/agent.sock"
+```
+
+Set a positive `ttl_secs` in the existing `[openshell.gateway.gateway_jwt]`
+table. The gateway socket must be an absolute Unix socket path in the gateway's
+filesystem. The gateway reuses the JWT trust bundle for up to five seconds
+and refreshes it on demand. For
+`token_exchange`, it also uses the socket to fetch its own JWT-SVID for the
+intermediate exchange. Configure only one of `spiffe_workload_identity` and
+`spiffe_broker`. Use the Broker API mode for shared Kubernetes supervisors.
+
+Select a compute driver explicitly with `openshell.gateway.compute_driver`,
+`OPENSHELL_COMPUTE_DRIVER`, or `--compute-driver`. For Docker, Podman, and
+MicroVM, set `provider_spiffe_workload_api_socket` to an absolute Unix socket
+path in the selected driver table. Docker and Podman project the socket into
+the dedicated supervisor. MicroVM connects from its host supervisor to a
+socket on the driver host. Podman's TCP endpoints serve direct supervisor
+exchanges. Managed Docker and Podman check supervisor image compatibility
+at startup when verified identity is enabled. With direct grants, Podman
+prepares the image when a sandbox needs it.
+The supervisor must reach the gateway over HTTPS or direct HTTP to a loopback
+IP address. Docker bridge networking and the default Podman Machine callback
+require HTTPS. In `openshell gateway info`, the capability
+`openshell.compute.provider-workload-identity.v5` reports that the driver
+supports the launch bundle, Workload API socket, and durable starts and stops.
+The gateway also requires `openshell.compute.ordered-provider-start`.
+Use matching gateway and driver versions. Settle pending starts and stops on their
+original gateway and driver pairing before upgrading, or restore that pairing
+to settle them. Driver instances that share a backend must share launch state.
+Podman stores it under
+`$XDG_STATE_HOME/openshell/podman/provider-launches`. Docker stores it with
+sandbox boundary state. MicroVM stores it under `provider-launches` in the
+configured VM state directory.
+
+Back up the gateway database, driver launch state, and sandbox backend state
+from the same recovery point. Stop the gateway and driver to keep the state
+stable during backup and restore. If the restored database is older than the
+launch journal, the driver can reject a launch as stale and leave the sandbox
+pending, which blocks start and deletion.
+
+Check issuer entitlement separately. The gateway makes the OAuth
+requests. Confirm each provider's
+`token_endpoint` is reachable from the gateway and that the gateway trusts the
+token service's TLS certificate. A loopback token endpoint refers to the
+gateway's own network namespace. Configure the OAuth server to trust the
+SPIFFE issuer and accept the stable sandbox subject. For `token_exchange`,
+also authorize the gateway's SPIFFE identity for the intermediate exchange.
+
+If an operator revokes caller driver configuration during a pending launch,
+a gateway and driver that support
+`openshell.compute.ordered-provider-start.receipt-lookup` can settle it from
+a matching stored terminal result without starting compute. A missing or
+unknown result leaves the launch pending.
+
+Configure the Workload API issuer to register both identities for each
+supervisor process. The stable ID is
+`<spiffe_id_prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`. The launch ID
+appends `/launch/<launch-uuid>` to the stable ID. The launch UUID changes on a
+fresh start and when gateway recovery replaces the supervisor. Bind both
+registrations to the intended live process and retire them when that process
+exits. The issuer controls which callers can request each identity.
+
+- For Docker and Podman, the driver sets
+  `openshell.ai/provider-launch-spiffe-id` on the supervisor container. Bind
+  the registration to that container's supervised process using trusted engine
+  metadata and the `openshell.ai/isolation-role=supervisor` label.
+  On rootless Podman, the engine owner controls the labels. Use an engine
+  controlled by a trusted host account and scope issuance to that account's
+  launches. [SPIRE container attestation](https://github.com/spiffe/spire/blob/main/doc/plugin_agent_workloadattestor_docker.md)
+- For MicroVM, use a trusted host attestor that independently binds the
+  launched supervisor to its kernel process identity and verifies that
+  identity for each Workload API caller. The launch ID and PID in the
+  driver log are diagnostic. A delayed PID lookup can identify a different
+  process after PID reuse. Stock SPIRE Unix selectors for user and
+  executable are shared across VM supervisors.
+  After a MicroVM driver restart, the supervisor waits for fresh launch
+  credentials from the gateway. If the gateway stays up, stop and start the
+  sandbox to launch its supervisor again.
+  [SPIRE Unix attestation](https://github.com/spiffe/spire/blob/main/doc/plugin_agent_workloadattestor_unix.md)
+
+The supervisor requests the stable ID for the provider audience and the launch
+ID for `urn:openshell:provider-grants:launch:<generation>`. On every grant the
+gateway verifies both subjects and audiences, the active session, and the
+provider attachment. The gateway sends the stable assertion to the token
+service and returns the final access token to the supervisor. See
+[Dynamic Token Grants](/how-it-works/providers/profiles#dynamic-token-grants).
+
+#### Verify dedicated provider identity
+
+Use a disposable trust domain with the deployment's Workload API attestor,
+an OAuth fixture that verifies JWT-SVID signatures and audiences, and a
+protected HTTP target that returns a success marker. Run the full check on
+Docker. Repeat the launch checks on two MicroVMs with the host attestor
+described above. Verify that each host supervisor is denied both identities
+belonging to the other, then repeat the stale-launch check after a restart.
+
+1. Attach the same provider to two Docker sandboxes and call the protected
+   target from both. Confirm the OAuth fixture sees a different stable subject
+   for each sandbox. At the Workload API issuer, record the attested peer,
+   registration, SPIFFE ID, requested audience, and issuance decision. Check
+   that each supervisor receives its stable ID for the provider audience and
+   its launch ID for the launch audience. The OAuth fixture should receive the
+   stable assertion on the final grant.
+2. Stop and start one sandbox, retire its old registrations, and register the
+   replacement. Confirm the OAuth fixture sees the same stable subject and the
+   issuer authorizes the replacement's new launch ID. Use an authorized test
+   peer outside the current registration to check that the issuer denies both
+   identities. Independently, check that the gateway accepts the current
+   session and proof and denies stale launch authorization before serving a
+   cached token or contacting OAuth.
+3. Give the final token a short lifetime and confirm a later request on the
+   same launch causes a fresh OAuth issuance. Interrupt gateway access, the
+   Workload API, and the OAuth endpoint separately. Check that a required
+   acquisition fails with a generic HTTP 502 and no request reaches the
+   protected target. A live gateway cache entry can cover an OAuth outage
+   while identity checks still pass. Allow recent assertions and bundles to
+   expire when checking the Workload API outage.
+
+Use request and issuance IDs to correlate the records. Keep raw credentials
+out of the records. Check workload environment, arguments, mounts, and
+response bodies for the Workload API socket, session JWT, assertions, and
+provider tokens.
+
+To disable the mode, remove the table, restart the gateway, and restart
+affected sandboxes before restoring provider traffic. A supervisor keeps the
+grant mode it selected at launch. Restart on matching builds before
+downgrading, so the replacement launch bundle omits the provider identity.
+This also refreshes saved launch bundles used during MicroVM driver recovery.
+Let pending provider starts and stops recover before changing the SPIFFE
+identity prefix or disabling the mode. Gateway recovery retries the same
+operation until the driver reports a terminal outcome. An explicit stop stays
+in `Stopping` until a matching receipt confirms that compute stopped or is
+absent. If a driver or container engine crashes during a backend change that
+it cannot verify after restart, the gateway keeps the operation pending and
+blocks another start or deletion.
+
+If Docker or Podman cannot confirm the outcome of a stop issued after
+runtime admission fails, the driver records it and blocks replacement of
+that retained workload across driver restarts.
 
 ### Sandbox identity through the SPIFFE Broker API
 
@@ -2221,11 +2389,9 @@ overlay_disk_mib = 4096
 # see IPv6 Egress and NAT64.
 # policy_dns_ipv6_egress    = "auto"
 # nat64_prefixes            = ["2001:db8:64::/96"]
-# VM guests cannot mount a host Workload API Unix socket. Configure only a
-# separately operated guest-reachable TCP listener and explicitly acknowledge
-# the exposure; host-only sockets are never exposed automatically.
-# provider_spiffe_workload_api_tcp_endpoint = "tcp:192.0.2.10:8081"
-# provider_spiffe_allow_guest_tcp = true
+# Optional Workload API Unix socket on the VM driver host. Configure
+# issuer-side attestation for each host supervisor launch.
+# provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 # Unsafe operator override. Host bind mounts expose gateway-host paths inside
 # VM sandboxes and can negate OpenShell isolation and filesystem controls.
 # Requires allow_driver_config = true and
@@ -2257,6 +2423,11 @@ externally managed `vm` socket owned by another user, the driver cannot read the
 gateway's staging directory and rootfs tar sources fail with a
 `FAILED_PRECONDITION` error; use a registry image reference instead.
 
+The legacy `provider_spiffe_workload_api_tcp_endpoint` and
+`provider_spiffe_allow_guest_tcp` settings are inactive. Use
+`provider_spiffe_workload_api_socket` on the VM driver host for provider grants.
+See the [host attestation requirements](#sandbox-identity-through-the-workload-api).
+
 ### Extension Driver
 
 Extension drivers run outside the gateway and expose the
@@ -2277,6 +2448,33 @@ compute_driver = "kyma"
 [openshell.drivers.kyma]
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
+
+An extension driver can opt into per-sandbox SPIFFE provider grants by staging
+a trusted Workload API Unix socket and the gateway's launch bundle for a
+compatible dedicated supervisor. Expose trusted runtime attributes the issuer
+can use to bind the launch SPIFFE ID in the bundle to that supervisor
+process. Replace supervisors through a gateway-coordinated launch so the
+gateway can advance the binding. Advertise
+`openshell.compute.provider-workload-identity.v5` when the driver provides the
+socket and launch bundle and supports ordered starts and stops. Advertise
+`openshell.compute.ordered-provider-start` and implement the Compute Driver
+API's `ordered_stop` and `ordered_start` exchanges. An automatic restart uses
+the same revision and operation ID for both stages. An explicit stop has its
+own operation ID and revision. A later start has a greater revision. For an
+explicit stop, return `OK` after confirming that compute stopped or
+`NOT_FOUND` after confirming it is absent. Persist each accepted stage and its
+terminal outcome before acknowledging it.
+Serialize retries across driver connections, reject superseded requests, and
+require a revision for verified starts. Keep the record until the sandbox is
+permanently deleted. See
+[Sandbox identity through the Workload API](#sandbox-identity-through-the-workload-api).
+
+Drivers that support receipt-only lookup advertise
+`openshell.compute.ordered-provider-start.receipt-lookup`. The gateway sets
+`StartSandboxRequest.ordered_start_receipt_only` (field 13) only after
+negotiating that capability. Return the matching stored terminal result with
+`replayed = true` without changing compute. Return a gRPC error when the result
+is missing or unknown so the gateway keeps the launch pending.
 
 ## Preflight package configuration {#gateway-config-preflight}
 

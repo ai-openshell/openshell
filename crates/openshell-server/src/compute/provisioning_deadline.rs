@@ -8,9 +8,11 @@
 //! Preparation has an absolute ceiling. The first authenticated supervisor
 //! configuration report starts admission repair, which remains armed until Ready.
 
-use openshell_core::proto::SandboxProvisioning;
+use openshell_core::proto::{Sandbox, SandboxPhase, SandboxProvisioning};
 use openshell_core::time::{timestamp_from_millis, timestamp_to_millis};
 use serde::{Deserialize, Serialize};
+
+use super::provisioning_operation;
 
 /// How long one scan pass waits, in total, for sandboxes' local keys. A sandbox
 /// whose keys are still busy is skipped until the next pass. Keys are taken in
@@ -276,7 +278,7 @@ impl ProvisioningDeadline {
 }
 
 /// Whether compute reclamation belongs to a timed-out provisioning attempt.
-pub fn timed_out(sandbox: &openshell_core::proto::Sandbox) -> bool {
+pub fn timed_out(sandbox: &Sandbox) -> bool {
     sandbox
         .status
         .as_ref()
@@ -285,12 +287,47 @@ pub fn timed_out(sandbox: &openshell_core::proto::Sandbox) -> bool {
 }
 
 /// A submitted operation still owns the possibility of a later backend commit.
-pub(super) fn driver_operation_pending(sandbox: &openshell_core::proto::Sandbox) -> bool {
+pub(super) fn driver_operation_pending(sandbox: &Sandbox) -> bool {
     sandbox
         .status
         .as_ref()
         .and_then(|status| status.provisioning.as_ref())
         .is_some_and(|record| record.driver_operation_pending)
+}
+
+fn pending_error_preparation_deadline(sandbox: &Sandbox) -> Option<&prost_types::Timestamp> {
+    if sandbox.phase() != i32::from(SandboxPhase::Error)
+        || !super::is_recoverable_error_reason(sandbox)
+    {
+        return None;
+    }
+    let record = sandbox.status.as_ref()?.provisioning.as_ref()?;
+    let deadline = record.deadline.as_ref()?;
+    if !record.driver_operation_pending
+        || record.preparation_deadline.as_ref() != Some(deadline)
+        || record.admission_start_time.is_some()
+        || provisioning_operation::pending_provider_restart_stop(sandbox)
+        || provisioning_operation::pending_provider_launch(sandbox)
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        return None;
+    }
+    Some(deadline)
+}
+
+fn can_claim_provisioning_timeout(sandbox: &Sandbox) -> bool {
+    matches!(
+        SandboxPhase::try_from(sandbox.phase()),
+        Ok(SandboxPhase::Provisioning | SandboxPhase::Starting)
+    ) || pending_error_preparation_deadline(sandbox).is_some()
+}
+
+pub(super) fn pending_error_preparation_overdue(sandbox: &Sandbox, now_ms: i64) -> bool {
+    pending_error_preparation_deadline(sandbox)
+        .and_then(|deadline| timestamp_to_millis(deadline).ok())
+        .is_some_and(|deadline| now_ms >= deadline)
 }
 
 /// Adopt an existing untimed attempt without granting it a new preparation phase.
@@ -366,8 +403,8 @@ pub fn allows_admission(record: &SandboxProvisioning, now_ms: i64) -> bool {
 
 /// Readiness, not admission acceptance, ends the repair window. A late Ready
 /// observation cannot win merely because the deadline scanner has not run yet.
-pub(super) fn reconcile_readiness(sandbox: &mut openshell_core::proto::Sandbox, now_ms: i64) {
-    use openshell_core::proto::{SandboxCondition, SandboxPhase};
+pub(super) fn reconcile_readiness(sandbox: &mut Sandbox, now_ms: i64) {
+    use openshell_core::proto::SandboxCondition;
     let Some(status) = sandbox.status.as_mut() else {
         return;
     };
@@ -415,7 +452,7 @@ pub(super) fn reconcile_readiness(sandbox: &mut openshell_core::proto::Sandbox, 
 }
 
 /// Attachment edits are stamped in the same sandbox CAS as the spec change.
-pub fn attachments_changed(sandbox: &mut openshell_core::proto::Sandbox, now_ms: i64) {
+pub fn attachments_changed(sandbox: &mut Sandbox, now_ms: i64) {
     if let Some(record) = sandbox
         .status
         .as_mut()
@@ -431,11 +468,10 @@ pub fn attachments_changed(sandbox: &mut openshell_core::proto::Sandbox, now_ms:
 /// rejection/expiry decision. Persist the returned record with the owning CAS.
 pub async fn refresh_configuration(
     store: &crate::persistence::Store,
-    sandbox: &mut openshell_core::proto::Sandbox,
+    sandbox: &mut Sandbox,
     now_ms: i64,
     repair_window_ms: i64,
 ) -> Result<(), String> {
-    use openshell_core::proto::SandboxPhase;
     if !matches!(
         SandboxPhase::try_from(sandbox.phase()),
         Ok(SandboxPhase::Provisioning | SandboxPhase::Starting)
@@ -489,10 +525,7 @@ impl super::ComputeRuntime {
 
     pub(super) async fn reconcile_provisioning_deadlines(&self, now_ms: i64) -> Result<(), String> {
         use crate::persistence::{ObjectListQuery, ObjectType};
-        use openshell_core::{
-            ObjectId, ObjectWorkspace,
-            proto::{Sandbox, SandboxPhase},
-        };
+        use openshell_core::{ObjectId, ObjectWorkspace};
         use prost::Message;
         let records = self
             .store
@@ -503,11 +536,7 @@ impl super::ComputeRuntime {
         for record in records {
             let candidate =
                 Sandbox::decode(record.payload.as_slice()).map_err(|error| error.to_string())?;
-            if !matches!(
-                SandboxPhase::try_from(candidate.phase()),
-                Ok(SandboxPhase::Provisioning | SandboxPhase::Starting)
-            ) && !timed_out(&candidate)
-            {
+            if !can_claim_provisioning_timeout(&candidate) && !timed_out(&candidate) {
                 continue;
             }
             // Expiration can fence Starting while its driver RPC owns the
@@ -608,15 +637,12 @@ impl super::ComputeRuntime {
     /// The separate cleanup step also requires the per-sandbox lifecycle gate.
     pub(crate) async fn claim_provisioning_timeout(
         &self,
-        current: &openshell_core::proto::Sandbox,
+        current: &Sandbox,
         now_ms: i64,
-    ) -> Result<Option<openshell_core::proto::Sandbox>, String> {
+    ) -> Result<Option<Sandbox>, String> {
         use openshell_core::ObjectId;
-        use openshell_core::proto::{Sandbox, SandboxCondition, SandboxPhase};
-        if !matches!(
-            SandboxPhase::try_from(current.phase()),
-            Ok(SandboxPhase::Provisioning | SandboxPhase::Starting)
-        ) {
+        use openshell_core::proto::SandboxCondition;
+        if !can_claim_provisioning_timeout(current) {
             return Ok(None);
         }
         let Some(record) = current
@@ -691,10 +717,9 @@ impl super::ComputeRuntime {
     /// cancellation, gateway restart, and a lost leader lease.
     pub(super) async fn reclaim_provisioning_timeout(
         &self,
-        expired: &openshell_core::proto::Sandbox,
+        expired: &Sandbox,
         lifecycle_guard: &super::SandboxLifecycleGuard,
     ) -> Result<(), String> {
-        use openshell_core::proto::Sandbox;
         use openshell_core::proto::compute::v1::StopSandboxRequest;
         use openshell_core::{ObjectId, ObjectName};
         let current = {
@@ -712,7 +737,7 @@ impl super::ComputeRuntime {
             .as_ref()
             .and_then(|status| status.provisioning.as_ref())
             .map(|record| record.attempt_id.as_str());
-        if current.phase() != i32::from(openshell_core::proto::SandboxPhase::Error)
+        if current.phase() != i32::from(SandboxPhase::Error)
             || current
                 .status
                 .as_ref()
@@ -731,6 +756,14 @@ impl super::ComputeRuntime {
             return Ok(());
         };
         if record.timeout_time.is_none() || record.cleanup_completed_time.is_some() {
+            return Ok(());
+        }
+        if provisioning_operation::pending_provider_launch(expired)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            // A replayable start can still be admitted by the driver. Settle
+            // that exact operation before issuing the timeout cleanup stop.
             return Ok(());
         }
         // A stop can observe NotFound before an in-flight create materializes
@@ -783,6 +816,7 @@ impl super::ComputeRuntime {
                             .stop_sandbox(tonic::Request::new(StopSandboxRequest {
                                 sandbox_id,
                                 name: sandbox_name,
+                                ordered_stop: None,
                             }))
                             .await
                     }

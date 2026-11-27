@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 const API_VERSION: &str = "v5.0.0";
 
 /// Timeout for individual Podman API calls.
-const API_TIMEOUT: Duration = Duration::from_mins(1);
+pub(crate) const API_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Maximum allowed size for the event stream line buffer (1 MB).
 const MAX_EVENT_BUFFER: usize = 1_048_576;
@@ -91,6 +91,8 @@ pub struct ContainerInspect {
     #[serde(default)]
     pub mounts: Option<Vec<Value>>,
     pub id: String,
+    #[serde(default)]
+    pub image: String,
     pub name: String,
     pub state: ContainerState,
     #[serde(default)]
@@ -172,12 +174,33 @@ pub struct ContainerConfig {
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub user: String,
-    /// The immutable image ID the container was created from. Podman records
-    /// the reference used at creation time here; workloads are always created
-    /// from a resolved image ID, so this pins the image the container runs
-    /// independently of any later tag movement.
     #[serde(default)]
-    pub image: String,
+    pub secrets: Option<Vec<ContainerSecret>>,
+    #[serde(
+        default,
+        rename = "Env",
+        deserialize_with = "provider_spiffe_socket_from_env"
+    )]
+    pub provider_spiffe_socket: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ContainerSecret {
+    pub name: String,
+}
+
+fn provider_spiffe_socket_from_env<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let env = <Option<Vec<String>> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(env.into_iter().flatten().find_map(|entry| {
+        let (name, value) = entry.split_once('=')?;
+        (name == openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
+            && !value.is_empty())
+        .then(|| value.to_owned())
+    }))
 }
 
 /// Immutable image metadata needed to bind OCI identity inspection to launch.
@@ -612,6 +635,26 @@ impl PodmanClient {
         .await
     }
 
+    pub(crate) async fn kill_paused_container(&self, name: &str) -> Result<(), PodmanApiError> {
+        validate_name(name)?;
+        self.request_ok(
+            hyper::Method::POST,
+            &format!("/libpod/containers/{name}/kill?signal=SIGKILL"),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn wait_for_container_exit(&self, name: &str) -> Result<i32, PodmanApiError> {
+        validate_name(name)?;
+        self.request_json(
+            hyper::Method::POST,
+            &format!("/libpod/containers/{name}/wait?condition=exited"),
+            None,
+        )
+        .await
+    }
+
     /// Stop a container with a grace period in seconds.
     pub async fn stop_container(
         &self,
@@ -725,6 +768,28 @@ impl PodmanClient {
             Ok(bytes)
         } else {
             Err(error_from_response(status.as_u16(), &bytes))
+        }
+    }
+
+    pub(crate) async fn container_path_exists(
+        &self,
+        name: &str,
+        path: &str,
+    ) -> Result<bool, PodmanApiError> {
+        validate_name(name)?;
+        let encoded_path = url_encode(path);
+        let (status, bytes) = self
+            .request(
+                hyper::Method::HEAD,
+                &format!("/libpod/containers/{name}/archive?path={encoded_path}"),
+                None,
+                API_TIMEOUT,
+            )
+            .await?;
+        match status {
+            hyper::StatusCode::NOT_FOUND => Ok(false),
+            status if status.is_success() => Ok(true),
+            status => Err(error_from_response(status.as_u16(), &bytes)),
         }
     }
 

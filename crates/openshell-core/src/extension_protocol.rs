@@ -47,6 +47,20 @@ pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
 pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
     "openshell.compute.update-sandbox-configuration";
 
+/// Driver provisions the Workload API, exposes the launch ID, and durably orders starts and stops.
+pub const COMPUTE_PROVIDER_WORKLOAD_IDENTITY: &str =
+    "openshell.compute.provider-workload-identity.v5";
+
+/// Driver fences provider launch effects using the revision sent with `StartSandbox`.
+pub const COMPUTE_ORDERED_PROVIDER_LAUNCH: &str = "openshell.compute.ordered-provider-launch";
+
+/// Driver durably orders and replays starts for verified provider identity.
+pub const COMPUTE_ORDERED_PROVIDER_START: &str = "openshell.compute.ordered-provider-start";
+
+/// Driver can return an ordered start receipt without admitting a start.
+pub const COMPUTE_ORDERED_PROVIDER_START_RECEIPT_LOOKUP: &str =
+    "openshell.compute.ordered-provider-start.receipt-lookup";
+
 /// Capability for supervisor middleware that implements HTTP hooks.
 ///
 /// A service selects HTTP hooks for all of its HTTP bindings by
@@ -160,6 +174,10 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
             supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
             supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
             supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
+            supported_capabilities.push(COMPUTE_PROVIDER_WORKLOAD_IDENTITY.to_string());
+            supported_capabilities.push(COMPUTE_ORDERED_PROVIDER_LAUNCH.to_string());
+            supported_capabilities.push(COMPUTE_ORDERED_PROVIDER_START.to_string());
+            supported_capabilities.push(COMPUTE_ORDERED_PROVIDER_START_RECEIPT_LOOKUP.to_string());
         }
         ExtensionFamily::SupervisorMiddleware => {
             supported_capabilities.push(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string());
@@ -458,20 +476,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compute_gateway_advertises_both_optional_extensions() {
+    fn compute_gateway_advertises_optional_extensions() {
         let gateway = gateway_metadata(ExtensionFamily::Compute);
-        assert!(
-            gateway
-                .supported_capabilities
-                .iter()
-                .any(|c| c == COMPUTE_ISOLATION_BACKEND)
-        );
-        assert!(
-            gateway
-                .supported_capabilities
-                .iter()
-                .any(|c| c == COMPUTE_UPDATE_SANDBOX_CONFIGURATION)
-        );
+        for capability in [
+            COMPUTE_ISOLATION_BACKEND,
+            COMPUTE_UPDATE_SANDBOX_CONFIGURATION,
+            COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+            COMPUTE_ORDERED_PROVIDER_LAUNCH,
+            COMPUTE_ORDERED_PROVIDER_START,
+            COMPUTE_ORDERED_PROVIDER_START_RECEIPT_LOOKUP,
+        ] {
+            assert!(has_capability(&gateway.supported_capabilities, capability));
+        }
     }
 
     fn compatible() -> (PeerMetadata, PeerMetadata) {

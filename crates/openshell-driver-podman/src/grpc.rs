@@ -177,11 +177,7 @@ impl ComputeDriver for ComputeDriverService {
                 if request.sandbox_id.is_empty() {
                     return Err(Status::invalid_argument("sandbox_id is required"));
                 }
-                self.driver
-                    .stop_sandbox(&request.sandbox_id)
-                    .await
-                    .map_err(Status::from)?;
-                Ok(Response::new(StopSandboxResponse {}))
+                self.driver.stop_sandbox_request(request).await
             })
             .await
     }
@@ -197,16 +193,7 @@ impl ComputeDriver for ComputeDriverService {
                     if request.sandbox_id.is_empty() {
                         return Err(Status::invalid_argument("sandbox_id is required"));
                     }
-                    self.driver
-                        .start_sandbox(
-                            &request.sandbox_id,
-                            &request.generation_id,
-                            &request.launch_authentication,
-                            request.sandbox.as_ref(),
-                        )
-                        .await
-                        .map_err(Status::from)?;
-                    Ok(Response::new(StartSandboxResponse::default()))
+                    self.driver.start_sandbox_request(request).await
                 }),
         )
         .await
@@ -694,6 +681,7 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "forward-id",
             vec![
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // inspect companion
                 StubResponse::new(StatusCode::NOT_FOUND, ""), // companion
                 StubResponse::new(StatusCode::NOT_FOUND, ""), // channel
                 // list_containers returns empty (container already gone)
