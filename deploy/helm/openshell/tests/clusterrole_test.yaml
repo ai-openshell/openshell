@@ -35,7 +35,7 @@ tests:
       - notExists:
           path: rules[?(@.resources[0] == "networkpolicies")].verbs[?(@ == "update")]
       - notExists:
-          path: rules[?(@.resources[0] == "networkpolicies" && @.resourceNames == null)].verbs[?(@ == "patch")]
+          path: rules[?(@.resources[0] == "networkpolicies" && !@.resourceNames)].verbs[?(@ == "patch")]
 
   - it: limits namespaced admission reads to PVCs
     set:
