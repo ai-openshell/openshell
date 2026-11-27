@@ -29,9 +29,6 @@ pub struct LocalDriver {
     /// Removes keys earlier releases accepted that the driver's strict table no
     /// longer does. The gateway warns about each, so the driver can reject them.
     pub drop_legacy_keys: fn(&mut toml::map::Map<String, toml::Value>),
-    /// Start a named driver again this often while its backend is unreachable.
-    /// Drivers that never retried leave it unset.
-    pub retry_unavailable: Option<UnavailableRetry>,
 }
 
 /// The gateway's view of a driver's table: where its binary is, and the table
@@ -163,13 +160,9 @@ impl LocalDriver {
                 socket_dir,
                 log_level: gateway_log_level,
             };
-            let outcome = match self.retry_unavailable {
-                Some(retry) => {
-                    launcher::launch_tolerating_unavailable(request, configure, on_exit, retry)
-                        .await?
-                }
-                None => launcher::launch(request, configure, on_exit).await?,
-            };
+            let outcome =
+                launcher::launch_tolerating_unavailable(request, configure, on_exit, BACKEND_RETRY)
+                    .await?;
             match outcome {
                 LaunchOutcome::Launched(launched) => launched,
                 LaunchOutcome::InvalidConfig(reason) => {
@@ -203,6 +196,9 @@ impl LocalDriver {
     }
 }
 
-/// How long to wait between starts while a named driver's backend is down.
-#[cfg(feature = "compute-driver-podman")]
-pub const BACKEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often a named driver is started while its backend is unreachable, such
+/// as a socket restarting during a package upgrade.
+const BACKEND_RETRY: UnavailableRetry = UnavailableRetry {
+    attempts: 6,
+    delay: std::time::Duration::from_secs(2),
+};
