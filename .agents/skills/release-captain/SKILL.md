@@ -32,9 +32,8 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
 
 - A train has one base version, such as `v0.1.4`, fixed by its `-pre.1` tag. A
   patch train can't take breaking changes to Stable interfaces.
-- `Release Auto-Tag` has no schedule while scheduled pre-releases are paused.
-  Dispatch it with `gh workflow run release-auto-tag.yml --ref main`. If `main`
-  has commits since the latest `-pre.N`, it tags the next one and dispatches
+- `Release Auto-Tag` runs on weekdays at 14:00 Europe/Zurich. If `main` has
+  commits since the latest `-pre.N`, it tags the next one and dispatches
   `Pre-release` (`release-prerelease.yml`, about 45 minutes). It skips when the
   train has no `-pre.1` or the base version is already stable.
 - `Pre-release` builds, then publishes and qualifies in parallel, and writes a
@@ -47,6 +46,9 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
   repository must exist and Actions must have a `BUF_TOKEN` secret with write
   access. A failed Buf push fails the release run; follow Recovery before
   rerunning the failed publication job.
+- Pre-release and stable builds leave the `experimental` feature disabled. Release
+  Dev enables it through `experimental: true`. Normal workspace builds, lint,
+  and tests enable `experimental` without separate CI lanes for development features.
 
 ## Setup
 
@@ -89,8 +91,10 @@ git worktree remove --force "$wt"
 
    If the next version has no `-pre.1`, start the train (Tuesday step 6).
 
-2. **Triage the compatibility review** for the candidate's run. It's advisory,
-   and a green job doesn't mean it found no breaks:
+2. **Triage the compatibility review** when enabled for the candidate's run.
+   Both Codex review jobs are temporarily skipped pending fixes; skip this step
+   while they are disabled. When enabled, the review is advisory, and a green
+   job doesn't mean it found no breaks:
 
    ```shell
    ATTEMPT=$(gh run view "$RUN" --json attempt --jq .attempt)

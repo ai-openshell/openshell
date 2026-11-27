@@ -209,6 +209,13 @@ pub struct PodmanComputeConfig {
     /// JSON is rejected instead of silently diverging from it.
     #[serde(skip)]
     pub additional_ca_bundle: Option<String>,
+    /// AAAA handling for the supervisor's mediated policy DNS (`auto`,
+    /// `enabled` or `disabled`). Unset means the supervisor default, `auto`.
+    pub policy_dns_ipv6_egress: Option<openshell_core::PolicyDnsIpv6Egress>,
+    /// NAT64 prefixes (RFC 6052) of the sandbox network. The supervisor
+    /// classifies addresses inside them by their embedded IPv4 address.
+    #[serde(default)]
+    pub nat64_prefixes: Vec<String>,
     /// User namespace mode for sandbox containers (e.g. `auto`, `private`).
     /// When unset, containers use the default user namespace.
     pub userns: Option<String>,
@@ -258,6 +265,43 @@ pub fn parse_id_map_entry(
     Ok((container_id, host_id, size))
 }
 
+/// Parse and validate the operator's `[openshell.drivers.podman]` table.
+///
+/// This is the only place the table is parsed. It has no side effects: it
+/// needs neither the gateway context nor Podman. An empty table selects the
+/// defaults.
+pub fn settings_from_table(table: &str) -> Result<PodmanComputeConfig, String> {
+    // The gateway supplies these through `Configure`. The standalone driver
+    // still takes them as flags, so the struct keeps the fields.
+    let keys: toml::Table =
+        toml::from_str(table).map_err(|error| format!("invalid podman driver table: {error}"))?;
+    if let Some(key) = GATEWAY_SUPPLIED_KEYS
+        .iter()
+        .find(|key| keys.contains_key(**key))
+    {
+        return Err(format!(
+            "invalid podman driver table: `{key}` is supplied by the gateway and cannot be set here"
+        ));
+    }
+    let mut config: PodmanComputeConfig =
+        toml::from_str(table).map_err(|error| format!("invalid podman driver table: {error}"))?;
+    if !config.grpc_endpoint.trim().is_empty() {
+        openshell_driver_sdk::validate_grpc_endpoint(&config.grpc_endpoint)?;
+    }
+    config
+        .validate_configuration()
+        .map_err(|error| error.to_string())?;
+    Ok(config)
+}
+
+/// Settings the gateway supplies through `Configure` instead of the table.
+const GATEWAY_SUPPLIED_KEYS: &[&str] = &[
+    "gateway_port",
+    "guest_tls_ca",
+    "allow_driver_config",
+    "resource_admission",
+];
+
 impl PodmanComputeConfig {
     /// Validate and normalize startup configuration without connecting to Podman.
     pub fn validate_configuration(&mut self) -> Result<(), crate::client::PodmanApiError> {
@@ -268,6 +312,9 @@ impl PodmanComputeConfig {
         self.validate_runtime_limits()?;
         self.validate_host_gateway_ip()?;
         self.validate_proxy_config()?;
+        self.ipv6_egress_config()
+            .validate()
+            .map_err(crate::client::PodmanApiError::InvalidInput)?;
         self.validate_app_armor_profile()?;
         if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
             let raw = socket.to_str().ok_or_else(|| {
@@ -284,6 +331,15 @@ impl PodmanComputeConfig {
         }
         self.canonicalize_userns()?;
         self.validate_userns_mappings()
+    }
+
+    /// Supervisor IPv6 egress settings in their shared form.
+    #[must_use]
+    pub fn ipv6_egress_config(&self) -> openshell_core::SupervisorIpv6EgressConfig {
+        openshell_core::SupervisorIpv6EgressConfig {
+            policy_dns_ipv6_egress: self.policy_dns_ipv6_egress,
+            nat64_prefixes: self.nat64_prefixes.clone(),
+        }
     }
 
     /// Returns `true` when the gateway CA is configured.
@@ -567,6 +623,8 @@ impl Default for PodmanComputeConfig {
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
             additional_ca_bundle: None,
+            policy_dns_ipv6_egress: None,
+            nat64_prefixes: Vec::new(),
             userns: None,
             uidmap: Vec::new(),
             gidmap: Vec::new(),
@@ -609,10 +667,41 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
             .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
             .field("proxy_ca_bundle", &self.proxy_ca_bundle)
+            .field("policy_dns_ipv6_egress", &self.policy_dns_ipv6_egress)
+            .field("nat64_prefixes", &self.nat64_prefixes)
             .field("userns", &self.userns)
             .field("uidmap", &self.uidmap)
             .field("gidmap", &self.gidmap)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    #[test]
+    fn gateway_supplied_keys_are_rejected() {
+        for key in [
+            "gateway_port = 8080",
+            "guest_tls_ca = \"/ca.pem\"",
+            "allow_driver_config = true",
+            "resource_admission = {}",
+        ] {
+            let error = settings_from_table(key).unwrap_err();
+            assert!(error.contains("supplied by the gateway"), "{error}");
+        }
+    }
+
+    #[test]
+    fn grpc_endpoint_is_checked_for_syntax_and_scheme() {
+        settings_from_table("grpc_endpoint = \"https://gw.test:8443\"").unwrap();
+        for bad in ["ftp://gw.test:1", "gw.test:8080"] {
+            assert!(
+                settings_from_table(&format!("grpc_endpoint = \"{bad}\"")).is_err(),
+                "accepted: {bad}"
+            );
+        }
     }
 }
 
@@ -1120,6 +1209,22 @@ mod tests {
                 "{allow:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn validate_configuration_checks_nat64_prefixes() {
+        let mut config: PodmanComputeConfig = serde_json::from_str(
+            r#"{"policy_dns_ipv6_egress":"enabled","nat64_prefixes":["2001:db8:64::/96"]}"#,
+        )
+        .expect("podman config parses");
+        assert_eq!(
+            config.policy_dns_ipv6_egress,
+            Some(openshell_core::PolicyDnsIpv6Egress::Enabled)
+        );
+        config.validate_configuration().unwrap();
+
+        config.nat64_prefixes = vec!["10.0.0.0/8".to_string()];
+        assert!(config.validate_configuration().is_err());
     }
 
     #[test]

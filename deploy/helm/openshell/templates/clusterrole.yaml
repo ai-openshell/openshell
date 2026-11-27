@@ -139,16 +139,16 @@ rules:
       - create
       - get
   {{- if $managedSshIngressEnabled }}
-  # Apply gateway-only SSH ingress isolation in managed namespaces.
+  # Server-side apply needs patch only for the fixed SSH policy name.
+  # The shared rule above provides get/create for runtime policies.
   - apiGroups:
       - networking.k8s.io
     resources:
       - networkpolicies
+    resourceNames:
+      - openshell-sandbox-ssh
     verbs:
-      - get
-      - create
       - patch
-      - update
   {{- end }}
   {{- end }}
 {{- end }}

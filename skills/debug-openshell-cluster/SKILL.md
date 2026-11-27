@@ -245,12 +245,23 @@ the driver did not supply an immutable image ID; Kubernetes currently omits it.
 When no image UID is available, `unmapped.container_image` preserves any known
 workload image reference, including for VM and shared-supervisor records.
 For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
-runtime libraries, CA certificates, and inherited user and working directory.
+runtime libraries, CA certificates, and working directory. The image defaults
+to UID/GID `65534:65534`; compute drivers select the runtime identity explicitly.
 Use container logs, engine inspection and the configured exec health probe for
 diagnostics; `exec ... sh`, package installation and in-container shell scripts
 are unavailable. Workload shells belong to the separate sandbox image. Preserve
 the driver-selected UID and writable runtime/log mounts when reproducing a
 supervisor startup failure.
+
+The image's exec healthcheck uses `/run/openshell/health.sock`. Docker and
+Podman override it to match their configured readiness sockets; Kubernetes
+uses its own TCP probes. On a direct image launch, check that the image probe
+matches the explicitly configured `--health-socket-path`; a dedicated
+supervisor does not create a readiness socket unless this flag is set.
+For direct shared or network-proxy launches, use `docker run --no-healthcheck`
+and monitor readiness externally: the shell-free image's native probe supports
+only Unix sockets. The dedicated readiness socket closes when the
+supervisor session becomes unready, so a stale socket file is not sufficient.
 
 A `ConfigurationInvalid` readiness condition means startup admission rejected
 the image/effective policy or provider configuration. The supervisor remains
@@ -307,7 +318,7 @@ for the marker format and delivery limits.
 docker info
 docker ps --filter name=openshell
 docker logs <container> --tail=200
-docker run --rm --entrypoint /openshell-sandbox "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-ghcr.io/nvidia/openshell/sandbox:latest}" --version
+docker run --rm --entrypoint /openshell-sandbox "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-quay.io/ai-openshell/sandbox:latest}" --version
 openshell status
 ```
 
@@ -352,6 +363,7 @@ Common findings:
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify the sibling binary next to `openshell-gateway`, or that the configured `sandbox_runtime_image` contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and the supervisor's gateway endpoint.
 - SSH host-key startup errors: use matching gateway, compute-driver, and supervisor releases. The gateway retains each sandbox's SSH key in its configured credential store and sends it only through the supervisor bootstrap bundle. Check credential-driver availability and compare the public `host_key_fingerprint` from sandbox JSON output; never print the bootstrap bundle or private key. A missing stored key for a sandbox with a fingerprint is an error, not permission to replace its identity. See the [sandbox SSH identity documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview).
+- Client reports `SSH host key mismatch for sandbox '<name>'`: the SSH server reached through the gateway presented a key other than the one the gateway publishes, and the client refused it before authentication. Read the published `host_key_fingerprint` with `openshell sandbox get <name> --output json` and compare it with the `gateway published` and `server presented` values in the error. Use matching gateway, compute-driver, and supervisor releases, then stop and start the sandbox so its supervisor restarts with the assigned key. Do not work around the check.
 - Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. For token grant failures on any HTTP protocol, including failures before endpoint selection, inspect `last_token_grant_failure` in JSON output. It contains the bounded destination and cause, survives unrelated successful traffic, and clears on matching grant success or a policy, provider, or supervisor reset. If several paths share a host and port, other failures before the path is known, such as TLS failures, remain only in logs. A `CredentialUnavailable` result from a failed dynamic token grant also carries `last_failure` with a closed-set `code`, `stage`, `recovery_action`, the provider and credential names, and the `request_id` that the workload received in its `x-openshell-request-id` response header. Search `openshell logs <name>` for that ID: the supervisor's `Token grant failed` line carries the code and stage for every endpoint, and the gateway's `dynamic token grant failed` line appears when the gateway hop failed. Verify the actual operation when current tool availability matters.
 - On Docker Desktop, repeated `Policy fetch failed after 5 attempts` messages
   can mean the supervisor's selected network mode cannot reach the gateway.
@@ -513,6 +525,12 @@ When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
 
 ### Step 6: Check Kubernetes Helm Gateways
 
+If a gateway, supervisor, or sandbox pod shows `ImagePullBackOff`, verify that
+the nodes can reach `quay.io/ai-openshell`, or the mirror set in
+`global.image.registry`, and that the requested image tag exists there. Images
+are public, so a pull failure after a successful chart download usually means
+the cluster has no route to the registry while the Helm client does.
+
 ```bash
 helm -n openshell status openshell
 helm -n openshell get values openshell
@@ -526,6 +544,15 @@ Use the log and rollout commands for the gateway resource kind that exists in
 the release. Look for failed installs, unexpected values, missing namespace, wrong
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
+
+If the opt-in storage preflight stops a fresh StatefulSet install, run
+`kubectl get storageclass` and set `server.dataStorageClass` to an existing
+class for dynamic provisioning. The Helm identity needs cluster-scoped
+`list storageclasses` permission for the check. If the API denies the lookup,
+set an explicit gateway class or disable the check. Set
+`storageClass.preflight.enabled=false` when reinstalling with retained gateway
+PVCs. Check `server.workspaceStorageClass` separately when the cluster has no
+default class.
 
 If Kubernetes rejects `app.kubernetes.io/version` on a resource or certgen hook,
 inspect the rendered label and chart app version. Charts normalize SemVer build
@@ -568,6 +595,15 @@ kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
 
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
+
+The Helm gateway container defaults to a read-only root filesystem. For
+`Read-only file system` errors, check that writes target the writable `/tmp`,
+`/var/lib/openshell-state`, or StatefulSet `/var/openshell` mounts. The chart adds
+a `gateway-tmp` emptyDir at `/tmp` unless `server.extraVolumeMounts` already mounts
+that path; the default optional OCSF log uses `/tmp/gateway-ocsf.jsonl`. Custom
+output paths need writable mounts through `server.extraVolumes` and
+`server.extraVolumeMounts`. Inspect `securityContext.readOnlyRootFilesystem` if
+an operator explicitly opted out.
 
 Gateway pod scheduling accepts top-level `nodeSelector`, `affinity`,
 `tolerations`, `priorityClassName`, and `topologySpreadConstraints` values for
@@ -843,15 +879,15 @@ blocks, every other one. A backend that holds the legacy key as `ShareLock`
 holds or waits for exactly one sandbox's SSH identity key, so its other
 advisory lock row in `pg_locks` is that sandbox's key.
 Sandbox create holds its mutation guard while it waits for those keys. A wait
-that runs out returns `UNAVAILABLE` with "lock sandbox SSH identity failed",
-and neither
-`openshell_server_mutation_lock_timeouts_total` nor
-`openshell_server_mutation_lock_errors_total` counts it. A 10-second wait for
-one of the replica's data-pool lock slots (half of
-`database_max_connections`), which provider refresh shares, fails the same way (or with "credential refresh
-coordination unavailable") and logs "data-pool lock slots stayed busy". At a
-small `database_max_connections`, slow refresh mints or slow credential
-drivers cause it, and raising the pool fixes it.
+that runs out returns `UNAVAILABLE` with reason `MUTATION_LOCK_TIMEOUT`, a
+one-second `RetryInfo`, and a message naming the SSH identity lock timeout, so
+clients retry the create; it also increments
+`openshell_server_mutation_lock_timeouts_total{scope="sandbox"}`. A 10-second
+wait for one of the replica's data-pool lock slots (half of
+`database_max_connections`), which provider refresh shares, fails the same way
+(or with "credential refresh coordination unavailable") and logs "data-pool
+lock slots stayed busy". At a small `database_max_connections`, slow refresh
+mints or slow credential drivers cause it, and raising the pool fixes it.
 
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
@@ -1073,7 +1109,7 @@ driver config includes `provider_spiffe_workload_api_socket_path`:
 helm -n openshell get values openshell | grep provider_spiffe_workload_api_socket_path
 kubectl get pods -A | grep -E 'spire|spiffe'
 kubectl -n openshell get configmap openshell-config -o yaml | grep provider_spiffe_workload_api_socket_path
-kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
+kubectl -n openshell get pod -l app.kubernetes.io/name=openshell -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
 ```
 
 Sandbox pods using provider token grants should have an
@@ -1392,9 +1428,14 @@ member at its cap, or the pool at gateway replicas × members × instances
 reached"; the gateway log warns "every supervisor is at its sandbox limit" or
 "supervisor pool is at its sandbox limit" to say which. Raise the cap or add
 members. Supervisor container
-resources come from `supervisor.resources` (unset by default; the chart
-recommends requests 250m and 768Mi with a 1.5Gi memory limit for 128
-sandboxes per supervisor). The chart rolls one member
+resources come from `supervisor.resources` (requests 250m and 768Mi, limits
+1 CPU and 1.5Gi by default for 128 sandboxes per supervisor). The gateway
+defaults to requests 500m and 512Mi, limits 2 CPUs and 2Gi. Check for
+`OOMKilled`, CPU throttling, or unschedulable requests; increase budgets for
+sandbox count, full gateway log tails, and failover. Empty maps retain chart
+defaults; set the corresponding `resources` or `resources.limits` to null to
+remove them. The 10,000-sandbox profile leaves gateway limits to the operator.
+The chart rolls one member
 at a time, sets no affinity by default (set `supervisor.affinity` to control
 supervisor scheduling; top-level `affinity` applies only to the gateway), gives
 each member a 60-second grace period to leave,

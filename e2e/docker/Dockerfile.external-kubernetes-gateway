@@ -3,12 +3,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
+ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:29ee70762214fe8190cea04ef1c0a84a8365879e047ce8f911ae5a5ab2355fa2
 FROM ${GATEWAY_BASE_IMAGE}
 
 ARG TARGETARCH
-ARG SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
-ARG SANDBOX_RUNTIME_IMAGE=ghcr.io/nvidia/openshell/sandbox:latest
+ARG SUPERVISOR_IMAGE=quay.io/ai-openshell/supervisor:latest
+ARG SANDBOX_RUNTIME_IMAGE=quay.io/ai-openshell/sandbox:latest
 COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
 COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-driver-kubernetes /usr/local/bin/openshell-driver-kubernetes
 

@@ -90,7 +90,7 @@ Install or upgrade OpenShell:
 
 ```shell
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --values values-ha.yaml \
@@ -303,6 +303,26 @@ lock held longer than 10 seconds.
 
 ## Scale the Gateway
 
+The chart initially requests `500m` CPU and `512Mi` memory per gateway, with
+limits of `2` CPUs and `2Gi` memory. These are starting budgets, not resources
+for the pool's maximum sandbox count. Size `resources` for your traffic,
+sandbox count, and the sessions a surviving replica takes over during failover.
+Gateway memory also grows as per-sandbox log tails fill; a full tail can retain
+about `4Mi` of heap per sandbox in addition to connections and runtime overhead.
+Monitor container memory and CPU throttling when increasing load.
+
+Override individual requests or limits in your values file. Helm merges maps,
+so `resources: {}` retains these defaults. Use `resources.limits: null` to
+remove the limits, or `resources: null` to remove the whole budget. Removing
+requests also requires disabling any HPA utilization targets that depend on them.
+
+Before upgrading an existing release, check its gateway memory usage. Installs
+that never set `resources` gain the `2Gi` memory limit when adopting these
+defaults and can be OOM-killed if their usage exceeds it. Requests-only
+overrides also retain default limits: `resources.requests.memory: 4Gi` with
+the default `2Gi` limit produces an invalid Pod. Set matching limits for your
+workload or remove them explicitly before upgrading.
+
 Scale the gateway by changing a fixed replica count or by letting a
 HorizontalPodAutoscaler choose one. In both cases, keep at least two ready
 replicas when availability must survive one gateway pod failure, and size
@@ -314,7 +334,7 @@ Change `replicaCount` in `values-ha.yaml`, then apply the release again:
 
 ```shell
 helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --values values-ha.yaml \
@@ -503,13 +523,14 @@ sandboxes at once. During a rollout, replicas from an earlier release still
 take a fleet-wide lock for that step, so it can wait on other sandboxes' steps
 until the rollout finishes. Each replica runs at most half of
 `database_max_connections` of these steps and provider refreshes at once, and a
-step that can't start within 10 seconds returns `UNAVAILABLE`. For other
-mutations, a lock wait longer than 10 seconds returns `UNAVAILABLE` with the
-reason `MUTATION_LOCK_TIMEOUT`, and clients can retry the request. A request
-that carried a `request_id` leaves its admission unresolved, like any other
-error, so a retry with the same ID returns `REQUEST_OUTCOME_UNCERTAIN`. Observe
-resource state and reconcile effects, then send a new request with a new
-`request_id`. Refer to
+step that can't start within 10 seconds returns `UNAVAILABLE` with the reason
+`MUTATION_LOCK_TIMEOUT`. Other mutations that wait longer than 10 seconds for a
+lock return the same reason. The CLI and the Rust SDK's retrying sandbox-create
+methods retry that reason automatically within a bounded budget; other clients
+retry the request explicitly. A request that carried a `request_id` leaves its
+admission unresolved, like any other error, so a retry with the same ID returns
+`REQUEST_OUTCOME_UNCERTAIN`. Observe resource state and reconcile effects, then
+send a new request with a new `request_id`. Refer to
 [Durable Request Admission](/sdk/api-errors#durable-request-admission).
 
 ### Upgrade from an Earlier Release
@@ -702,21 +723,24 @@ helm install openshell <chart> -n openshell \
   --set server.externalDbSecret=<secret> --set supervisor.replicas=80
 ```
 
-Supervisor memory grows with the sandboxes it runs. The chart sets no
-`supervisor.resources` by default. For 128 sandboxes per supervisor, request
-`250m` CPU and `768Mi` memory, with a `1.5Gi` memory limit, and scale memory
-with `maxInstancesPerMember`.
+Supervisor memory grows with the sandboxes it runs. For the default of 128
+sandboxes per supervisor, `supervisor.resources` requests `250m` CPU and
+`768Mi` memory, with limits of `1` CPU and `1.5Gi` memory. Increase the budget
+with `maxInstancesPerMember`, and leave capacity for a member failure. Use
+`supervisor.resources.limits: null` to remove limits or
+`supervisor.resources: null` to omit the budget.
 
 The chart ships `values-scale-10k.yaml` as a starting point for about 10,000
 sandboxes: 2 gateway replicas with up to 40 supervisors each, and a supervisor
 HPA from 10 to 80 replicas at 128 sandboxes each. It needs an external
-database. Pull the chart to get the file, then install from the extracted
-copy:
+database. The profile removes the initial gateway limits; set measured gateway
+requests and limits for your workload before production use. Pull the chart
+to get the file, then install from the extracted copy:
 
 ```shell
-helm pull oci://ghcr.io/nvidia/openshell/helm-chart --version <version> --untar
-helm install openshell ./helm-chart -n openshell \
-  -f helm-chart/values-scale-10k.yaml --set server.externalDbSecret=<secret>
+helm pull oci://quay.io/ai-openshell/charts/openshell --version <version> --untar
+helm install openshell ./openshell -n openshell \
+  -f openshell/values-scale-10k.yaml --set server.externalDbSecret=<secret>
 ```
 
 ## Next Steps

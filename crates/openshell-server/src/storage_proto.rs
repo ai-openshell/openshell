@@ -222,6 +222,14 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // Cedar policies add the explicitly present CedarPolicy message and the gateway-managed
+    // provider_credential_rules map to SandboxPolicy in both closures. Existing
+    // rows decode no Cedar message and remain YAML policies.
+    // Cedar endpoint settings add the repeated endpoint_settings field to
+    // SandboxPolicy in both closures. Existing rows decode it empty, so stored
+    // Cedar policies keep their current behavior.
+    // SupervisorHello and GetSandboxConfigRequest negotiate Cedar support with
+    // public-only capability fields; durable schemas remain unchanged.
     // Supervisor middleware binding policy and selectors are public-only. An
     // absent policy preserves dynamic discovery; older supervisors ignore both fields.
     // Suspend/resume adds two public request messages without durable request
@@ -241,14 +249,16 @@ mod tests {
     // Discovery RPCs move to ServiceDiscovery. Application URL maps add two
     // public-only messages alongside main's public APIs; durable schemas
     // and the public/durable overlap remain unchanged.
+    // The service backend HTTP version is part of both schemas. Legacy
+    // endpoint records omit it and continue to use HTTP/1.1.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3f6f958d6907255c148c366a45bd998beddd39432f2165bebe6c060eb28ef10c";
+        "edfc80ad192e77e1a9d1e1d6e3342280e4438f8bf7cb49969f580060df9a056a";
     // The storage.v2 refresh root adds retired handles and the first mint's
     // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
-        "e956b54b3f121eaae7d492437a3fa8f56fb3c8bbe8d3366a46dd730caed63203";
+        "ca31950286327bc385fae933bbb9e34d3c9191214f9b549c558bba40957fcc65";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
+        "d0eead2cd403f6f52ecd9b7df73ca7db15e84dd847e11bc9d50469970204e589";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -630,6 +640,7 @@ mod tests {
         let mut isolation_methods = BTreeSet::new();
         let mut sandbox_protocol_methods = BTreeSet::new();
         let mut supervisor_host_methods = BTreeSet::new();
+        let mut driver_launch_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
             for service in &file.service {
@@ -660,6 +671,16 @@ mod tests {
                     supervisor_host_methods.extend(service.method.iter().map(|method| {
                         method.name.as_deref().expect("supervisor host method name")
                     }));
+                }
+                // Private gateway-to-driver launch protocol: served by launched
+                // compute drivers, never part of the public SDK surface.
+                if package == "openshell.driver.launch.v1" {
+                    assert_eq!(service_name, "DriverLaunch");
+                    driver_launch_methods.extend(
+                        service.method.iter().map(|method| {
+                            method.name.as_deref().expect("driver launch method name")
+                        }),
+                    );
                 }
                 if !matches!(
                     (package, service_name),
@@ -701,6 +722,10 @@ mod tests {
             BTreeSet::from(["Exchange", "Mediate"])
         );
         assert_eq!(supervisor_host_methods, BTreeSet::from(["Attach"]));
+        assert_eq!(
+            driver_launch_methods,
+            BTreeSet::from(["Configure", "GetLaunchInfo", "Shutdown"])
+        );
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -721,7 +746,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            121 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            124 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -792,9 +817,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (367, 31),
-                (102, 22),
-                (86, 22),
+                (369, 32),
+                (104, 23),
+                (88, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -805,7 +830,9 @@ mod tests {
 
     #[test]
     fn service_endpoint_without_authorization_mode_decodes_as_strip() {
-        use openshell_core::proto::{ServiceAuthorizationMode, ServiceEndpoint};
+        use openshell_core::proto::{
+            ServiceAuthorizationMode, ServiceBackendHttpVersion, ServiceEndpoint,
+        };
 
         let endpoint = ServiceEndpoint::decode(
             legacy_bytes(SERVICE_ENDPOINT_WITHOUT_AUTHORIZATION_MODE).as_slice(),
@@ -824,6 +851,10 @@ mod tests {
         assert_eq!(
             crate::service_routing::effective_authorization_mode(endpoint.authorization_mode),
             ServiceAuthorizationMode::Strip
+        );
+        assert_eq!(
+            endpoint.backend_http_version(),
+            ServiceBackendHttpVersion::Unspecified
         );
     }
 

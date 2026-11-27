@@ -81,6 +81,14 @@ This creates a sandbox whose canonical main process is `/bin/bash -l` and
 attaches your terminal to that retained process. Add `--detach` to return after
 the sandbox becomes ready without attaching.
 
+Creates retry while the gateway mutation lock is busy. The CLI retries for up
+to 60 seconds by default, backing off from the gateway's suggested delay to a
+10-second ceiling and making at most five create attempts, and prints its
+progress to stderr. Change the budget with `--create-retry-timeout SECONDS` or
+`OPENSHELL_CREATE_RETRY_TIMEOUT`, or pass `--no-create-retry` to fail on the
+first busy reply. Only a `MUTATION_LOCK_TIMEOUT` failure retries; every other
+failure stops the command.
+
 An explicit trailing command is foreground even when stdin or stdout is not a
 terminal. The CLI streams its stdout and stderr and reports the command's exit
 status after output drains. A failure to deliver output makes the CLI report a
@@ -355,11 +363,18 @@ Key flags:
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
 - `--no-keep`: Delete the sandbox after main output and the exit result drain
+- `--create-retry-timeout SECONDS`: Keep retrying while the gateway mutation lock is busy for this many seconds (default 60, or `OPENSHELL_CREATE_RETRY_TIMEOUT`); at most five create attempts are made, with the delay backing off to 10 seconds. The budget bounds the waits between attempts; the attempt in flight when it runs out can still wait the gateway's 10-second lock budget before the final answer
+- `--no-create-retry`: Fail immediately instead of retrying a busy gateway mutation lock
 - `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
 
 If the driver rejects foreground attachment during create validation, use `--detach`.
+
+A named create that hits `ALREADY_EXISTS` while the previous sandbox with that
+name is still being deleted or is still being created waits for cleanup and
+retries within the same budget. A live sandbox holding the name is reported
+immediately.
 
 `--detach` adds no attachment grace period. When the canonical process exits,
 its terminal phase is reported immediately. A foreground create declares one
@@ -581,6 +596,14 @@ SSH-session response and pin it to the sandbox ID. Recreating a deleted
 sandbox, even under the same name, creates a different identity. See the
 [sandbox SSH documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
 for verification behavior and release compatibility.
+
+The CLI, the TUI, and generated SSH config entries verify the host key against
+that fingerprint on every SSH connection they open, and refuse a different key
+with `SSH host key mismatch`. They also refuse a connection they cannot
+verify: the gateway published no fingerprint, or the SSH config entry predates
+host-key verification. The output prints the fix. Set
+`OPENSHELL_SSH_REQUIRE_HOST_KEY=0` to connect anyway, with a `NOT verified`
+warning.
 
 For an infrastructure `Error` on a backend that supports restarting stopped sandboxes, fix the reported cause, run `sandbox stop`, and wait for it to succeed before running `sandbox start`. This retains the sandbox and persistent workspace but cannot recover deleted resources or storage. For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 
@@ -1065,13 +1088,16 @@ openshell sandbox create \
   --detach \
   -- ./start-server.sh
 
-# Expose and manage an HTTP service through the gateway.
+# Expose and manage a named HTTP service.
 openshell service expose my-app 8080 web \
   --authorization-mode bearer-passthrough
 openshell service list my-app
 openshell service list my-app --output json
 openshell service get my-app web
 openshell service delete my-app web
+
+# Expose a service that listens for cleartext HTTP/2, such as native gRPC.
+openshell service expose my-app 50051 agent --backend-http-version 2
 ```
 
 Use `openshell service list --all-workspaces` for a Platform Admin view across
@@ -1081,6 +1107,8 @@ workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
 request and keeps the sandbox running. Add `--output json` for automation; the
 result contains a `service_urls` map whose empty key is the unnamed endpoint.
 Use `openshell service expose` after creation to add or update named endpoints.
+An HTTP/2 backend requires the supervisor application listener. Clients use the
+application URL with HTTP/2 over TLS.
 
 Exposed services strip `Authorization` by default. Select
 `bearer-passthrough` only when the application inside the sandbox authenticates
@@ -1089,9 +1117,10 @@ one non-empty Bearer credential and forwards that value unchanged. It rejects
 duplicate, malformed, or non-Bearer authorization before contacting the
 application. The application remains responsible for validating the token, and
 the raw token reaches the sandbox process, so never log it. Service routes
-bypass control-plane RPC authorization, but they still use the gateway's
-existing listener, domain routing, and TLS configuration, including any client
-certificate requirement. See the published
+bypass control-plane RPC authorization. Gateway service URLs use the gateway's
+listener and TLS configuration, including any client certificate requirement.
+The supervisor application listener uses application or ingress authentication.
+See the published
 [sandbox service documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
 for the complete security contract.
 

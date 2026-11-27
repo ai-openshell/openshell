@@ -32,6 +32,11 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | Concrete Isolation Backend RPC client and authenticated Sandbox Protocol shared with `openshell-sandbox` |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
 | `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
+| `crates/openshell-policy-runtime-interface/` | Policy runtime interface | Engine-neutral decisions, request metadata, snapshots, and staged reload contracts |
+| `crates/openshell-policy-cedar/` | Cedar policy engine | Validation, Landlock/L7/DNS derivation, and evaluation for Cedar-authored sandbox policies; linked only with the gateway and supervisor `experimental` feature |
+| `crates/openshell-policy-cedar-schema/` | Cedar policy schema | Canonical Cedar schema and entity, action, and context names; linked only with the `experimental` feature |
+| `crates/openshell-policy-cedar-adapter/` | Cedar message adapter | Cedar analysis, filesystem grants, and endpoint inventory shared by gateway and runtime composition |
+| `crates/openshell-policy-cedar-runtime/` | Cedar runtime adapter | Implements the policy runtime contracts; selected by supervisor composition with the `experimental` feature |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
@@ -47,12 +52,15 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-spiffe/` | SPIFFE identity types | Dependency-light SPIFFE ID mapping, claim parsing, and the sandbox identity provider interface |
 | `crates/openshell-spire/` | SPIRE adapter | Gateway-owned SPIFFE Broker API client that issues and verifies stable sandbox JWT-SVIDs |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
+| `crates/openshell-driver-launch/` | Driver launch protocol | `DriverLaunch` `GetLaunchInfo`/`Configure` service and the `Deferred` wrapper for launched compute drivers |
+| `crates/openshell-driver-sdk/` | Launched-driver SDK | Stdin table reader, start-up exit codes, staged network-trust loader, telemetry and admission conversion, and gateway context |
 | `crates/openshell-driver-kubernetes-secrets/` | Kubernetes Secrets credential driver | In-process `CredentialDriver` backend for OpenShell-managed K8s Secret storage |
 | `crates/openshell-driver-vault/` | Vault credential driver | In-process `CredentialDriver` backend for Vault-compatible KV storage |
 | `crates/openshell-driver-db-credstore/` | Database credential driver | In-process `CredentialDriver` backend for gateway database credential storage |
 | `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
-| `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
-| `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
+| `crates/openshell-container-runtime/` | Container runtime helpers | Code used only by the desktop compute drivers (Docker, Podman, VM), starting with Podman socket discovery; moves with the drivers |
+| `crates/openshell-driver-docker/` | Docker compute driver | Gateway-launched `ComputeDriver` subprocess for local Docker sandbox containers |
+| `crates/openshell-driver-podman/` | Podman compute driver | Gateway-launched `ComputeDriver` subprocess for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
 | [`crates/openshell-driver-mxc/`](https://github.com/ai-openshell/openshell/tree/windows/crates/openshell-driver-mxc) (`windows` branch) | Microsoft MXC compute driver | Native Windows ProcessContainer backend; see the Windows branch for the maintained implementation |
 | [`crates/openshell-mxc-boundary/`](https://github.com/ai-openshell/openshell/tree/windows/crates/openshell-mxc-boundary) (`windows` branch) | Windows sandbox boundary | Dedicated Windows workload boundary paired with the host supervisor |

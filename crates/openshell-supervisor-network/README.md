@@ -1,7 +1,7 @@
 # Network supervisor
 
-This crate forbids unsafe code, including its local tests. Typed socket APIs
-provide original-destination lookup for transparent proxying.
+This crate forbids unsafe code outside its test-only allocation counter. Typed
+socket APIs provide original-destination lookup for transparent proxying.
 
 Socket attribution tests pass a duplicate connected socket as a spawned child's
 stdin. Re-executing the test binary checks multiple holders with the same binary
@@ -9,11 +9,8 @@ identity; executing a different binary checks ambiguous shared-socket identity.
 The fixture kills and reaps the child when the parent test ends.
 
 The manual proxy performance baseline still counts allocations. Its test-only
-global allocator uses `openshell-driver-vm::allocation_tracking`; the unsafe
-allocator implementation belongs to the VM crate. The VM dependency disables
-default features, so this instrumentation does not
-require the compute runtime or Unix-only sandbox library. It is a development
-dependency only.
+global allocator lives in `test_support::alloc`, the only place in the crate
+that allows unsafe code, and is compiled only for tests.
 
 ## Connections without inspection
 
@@ -53,13 +50,12 @@ transparent connections lazily refresh expired, policy-backed mappings through
 the same trusted resolver and destination-validation path as sandbox DNS
 queries. Refreshes for one address share a lock; failed refreshes back off for
 one second and never authorize expired upstream addresses.
-`PolicyDnsService::lookup_for_connect` owns refresh coordination and returns
-the resulting mapping; the underlying store stays synchronous. Observation-only
-mappings, wrong ports, and mappings from a previous policy generation cannot refresh.
-Refresh eligibility uses the authored ports, independently of which ports the
-latest DNS addresses satisfied. Dispatch reauthorizes mapped connections and
-rebuilds their connectors from current pins instead of retaining staged pins
-across a refresh.
+`PolicyDnsService::lookup_for_connect` and `lookup_for_pin` coordinate refreshes;
+the underlying store stays synchronous. Observation-only mappings cannot refresh.
+A synthetic address identifies a name and address family across policy reloads.
+Each connection is authorized by the current policy, and its destination rules
+filter the mapping's pinned addresses. Dispatch rebuilds connectors from current
+pins instead of retaining staged pins across a refresh.
 
 ## Reserved destinations
 
@@ -124,3 +120,33 @@ filtering preserves raw HTTP bytes
 and borrows unchanged header blocks. It removes only protected receipt fields
 and their `Connection` or `Trailer` nominations, including folded continuations,
 without adding general response-header validation.
+
+## Policy engines
+
+Networking consumes `PolicyEngine` and `TunnelPolicyEngine` from
+`openshell-policy-runtime-interface`. Supervisor composition selects the
+backend once at startup. `opa::OpaEngine` implements the YAML backend here;
+`openshell-policy-cedar-runtime` implements Cedar in a separate crate.
+
+The proxy, relay, and policy DNS use shared decisions and generation guards.
+YAML relays attach a connection revalidator that compares full Rego endpoint
+rules across every intervening generation and checks credentials the connection
+used. Unrelated changes re-pin the connection; narrowing, quarantine, expired
+history, or a used credential's rotation closes it. Ordinary guards and Cedar
+connections retain strict invalidation on reload.
+An admitted connection carries an opaque destination authorizer that checks
+resolved addresses against the same policy snapshot. Networking applies its
+always-blocked address checks before the authorizer and blocks control-plane
+ports for IP literals independently of the backend. Explicit trusted gateway
+aliases retain their pinned validation. Reloads stage and commit
+through the backend contract, preserving atomic policy, middleware, and
+credential publication without inspecting concrete engine variants.
+
+`policy_types`, `policy_data`, `binary_resolution`, and `network_middleware`
+reexport shared runtime helpers. `policy_validation` reexports the policy
+composition layer's bounded validation diagnostics. The `experimental` feature
+forwards shared policy validation features without importing a Cedar runtime
+into production networking code.
+
+Cross-backend conformance scenarios live in `tests/policy-conformance`.
+Its engine-neutral networking probes are exposed only by `test-support`.

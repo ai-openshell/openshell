@@ -17,6 +17,11 @@ on:
         required: false
         type: string
         default: ""
+      experimental:
+        description: Enable the gateway and supervisor experimental feature flag
+        required: false
+        type: boolean
+        default: false
     secrets:
       CACHIX_AUTH_TOKEN:
         required: true
@@ -40,6 +45,12 @@ jobs:
           - package: openshell-gateway
             binary: openshell-gateway
             triple: aarch64-apple-darwin
+          - package: openshell-driver-podman
+            binary: openshell-driver-podman
+            triple: aarch64-apple-darwin
+          - package: openshell-driver-docker
+            binary: openshell-driver-docker
+            triple: aarch64-apple-darwin
           - package: openshell-supervisor
             binary: openshell-supervisor
             triple: aarch64-apple-darwin
@@ -61,3 +72,4 @@ jobs:
           triple: ${{ matrix.triple }}
           cargo-version: ${{ inputs.cargo-version }}
           supervisor-image-tag: ${{ inputs.supervisor-image-tag }}
+          extra-cargo-flags: ${{ (matrix.package == 'openshell-gateway' || matrix.package == 'openshell-supervisor') && inputs.experimental && '--features experimental' || '' }}

@@ -7,7 +7,7 @@ Edit README.md.gotmpl and values.yaml, then run `mise run helm:docs`.
 
 > **Experimental** - the Kubernetes deployment path is under active development. Expect rough edges and breaking changes.
 
-This chart deploys the OpenShell gateway into a Kubernetes cluster. It is published as an OCI artifact to GHCR at `oci://ghcr.io/nvidia/openshell/helm-chart`.
+This chart deploys the OpenShell gateway into a Kubernetes cluster. It is published as an OCI artifact to Quay at `oci://quay.io/ai-openshell/charts/openshell`.
 
 By default, this chart also creates the namespace-scoped resources needed by
 sandboxes. For a shared-gateway deployment, install it with
@@ -52,7 +52,7 @@ A cluster-admin applies the cluster-scoped objects once per gateway
 ServiceAccount, rendered from the same values the release uses:
 
 ```shell
-helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+helm template openshell oci://quay.io/ai-openshell/charts/openshell --version <version> \
   --namespace openshell -f my-values.yaml \
   --set rbac.create=true \
   --set rbac.clusterScoped.create=true \
@@ -66,7 +66,7 @@ objects omitted, using [`ci/values-namespace-admin.yaml`](ci/values-namespace-ad
 or the equivalent `--set`:
 
 ```shell
-helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+helm upgrade --install openshell oci://quay.io/ai-openshell/charts/openshell --version <version> \
   --namespace openshell -f my-values.yaml \
   --set rbac.clusterScoped.create=false
 ```
@@ -99,7 +99,7 @@ With `rbac.create=false` the cluster-admin applies the namespaced RBAC too,
 adding it to the same render:
 
 ```shell
-helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+helm template openshell oci://quay.io/ai-openshell/charts/openshell --version <version> \
   --namespace openshell -f my-values.yaml \
   --set rbac.create=true \
   --set rbac.clusterScoped.create=true \
@@ -163,10 +163,21 @@ supported Sandbox API (`agents.x-k8s.io/v1beta1` or
 `agentSandbox.preflight.enabled=false` for offline `helm template` rendering,
 where Helm cannot discover cluster APIs.
 
+Run `kubectl get storageclass` before installing. For dynamic provisioning
+without a default, set `server.dataStorageClass` (gateway StatefulSet) and
+`server.workspaceStorageClass` (sandbox workspaces).
+
+`storageClass.preflight.enabled=true` checks gateway storage on fresh StatefulSet
+installs with no gateway class set. The Helm identity needs cluster-scoped
+`list storageclasses` permission. A denied lookup stops Helm rendering. If
+that permission is unavailable, set `server.dataStorageClass` explicitly or
+disable the preflight. If a reinstall reuses retained gateway PVCs, set
+`storageClass.preflight.enabled=false`. Preview with `helm template --dry-run=server`.
+
 ## Install on Kubernetes
 
 ```shell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version>
+helm install openshell oci://quay.io/ai-openshell/charts/openshell --version <version>
 ```
 
 ## Install on OpenShift
@@ -178,7 +189,7 @@ See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/
 oc create ns openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
+helm install openshell oci://quay.io/ai-openshell/charts/openshell --version <version> -n openshell \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
@@ -364,7 +375,7 @@ recreate the StatefulSet so its template matches:
 kubectl -n openshell patch pvc openshell-data-openshell-0 \
   -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
 kubectl -n openshell delete statefulset openshell --cascade=orphan
-helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <installed-version> \
+helm upgrade openshell oci://quay.io/ai-openshell/charts/openshell --version <installed-version> \
   --reuse-values -n openshell --set server.dataStorageSize=20Gi
 ```
 
@@ -389,7 +400,7 @@ kubectl create secret generic my-pg-credentials -n openshell \
 Then install the chart pointing at that Secret:
 
 ```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+helm install openshell oci://quay.io/ai-openshell/charts/openshell --version <version> \
   -n openshell \
   --set workload.kind=deployment \
   --set server.externalDbSecret=my-pg-credentials
@@ -635,13 +646,13 @@ for peer identity policies, multi-node registrations, and authorization.
 | gateway.image.digest | string | `""` | Gateway image digest. When set, this takes precedence over tag. |
 | gateway.image.pullPolicy | string | `nil` | Gateway image pull policy. Empty uses global.image.pullPolicy. |
 | gateway.image.registry | string | `""` | Gateway image registry. Empty uses global.image.registry. |
-| gateway.image.repository | string | `"openshell/gateway"` | Gateway image repository. |
+| gateway.image.repository | string | `"ai-openshell/gateway"` | Gateway image repository. |
 | gateway.image.tag | string | `""` | Gateway image tag. Defaults to the chart appVersion when empty. |
 | gateway.listenAddress | string | `"0.0.0.0"` | Gateway listener IP. Use `::` for IPv6. |
 | gatewayConfig | object | `{"openshell":{"version":2},"openshell.gateway":{"enable_gateway_service_routing":false}}` | Non-secret gateway application configuration. Top-level keys name TOML tables and are rendered into the mounted gateway.toml file. Kubernetes resource inputs remain outside this map; template expressions derive the corresponding runtime values from their resource owner. |
 | gatewayConfig."openshell.gateway".enable_gateway_service_routing | bool | `false` | Opt in to gateway-mediated sandbox service URLs and forwarding. Disabled for Kubernetes; configure application-listener ingress or explicitly enable this path. |
 | global.image.pullPolicy | string | `"IfNotPresent"` | Shared OpenShell image pull policy. Individual image pull policies take precedence. |
-| global.image.registry | string | `"ghcr.io/nvidia"` | Shared OpenShell image registry. Individual image registries take precedence. |
+| global.image.registry | string | `"quay.io"` | Shared OpenShell image registry. Individual image registries take precedence. |
 | global.image.tag | string | `""` | Shared OpenShell image tag. Defaults to the chart appVersion when empty. |
 | grpcRoute.backendTLSPolicy.caCertificateConfigMapName | string | `""` | Name of the ConfigMap containing the CA certificate (key: ca.crt) used to validate the gateway pod's TLS certificate. Defaults to `<fullname>-backend-ca` when empty. The certgen hook auto-creates this: with pkiInitJob (default), immediately on install/upgrade; with cert-manager, the hook polls for pkiInitJob.timeoutSeconds seconds waiting for cert-manager to issue the server certificate, then creates the ConfigMap. A single install usually succeeds; if cert-manager takes longer, increase pkiInitJob.timeoutSeconds. By default (pkiInitJob.failOnTimeout=true), the install fails if the timeout is reached; set failOnTimeout=false to allow the install to succeed and run `helm upgrade` after the certificate is issued. |
 | grpcRoute.backendTLSPolicy.enabled | bool | `false` | Create a BackendTLSPolicy resource for end-to-end TLS between the Gateway proxy and the OpenShell gateway pod. The traffic flow is: client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod. Requires server.disableTls=false and server.tls.enableMtls=false. The certgen hook auto-creates the backend CA ConfigMap. |
@@ -702,7 +713,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | rbac.clusterScoped.create | bool | `true` | Create the cluster-scoped ClusterRole and ClusterRoleBinding. Disable for a namespace-admin install where a cluster-admin applies them separately; the gateway ServiceAccount name and namespace are unchanged, so a pre-created ClusterRoleBinding still matches. |
 | rbac.create | bool | `true` | Create the RBAC objects that grant the gateway ServiceAccount access. Disable to supply the namespaced sandbox and peer Role/RoleBinding and the cluster-scoped ClusterRole/ClusterRoleBinding out of band. The certgen hook and credential driver RBAC keep their own flags. |
 | replicaCount | int | `1` | Number of OpenShell gateway replicas. Values greater than 1 require server.externalDbSecret because the default SQLite backend is per pod. |
-| resources | object | `{}` | Gateway pod resource requests and limits. |
+| resources | object | `{"limits":{"cpu":"2","memory":"2Gi"},"requests":{"cpu":"500m","memory":"512Mi"}}` | Gateway container resource requests and limits for an initial deployment. Size for the number of sandboxes, retained logs, traffic, and failover; the pool's logical capacity does not determine a safe resource budget. Set resources to null to omit the budget, or limits to null to omit limits. |
 | sandbox.image.digest | string | `""` | Sandbox image digest. When set, this takes precedence over tag. |
 | sandbox.image.pullPolicy | string | `nil` | Sandbox image pull policy. Leave unset to use the Kubernetes image default. |
 | sandbox.image.repository | string | `"nvcr.io/nvidia/base/ubuntu"` | Default standalone sandbox image repository. |
@@ -710,13 +721,14 @@ for peer identity policies, multi-node registrations, and authorization.
 | sandboxRuntime.image.digest | string | `""` | Sandbox runtime image digest. When set, this takes precedence over tag. |
 | sandboxRuntime.image.pullPolicy | string | `nil` | Sandbox runtime image pull policy. Empty uses global.image.pullPolicy. |
 | sandboxRuntime.image.registry | string | `""` | Sandbox runtime image registry. Empty uses global.image.registry. |
-| sandboxRuntime.image.repository | string | `"openshell/sandbox"` | Sandbox runtime image repository. |
+| sandboxRuntime.image.repository | string | `"ai-openshell/sandbox"` | Sandbox runtime image repository. |
 | sandboxRuntime.image.tag | string | `""` | Sandbox runtime image tag. Defaults to the chart appVersion when empty. |
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
 | sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
 | securityContext.allowPrivilegeEscalation | bool | `false` | Whether the gateway container can gain additional privileges. |
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
+| securityContext.readOnlyRootFilesystem | bool | `true` | Mount the gateway container root filesystem read-only. Mount additional writable paths with server.extraVolumes and server.extraVolumeMounts. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | securityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the gateway container. |
@@ -807,6 +819,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
+| storageClass.preflight.enabled | bool | `false` | On a fresh StatefulSet install with no server.dataStorageClass, check for a default StorageClass. The Helm identity must be allowed to list StorageClasses. |
 | supervisor.affinity | object | `{}` | Affinity rules for the shared supervisor pod, rendered only when gatewayConfig selects supervisor_topology = "gateway". Top-level affinity applies only to the gateway pod. |
 | supervisor.autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":120,"type":"Pods","value":1}],"stabilizationWindowSeconds":300}}` | HPA scaling behavior. Remove at most one member every two minutes, after a five-minute stabilization window, to allow ownership handoff. |
 | supervisor.autoscaling.enabled | bool | `false` | Enable memory-based autoscaling of the shared supervisor Deployment. Requires supervisor_topology = "gateway" and the Kubernetes resource metrics API (usually Metrics Server). When enabled, the HPA owns the replica count and supervisor.replicas is ignored. |
@@ -816,7 +829,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | supervisor.image.digest | string | `""` | Supervisor image digest. When set, this takes precedence over tag. |
 | supervisor.image.pullPolicy | string | `nil` | Supervisor image pull policy. Empty uses global.image.pullPolicy. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
-| supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
+| supervisor.image.repository | string | `"ai-openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
 | supervisor.listenAddress | string | `"0.0.0.0"` | Shared supervisor listener IP. Use `::` for IPv6. |
 | supervisor.network.additionalCaConfigMapName | string | `""` | Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust. |
@@ -830,7 +843,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | supervisor.pool.maxMembersPerGateway | int | `32` | Most supervisors one gateway replica serves, rendered as [openshell.gateway.supervisor_pool] max_members_per_gateway. Must be a positive integer. The pool runs at most gateway replicas times maxMembersPerGateway times maxInstancesPerMember sandboxes, never more than 131072. |
 | supervisor.recoveryTimeoutSeconds | int | `60` | Seconds a sandbox workload stays frozen after losing its pool member's supervision before the sandbox runtime terminates it, rendered as [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an integer from 30 to 300. Null leaves the gateway's pool default of 60 seconds. |
 | supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. Ignored when supervisor.autoscaling.enabled is true. Must not exceed replicaCount * supervisor.pool.maxMembersPerGateway. |
-| supervisor.resources | object | `{}` | Resources of each shared supervisor container, unset by default. Memory grows with the sandboxes a supervisor runs; for the default of 128 sandboxes, request 250m CPU and 768Mi memory with a 1.5Gi memory limit. Refer to Size Sandbox Capacity in the High Availability guide. |
+| supervisor.resources | object | `{"limits":{"cpu":"1","memory":"1.5Gi"},"requests":{"cpu":"250m","memory":"768Mi"}}` | Resources of each shared supervisor container, initially sized for 128 sandboxes. Increase these with pool.maxInstancesPerMember and allow for failover. Refer to Size Sandbox Capacity in the High Availability guide. Set resources to null to omit the budget, or limits to null to omit limits. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | topologySpreadConstraints | list | `[]` | Topology spread constraints for the gateway pod, used to spread replicas across zones or nodes. Empty = omit the field. |

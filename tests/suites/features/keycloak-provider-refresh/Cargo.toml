@@ -6,7 +6,7 @@ name = "keycloak-provider-refresh"
 description = "Features suite: provider OAuth refresh against Keycloak"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/ai-openshell/openshell"
 publish = false
@@ -19,4 +19,4 @@ harness = false
 [dependencies]
 keycloak-support = { path = "../../../support/keycloak" }
 openshell-testkit = { path = "../../../testkit/testkit" }
-tempfile = "3"
+prost-types = "0.14"

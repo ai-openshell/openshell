@@ -9,6 +9,8 @@ use std::num::{NonZeroI64, NonZeroU64};
 use std::path::PathBuf;
 use tracing::info;
 
+mod serve;
+
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_core::{AppArmorProfile, ImagePullPolicy, VERSION};
@@ -182,6 +184,14 @@ struct Args {
     /// read-only into the supervisor container.
     #[arg(long, env = "OPENSHELL_SANDBOX_ADDITIONAL_CA_BUNDLE")]
     sandbox_additional_ca_bundle: Option<String>,
+    /// AAAA handling for the supervisor's mediated policy DNS: `auto`,
+    /// `enabled` or `disabled`.
+    #[arg(long, env = "OPENSHELL_SANDBOX_POLICY_DNS_IPV6_EGRESS")]
+    sandbox_policy_dns_ipv6_egress: Option<openshell_core::PolicyDnsIpv6Egress>,
+
+    /// NAT64 prefixes (RFC 6052 CIDRs) of the sandbox network.
+    #[arg(long, env = "OPENSHELL_SANDBOX_NAT64_PREFIXES", value_delimiter = ',')]
+    sandbox_nat64_prefixes: Vec<String>,
 
     /// User namespace mode for sandbox containers (e.g. `auto`).
     /// When unset, containers use the default user namespace.
@@ -205,6 +215,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(code) = serve::dispatch().await {
+        std::process::exit(code);
+    }
     let args = Args::parse();
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_podman::otel_tracing::TRACING,
@@ -262,6 +275,8 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
             proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
             additional_ca_bundle: args.sandbox_additional_ca_bundle,
+            policy_dns_ipv6_egress: args.sandbox_policy_dns_ipv6_egress,
+            nat64_prefixes: args.sandbox_nat64_prefixes,
             userns: args.userns,
             uidmap: args.uidmap,
             gidmap: args.gidmap,

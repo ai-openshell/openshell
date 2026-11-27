@@ -17,11 +17,13 @@ env:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   build-ci-image:
     name: Build (${{ matrix.arch }})
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -78,6 +80,9 @@ jobs:
     needs: build-ci-image
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0

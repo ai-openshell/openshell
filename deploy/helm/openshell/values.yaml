@@ -10,7 +10,7 @@ replicaCount: 1
 global:
   image:
     # -- Shared OpenShell image registry. Individual image registries take precedence.
-    registry: ghcr.io/nvidia
+    registry: quay.io
     # -- Shared OpenShell image tag. Defaults to the chart appVersion when empty.
     tag: ""
     # -- Shared OpenShell image pull policy. Individual image pull policies take precedence.
@@ -32,7 +32,7 @@ gateway:
     # -- Gateway image registry. Empty uses global.image.registry.
     registry: ""
     # -- Gateway image repository.
-    repository: openshell/gateway
+    repository: ai-openshell/gateway
     # -- Gateway image pull policy. Empty uses global.image.pullPolicy.
     pullPolicy: null
     # -- Gateway image tag. Defaults to the chart appVersion when empty.
@@ -48,7 +48,7 @@ sandboxRuntime:
     # -- Sandbox runtime image registry. Empty uses global.image.registry.
     registry: ""
     # -- Sandbox runtime image repository.
-    repository: openshell/sandbox
+    repository: ai-openshell/sandbox
     # -- Sandbox runtime image pull policy. Empty uses global.image.pullPolicy.
     pullPolicy: null
     # -- Sandbox runtime image tag. Defaults to the chart appVersion when empty.
@@ -62,7 +62,7 @@ supervisor:
     # -- Supervisor image registry. Empty uses global.image.registry.
     registry: ""
     # -- Supervisor image repository.
-    repository: openshell/supervisor
+    repository: ai-openshell/supervisor
     # -- Supervisor image pull policy. Empty uses global.image.pullPolicy.
     # Prefer always, if_not_present, or never; the chart also accepts legacy
     # Kubernetes spellings Always, IfNotPresent, and Never.
@@ -95,16 +95,17 @@ supervisor:
     # maxMembersPerGateway times maxInstancesPerMember sandboxes, never more
     # than 131072.
     maxMembersPerGateway: 32
-  # -- Resources of each shared supervisor container, unset by default.
-  # Memory grows with the sandboxes a supervisor runs; for the default of 128
-  # sandboxes, request 250m CPU and 768Mi memory with a 1.5Gi memory limit.
-  # Refer to Size Sandbox Capacity in the High Availability guide.
-  resources: {}
-  #   requests:
-  #     cpu: 250m
-  #     memory: 768Mi
-  #   limits:
-  #     memory: 1.5Gi
+  # -- Resources of each shared supervisor container, initially sized for
+  # 128 sandboxes. Increase these with pool.maxInstancesPerMember and allow
+  # for failover. Refer to Size Sandbox Capacity in the High Availability guide.
+  # Set resources to null to omit the budget, or limits to null to omit limits.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 768Mi
+    limits:
+      cpu: "1"
+      memory: 1.5Gi
   autoscaling:
     # -- Enable memory-based autoscaling of the shared supervisor Deployment.
     # Requires supervisor_topology = "gateway" and the Kubernetes resource
@@ -275,6 +276,9 @@ podSecurityContext:
   fsGroup: 1000
 
 securityContext:
+  # -- Mount the gateway container root filesystem read-only. Mount additional
+  # writable paths with server.extraVolumes and server.extraVolumeMounts.
+  readOnlyRootFilesystem: true
   # -- Require the gateway container to run as a non-root user.
   runAsNonRoot: true
   # -- UID assigned to the gateway container.
@@ -325,6 +329,11 @@ agentSandbox:
   preflight:
     # -- Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting.
     enabled: true
+
+storageClass:
+  preflight:
+    # -- On a fresh StatefulSet install with no server.dataStorageClass, check for a default StorageClass. The Helm identity must be allowed to list StorageClasses.
+    enabled: false
 
 # Pod restart behavior and health probe tuning.
 podLifecycle:
@@ -407,8 +416,17 @@ probes:
     # -- Readiness probe failure threshold before the pod is marked not ready.
     failureThreshold: 3
 
-# -- Gateway pod resource requests and limits.
-resources: {}
+# -- Gateway container resource requests and limits for an initial deployment.
+# Size for the number of sandboxes, retained logs, traffic, and failover; the
+# pool's logical capacity does not determine a safe resource budget.
+# Set resources to null to omit the budget, or limits to null to omit limits.
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
 
 # -- Node selector for the gateway pod.
 nodeSelector: {}

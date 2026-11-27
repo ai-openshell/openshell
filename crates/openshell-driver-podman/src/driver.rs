@@ -437,12 +437,19 @@ fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
 /// Return the first responsive local Podman API socket.
 #[must_use]
 pub fn detect_socket() -> Option<PathBuf> {
-    crate::socket_discovery::detect_socket()
+    openshell_container_runtime::podman_socket::detect_socket()
 }
 
 #[must_use]
 pub fn is_available() -> bool {
     detect_socket().is_some()
+}
+
+/// Check that Podman is reachable with `config`: resolve the socket, honouring
+/// `socket_path` and `OPENSHELL_PODMAN_SOCKET`, and ping it. Creates nothing.
+pub async fn check_backend(config: &PodmanComputeConfig) -> Result<(), PodmanApiError> {
+    let socket_path = resolve_socket_path(config.socket_path.clone(), detect_socket)?;
+    PodmanClient::new(socket_path).ping().await
 }
 
 /// Resolve the socket to connect to: explicit configuration wins, otherwise
@@ -3871,25 +3878,23 @@ mod tests {
     #[test]
     fn supervisor_pull_policy_refreshes_mutable_tags_only() {
         assert_eq!(
-            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:dev"),
+            runtime_image_pull_policy("quay.io/ai-openshell/supervisor:dev"),
             "newer"
         );
         assert_eq!(
-            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:latest"),
+            runtime_image_pull_policy("quay.io/ai-openshell/supervisor:latest"),
             "newer"
         );
         assert_eq!(
-            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor"),
+            runtime_image_pull_policy("quay.io/ai-openshell/supervisor"),
             "newer"
         );
         assert_eq!(
-            runtime_image_pull_policy(
-                "ghcr.io/nvidia/openshell/supervisor:0.0.47-dev.13-g57b71c68f"
-            ),
+            runtime_image_pull_policy("quay.io/ai-openshell/supervisor:0.0.47-dev.13-g57b71c68f"),
             "missing"
         );
         assert_eq!(
-            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor@sha256:abc123"),
+            runtime_image_pull_policy("quay.io/ai-openshell/supervisor@sha256:abc123"),
             "missing"
         );
     }

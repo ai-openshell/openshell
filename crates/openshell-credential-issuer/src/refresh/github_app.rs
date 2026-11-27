@@ -206,9 +206,11 @@ pub(super) async fn mint(state: &MintRequest) -> Result<MintedCredential, Refres
     if token.token.is_empty() || !token.token.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(invalid_response());
     }
-    let expires_at_ms = chrono::DateTime::parse_from_rfc3339(&token.expires_at)
+    let expires_at_ms = token
+        .expires_at
+        .parse::<jiff::Timestamp>()
         .map_err(|_| invalid_response())?
-        .timestamp_millis();
+        .as_millisecond();
     let now_ms = current_time_ms();
     if expires_at_ms <= now_ms {
         return Err(invalid_response());
@@ -470,13 +472,28 @@ mod tests {
             server.uri()
         )]];
         assert!(mint(&request).await.is_err());
+        let base = server.uri();
+        for (prefix, grant) in [("/a^b", "/a^b"), ("/a^b", "/a%5Eb"), ("/a%5Eb", "/a^b")] {
+            let mut request = state(&format!("{base}{prefix}"));
+            request.secret_endpoint_allowlists = vec![vec![format!(
+                "{base}{grant}/app/installations/123/access_tokens"
+            )]];
+            let failure = mint(&request).await.err().unwrap();
+            assert_eq!(failure.recovery_action, Recovery::FixConfiguration);
+            if prefix.contains('^') {
+                assert!(
+                    failure.status.message().contains("literal")
+                        && failure.status.message().contains("caret")
+                );
+            }
+        }
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn github_app_mints_scoped_token_with_verified_app_jwt() {
         let server = MockServer::start().await;
-        let expiry = chrono::Utc::now() + chrono::Duration::minutes(30);
+        let expiry = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(30);
         let token = format!("ghs_123_{}", "opaque".repeat(100));
         Mock::given(method("POST"))
             .and(path("/app/installations/123/access_tokens"))
@@ -486,7 +503,7 @@ mod tests {
                 serde_json::json!({"repository_ids": [42,43], "permissions": {"contents":"read"}}),
             ))
             .respond_with(ResponseTemplate::new(201).set_body_json(
-                serde_json::json!({"token": token, "expires_at": expiry.to_rfc3339()}),
+                serde_json::json!({"token": token, "expires_at": expiry.to_string()}),
             ))
             .expect(1)
             .mount(&server)
@@ -494,7 +511,7 @@ mod tests {
         let before = current_time_ms() / 1000;
         let minted = mint(&state(&server.uri())).await.unwrap();
         assert_eq!(minted.access_token, token);
-        assert_eq!(minted.expires_at_ms, expiry.timestamp_millis());
+        assert_eq!(minted.expires_at_ms, expiry.as_millisecond());
         assert!(minted.refresh_token.is_none());
         assert!(minted.additional_credentials.is_empty());
         let requests = server.received_requests().await.unwrap();
@@ -520,9 +537,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_app_posts_to_the_exact_encoded_installation_path() {
+        use axum::http::Uri;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let app = Router::new().fallback_service(post(|uri: Uri, headers: HeaderMap| async move {
+            assert!(
+                headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("Bearer ")
+            );
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "token": uri.path(), "expires_at": "2099-01-01T00:00:00Z"
+                })),
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let exercise = async {
+            for prefix in ["/a%5Eb", "/a%5eb", "/a%255Eb"] {
+                let mut input = state(&format!("{base}{prefix}/api/v3"));
+                let path = format!("{prefix}/api/v3/app/installations/123/access_tokens");
+                input.secret_endpoint_allowlists = vec![vec![format!("{base}{path}")]];
+                assert_eq!(mint(&input).await.unwrap().access_token, path);
+            }
+        };
+        tokio::select! {
+            result = axum::serve(listener, app) => panic!("loopback server stopped: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(10), exercise) => {
+                result.expect("GitHub App token exchanges timed out");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn github_app_mints_using_enterprise_default_api_version() {
         let server = MockServer::start().await;
-        let expiry = chrono::Utc::now() + chrono::Duration::minutes(30);
+        let expiry = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(30);
         Mock::given(method("POST"))
             .and(path("/api/v3/app/installations/123/access_tokens"))
             .respond_with(move |request: &wiremock::Request| {
@@ -536,7 +591,7 @@ mod tests {
                     );
                 }
                 ResponseTemplate::new(201).set_body_json(
-                    serde_json::json!({"token": "enterprise-token", "expires_at": expiry.to_rfc3339()}),
+                    serde_json::json!({"token": "enterprise-token", "expires_at": expiry.to_string()}),
                 )
             })
             .expect(1)
@@ -546,7 +601,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(minted.access_token, "enterprise-token");
-        assert_eq!(minted.expires_at_ms, expiry.timestamp_millis());
+        assert_eq!(minted.expires_at_ms, expiry.as_millisecond());
         let requests = server.received_requests().await.unwrap();
         assert!(!requests[0].headers.contains_key("x-github-api-version"));
     }

@@ -17,6 +17,11 @@ on:
         required: false
         type: string
         default: ""
+      experimental:
+        description: Enable the gateway and supervisor experimental feature flag
+        required: false
+        type: boolean
+        default: false
     secrets:
       CACHIX_AUTH_TOKEN:
         required: true
@@ -81,6 +86,7 @@ jobs:
     env:
       PACKAGE: openshell-gateway
       BINARY: openshell-gateway
+      EXTRA_CARGO_FLAGS: ${{ inputs.experimental && '--features experimental' || '' }}
     strategy:
       matrix:
         include:
@@ -97,6 +103,8 @@ jobs:
     env:
       PACKAGE: ${{ matrix.package }}
       BINARY: ${{ matrix.binary }}
+      # Only supervisor entries define the experimental feature flag.
+      EXTRA_CARGO_FLAGS: ${{ matrix.package == 'openshell-supervisor' && inputs.experimental && '--features experimental' || '' }}
     strategy:
       matrix:
         include:
@@ -115,6 +123,38 @@ jobs:
           - package: openshell-supervisor
             binary: openshell-supervisor
             triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps: *build_steps
+
+  podman-driver:
+    name: openshell-driver-podman (${{ matrix.triple }})
+    env:
+      PACKAGE: openshell-driver-podman
+      BINARY: openshell-driver-podman
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps: *build_steps
+
+  docker-driver:
+    name: openshell-driver-docker (${{ matrix.triple }})
+    env:
+      PACKAGE: openshell-driver-docker
+      BINARY: openshell-driver-docker
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - triple: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60

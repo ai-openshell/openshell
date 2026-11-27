@@ -15,7 +15,7 @@ tests:
           path: metadata.name
           value: openshell-node-reader-my-namespace
 
-  - it: grants managed namespace NetworkPolicy apply permissions
+  - it: restricts managed SSH policy mutation to its fixed name
     set:
       server.drivers.kubernetes.workspaceMode: managed
     asserts:
@@ -24,7 +24,18 @@ tests:
           content:
             apiGroups: ["networking.k8s.io"]
             resources: ["networkpolicies"]
-            verbs: ["get", "create", "patch", "update"]
+            resourceNames: ["openshell-sandbox-ssh"]
+            verbs: ["patch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["create", "get"]
+      - notExists:
+          path: rules[?(@.resources[0] == "networkpolicies")].verbs[?(@ == "update")]
+      - notExists:
+          path: rules[?(@.resources[0] == "networkpolicies" && !@.resourceNames)].verbs[?(@ == "patch")]
 
   - it: limits namespaced admission reads to PVCs
     set:
@@ -77,7 +88,8 @@ tests:
           content:
             apiGroups: ["networking.k8s.io"]
             resources: ["networkpolicies"]
-            verbs: ["get", "create", "patch", "update"]
+            resourceNames: ["openshell-sandbox-ssh"]
+            verbs: ["patch"]
 
   - it: gives schema-v2 managed SSH ingress precedence over the legacy alias
     set:
@@ -92,7 +104,8 @@ tests:
           content:
             apiGroups: ["networking.k8s.io"]
             resources: ["networkpolicies"]
-            verbs: ["get", "create", "patch", "update"]
+            resourceNames: ["openshell-sandbox-ssh"]
+            verbs: ["patch"]
 
   - it: omits credential Secret access in managed mode
     set:
@@ -124,7 +137,7 @@ tests:
         - name: registry-two
     asserts:
       - notExists:
-          path: rules[*].resourceNames
+          path: rules[?(@.resources[0] == "secrets")].resourceNames
       - contains:
           path: rules
           content:

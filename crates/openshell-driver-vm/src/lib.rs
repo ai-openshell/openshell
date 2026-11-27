@@ -11,9 +11,6 @@ compile_error!(
      build a telemetry-free VM driver with `--no-default-features --features defaults-without-telemetry`"
 );
 
-#[cfg(feature = "allocation-tracking")]
-pub mod allocation_tracking;
-
 #[cfg(feature = "compute-driver")]
 pub mod driver;
 #[cfg(feature = "compute-driver")]
@@ -36,6 +33,8 @@ pub mod procguard;
 mod rootfs;
 #[cfg(feature = "compute-driver")]
 mod runtime;
+#[cfg(feature = "compute-driver")]
+pub mod settings;
 
 #[cfg(feature = "compute-driver")]
 pub use driver::{VmDriver, VmDriverConfig};

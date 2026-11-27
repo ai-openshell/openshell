@@ -98,6 +98,13 @@ management, agent execution, and provider access via gRPC.
 # Extract vendored Cargo dependencies and configure offline build
 tar xf %{SOURCE1}
 %cargo_prep -v vendor
+# %%cargo_prep only redirects crates-io to the vendor directory. Git
+# dependencies need their own [source."git+..."] replacement tables, which
+# deploy/rpm/create-vendor-archive.sh captures from `cargo vendor` when
+# building Source1. Absent when the lockfile has no git dependencies.
+if [ -f vendor/.cargo-git-sources.toml ]; then
+  cat vendor/.cargo-git-sources.toml >> .cargo/config.toml
+fi
 
 # Patch workspace version from placeholder to actual build identity.
 sed -i 's/^version = "0.0.0"/version = "%{openshell_cargo_version}"/' Cargo.toml
@@ -107,6 +114,8 @@ grep -q 'version = "%{openshell_cargo_version}"' Cargo.toml || (echo "ERROR: Car
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell"
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-gateway"
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-prover"
+test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-driver-podman"
+test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-driver-docker"
 
 # Generate vendored crate manifest and license metadata.
 # cargo-vendor.txt is consumed by an RPM generator (from cargo-rpm-macros)
@@ -128,6 +137,12 @@ install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-prover" %{buildroo
 
 # --- Gateway binary ---
 install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-gateway" %{buildroot}%{_bindir}/%{name}-gateway
+
+# --- Podman compute driver, launched by the gateway ---
+install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-driver-podman" %{buildroot}%{_libexecdir}/%{name}/%{name}-driver-podman
+
+# --- Docker compute driver, launched by the gateway ---
+install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-driver-docker" %{buildroot}%{_libexecdir}/%{name}/%{name}-driver-docker
 
 # --- Default gateway TOML config template ---
 # Shipped as a read-only reference in %{_datadir}. The systemd unit seeds a
@@ -308,6 +323,8 @@ grep -q 'gateway.toml.default.v1' %{buildroot}%{_userunitdir}/%{name}-gateway.se
 %doc %{_docdir}/%{name}-gateway/CONFIGURATION.md
 %doc %{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
 %{_bindir}/%{name}-gateway
+%{_libexecdir}/%{name}/%{name}-driver-podman
+%{_libexecdir}/%{name}/%{name}-driver-docker
 %{_userunitdir}/%{name}-gateway.service
 %{_libexecdir}/%{name}-gateway-migrate-config
 %{_datadir}/%{name}-gateway/gateway.toml.default

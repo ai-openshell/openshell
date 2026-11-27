@@ -3,6 +3,8 @@
 
 //! Credential, identity, socket-owner and request-tracing fixtures.
 
+#[allow(unsafe_code)]
+pub mod alloc;
 pub mod request_tracing;
 
 pub fn response_request_id(response: &[u8]) -> &str {

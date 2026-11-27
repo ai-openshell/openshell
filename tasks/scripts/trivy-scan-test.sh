@@ -120,6 +120,51 @@ expect_status 2 "broad ignore path" \
   env TRIVY_IGNORE_FILE="${TMP_DIR}/broad-ignore.yaml" \
   "${SCANNER}" validate-ignore
 
+# Real kube-system workloads and networking permissions must remain visible.
+mkdir -p "${TMP_DIR}/namespaces"
+cat >"${TMP_DIR}/namespaces/user-pod.yaml" <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: user-workload
+  namespace: kube-system
+spec:
+  containers:
+    - name: application
+      image: example.test/application:1
+EOF
+cat >"${TMP_DIR}/namespaces/role.yaml" <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: network-manager
+  namespace: openshell
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get"]
+EOF
+# Use embedded checks so this regression needs no network or cached database.
+expect_status 0 "scan a kube-system workload and networking permissions" \
+  trivy config --skip-version-check --skip-check-update --quiet \
+  --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+  --cache-dir "${TMP_DIR}/trivy-cache" --ignorefile "${REPO_ROOT}/.trivyignore.yaml" \
+  --format json --output "${TMP_DIR}/namespaces.json" "${TMP_DIR}/namespaces"
+if ! jq -e '
+  [.Results[]? as $result | $result.Misconfigurations[]?
+    | select(.ID == "KSV-0037" or .ID == "KSV-0056")
+    | {id: .ID, target: $result.Target}]
+  | sort_by(.id) == [
+      {id: "KSV-0037", target: "user-pod.yaml"},
+      {id: "KSV-0056", target: "role.yaml"}
+    ]
+' "${TMP_DIR}/namespaces.json" >/dev/null; then
+  echo "FAIL: expected kube-system Pod and NetworkPolicy permissions to remain findings; observed:" >&2
+  jq '[.Results[]? | {target: .Target, ids: [.Misconfigurations[]?.ID]}]' \
+    "${TMP_DIR}/namespaces.json" >&2
+  exit 1
+fi
+
 # Consolidate more than 20 Helm profiles without losing resource identity or
 # the per-profile input counts needed by the gate. Exercise real Trivy SARIF
 # conversion with synthetic JSON; this requires no network or image downloads.
@@ -221,6 +266,15 @@ jq -se '
 ' "${TRIVY_TEST_CALLS}" >/dev/null
 jq -se 'length == 3' "${TMP_DIR}/scan-reports/"config-packaged-*.json >/dev/null
 test -z "$(find "${TMP_DIR}/scan-reports" -name '*.sarif' -print -quit)"
+
+expect_status 0 "scan a chart published under its current name" \
+  env TRIVY_REPORT_DIR="${TMP_DIR}/renamed-chart" "${SCANNER}" config \
+  --chart-ref oci://registry-a.example/charts/openshell:1.2.0
+jq -se 'length == 1' "${TMP_DIR}/renamed-chart/"config-packaged-*.json >/dev/null
+
+expect_status 2 "reject a chart with no local source" \
+  env TRIVY_REPORT_DIR="${TMP_DIR}/unknown-chart" "${SCANNER}" config \
+  --chart-ref oci://registry-a.example/charts/not-a-chart:1.0.0
 
 expect_status 0 "retain image registry, path and platform identity" \
   env TRIVY_REPORT_DIR="${TMP_DIR}/images" "${SCANNER}" images \

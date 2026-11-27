@@ -6,7 +6,7 @@ name = "openshell-testkit"
 description = "Shared support for OpenShell end-to-end test suites"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/ai-openshell/openshell"
 publish = false
@@ -18,12 +18,14 @@ name = "testkit"
 openshell-bootstrap = { path = "../../../crates/openshell-bootstrap" }
 openshell-core = { path = "../../../crates/openshell-core", default-features = false }
 openshell-policy = { path = "../../../crates/openshell-policy" }
+openshell-providers = { path = "../../../crates/openshell-providers" }
 openshell-sdk = { path = "../../../crates/openshell-sdk" }
 openshell-testkit-macros = { path = "../testkit-macros" }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 libtest-mimic = "0.8"
 linkme = "0.3"
+prost-types = "0.14"
 quick-junit = "0.8"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }

@@ -7,6 +7,7 @@
 
 mod image_update;
 mod isolation;
+pub mod launch;
 pub mod otel_tracing;
 mod workspace;
 
@@ -56,12 +57,10 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
     WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::{
-    deserialize_optional_non_empty_string_list, struct_to_json_value,
-};
+use openshell_core::proto_struct::{deserialize_optional_non_empty_string_list, from_struct};
 use openshell_core::{
     AppArmorProfile, Error, ImagePullPolicy, NetworkSupervisorTrustBundle, Result as CoreResult,
-    UpstreamProxyConfig,
+    SupervisorIpv6EgressConfig, UpstreamProxyConfig,
 };
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
@@ -274,6 +273,10 @@ pub struct DockerComputeConfig {
     /// Gateway-host PEM CA bundle trusted for the corporate proxy and for
     /// server certificates re-signed by a TLS-intercepting proxy.
     pub proxy_ca_bundle: Option<PathBuf>,
+    /// Policy DNS IPv6 egress mode and NAT64 prefixes supplied to the
+    /// supervisor.
+    #[serde(flatten)]
+    pub ipv6_egress: SupervisorIpv6EgressConfig,
 
     /// Host UNIX socket projected into the supervisor for provider identity.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
@@ -286,6 +289,18 @@ pub struct DockerComputeConfig {
 impl DockerComputeConfig {
     /// Validate startup configuration without connecting to Docker.
     pub fn validate_configuration(&self, gateway_bind_address: SocketAddr) -> CoreResult<()> {
+        self.validate_table()?;
+        if gateway_bind_address.port() == 0 {
+            return Err(Error::config(
+                "docker compute driver requires a fixed non-zero gateway bind port",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The checks that need neither the gateway nor Docker: everything about
+    /// the operator's table.
+    pub fn validate_table(&self) -> CoreResult<()> {
         self.resource_admission.validate().map_err(Error::config)?;
         if let Some(socket_path) = self.socket_path.as_deref()
             && socket_path.to_str().is_none()
@@ -300,14 +315,10 @@ impl DockerComputeConfig {
         self.upstream_proxy.validate().map_err(Error::config)?;
         validate_docker_proxy_auth_file(&self.upstream_proxy)?;
         validate_docker_proxy_ca_bundle(self)?;
+        self.ipv6_egress.validate().map_err(Error::config)?;
         if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
             openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
                 .map_err(Error::config)?;
-        }
-        if gateway_bind_address.port() == 0 {
-            return Err(Error::config(
-                "docker compute driver requires a fixed non-zero gateway bind port",
-            ));
         }
         Ok(())
     }
@@ -340,6 +351,7 @@ impl Default for DockerComputeConfig {
             persist_workspace: false,
             upstream_proxy: UpstreamProxyConfig::default(),
             proxy_ca_bundle: None,
+            ipv6_egress: SupervisorIpv6EgressConfig::default(),
             provider_spiffe_workload_api_socket: None,
             app_armor_profile: None,
         }
@@ -377,6 +389,7 @@ struct DockerDriverRuntimeConfig {
     workspace_storage: workspace::Storage,
     upstream_proxy: UpstreamProxyConfig,
     proxy_ca_bundle: Option<PathBuf>,
+    ipv6_egress: SupervisorIpv6EgressConfig,
     provider_spiffe_workload_api_socket: Option<PathBuf>,
     app_armor_profile: Option<AppArmorProfile>,
     /// Immutable gateway-normalized additional destination trust. This is
@@ -795,8 +808,7 @@ impl DockerSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        serde_json::from_value(struct_to_json_value(config))
-            .map_err(|err| format!("invalid docker driver_config: {err}"))
+        from_struct(config).map_err(|err| format!("invalid docker driver_config: {err}"))
     }
 }
 
@@ -1049,6 +1061,7 @@ impl DockerComputeDriver {
                 resource_admission: docker_config.resource_admission.clone(),
                 upstream_proxy: docker_config.upstream_proxy.clone(),
                 proxy_ca_bundle: docker_config.proxy_ca_bundle.clone(),
+                ipv6_egress: docker_config.ipv6_egress.clone(),
                 provider_spiffe_workload_api_socket: docker_config
                     .provider_spiffe_workload_api_socket
                     .clone(),
@@ -5722,6 +5735,7 @@ async fn spawn_docker_control_process(
         &config.upstream_proxy,
         config.proxy_ca_bundle.is_some(),
     ));
+    command.extend(config.ipv6_egress.supervisor_args());
     let runtime_initiated = read_docker_runtime_descriptor(&sandbox.id, config).await?
         .is_some_and(|descriptor| matches!(descriptor.transport, openshell_sandbox_backend::boundary_protocol::SandboxTransport::RuntimeInitiatedUnix { .. }));
     command.extend(docker_network_trust_supervisor_args(
