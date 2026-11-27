@@ -699,16 +699,17 @@ mod tests {
             enrichment::SOURCE_KEY.to_string(),
             "service.name".to_string(),
         ];
-        let (signal, batch) = rx.recv().await.expect("logs buffered");
+        let mut batches = [rx.recv().await.unwrap(), rx.recv().await.unwrap()];
+        batches.sort_by_key(|(signal, _)| signal.index());
+        let [(signal, batch), (metrics_signal, metrics_batch)] = batches;
         assert_eq!(signal, Signal::Logs);
         let decoded = ExportLogsServiceRequest::decode(batch).unwrap();
         assert_eq!(
             attributes(decoded.resource_logs[0].resource.clone()),
             expected
         );
-        let (signal, batch) = rx.recv().await.expect("metrics buffered");
-        assert_eq!(signal, Signal::Metrics);
-        let decoded = ExportMetricsServiceRequest::decode(batch).unwrap();
+        assert_eq!(metrics_signal, Signal::Metrics);
+        let decoded = ExportMetricsServiceRequest::decode(metrics_batch).unwrap();
         assert_eq!(
             attributes(decoded.resource_metrics[0].resource.clone()),
             expected

@@ -74,6 +74,14 @@ impl Signal {
         }
     }
 
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Traces => "traces",
+            Self::Logs => "logs",
+            Self::Metrics => "metrics",
+        }
+    }
+
     const fn index(self) -> usize {
         self as usize
     }
@@ -111,7 +119,8 @@ pub const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 pub const ENRICHMENT_CONCURRENCY: usize = 2;
 /// Number of enriched trace batches held between receipt and export. Logs
 /// and metrics each get a quarter of it in a buffer of their own, so a chatty
-/// signal cannot crowd out the others.
+/// signal cannot fill the others' buffers; the export task drains them
+/// round robin.
 pub const BUFFER_CAPACITY: usize = 32;
 /// Deadline for one export attempt to the collector.
 pub const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -141,6 +150,11 @@ struct SignalCounts {
     exported: AtomicU64,
     rejected: AtomicU64,
     export_failures: AtomicU64,
+    /// Whether the most recent export of this signal failed. Cleared by the
+    /// next success.
+    last_export_failed: AtomicBool,
+    first_rejection_logged: AtomicBool,
+    first_failure_logged: AtomicBool,
 }
 
 impl SignalCounts {
@@ -171,11 +185,6 @@ impl SignalCounts {
 #[derive(Debug, Default)]
 pub struct RelayCounters {
     signals: [SignalCounts; Signal::ALL.len()],
-    /// Whether the most recent export attempt failed. Cleared by the next
-    /// success; flushes skip waiting while it is set.
-    last_export_failed: AtomicBool,
-    first_rejection_logged: AtomicBool,
-    first_failure_logged: AtomicBool,
     final_summary_logged: AtomicBool,
 }
 
@@ -190,43 +199,54 @@ impl RelayCounters {
     }
 
     /// Records one export request refused with 503 because the buffer was
-    /// full. Warns on the first occurrence only.
+    /// full. Warns on the first occurrence per signal only.
     pub fn record_rejection(&self, signal: Signal) {
-        self.counts(signal).rejected.fetch_add(1, Ordering::Relaxed);
-        if !self.first_rejection_logged.swap(true, Ordering::Relaxed) {
+        let counts = self.counts(signal);
+        counts.rejected.fetch_add(1, Ordering::Relaxed);
+        if !counts.first_rejection_logged.swap(true, Ordering::Relaxed) {
             warn!(
-                buffer_capacity = BUFFER_CAPACITY,
+                signal = signal.name(),
+                buffer_capacity = buffer::queue_capacity(signal, BUFFER_CAPACITY),
                 "OTLP relay rejected an agent export: buffer full"
             );
         }
     }
 
     /// Records one export attempt that failed or timed out. Warns on the
-    /// first occurrence only.
+    /// first occurrence per signal only.
     pub fn record_export_failure(
         &self,
         signal: Signal,
         endpoint: &str,
         error: &dyn std::fmt::Display,
     ) {
-        self.counts(signal)
-            .export_failures
-            .fetch_add(1, Ordering::Relaxed);
-        self.last_export_failed.store(true, Ordering::Relaxed);
-        if !self.first_failure_logged.swap(true, Ordering::Relaxed) {
-            warn!(endpoint, %error, "OTLP relay export to collector failed");
+        let counts = self.counts(signal);
+        counts.export_failures.fetch_add(1, Ordering::Relaxed);
+        counts.last_export_failed.store(true, Ordering::Relaxed);
+        if !counts.first_failure_logged.swap(true, Ordering::Relaxed) {
+            warn!(
+                signal = signal.name(),
+                endpoint,
+                %error,
+                "OTLP relay export to collector failed"
+            );
         }
     }
 
     /// Records one batch delivered to the collector.
     pub fn record_export_success(&self, signal: Signal) {
-        self.counts(signal).exported.fetch_add(1, Ordering::Relaxed);
-        self.last_export_failed.store(false, Ordering::Relaxed);
+        let counts = self.counts(signal);
+        counts.exported.fetch_add(1, Ordering::Relaxed);
+        counts.last_export_failed.store(false, Ordering::Relaxed);
     }
 
-    /// Whether the most recent export attempt failed.
-    fn last_export_failed(&self) -> bool {
-        self.last_export_failed.load(Ordering::Relaxed)
+    /// Whether batches are pending and the most recent export of every
+    /// signal that has some failed. A collector that rejects only logs or
+    /// metrics does not count, so trace batches still get flushed.
+    fn collector_down(&self) -> bool {
+        let mut pending = self.signals.iter().filter(|counts| counts.pending() > 0);
+        pending.clone().next().is_some()
+            && pending.all(|counts| counts.last_export_failed.load(Ordering::Relaxed))
     }
 
     /// Current counts over all signals.
@@ -287,16 +307,16 @@ impl RelayCounters {
         );
     }
 
-    /// Logs the final summary once, and only when something was rejected or
-    /// failed (FR-009). Called from `shutdown` and, for lifecycle paths that
+    /// Logs the final summary once, when anything was exported, rejected or
+    /// failed. Called from `shutdown` and, for lifecycle paths that
     /// drop the relay without shutting it down, from `Drop`.
     fn log_final_summary(&self) {
         let CounterSnapshot {
+            exported,
             rejected,
             export_failures,
-            ..
         } = self.snapshot();
-        if (rejected > 0 || export_failures > 0)
+        if (exported > 0 || rejected > 0 || export_failures > 0)
             && !self.final_summary_logged.swap(true, Ordering::Relaxed)
         {
             self.log_summary();
@@ -604,11 +624,11 @@ impl OtlpRelay {
     /// supervisor stays up for exec sessions afterwards, so their traces
     /// are still relayed; [`Self::shutdown`] runs at final teardown.
     ///
-    /// Returns at once when the most recent export failed: a collector that
-    /// is down would only run the clock out, and trace delivery must not
+    /// Returns at once when the most recent export of every pending signal
+    /// failed: a collector that is down would only run the clock out, and trace delivery must not
     /// delay the exit report.
     pub async fn flush(&self, bound: Duration) {
-        if self.counters.last_export_failed() {
+        if self.counters.collector_down() {
             let pending = self.counters.pending();
             if pending > 0 {
                 warn!(
@@ -642,7 +662,8 @@ impl OtlpRelay {
     /// collector for at most `flush_bound`, and logs the final summary.
     /// Never fails; batches still pending at the deadline are discarded and
     /// counted as export failures. Like [`Self::flush`], it does not wait for
-    /// the collector when the most recent export failed.
+    /// the collector when the most recent export of every pending signal
+    /// failed.
     pub async fn shutdown(mut self, flush_bound: Duration) {
         let started = Instant::now();
         let exported_before = self.counters.snapshot().exported;
@@ -653,7 +674,7 @@ impl OtlpRelay {
         }
         self.server.close_buffer();
 
-        if self.counters.last_export_failed() {
+        if self.counters.collector_down() {
             self.export_task.abort();
             let _ = (&mut self.export_task).await;
             let discarded = self.counters.discard_pending();
@@ -961,7 +982,17 @@ mod tests {
             "spoofed attribution keys were appended to, not replaced: {:?}",
             received.duplicate_resource_keys
         );
-        assert_eq!(relay.counters.snapshot().exported, 2);
+        wait_until(Duration::from_secs(5), || relay.counters.pending() == 0).await;
+        let exported = |signal| relay.counters.counts(signal).snapshot().exported;
+        assert_eq!(
+            [
+                exported(Signal::Traces),
+                exported(Signal::Logs),
+                exported(Signal::Metrics)
+            ],
+            [0, 1, 1]
+        );
+        relay.flush(Duration::from_secs(1)).await;
     }
 
     #[tokio::test]
@@ -1357,10 +1388,42 @@ mod tests {
     #[tokio::test]
     async fn a_successful_export_clears_the_failure_flag() {
         let counters = RelayCounters::default();
+        counters.record_accepted(Signal::Traces);
         counters.record_export_failure(Signal::Traces, "http://collector:4317", &"boom");
-        assert!(counters.last_export_failed());
+        counters.record_accepted(Signal::Traces);
+        assert!(counters.collector_down());
         counters.record_export_success(Signal::Traces);
-        assert!(!counters.last_export_failed());
+        counters.record_accepted(Signal::Traces);
+        assert!(!counters.collector_down());
+    }
+
+    #[tokio::test]
+    async fn a_failing_signal_does_not_mark_the_collector_down_for_the_others() {
+        let counters = RelayCounters::default();
+        counters.record_accepted(Signal::Traces);
+        counters.record_accepted(Signal::Logs);
+        counters.record_export_failure(Signal::Logs, "http://collector:4317", &"404");
+        assert_eq!(counters.counts(Signal::Logs).pending(), 0);
+        assert!(!counters.collector_down(), "traces never failed");
+        counters.record_export_failure(Signal::Traces, "http://collector:4317", &"down");
+        counters.record_accepted(Signal::Traces);
+        assert!(counters.collector_down());
+    }
+
+    #[tokio::test]
+    async fn flush_delivers_traces_after_a_logs_export_failure() {
+        let collector = OtlpTestServer::start().await;
+        let (relay, _reserved, gate) = gated(collector.endpoint());
+        assert_eq!(post(&relay, "last-span").await, 200);
+        relay
+            .counters
+            .record_export_failure(Signal::Logs, collector.endpoint(), &"404");
+        gate.send_replace(true);
+        relay.flush(FLUSH_TIMEOUT).await;
+        assert_eq!(relay.counters.counts(Signal::Traces).snapshot().exported, 1);
+        relay.shutdown(FLUSH_TIMEOUT).await;
+        let received = collector.shutdown().await;
+        assert!(received.spans.iter().any(|span| span.name == "last-span"));
     }
 
     #[tokio::test]
@@ -1423,6 +1486,44 @@ mod tests {
             1
         );
         assert_eq!(counters.snapshot().rejected, 10);
+
+        counters.record_rejection(Signal::Logs);
+        let warnings = logs.events(
+            tracing::Level::WARN,
+            "OTLP relay rejected an agent export: buffer full",
+        );
+        assert_eq!(warnings.len(), 2, "the latch is per signal");
+        assert_eq!(warnings[1].field("buffer_capacity"), Some(8));
+    }
+
+    #[tokio::test]
+    async fn summary_names_the_counts_of_each_signal() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        let counters = RelayCounters::default();
+        counters.record_export_success(Signal::Logs);
+        counters.record_rejection(Signal::Metrics);
+        counters.record_rejection(Signal::Metrics);
+        counters.record_export_failure(Signal::Traces, "http://collector:4317", &"boom");
+        counters.log_final_summary();
+        let summary = &logs.events(tracing::Level::INFO, "OTLP relay summary")[0];
+        assert_eq!(summary.field("logs_exported"), Some(1));
+        assert_eq!(summary.field("metrics_rejected"), Some(2));
+        assert_eq!(summary.field("traces_export_failures"), Some(1));
+        assert_eq!(summary.field("logs_rejected"), Some(0));
+        assert_eq!(summary.field("metrics_exported"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn final_summary_is_logged_when_batches_were_only_exported() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        let counters = RelayCounters::default();
+        counters.log_final_summary();
+        assert_eq!(logs.count(tracing::Level::INFO, "OTLP relay summary"), 0);
+        counters.record_export_success(Signal::Logs);
+        counters.log_final_summary();
+        assert_eq!(logs.count(tracing::Level::INFO, "OTLP relay summary"), 1);
     }
 
     #[tokio::test]
@@ -1592,11 +1693,9 @@ mod tests {
             logs.count(tracing::Level::INFO, "OTLP relay flushed before exit"),
             1
         );
-        assert_eq!(
-            logs.count(tracing::Level::INFO, "OTLP relay summary"),
-            0,
-            "no final summary when nothing was rejected or failed"
-        );
+        let summaries = logs.events(tracing::Level::INFO, "OTLP relay summary");
+        assert_eq!(summaries.len(), 1, "exported batches get a final summary");
+        assert_eq!(summaries[0].field("traces_exported"), Some(3));
     }
 
     #[tokio::test]

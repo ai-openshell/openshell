@@ -1389,6 +1389,7 @@ mod tests {
     fn canonical_process_sees_relay_endpoint_and_never_the_collector() {
         use openshell_core::sandbox_env::{
             OTEL_EXPORTER_OTLP_COMPRESSION, OTEL_EXPORTER_OTLP_ENDPOINT,
+            OTEL_EXPORTER_OTLP_LOGS_COMPRESSION, OTEL_EXPORTER_OTLP_METRICS_COMPRESSION,
             OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
             OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTLP_RELAY_ENDPOINT,
         };
@@ -1460,6 +1461,8 @@ mod tests {
             HashMap::from([
                 (OTEL_EXPORTER_OTLP_PROTOCOL.into(), "grpc".into()),
                 (OTEL_EXPORTER_OTLP_TRACES_COMPRESSION.into(), "gzip".into()),
+                (OTEL_EXPORTER_OTLP_LOGS_COMPRESSION.into(), "gzip".into()),
+                (OTEL_EXPORTER_OTLP_METRICS_COMPRESSION.into(), "gzip".into()),
             ]),
             provider_redirect(),
             true,
@@ -1467,6 +1470,8 @@ mod tests {
         for key in [
             OTEL_EXPORTER_OTLP_COMPRESSION,
             OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
+            OTEL_EXPORTER_OTLP_LOGS_COMPRESSION,
+            OTEL_EXPORTER_OTLP_METRICS_COMPRESSION,
         ] {
             assert_eq!(
                 get(&variables, key).as_deref(),

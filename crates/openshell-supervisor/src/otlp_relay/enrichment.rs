@@ -121,7 +121,7 @@ impl std::fmt::Display for EnrichError {
         match self {
             Self::Malformed(error) => write!(f, "malformed OTLP export request: {error}"),
             Self::TooManyResourceSpans => {
-                write!(f, "more than {MAX_RESOURCE_SPANS} resource_spans entries")
+                write!(f, "more than {MAX_RESOURCE_SPANS} resource entries")
             }
             Self::TooManyResourceAttributes => {
                 write!(f, "more than {MAX_RESOURCE_ATTRIBUTES} resource attributes")
@@ -174,7 +174,7 @@ fn enrich_to_vec(raw: &[u8], sandbox_id: &str) -> Result<Vec<u8>, EnrichError> {
         if tag == RESOURCE_SPANS_TAG {
             if wire_type != WireType::LengthDelimited {
                 return Err(EnrichError::Malformed(
-                    "resource_spans is not length-delimited".into(),
+                    "resource entry is not length-delimited".into(),
                 ));
             }
             entries += 1;

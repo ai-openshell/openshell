@@ -58,12 +58,11 @@ pub struct BatchReceiver {
 
 impl BatchReceiver {
     /// Next buffered batch, or `None` once every sender has been dropped and
-    /// the buffer is drained. Traces go before logs and logs before metrics
-    /// when several are waiting; arrival order holds within a signal.
+    /// the buffer is drained. When several signals are waiting, tokio picks
+    /// one at random, so none starves; arrival order holds within a signal.
     pub async fn recv(&mut self) -> Option<(Signal, Bytes)> {
         let [traces, logs, metrics] = &mut self.queues;
         tokio::select! {
-            biased;
             Some(batch) = traces.recv() => Some((Signal::Traces, batch)),
             Some(batch) = logs.recv() => Some((Signal::Logs, batch)),
             Some(batch) = metrics.recv() => Some((Signal::Metrics, batch)),
@@ -72,17 +71,20 @@ impl BatchReceiver {
     }
 }
 
+/// Queue size of `signal` for a buffer of `capacity` trace batches: logs and
+/// metrics get a quarter of that, rounded up.
+pub fn queue_capacity(signal: Signal, capacity: usize) -> usize {
+    match signal {
+        Signal::Traces => capacity,
+        Signal::Logs | Signal::Metrics => capacity.div_ceil(4),
+    }
+}
+
 /// Creates a buffer holding at most `capacity` trace batches and a quarter
 /// of that, rounded up, for each of logs and metrics.
 pub fn new_buffer(capacity: usize) -> (BatchSender, BatchReceiver) {
     let (senders, receivers): (Vec<_>, Vec<_>) = Signal::ALL
-        .map(|signal| {
-            let capacity = match signal {
-                Signal::Traces => capacity,
-                Signal::Logs | Signal::Metrics => capacity.div_ceil(4),
-            };
-            mpsc::channel(capacity)
-        })
+        .map(|signal| mpsc::channel(queue_capacity(signal, capacity)))
         .into_iter()
         .unzip();
     (
@@ -118,18 +120,37 @@ mod tests {
     #[tokio::test]
     async fn a_full_signal_does_not_block_the_others() {
         let (tx, mut rx) = new_buffer(32);
-        for _ in 0..8 {
-            tx.try_send(Signal::Logs, Bytes::from_static(b"l")).unwrap();
+        for signal in [Signal::Logs, Signal::Metrics] {
+            for _ in 0..8 {
+                tx.try_send(signal, Bytes::from_static(b"x")).unwrap();
+            }
+            assert_eq!(
+                tx.try_send(signal, Bytes::from_static(b"x")),
+                Err(SendError::BufferFull)
+            );
         }
-        assert_eq!(
-            tx.try_send(Signal::Logs, Bytes::from_static(b"l")),
-            Err(SendError::BufferFull)
-        );
+        tx.try_send(T, Bytes::from_static(b"t")).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..17 {
+            seen.push(rx.recv().await.unwrap().0);
+        }
+        assert_eq!(seen.iter().filter(|s| **s == T).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_busy_signal_does_not_starve_the_others() {
+        let (tx, mut rx) = new_buffer(32);
+        for _ in 0..32 {
+            tx.try_send(T, Bytes::from_static(b"t")).unwrap();
+        }
+        tx.try_send(Signal::Logs, Bytes::from_static(b"l")).unwrap();
         tx.try_send(Signal::Metrics, Bytes::from_static(b"m"))
             .unwrap();
-        tx.try_send(T, Bytes::from_static(b"t")).unwrap();
-        assert_eq!(rx.recv().await.unwrap().0, T);
-        assert_eq!(rx.recv().await.unwrap().0, Signal::Logs);
+        let mut seen = Vec::new();
+        for _ in 0..16 {
+            seen.push(rx.recv().await.unwrap().0);
+        }
+        assert!(seen.contains(&Signal::Logs) && seen.contains(&Signal::Metrics));
     }
 
     #[tokio::test]
@@ -139,10 +160,14 @@ mod tests {
         tx.try_send(Signal::Metrics, Bytes::from_static(b"b"))
             .unwrap();
         drop(tx);
-        assert_eq!(rx.recv().await.unwrap(), (T, Bytes::from_static(b"a")));
+        let mut got = vec![rx.recv().await.unwrap(), rx.recv().await.unwrap()];
+        got.sort_by_key(|(signal, _)| signal.index());
         assert_eq!(
-            rx.recv().await.unwrap(),
-            (Signal::Metrics, Bytes::from_static(b"b"))
+            got,
+            [
+                (T, Bytes::from_static(b"a")),
+                (Signal::Metrics, Bytes::from_static(b"b"))
+            ]
         );
         assert!(rx.recv().await.is_none());
     }

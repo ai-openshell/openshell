@@ -59,8 +59,8 @@ dropped.
 When `AgentSpec::otlp_relay_active` is set, `child_env::apply_otlp_relay_env`
 gives every workload process (main, exec, and SSH) `OTEL_EXPORTER_OTLP_ENDPOINT`
 pointing at the relay address, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, and
-`none` for `OTEL_EXPORTER_OTLP_COMPRESSION` and
-`OTEL_EXPORTER_OTLP_TRACES_COMPRESSION`, and removes any inherited
+`none` for `OTEL_EXPORTER_OTLP_COMPRESSION` and the traces, logs, and metrics
+compression variables, and removes any inherited
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. These defaults apply after the provider
 variables. If the creation request or a per-exec environment names a generic
 or traces-specific OTLP endpoint, the runtime injects nothing, and the

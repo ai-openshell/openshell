@@ -6,8 +6,10 @@ use std::hash::BuildHasher;
 use std::path::Path;
 
 use openshell_core::sandbox_env::{
-    OTEL_EXPORTER_OTLP_COMPRESSION, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL,
-    OTEL_EXPORTER_OTLP_TRACES_COMPRESSION, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTLP_RELAY_ENDPOINT,
+    OTEL_EXPORTER_OTLP_COMPRESSION, OTEL_EXPORTER_OTLP_ENDPOINT,
+    OTEL_EXPORTER_OTLP_LOGS_COMPRESSION, OTEL_EXPORTER_OTLP_METRICS_COMPRESSION,
+    OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTLP_RELAY_ENDPOINT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,16 +61,18 @@ const OTLP_ENDPOINT_VARS: [&str; 2] = [
 /// Only the generic endpoint and protocol are set. Signal-specific variables
 /// take precedence over them in every SDK, so an endpoint the workload sets
 /// later at any layer, generic or traces-specific, wins over this default.
-/// Compression is disabled for both the generic and the traces-specific
+/// Compression is disabled for the generic and every signal-specific
 /// variable because the relay refuses compressed bodies, and a `gzip` value
 /// from the image or the creation request would otherwise make every export
 /// fail.
-pub fn otlp_relay_env_vars() -> [(&'static str, &'static str); 4] {
+pub fn otlp_relay_env_vars() -> [(&'static str, &'static str); 6] {
     [
         (OTEL_EXPORTER_OTLP_ENDPOINT, OTLP_RELAY_ENDPOINT),
         (OTEL_EXPORTER_OTLP_PROTOCOL, "http/protobuf"),
         (OTEL_EXPORTER_OTLP_COMPRESSION, "none"),
         (OTEL_EXPORTER_OTLP_TRACES_COMPRESSION, "none"),
+        (OTEL_EXPORTER_OTLP_LOGS_COMPRESSION, "none"),
+        (OTEL_EXPORTER_OTLP_METRICS_COMPRESSION, "none"),
     ]
 }
 
@@ -231,6 +235,8 @@ mod tests {
                 ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
                 ("OTEL_EXPORTER_OTLP_COMPRESSION", "none"),
                 ("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "none"),
+                ("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "none"),
+                ("OTEL_EXPORTER_OTLP_METRICS_COMPRESSION", "none"),
             ]
         );
     }
