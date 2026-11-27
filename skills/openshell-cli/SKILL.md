@@ -95,9 +95,11 @@ attachment and delete its sandbox after the service exits.
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
 For native Windows MXC, supply the Windows command and absolute working
-directory through `--driver-config-json` and use `--detach`. The gateway
-administrator must enable caller driver configuration. Foreground attachment
-is rejected before provisioning; `--no-tty` alone does not request detachment.
+directory through `--driver-config-json`. The gateway administrator must enable
+caller driver configuration. A foreground create with a command after `--`
+streams the command's output to the CLI and returns its exit code; use
+`--no-tty`, because an interactive terminal is rejected before provisioning.
+Add `--detach` to run the command in the background.
 Use `sandbox exec <name> --no-tty -- <executable> [args...]` for an additional
 command. For shell builtins, pass a single command string after `cmd.exe /d /c`.
 Use `sandbox start <name>` to relaunch a stopped, completed, or failed-main-process sandbox with its
@@ -327,7 +329,7 @@ Key flags:
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
 
-If the driver rejects foreground attachment during create validation, use `--detach`.
+If the driver rejects an interactive terminal during create validation (MXC), use `--no-tty` or `--detach`.
 
 `--detach` adds no attachment grace period. When the canonical process exits,
 its terminal phase is reported immediately. A foreground create declares one
