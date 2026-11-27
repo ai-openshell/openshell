@@ -4649,6 +4649,44 @@ fn volume_in_use_conflict_is_retryable() {
 }
 
 #[tokio::test]
+async fn volume_removal_retries_after_removing_managed_users() {
+    let config = runtime_config();
+    let (docker, server) = workspace::tests::docker_api(vec![
+        (
+            "DELETE",
+            "/volumes/vol".to_string(),
+            409,
+            serde_json::json!({"message": "volume is in use - [c1]"}),
+        ),
+        (
+            "GET",
+            // Only this sandbox's managed containers may be removed.
+            "sandbox-id%3Dsandbox-1".to_string(),
+            200,
+            serde_json::json!([{"Id": "c1"}]),
+        ),
+        (
+            "DELETE",
+            "/containers/c1?v=false&force=true".to_string(),
+            204,
+            serde_json::Value::Null,
+        ),
+        (
+            "DELETE",
+            "/volumes/vol".to_string(),
+            204,
+            serde_json::Value::Null,
+        ),
+    ])
+    .await;
+
+    remove_docker_volume(&docker, &config, "sandbox-1", "vol")
+        .await
+        .expect("volume removal succeeds once its users are gone");
+    assert_eq!(server.await.unwrap().len(), 4);
+}
+
+#[tokio::test]
 async fn missing_start_generation_is_adopted() {
     let directory = TempDir::new().expect("create temporary directory");
     let path = directory.path().join(START_GENERATION_FILE);

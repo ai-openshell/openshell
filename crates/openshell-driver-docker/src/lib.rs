@@ -4385,7 +4385,7 @@ async fn create_docker_channel_volume(
             create_docker_runtime_volume(docker, sandbox, config, name.clone(), create).await
         {
             for created in &names[..index] {
-                let _ = remove_docker_volume(docker, created).await;
+                let _ = remove_docker_volume(docker, config, &sandbox.id, created).await;
             }
             return Err(error);
         }
@@ -4459,16 +4459,22 @@ async fn remove_docker_channel_volume_by_id(
 ) -> Result<(), Status> {
     remove_docker_volume(
         docker,
+        config,
+        sandbox_id,
         &docker_channel_volume_name_by_id(sandbox_id, config),
     )
     .await?;
     remove_docker_volume(
         docker,
+        config,
+        sandbox_id,
         &docker_supervisor_volume_name_by_id(sandbox_id, config),
     )
     .await?;
     remove_docker_volume(
         docker,
+        config,
+        sandbox_id,
         &docker_control_volume_name_by_id(sandbox_id, config),
     )
     .await
@@ -4486,9 +4492,14 @@ const VOLUME_REMOVE_ATTEMPTS: usize = 5;
 const VOLUME_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// Removes a runtime volume. A container create that was already in flight
-/// when provisioning was cancelled can still mount it, so remove such
-/// containers and retry while Docker reports the volume in use.
-async fn remove_docker_volume(docker: &Docker, name: &str) -> Result<(), Status> {
+/// when provisioning was cancelled can still mount it, so remove this
+/// sandbox's managed containers and retry while Docker reports it in use.
+async fn remove_docker_volume(
+    docker: &Docker,
+    config: &DockerDriverRuntimeConfig,
+    sandbox_id: &str,
+    name: &str,
+) -> Result<(), Status> {
     let mut attempt = 1;
     loop {
         match docker
@@ -4499,7 +4510,7 @@ async fn remove_docker_volume(docker: &Docker, name: &str) -> Result<(), Status>
             Err(error) if is_not_found_error(&error) => return Ok(()),
             Err(error) if is_volume_in_use_error(&error) && attempt < VOLUME_REMOVE_ATTEMPTS => {
                 attempt += 1;
-                remove_containers_using_volume(docker, name).await?;
+                remove_containers_using_volume(docker, config, sandbox_id, name).await?;
                 tokio::time::sleep(VOLUME_REMOVE_RETRY_DELAY).await;
             }
             Err(error) => {
@@ -4511,8 +4522,17 @@ async fn remove_docker_volume(docker: &Docker, name: &str) -> Result<(), Status>
     }
 }
 
-async fn remove_containers_using_volume(docker: &Docker, volume: &str) -> Result<(), Status> {
-    let filters = HashMap::from([("volume".to_string(), vec![volume.to_string()])]);
+async fn remove_containers_using_volume(
+    docker: &Docker,
+    config: &DockerDriverRuntimeConfig,
+    sandbox_id: &str,
+    volume: &str,
+) -> Result<(), Status> {
+    let mut filters = managed_resource_label_filters(
+        &config.sandbox_namespace,
+        [format!("{LABEL_SANDBOX_ID}={sandbox_id}")],
+    );
+    filters.insert("volume".to_string(), vec![volume.to_string()]);
     let containers = docker
         .list_containers(Some(
             ListContainersOptionsBuilder::default()
