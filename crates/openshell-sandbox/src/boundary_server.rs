@@ -4386,6 +4386,40 @@ mod linux {
     type ProcessExit = Result<ExitStatusWire, String>;
     type SharedProcessExit = Arc<(Mutex<Option<ProcessExit>>, Condvar)>;
 
+    /// Records the agent's exit and wakes its waiters. Dropping it before the
+    /// exit is recorded, as when runtime shutdown cancels the reaper, records
+    /// an error so no `Wait` stays parked.
+    struct ExitRecorder(SharedProcessExit);
+
+    impl ExitRecorder {
+        fn record(&self, result: ProcessExit) {
+            let (state, changed) = &*self.0;
+            lock(state).get_or_insert(result);
+            changed.notify_all();
+        }
+    }
+
+    fn wait_for_exit(exit: &SharedProcessExit) -> ProcessExit {
+        let (state, changed) = &**exit;
+        let mut guard = lock(state);
+        loop {
+            if let Some(result) = guard.as_ref() {
+                return result.clone();
+            }
+            guard = changed
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    impl Drop for ExitRecorder {
+        fn drop(&mut self) {
+            self.record(Err(
+                "process runtime stopped before the agent exited".to_string()
+            ));
+        }
+    }
+
     struct ManagedProcess {
         process_id: String,
         signaler: AgentSignaler,
@@ -4470,16 +4504,14 @@ mod linux {
             let loopback_connector = spawned.loopback_connector();
             let main_session = spawned.main_session();
             let exit = Arc::new((Mutex::new(None), Condvar::new()));
-            let reaper_exit = exit.clone();
+            let recorder = ExitRecorder(exit.clone());
             runtime.spawn(async move {
                 let result = spawned
                     .wait()
                     .await
                     .map(process_status)
                     .map_err(|error| format!("wait for process supervisor leaf: {error}"));
-                let (state, changed) = &*reaper_exit;
-                *lock(state) = Some(result);
-                changed.notify_all();
+                recorder.record(result);
             });
             Ok(Self {
                 process_id,
@@ -4500,16 +4532,7 @@ mod linux {
         }
 
         fn wait(&self) -> ProcessExit {
-            let (state, changed) = &*self.exit;
-            let mut exit = lock(state);
-            loop {
-                if let Some(result) = exit.as_ref() {
-                    return result.clone();
-                }
-                exit = changed
-                    .wait(exit)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
+            wait_for_exit(&self.exit)
         }
 
         fn signal(&self, signal: SignalWire) -> Result<(), String> {
@@ -6321,6 +6344,38 @@ mod linux {
             openshell_sandbox_backend::boundary_protocol::decode_frame::<ResponseEnvelope>(&frame)
                 .expect("decode logical response")
                 .response
+        }
+
+        #[test]
+        fn cancelled_reaper_releases_a_parked_wait() {
+            let exit: SharedProcessExit = Arc::new((Mutex::new(None), Condvar::new()));
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let recorder = ExitRecorder(exit.clone());
+            runtime.spawn(async move {
+                let _recorder = recorder;
+                std::future::pending::<()>().await;
+            });
+            let (done, released) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || done.send(wait_for_exit(&exit)));
+            drop(runtime);
+            let result = released
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a cancelled reaper left Wait parked");
+            assert!(result.is_err());
+            waiter.join().expect("waiter thread").expect("send result");
+        }
+
+        #[test]
+        fn recorded_exit_survives_the_recorder_drop() {
+            let exit: SharedProcessExit = Arc::new((Mutex::new(None), Condvar::new()));
+            let recorder = ExitRecorder(exit.clone());
+            recorder.record(Err("first".to_string()));
+            drop(recorder);
+            assert!(matches!(wait_for_exit(&exit), Err(message) if message == "first"));
         }
 
         /// A shared supervisor outlives the sandboxes it serves and keeps
