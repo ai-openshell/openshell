@@ -769,7 +769,7 @@ async fn run_sandbox_with_backend(
     } = config;
     // The current client attachment adapter is SSH; retaining a process's I/O
     // internally does not make it reachable by a foreground client.
-    if await_main_process_attachment && (!cfg!(unix) || ssh_socket_path.is_none()) {
+    if await_main_process_attachment && ssh_socket_path.is_none() {
         return Err(miette::miette!(
             "foreground attachment to the main process requires a supported SSH access adapter; create the sandbox with --detach"
         ));
