@@ -566,7 +566,6 @@ pub async fn launch(
 }
 
 /// How often to start a driver whose backend is unreachable.
-#[cfg(any(feature = "compute-driver-docker", feature = "compute-driver-podman"))]
 #[derive(Clone, Copy)]
 pub struct UnavailableRetry {
     pub attempts: u32,
@@ -577,7 +576,6 @@ pub struct UnavailableRetry {
 ///
 /// Only an "unavailable" result is retried. An invalid table or a crash is
 /// final.
-#[cfg(any(feature = "compute-driver-docker", feature = "compute-driver-podman"))]
 pub async fn launch_tolerating_unavailable(
     request: LaunchRequest<'_>,
     configure: ConfigureCall,

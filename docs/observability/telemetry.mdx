@@ -37,17 +37,17 @@ Cargo cannot subtract a single default feature, so `defaults-without-telemetry` 
 
 ### Select Compute Drivers
 
-The gateway exposes separate Cargo features for its built-in compute drivers: `compute-driver-kubernetes`, `compute-driver-docker`, `compute-driver-podman`, `compute-driver-vm`, and `compute-driver-mxc`. Disable the default feature set, then enable only the drivers and telemetry mode the target binary needs:
+The gateway exposes Cargo features for its built-in compute drivers: `compute-driver-kubernetes`, `compute-driver-mxc`, and `driver-launcher`. The `driver-launcher` feature enables the launchers for the Docker, Podman, and VM drivers, which run as separate binaries; it replaces the former `compute-driver-docker`, `compute-driver-podman`, and `compute-driver-vm` features, which no longer exist. Disable the default feature set, then enable only the drivers and telemetry mode the target binary needs:
 
 ```shell
-# Docker only, with telemetry support.
-cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-docker
+# Docker, Podman, and VM launchers only, with telemetry support.
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,driver-launcher
 
-# Docker and VM only, with telemetry compiled out.
-cargo build --release -p openshell-gateway --no-default-features --features compute-driver-docker,compute-driver-vm
+# Docker, Podman, and VM launchers plus Kubernetes, with telemetry compiled out.
+cargo build --release -p openshell-gateway --no-default-features --features driver-launcher,compute-driver-kubernetes
 
 # Windows MXC only, with telemetry support and prebuilt Z3.
 cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-mxc,openshell-server/prebuilt-z3
 ```
 
-Regular builds keep their platform driver set through the default `in-tree-compute-drivers` compatibility feature. On Windows, `compute-driver-mxc` selects MXC and the other four features install unsupported-driver stubs. On other platforms, MXC is excluded.
+Regular builds keep their platform driver set through the default `in-tree-compute-drivers` compatibility feature. On Windows, `compute-driver-mxc` selects MXC and `driver-launcher` and `compute-driver-kubernetes` install unsupported-driver stubs. On other platforms, MXC is excluded.

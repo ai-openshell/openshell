@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(all(unix, feature = "compute-driver-vm"))]
+#![cfg(all(unix, feature = "driver-launcher"))]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -286,7 +286,6 @@ async fn vm_table_without_selection_does_not_probe_tools() {
     assert!(!combined(&output).contains("VM host tool"));
 }
 
-#[cfg(feature = "compute-driver-docker")]
 #[tokio::test]
 async fn unrelated_driver_does_not_require_vm_tools() {
     let fixture = Fixture::new();

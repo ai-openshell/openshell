@@ -204,5 +204,4 @@ impl LocalDriver {
 }
 
 /// How long to wait between starts while a named driver's backend is down.
-#[cfg(feature = "compute-driver-podman")]
 pub const BACKEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);

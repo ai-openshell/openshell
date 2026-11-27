@@ -657,7 +657,6 @@ fn configure_omits_what_the_gateway_does_not_have() {
 }
 
 #[tokio::test]
-#[cfg(any(feature = "compute-driver-docker", feature = "compute-driver-podman"))]
 async fn an_unreachable_backend_is_retried_a_bounded_number_of_times() {
     let dir = tempfile::tempdir().unwrap();
     let counter = dir.path().join("starts");
@@ -690,7 +689,6 @@ async fn an_unreachable_backend_is_retried_a_bounded_number_of_times() {
 }
 
 #[tokio::test]
-#[cfg(any(feature = "compute-driver-docker", feature = "compute-driver-podman"))]
 async fn an_invalid_table_or_a_crash_is_not_retried() {
     let dir = tempfile::tempdir().unwrap();
     for (name, code) in [("invalid", 78), ("crash", 1)] {
