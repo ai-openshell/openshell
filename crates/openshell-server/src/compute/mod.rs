@@ -260,12 +260,51 @@ const START_PHASE_CAS_RETRY_LIMIT: usize = 3;
 /// which every HA replica applies without the per-replica lifecycle gate.
 const STOP_PHASE_CAS_RETRY_LIMIT: usize = 5;
 const SUPERVISOR_SESSION_CAS_RETRY_LIMIT: usize = 3;
+/// Watch snapshots are phase-agnostic, so this retry does not belong to the
+/// `<LIFECYCLE>_PHASE_CAS_RETRY_LIMIT` family above.
+const WATCH_UPDATE_CAS_RETRY_LIMIT: usize = 3;
+// The loop below always attempts the update at least once, so its trailing
+// `Ok(())` can never report success without a write having been attempted.
+const _: () = assert!(WATCH_UPDATE_CAS_RETRY_LIMIT >= 1);
+
+/// Failure of a watch-driven sandbox update.
+///
+/// The retry wrapper only re-enters the update on [`Self::Conflict`]; every
+/// other failure is surfaced without retrying.
+#[derive(Debug)]
+enum SandboxUpdateError {
+    Conflict {
+        current_resource_version: Option<u64>,
+    },
+    Other(String),
+}
+
+impl fmt::Display for SandboxUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict {
+                current_resource_version,
+            } => write!(
+                f,
+                "concurrent modification detected during sandbox reconciliation (current resource_version: {})",
+                current_resource_version
+                    .map_or_else(|| "unknown".to_string(), |version| version.to_string())
+            ),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
 
 /// Serializes request-side lifecycle mutations for the same stable sandbox ID.
 ///
-/// Watch events deliberately do not use these gates, so a slow driver delete
-/// cannot block the sequential watch loop. Weak values let entries disappear
-/// after the last request using a sandbox's gate completes.
+/// A watch snapshot that can be applied directly never takes these gates. A
+/// snapshot that must be revalidated (`apply_sandbox_update_once`, gated on
+/// Starting, a Ready container exit, or a stopped bootstrap) takes the gate:
+/// the first attempt waits for it (`lock_for`), while a retry only tries it
+/// without blocking (`try_lock_for`) and defers to reconciliation when it is
+/// held. A slow driver operation can therefore not stall the sequential watch
+/// loop through the retry path. Weak values let entries disappear after the
+/// last request using a sandbox's gate completes.
 #[derive(Debug, Default)]
 struct LifecycleGateRegistry {
     gates: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -1349,6 +1388,8 @@ pub struct ComputeRuntime {
     /// coordinates one for the in-process driver.
     supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
     service_route_index: Arc<OnceLock<Arc<crate::service_routing::ServiceRouteIndex>>>,
+    #[cfg(test)]
+    sandbox_update_conflict_hook: Arc<sandbox_update_conflict_hook::SandboxUpdateConflictHook>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -1466,6 +1507,10 @@ impl ComputeRuntime {
             supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
             service_route_index: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            sandbox_update_conflict_hook: Arc::new(
+                sandbox_update_conflict_hook::SandboxUpdateConflictHook::default(),
+            ),
         })
     }
 
@@ -6041,14 +6086,74 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    async fn apply_sandbox_update(&self, mut incoming: DriverSandbox) -> Result<(), String> {
+    async fn apply_sandbox_update(&self, incoming: DriverSandbox) -> Result<(), String> {
+        // Each attempt re-reads the store and forces the revalidation path,
+        // which re-queries the driver, so a retry cannot apply a stale snapshot
+        // over a Starting, Ready, or Stopped transition: for those phases the
+        // path either applies the live driver snapshot or retains the current
+        // state. When the driver re-read fails or reports nothing and the fresh
+        // record's phase is outside those three (Provisioning, Error, Deleting,
+        // Unknown), the original event snapshot proceeds to
+        // `apply_sandbox_update_locked` exactly as on a first attempt.
+        for attempt in 1..=WATCH_UPDATE_CAS_RETRY_LIMIT {
+            match self.apply_sandbox_update_once(&incoming, attempt > 1).await {
+                Ok(()) => return Ok(()),
+                Err(SandboxUpdateError::Conflict {
+                    current_resource_version,
+                }) if attempt < WATCH_UPDATE_CAS_RETRY_LIMIT => {
+                    info!(
+                        sandbox_id = %incoming.id,
+                        attempt,
+                        current_resource_version = current_resource_version.map_or_else(
+                            || "unknown".to_string(),
+                            |version| version.to_string()
+                        ),
+                        "Sandbox update lost a concurrent write; retrying"
+                    );
+                    // Never sleep here: watch events are processed sequentially,
+                    // and this must not delay other sandboxes. Immediate retry is
+                    // enough because each attempt re-reads the record, so a
+                    // competing write that already committed is absorbed by the
+                    // next attempt; a write still in flight is exactly the case
+                    // the exhaustion fallback defers to reconciliation for.
+                    tokio::task::yield_now().await;
+                }
+                Err(SandboxUpdateError::Conflict {
+                    current_resource_version,
+                }) => {
+                    warn!(
+                        sandbox_id = %incoming.id,
+                        attempt,
+                        current_resource_version = current_resource_version.map_or_else(
+                            || "unknown".to_string(),
+                            |version| version.to_string()
+                        ),
+                        "Sandbox update still conflicts after retries; leaving it to reconciliation"
+                    );
+                    return Ok(());
+                }
+                Err(SandboxUpdateError::Other(message)) => return Err(message),
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_sandbox_update_once(
+        &self,
+        incoming: &DriverSandbox,
+        revalidate: bool,
+    ) -> Result<(), SandboxUpdateError> {
         let guard = self.lock_sandbox_local(&incoming.id).await;
         let mut existing = self
             .store
             .get(Sandbox::object_type(), &incoming.id)
             .await
-            .map_err(|e| e.to_string())?;
-        let existing_sandbox = existing.as_ref().map(decode_sandbox_record).transpose()?;
+            .map_err(|e| SandboxUpdateError::Other(e.to_string()))?;
+        let existing_sandbox = existing
+            .as_ref()
+            .map(decode_sandbox_record)
+            .transpose()
+            .map_err(SandboxUpdateError::Other)?;
         let existing_phase = existing_sandbox
             .as_ref()
             .map_or(SandboxPhase::Unknown, |sandbox| {
@@ -6056,11 +6161,15 @@ impl ComputeRuntime {
             });
 
         let ready_container_exit = existing_phase == SandboxPhase::Ready
-            && (driver_snapshot_confirms_stopped(&incoming)
-                || driver_snapshot_reports_runtime_restart(&incoming));
+            && (driver_snapshot_confirms_stopped(incoming)
+                || driver_snapshot_reports_runtime_restart(incoming));
         let stopped_bootstrap =
-            existing_phase == SandboxPhase::Stopped && driver_snapshot_confirms_starting(&incoming);
-        if existing_phase != SandboxPhase::Starting && !ready_container_exit && !stopped_bootstrap {
+            existing_phase == SandboxPhase::Stopped && driver_snapshot_confirms_starting(incoming);
+        if !revalidate
+            && existing_phase != SandboxPhase::Starting
+            && !ready_container_exit
+            && !stopped_bootstrap
+        {
             // Boxed so this update's future stays small for its callers.
             return Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await;
         }
@@ -6075,32 +6184,53 @@ impl ComputeRuntime {
         // revalidated so it cannot undo the completed stop.
         // Release this sandbox's local mutation lock, wait for that lifecycle
         // operation, and then reread both the driver and store before applying
-        // an authoritative observation. Taking the per-sandbox gate only for
-        // these ambiguous snapshots avoids delaying unrelated watch events behind
-        // slow lifecycle operations.
+        // an authoritative observation. A first-attempt ambiguous snapshot
+        // waits on the per-sandbox gate as before. A retry only tries the gate
+        // without blocking: the sequential watch loop must never stall behind a
+        // lifecycle operation that holds the gate across a slow driver RPC, so
+        // a busy gate defers the stale retry to reconciliation instead.
         let existing_name = existing_sandbox.as_ref().map_or_else(
             || incoming.name.clone(),
             |sandbox| sandbox.object_name().to_string(),
         );
         drop(guard);
-        let _lifecycle_guard = self.lifecycle_gates.lock_for(&incoming.id).await;
+        let _lifecycle_guard = if revalidate {
+            let Some(guard) = self.lifecycle_gates.try_lock_for(&incoming.id) else {
+                warn!(
+                    sandbox_id = %incoming.id,
+                    "Sandbox update retry deferred to reconciliation: lifecycle gate is busy"
+                );
+                return Ok(());
+            };
+            guard
+        } else {
+            self.lifecycle_gates.lock_for(&incoming.id).await
+        };
         let observed = self.get_driver_sandbox(&incoming.id, &existing_name).await;
         let _guard = self.lock_sandbox_local(&incoming.id).await;
         existing = self
             .store
             .get(Sandbox::object_type(), &incoming.id)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| SandboxUpdateError::Other(e.to_string()))?;
         let current_phase = existing
             .as_ref()
             .map(decode_sandbox_record)
-            .transpose()?
+            .transpose()
+            .map_err(SandboxUpdateError::Other)?
             .map_or(SandboxPhase::Unknown, |sandbox| {
                 SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
             });
 
-        match observed {
-            Ok(Some(live)) if live.id == incoming.id && live.status.is_some() => incoming = live,
+        // Only an authoritative live read replaces the event snapshot; every
+        // other outcome keeps it, so a retry re-enters with the original
+        // snapshot and revalidates it against the fresh record.
+        let replacement;
+        let incoming = match observed {
+            Ok(Some(live)) if live.id == incoming.id && live.status.is_some() => {
+                replacement = live;
+                &replacement
+            }
             Ok(Some(_) | None) | Err(_)
                 if matches!(
                     current_phase,
@@ -6113,17 +6243,17 @@ impl ComputeRuntime {
                 );
                 return Ok(());
             }
-            Ok(Some(_) | None) | Err(_) => {}
-        }
+            Ok(Some(_) | None) | Err(_) => incoming,
+        };
 
         Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await
     }
 
     async fn apply_sandbox_update_locked(
         &self,
-        incoming: DriverSandbox,
+        incoming: &DriverSandbox,
         existing_record: Option<ObjectRecord>,
-    ) -> Result<(), String> {
+    ) -> Result<(), SandboxUpdateError> {
         let Some(existing_record) = existing_record else {
             // The gateway store is authoritative. API creation persists the
             // complete row before asking the driver to create its resource, so
@@ -6135,7 +6265,8 @@ impl ComputeRuntime {
             );
             return Ok(());
         };
-        let existing = decode_sandbox_record(&existing_record)?;
+        let existing =
+            decode_sandbox_record(&existing_record).map_err(SandboxUpdateError::Other)?;
 
         if SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown)
             == SandboxPhase::Deleting
@@ -6151,39 +6282,44 @@ impl ComputeRuntime {
             .await
     }
 
-    // Subsequent driver snapshot for an existing sandbox: apply a single-attempt CAS update.
-    // On conflict the next watch event will naturally retry.
+    // Subsequent driver snapshot for an existing sandbox: apply a CAS update.
+    // The watch-path caller (`apply_sandbox_update`) retries a conflict a
+    // bounded number of times, re-reading and revalidating the snapshot each
+    // pass; after that reconciliation owns the sandbox. The reconciliation
+    // sweep callers report the conflict through `SandboxUpdateError` without
+    // retrying.
     async fn update_sandbox_record(
         &self,
-        incoming: DriverSandbox,
+        incoming: &DriverSandbox,
         expected_resource_version: u64,
         existing_phase: SandboxPhase,
-    ) -> Result<(), String> {
-        let session_connected = self.supervisor_session_ready(&incoming.id).await?;
+    ) -> Result<(), SandboxUpdateError> {
+        let session_connected = self
+            .supervisor_session_ready(&incoming.id)
+            .await
+            .map_err(SandboxUpdateError::Other)?;
+        #[cfg(test)]
+        self.sandbox_update_conflict_hook
+            .maybe_inject(&self.store, incoming)
+            .await?;
         let sandbox = self
             .store
-            .update_message_cas::<Sandbox, _>(
-                &incoming.id,
-                expected_resource_version,
-                |sandbox| {
-                    apply_driver_snapshot(
-                        sandbox,
-                        &incoming,
-                        session_connected,
-                        self.driver_info.driver_reports_runtime_readiness,
-                    );
-                },
-            )
+            .update_message_cas::<Sandbox, _>(&incoming.id, expected_resource_version, |sandbox| {
+                apply_driver_snapshot(
+                    sandbox,
+                    incoming,
+                    session_connected,
+                    self.driver_info.driver_reports_runtime_readiness,
+                );
+            })
             .await
             .map_err(|e| match e {
                 crate::persistence::PersistenceError::Conflict {
                     current_resource_version,
-                } => format!(
-                    "concurrent modification detected during sandbox reconciliation (current resource_version: {})",
-                    current_resource_version
-                        .map_or_else(|| "unknown".to_string(), |v| v.to_string())
-                ),
-                other => other.to_string(),
+                } => SandboxUpdateError::Conflict {
+                    current_resource_version,
+                },
+                other => SandboxUpdateError::Other(other.to_string()),
             })?;
 
         self.sandbox_index.update_from_sandbox(&sandbox);
@@ -6191,7 +6327,11 @@ impl ComputeRuntime {
         if existing_phase != SandboxPhase::Stopped
             && sandbox.phase() == SandboxPhase::Stopped as i32
         {
-            self.cleanup_stopped_sandbox_sessions(&sandbox).await?;
+            // The CAS already applied the snapshot; retrying this cleanup would
+            // re-apply it, so a failure here must not be treated as a conflict.
+            self.cleanup_stopped_sandbox_sessions(&sandbox)
+                .await
+                .map_err(SandboxUpdateError::Other)?;
         }
         Ok(())
     }
@@ -7147,8 +7287,9 @@ impl ComputeRuntime {
             return Ok(());
         }
 
-        self.apply_sandbox_update_locked(current, Some(existing))
+        self.apply_sandbox_update_locked(&current, Some(existing))
             .await
+            .map_err(|error| error.to_string())
     }
 
     async fn prune_missing_sandbox(
@@ -7213,8 +7354,9 @@ impl ComputeRuntime {
 
         if let Some(current) = current {
             return self
-                .apply_sandbox_update_locked(current, Some(current_record))
-                .await;
+                .apply_sandbox_update_locked(&current, Some(current_record))
+                .await
+                .map_err(|error| error.to_string());
         }
 
         let sandbox = decode_sandbox_record(&current_record)?;
@@ -9256,6 +9398,200 @@ pub fn new_test_runtime_with_driver(
         supervisor_otlp_tls: Arc::new(OnceLock::new()),
         supervisor_host: None,
         service_route_index: Arc::new(OnceLock::new()),
+        #[cfg(test)]
+        sandbox_update_conflict_hook: Arc::new(
+            sandbox_update_conflict_hook::SandboxUpdateConflictHook::default(),
+        ),
+    }
+}
+
+/// Test-only failure injection at the sandbox snapshot-update CAS point.
+///
+/// Mirrors the `fail_next_store` credential hook. It injects at the shared
+/// snapshot-update CAS reached through `apply_sandbox_update_locked`, so both
+/// the watch loop (`apply_sandbox_update`) and the reconciliation sweep
+/// (`reconcile_snapshot_sandbox` and `prune_missing_sandbox`) fire it. The
+/// version the CAS pins is captured inside that chain, so no outside write can
+/// land between that read and the CAS.
+#[cfg(test)]
+mod sandbox_update_conflict_hook {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use openshell_core::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
+    use prost::Message;
+
+    use super::{
+        DriverSandbox, Sandbox, SandboxPhase, SandboxUpdateError, Store, WriteCondition,
+        sandbox_resource_version,
+    };
+    use crate::persistence::ObjectType;
+
+    #[derive(Debug, Default)]
+    pub(super) struct SandboxUpdateConflictHook {
+        armed: AtomicBool,
+        /// Fires left before the hook disarms; zero fires on every attempt while armed.
+        remaining: AtomicUsize,
+        fired: AtomicUsize,
+        state: Mutex<HookState>,
+    }
+
+    /// Settings the arming methods replace together under one lock.
+    #[derive(Debug, Default)]
+    struct HookState {
+        /// When set, only snapshots for this sandbox fire the hook.
+        target: Option<String>,
+        mode: WatchUpdateConflictMode,
+        /// Phase written by a bumping hook, so a competing write can win a race
+        /// that the retry must revalidate against.
+        phase: Option<SandboxPhase>,
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    enum WatchUpdateConflictMode {
+        #[default]
+        Bump,
+        NonConflict,
+    }
+
+    impl SandboxUpdateConflictHook {
+        /// Fire `remaining` times, then disarm; zero keeps firing on every attempt.
+        pub(super) fn arm(&self, remaining: usize) {
+            self.arm_bump(None, remaining);
+        }
+
+        /// Arm the hook for one sandbox only, so another sandbox can still apply.
+        pub(super) fn arm_for(&self, sandbox_id: &str, remaining: usize) {
+            self.arm_bump(Some(sandbox_id.to_string()), remaining);
+        }
+
+        /// Fail the next CAS with a non-conflict error, which must not be retried.
+        pub(super) fn arm_non_conflict(&self) {
+            self.arm_state(None, WatchUpdateConflictMode::NonConflict, 1);
+        }
+
+        fn arm_bump(&self, target: Option<String>, remaining: usize) {
+            self.arm_state(target, WatchUpdateConflictMode::Bump, remaining);
+        }
+
+        fn arm_state(
+            &self,
+            target: Option<String>,
+            mode: WatchUpdateConflictMode,
+            remaining: usize,
+        ) {
+            self.armed.store(true, Ordering::SeqCst);
+            self.remaining.store(remaining, Ordering::SeqCst);
+            self.fired.store(0, Ordering::SeqCst);
+            let mut state = self
+                .state
+                .lock()
+                .expect("watch update hook state lock poisoned");
+            state.target = target;
+            state.mode = mode;
+            state.phase = None;
+        }
+
+        pub(super) fn set_conflicting_phase(&self, phase: SandboxPhase) {
+            self.state
+                .lock()
+                .expect("watch update hook state lock poisoned")
+                .phase = Some(phase);
+        }
+
+        pub(super) fn fired(&self) -> usize {
+            self.fired.load(Ordering::SeqCst)
+        }
+
+        /// Fire once if armed: perform a genuine competing write, or fail with a
+        /// synthetic non-conflict error.
+        pub(super) async fn maybe_inject(
+            &self,
+            store: &Store,
+            incoming: &DriverSandbox,
+        ) -> Result<(), SandboxUpdateError> {
+            if !self.armed.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let (target, mode, conflicting_phase) = {
+                let state = self
+                    .state
+                    .lock()
+                    .expect("watch update hook state lock poisoned");
+                (state.target.clone(), state.mode, state.phase)
+            };
+            if let Some(target) = target.as_deref()
+                && target != incoming.id
+            {
+                return Ok(());
+            }
+
+            let remaining = self.remaining.load(Ordering::SeqCst);
+            self.fired.fetch_add(1, Ordering::SeqCst);
+            if remaining == 0 {
+                // Stay armed and fire on every attempt.
+            } else if remaining == 1 {
+                self.armed.store(false, Ordering::SeqCst);
+                self.remaining.store(0, Ordering::SeqCst);
+            } else {
+                self.remaining.store(remaining - 1, Ordering::SeqCst);
+            }
+
+            match mode {
+                WatchUpdateConflictMode::Bump => {
+                    self.apply_competing_write(store, incoming, conflicting_phase)
+                        .await?;
+                    Ok(())
+                }
+                WatchUpdateConflictMode::NonConflict => Err(SandboxUpdateError::Other(
+                    "injected non-conflict sandbox update failure".to_string(),
+                )),
+            }
+        }
+
+        /// Write the sandbox row the way another replica would, bumping its
+        /// resource version so the caller's CAS loses a genuine race.
+        async fn apply_competing_write(
+            &self,
+            store: &Store,
+            incoming: &DriverSandbox,
+            conflicting_phase: Option<SandboxPhase>,
+        ) -> Result<(), SandboxUpdateError> {
+            let Some(mut current) = store
+                .get_message::<Sandbox>(&incoming.id)
+                .await
+                .map_err(|error| SandboxUpdateError::Other(error.to_string()))?
+            else {
+                return Ok(());
+            };
+            let expected_version = sandbox_resource_version(&current);
+            if let Some(phase) = conflicting_phase {
+                current.set_phase(phase as i32);
+            }
+            let labels = current.object_labels();
+            let labels_json = if labels.as_ref().is_none_or(HashMap::is_empty) {
+                None
+            } else {
+                Some(
+                    serde_json::to_string(&labels)
+                        .map_err(|error| SandboxUpdateError::Other(error.to_string()))?,
+                )
+            };
+            store
+                .put_if(
+                    Sandbox::object_type(),
+                    current.object_id(),
+                    current.object_name(),
+                    current.object_workspace(),
+                    &current.encode_to_vec(),
+                    labels_json.as_deref(),
+                    WriteCondition::MatchResourceVersion(expected_version),
+                )
+                .await
+                .map_err(|error| SandboxUpdateError::Other(error.to_string()))?;
+            Ok(())
+        }
     }
 }
 
@@ -10028,6 +10364,7 @@ mod tests {
         get_started: Notify,
         get_release: Semaphore,
         get_blocked: AtomicBool,
+        get_calls: AtomicUsize,
         get_outcome: TestMutex<ControlledGetOutcome>,
     }
 
@@ -10079,6 +10416,7 @@ mod tests {
                 get_started: Notify::new(),
                 get_release: Semaphore::new(0),
                 get_blocked: AtomicBool::new(false),
+                get_calls: AtomicUsize::new(0),
                 get_outcome: TestMutex::new(ControlledGetOutcome::Missing),
             })
         }
@@ -10207,6 +10545,10 @@ mod tests {
             self.start_calls.load(Ordering::SeqCst)
         }
 
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+
         fn start_requests(&self) -> Vec<(String, String)> {
             self.start_requests
                 .lock()
@@ -10291,6 +10633,7 @@ mod tests {
             &self,
             _request: Request<GetSandboxRequest>,
         ) -> Result<tonic::Response<GetSandboxResponse>, Status> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
             self.get_started.notify_one();
             if self.get_blocked.load(Ordering::SeqCst) {
                 self.get_release
@@ -10600,6 +10943,9 @@ mod tests {
             supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
             service_route_index: Arc::new(OnceLock::new()),
+            sandbox_update_conflict_hook: Arc::new(
+                sandbox_update_conflict_hook::SandboxUpdateConflictHook::default(),
+            ),
         }
     }
 
