@@ -3,12 +3,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# The GNU-linked gateway binary is staged at:
+# The GNU-linked gateway binary and the Docker and Podman compute drivers it
+# launches as subprocesses are staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-gateway
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-driver-docker
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-driver-podman
 #
 # Distroless Debian provides the glibc runtime required by the binary.
 
-ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
+ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:29ee70762214fe8190cea04ef1c0a84a8365879e047ce8f911ae5a5ab2355fa2
 FROM ${GATEWAY_BASE_IMAGE} AS gateway
 
 ARG TARGETARCH
@@ -16,6 +19,9 @@ ARG TARGETARCH
 WORKDIR /app
 
 COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
+# /usr/libexec/openshell is one of the directories the gateway searches for drivers.
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-driver-docker /usr/libexec/openshell/openshell-driver-docker
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-driver-podman /usr/libexec/openshell/openshell-driver-podman
 
 USER 1000:1000
 EXPOSE 8080

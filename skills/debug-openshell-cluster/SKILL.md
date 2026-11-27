@@ -352,6 +352,7 @@ Common findings:
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify the sibling binary next to `openshell-gateway`, or that the configured `sandbox_runtime_image` contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and the supervisor's gateway endpoint.
 - SSH host-key startup errors: use matching gateway, compute-driver, and supervisor releases. The gateway retains each sandbox's SSH key in its configured credential store and sends it only through the supervisor bootstrap bundle. Check credential-driver availability and compare the public `host_key_fingerprint` from sandbox JSON output; never print the bootstrap bundle or private key. A missing stored key for a sandbox with a fingerprint is an error, not permission to replace its identity. See the [sandbox SSH identity documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview).
+- Client reports `SSH host key mismatch for sandbox '<name>'`: the SSH server reached through the gateway presented a key other than the one the gateway publishes, and the client refused it before authentication. Read the published `host_key_fingerprint` with `openshell sandbox get <name> --output json` and compare it with the `gateway published` and `server presented` values in the error. Use matching gateway, compute-driver, and supervisor releases, then stop and start the sandbox so its supervisor restarts with the assigned key. Do not work around the check.
 - Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. For token grant failures on any HTTP protocol, including failures before endpoint selection, inspect `last_token_grant_failure` in JSON output. It contains the bounded destination and cause, survives unrelated successful traffic, and clears on matching grant success or a policy, provider, or supervisor reset. If several paths share a host and port, other failures before the path is known, such as TLS failures, remain only in logs. A `CredentialUnavailable` result from a failed dynamic token grant also carries `last_failure` with a closed-set `code`, `stage`, `recovery_action`, the provider and credential names, and the `request_id` that the workload received in its `x-openshell-request-id` response header. Search `openshell logs <name>` for that ID: the supervisor's `Token grant failed` line carries the code and stage for every endpoint, and the gateway's `dynamic token grant failed` line appears when the gateway hop failed. Verify the actual operation when current tool availability matters.
 - On Docker Desktop, repeated `Policy fetch failed after 5 attempts` messages
   can mean the supervisor's selected network mode cannot reach the gateway.
@@ -533,6 +534,15 @@ the release. Look for failed installs, unexpected values, missing namespace, wro
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+If the opt-in storage preflight stops a fresh StatefulSet install, run
+`kubectl get storageclass` and set `server.dataStorageClass` to an existing
+class for dynamic provisioning. The Helm identity needs cluster-scoped
+`list storageclasses` permission for the check. If the API denies the lookup,
+set an explicit gateway class or disable the check. Set
+`storageClass.preflight.enabled=false` when reinstalling with retained gateway
+PVCs. Check `server.workspaceStorageClass` separately when the cluster has no
+default class.
+
 If Kubernetes rejects `app.kubernetes.io/version` on a resource or certgen hook,
 inspect the rendered label and chart app version. Charts normalize SemVer build
 metadata for labels (`0.1.9+build.1` becomes `0.1.9_build.1`) without changing
@@ -574,6 +584,15 @@ kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
 
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
+
+The Helm gateway container defaults to a read-only root filesystem. For
+`Read-only file system` errors, check that writes target the writable `/tmp`,
+`/var/lib/openshell-state`, or StatefulSet `/var/openshell` mounts. The chart adds
+a `gateway-tmp` emptyDir at `/tmp` unless `server.extraVolumeMounts` already mounts
+that path; the default optional OCSF log uses `/tmp/gateway-ocsf.jsonl`. Custom
+output paths need writable mounts through `server.extraVolumes` and
+`server.extraVolumeMounts`. Inspect `securityContext.readOnlyRootFilesystem` if
+an operator explicitly opted out.
 
 Gateway pod scheduling accepts top-level `nodeSelector`, `affinity`,
 `tolerations`, `priorityClassName`, and `topologySpreadConstraints` values for
