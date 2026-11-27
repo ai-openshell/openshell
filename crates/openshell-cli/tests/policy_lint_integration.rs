@@ -4,6 +4,68 @@
 mod common;
 
 #[test]
+fn policy_lint_warns_for_statically_blocked_control_plane_ports() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("policy.yaml");
+    std::fs::write(
+        &file,
+        r"
+version: 1
+network_policies:
+  cluster-api:
+    endpoints:
+      - {host: api.cluster.example, port: 6443, protocol: tcp}
+  node:
+    endpoints:
+      - {host: node.cluster.example, ports: [443, 10250, 2379, 10250]}
+      - {host: '2001:db8::1', port: 6443}
+  restricted:
+    endpoints:
+      - {host: '*.restricted.example', port: 2380, allowed_ips: [10.0.0.0/24]}
+  hostless:
+    endpoints:
+      - {port: 10255, allowed_ips: [10.1.0.0/24]}
+  ordinary:
+    endpoints:
+      - {host: web.example, port: 443}
+      - {host: '*.public.example', port: 6443}
+      - {host: 'bad name.example', port: 6443}
+      - {host: '[2001:db8::1]', port: 6443}
+      - {host: '*.invalid.example', port: 6443, allowed_ips: [not-an-ip]}
+      - {host: '*.loopback.example', port: 6443, allowed_ips: [127.0.0.1]}
+  special:
+    endpoints:
+      - {host: HOST.DOCKER.INTERNAL, port: 6443}
+      - {host: policy.local, port: 6443}
+      - {host: 198.18.0.1, port: 6443}
+      - {host: '::ffff:198.18.0.1', port: 6443}
+",
+    )
+    .unwrap();
+
+    let output = common::run_isolated(&["policy", "lint", file.to_str().unwrap()]);
+    assert_eq!(output.code, 0, "{}", output.combined);
+    assert!(output.stdout.contains("Policy is valid (offline)"));
+    assert!(!output.stdout.contains("blocked control-plane port"));
+    let warnings: Vec<_> = output
+        .combined
+        .lines()
+        .filter(|line| line.contains("blocked control-plane port"))
+        .collect();
+    assert_eq!(
+        warnings,
+        [
+            r#"Warning: network policy "cluster-api" endpoint[0] ("api.cluster.example") lists blocked control-plane port 6443 for TCP egress"#,
+            r#"Warning: network policy "hostless" endpoint[0] ("<any-host>") lists blocked control-plane port 10255 for TCP egress"#,
+            r#"Warning: network policy "node" endpoint[0] ("node.cluster.example") lists blocked control-plane port 2379 for TCP egress"#,
+            r#"Warning: network policy "node" endpoint[0] ("node.cluster.example") lists blocked control-plane port 10250 for TCP egress"#,
+            r#"Warning: network policy "node" endpoint[1] ("2001:db8::1") lists blocked control-plane port 6443 for TCP egress"#,
+            r#"Warning: network policy "restricted" endpoint[0] ("*.restricted.example") lists blocked control-plane port 2380 for TCP egress"#,
+        ]
+    );
+}
+
+#[test]
 fn policy_lint_runs_offline_and_reports_file_errors() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("policy.yaml");
@@ -42,7 +104,7 @@ fn policy_lint_runs_offline_and_reports_file_errors() {
             vec!["mode: redact", "run_as_user"],
         ),
         (
-            "version: 1\nnetwork_policies:\n  conflict:\n    endpoints:\n      - {host: example.com, port: 443}\n      - {host: example.com, port: 443, tls: skip}\n",
+            "version: 1\nnetwork_policies:\n  conflict:\n    endpoints:\n      - {host: example.com, port: 6443}\n      - {host: example.com, port: 6443, tls: skip}\n",
             false,
             vec!["overlap", "conflicting"],
         ),
@@ -61,6 +123,11 @@ fn policy_lint_runs_offline_and_reports_file_errors() {
         ] {
             let output = common::run_isolated(&args);
             assert_eq!(output.code == 0, valid, "{yaml}\n{}", output.combined);
+            assert!(
+                !output.combined.contains("blocked control-plane port"),
+                "{}",
+                output.combined
+            );
             assert!(
                 !output.combined.contains("failed to connect"),
                 "{}",

@@ -25,7 +25,7 @@ use crate::policy_dns::{
     ConnectLookupError, MappingLookup, MappingLookupError, PolicyDnsService, TrustedResolver,
 };
 use crate::policy_engine::PolicyEngine;
-use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
+use crate::policy_local::PolicyLocalContext;
 use crate::policy_types::{NetworkAction, PolicyGenerationGuard};
 use crate::telemetry::egress_emit;
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
@@ -38,8 +38,9 @@ use openshell_core::endpoint_status::{
     EndpointObservationContext, EndpointObservationSender, EndpointResult,
 };
 use openshell_core::net::{
+    BLOCKED_CONTROL_PLANE_PORTS, POLICY_LOCAL_ADDRESS, POLICY_LOCAL_HOST,
     connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip, is_link_local_ip,
-    set_tcp_nodelay_best_effort,
+    normalize_host_lookup_key, parse_ip_network, set_tcp_nodelay_best_effort,
 };
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
@@ -274,16 +275,6 @@ fn emit_credential_endpoint_mismatch(
         crate::telemetry::emit_decision([event, finding], Some(connect_span));
     }
 }
-
-/// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
-/// machine. Traffic to these names is eligible for the trusted-gateway SSRF
-/// exemption when the resolved IP matches the driver-injected value read from
-/// `/etc/hosts` at proxy startup.
-pub(crate) const HOST_GATEWAY_ALIASES: &[&str] = &[
-    "host.openshell.internal",
-    "host.containers.internal",
-    "host.docker.internal",
-];
 
 /// Cloud instance metadata IPs that are NEVER exempted from SSRF blocking,
 /// even when they coincidentally match a host-gateway alias resolution.
@@ -746,7 +737,7 @@ async fn preauthorize_transparent_open(
             }),
         ));
     }
-    if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS) {
+    if destination.ip() == IpAddr::V4(POLICY_LOCAL_ADDRESS) {
         if destination.port() != 80 || !has_policy_local {
             emit_staged_transparent_denial(
                 destination,
@@ -2851,7 +2842,7 @@ async fn handle_mediated_connection(
             if openshell_core::google_cloud::is_metadata_destination(destination) {
                 metadata_transparent = true;
                 (None, None, None)
-            } else if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS)
+            } else if destination.ip() == IpAddr::V4(POLICY_LOCAL_ADDRESS)
                 && destination.port() == 80
             {
                 policy_local_transparent = true;
@@ -4478,23 +4469,6 @@ fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
     }
 }
 
-fn normalize_host_lookup_key(host: &str) -> &str {
-    let h = host
-        .strip_prefix('[')
-        .and_then(|trimmed| trimmed.strip_suffix(']'))
-        .unwrap_or(host);
-    h.strip_suffix('.').unwrap_or(h)
-}
-
-/// Returns `true` if `host` is one of the well-known driver-injected aliases
-/// for the host machine (e.g. `host.openshell.internal`).
-pub(crate) fn is_host_gateway_alias(host: &str) -> bool {
-    let h = normalize_host_lookup_key(host);
-    HOST_GATEWAY_ALIASES
-        .iter()
-        .any(|alias| alias.eq_ignore_ascii_case(h))
-}
-
 /// Returns `true` if `ip` is a known cloud instance metadata endpoint that
 /// must never be exempted from SSRF blocking.
 ///
@@ -5032,17 +5006,6 @@ async fn resolve_and_check_declared_endpoint(
 /// control-plane services on the same network.
 const MIN_SAFE_PREFIX_LEN: u8 = 16;
 
-/// Ports that are always blocked in `resolve_and_check_allowed_ips`, even
-/// when the resolved IP matches an `allowed_ips` entry.  These ports belong
-/// to control-plane services that should never be reachable from a sandbox.
-const BLOCKED_CONTROL_PLANE_PORTS: &[u16] = &[
-    2379,  // etcd client
-    2380,  // etcd peer
-    6443,  // Kubernetes API server
-    10250, // kubelet API
-    10255, // kubelet read-only
-];
-
 /// Parse CIDR/IP strings into `IpNet` values, rejecting invalid entries and
 /// entries that overlap always-blocked ranges (loopback, link-local,
 /// unspecified).
@@ -5057,19 +5020,8 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
     let mut errors = Vec::new();
 
     for entry in raw {
-        // Try as CIDR first, then as bare IP (convert to /32 or /128)
-        let parsed = entry.parse::<ipnet::IpNet>().or_else(|_| {
-            entry
-                .parse::<IpAddr>()
-                .map(|ip| match ip {
-                    IpAddr::V4(v4) => ipnet::IpNet::V4(ipnet::Ipv4Net::from(v4)),
-                    IpAddr::V6(v6) => ipnet::IpNet::V6(ipnet::Ipv6Net::from(v6)),
-                })
-                .map_err(|_| ())
-        });
-
-        match parsed {
-            Ok(n) => {
+        match parse_ip_network(entry) {
+            Some(n) => {
                 // Reject entries that overlap always-blocked ranges — these
                 // would be silently denied at runtime by is_always_blocked_ip
                 // and cause confusing UX (accepted in policy, never works).
@@ -5100,7 +5052,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
                 }
                 nets.push(n);
             }
-            Err(()) => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
+            None => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
         }
     }
 
@@ -7874,6 +7826,7 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
     reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
 )]
 mod tests {
+    use openshell_core::net::is_host_gateway_alias;
     mod destination_policy;
     mod ipv4_mapped;
     mod request_trace;
@@ -10138,7 +10091,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
     #[tokio::test]
     async fn staged_policy_local_open_reaches_the_sandbox_scoped_api() {
-        let addr = crate::policy_dns::POLICY_LOCAL_ADDRESS;
+        let addr = POLICY_LOCAL_ADDRESS;
         for ip in [IpAddr::V4(addr), IpAddr::V6(addr.to_ipv6_mapped())] {
             assert_policy_local_open_served(SocketAddr::new(ip, 80)).await;
         }
