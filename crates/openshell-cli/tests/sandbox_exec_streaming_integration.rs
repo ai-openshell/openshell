@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use helpers::{build_ca, build_client_cert, build_server_cert};
 use openshell_core::proto::{self, exec_sandbox_event, exec_sandbox_input};
+use openshell_core::replica_routing::{OWNER_REPLICA_HEADER, ROUTE_REPLICA_HEADER};
 use openshell_server::test_support::grpc::open_shell_server::{OpenShell, OpenShellServer};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -33,12 +34,19 @@ enum Scenario {
     EarlyExit,
     ErrorAfterExit,
     ErrorAfterInput,
+    /// The gateway's readiness gate rejects the first interactive attempt,
+    /// then the edge proxy answers the routed resend as unavailable.
+    ReadinessThenRoutedUnavailable,
+    /// The rewait's entry read meets a transient unavailable, then the routed
+    /// resend succeeds.
+    RewaitTransientLookup,
 }
 
 #[derive(Default)]
 struct Calls {
     lookups: usize,
     unary: usize,
+    interactive: usize,
     starts: Vec<proto::ExecSandboxRequest>,
     input_bytes: usize,
 }
@@ -91,6 +99,10 @@ impl MockGateway {
                 if matches!(self.scenario, Scenario::ErrorAfterExit) {
                     send_trailer_error(&output).await;
                 }
+                return;
+            }
+            Scenario::ReadinessThenRoutedUnavailable | Scenario::RewaitTransientLookup => {
+                let _ = output.send(Ok(exit(0))).await;
                 return;
             }
             Scenario::Echo | Scenario::ErrorAfterInput => {}
@@ -158,8 +170,17 @@ impl OpenShell for MockGateway {
         &self,
         _: Request<proto::GetSandboxRequest>,
     ) -> Result<Response<proto::SandboxResponse>, Status> {
-        self.calls.lock().unwrap().lookups += 1;
-        Ok(Response::new(proto::SandboxResponse {
+        let lookup = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.lookups += 1;
+            calls.lookups
+        };
+        if matches!(self.scenario, Scenario::RewaitTransientLookup) && lookup == 2 {
+            // The edge proxy answers `unavailable` while gateway replicas
+            // roll, which is exactly when the rewait re-reads the sandbox.
+            return Err(Status::unavailable("no healthy upstream"));
+        }
+        let mut response = Response::new(proto::SandboxResponse {
             sandbox: Some(proto::Sandbox {
                 metadata: Some(proto::datamodel::v1::ObjectMeta {
                     id: "test-id".to_string(),
@@ -174,7 +195,12 @@ impl OpenShell for MockGateway {
                 ..Default::default()
             }),
             ..Default::default()
-        }))
+        });
+        response.metadata_mut().insert(
+            OWNER_REPLICA_HEADER,
+            tonic::metadata::AsciiMetadataValue::from_static("gateway-test"),
+        );
+        Ok(response)
     }
 
     async fn exec_sandbox(
@@ -189,6 +215,35 @@ impl OpenShell for MockGateway {
         &self,
         request: Request<tonic::Streaming<proto::ExecSandboxInput>>,
     ) -> Result<Response<EventStream>, Status> {
+        let routed = request.metadata().contains_key(ROUTE_REPLICA_HEADER);
+        if matches!(
+            self.scenario,
+            Scenario::ReadinessThenRoutedUnavailable | Scenario::RewaitTransientLookup
+        ) {
+            let attempt = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.interactive += 1;
+                calls.interactive
+            };
+            match (self.scenario, attempt) {
+                (_, 1) => {
+                    assert!(routed, "the first attempt targets the owner");
+                    // The gateway's readiness gate, before any relay opens.
+                    return Err(Status::failed_precondition("sandbox is not ready"));
+                }
+                (Scenario::ReadinessThenRoutedUnavailable, 2) => {
+                    assert!(routed, "the resend targets the owner the rewait re-learned");
+                    return Err(Status::unavailable("no healthy upstream"));
+                }
+                (Scenario::ReadinessThenRoutedUnavailable, 3) => {
+                    assert!(!routed, "the fallback must retry without routing");
+                }
+                (Scenario::RewaitTransientLookup, 2) => {
+                    assert!(routed, "the resend targets the owner the rewait re-learned");
+                }
+                _ => panic!("unexpected interactive attempt {attempt}"),
+            }
+        }
         let (sender, receiver) = mpsc::channel(1);
         let service = self.clone();
         tokio::spawn(async move {
@@ -273,6 +328,9 @@ impl TestGateway {
             "exec",
             "--name",
             "test-sandbox",
+            // Opt into the readiness wait the retry scenarios exercise.
+            "--exec-wait-timeout",
+            "30",
         ]);
         command
             .args(["--no-tty", "--no-login-shell", "--", "test-command"])
@@ -441,4 +499,52 @@ async fn default_open_pipe_overflow_warns_after_forwarding_prefix() {
     timeout(DEADLINE, drain).await.unwrap().unwrap();
     gateway.assert_one_stream();
     assert!(gateway.calls.lock().unwrap().input_bytes <= STDIN_LIMIT);
+}
+
+/// Run an exec whose collected stdin forces the interactive streaming path,
+/// then closes so the request is replayable.
+async fn run_large_pipe_exec(gateway: &TestGateway) -> Output {
+    let input_path = gateway.config.path().join("stdin");
+    std::fs::write(&input_path, vec![b'x'; 1024 * 1024]).unwrap();
+    let child = gateway
+        .command()
+        .stdin(Stdio::from(std::fs::File::open(input_path).unwrap()))
+        .spawn()
+        .unwrap();
+    finish(child).await
+}
+
+/// The interactive resend after a readiness-gate rejection has the same
+/// unrouted fallback as the first attempt: the edge proxy can answer the
+/// re-learned owner with `unavailable` while replicas roll, and no gateway
+/// received the command, so replaying the start message is safe.
+#[tokio::test]
+async fn interactive_resend_retries_unrouted_after_readiness_rejection() {
+    let gateway = TestGateway::start(Scenario::ReadinessThenRoutedUnavailable).await;
+    let output = run_large_pipe_exec(&gateway).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = gateway.calls.lock().unwrap();
+    assert_eq!(calls.interactive, 3, "the resend must fall back unrouted");
+    assert_eq!(calls.starts.len(), 1, "a command must not be relaunched");
+}
+
+/// The rewait's entry read tolerates the edge proxy's transient `unavailable`
+/// the way the main wait loop does, instead of failing the exec.
+#[tokio::test]
+async fn rewait_entry_read_tolerates_unavailable() {
+    let gateway = TestGateway::start(Scenario::RewaitTransientLookup).await;
+    let output = run_large_pipe_exec(&gateway).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = gateway.calls.lock().unwrap();
+    assert_eq!(calls.lookups, 3, "the rewait must retry the transient read");
+    assert_eq!(calls.interactive, 2);
+    assert_eq!(calls.starts.len(), 1, "a command must not be relaunched");
 }

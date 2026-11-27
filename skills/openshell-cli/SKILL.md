@@ -476,6 +476,9 @@ whether attachment is available. A nonzero main-process exit under
 `on-failure`, or any exit under `always`,
 moves the sandbox to `Starting` during backoff and resource replacement. Connect
 and exec commands resume after the new supervisor session makes it `Ready`.
+`sandbox exec` waits up to its readiness budget (45 seconds by default) for that
+`Ready` when the sandbox reads `Provisioning` or `Starting`, instead of failing
+on the first read.
 An explicit `sandbox stop` cancels a pending restart.
 
 ### Upload and download files
@@ -520,6 +523,11 @@ command exited successfully. A descendant that keeps an inherited output pipe
 open for more than 30 seconds after the command exits triggers that failure.
 Check whether the command ran before retrying work with side effects. Use
 `sandbox connect` to attach to the canonical main process.
+If the sandbox is `Provisioning` or `Starting`, such as during a shared
+supervisor takeover, exec waits up to 45 seconds for it to reach `Ready` before
+starting the command (`--exec-wait-timeout SECONDS` or
+`OPENSHELL_EXEC_WAIT_TIMEOUT`; `--no-exec-wait` fails immediately). Any other
+phase fails immediately, and wait progress goes to stderr.
 Use `--env` only for non-secret values. Attach credentials to the sandbox with a
 provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 

@@ -28,6 +28,7 @@ pub mod endpoint_failure;
 pub mod endpoint_path;
 pub mod endpoint_status;
 pub mod error;
+pub mod exec_wait;
 pub mod extension_protocol;
 #[cfg(unix)]
 pub mod external_driver_socket;

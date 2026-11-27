@@ -15,8 +15,8 @@ use openshell_core::proto::{
     CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
     CreateSshSessionResponse, DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest,
     DeleteSandboxResponse, DeleteSandboxTemplateRequest, DetachSandboxProviderRequest,
-    DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxRequest, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxTemplateRequest,
     GpuResourceRequirements, HealthRequest, HealthResponse, ListProvidersRequest,
@@ -27,8 +27,8 @@ use openshell_core::proto::{
     SandboxResponse, SandboxStatus, SandboxStreamEvent, SandboxTemplateResponse,
     SandboxWorkloadTemplate, ServiceAuthorizationMode, ServiceBackendHttpVersion, ServiceEndpoint,
     ServiceStatus, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event, tcp_forward_frame,
-    tcp_forward_init,
+    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, sandbox_stream_event,
+    tcp_forward_frame, tcp_forward_init,
 };
 use openshell_core::rpc_error::StatusExt as _;
 use openshell_server::test_support::grpc::open_shell_server::{OpenShell, OpenShellServer};
@@ -92,6 +92,15 @@ struct SandboxState {
     /// sandboxes. Checked before `get_sandbox_failures` and
     /// `get_sandbox_phases`.
     get_sandbox_script: Arc<Mutex<VecDeque<GetSandboxOutcome>>>,
+    /// Scripted `x-openshell-owner` response headers for `get_sandbox`, oldest
+    /// first. `None` leaves that response unrouted.
+    get_sandbox_owner: Arc<Mutex<VecDeque<Option<&'static str>>>>,
+    /// Scripted `exec_sandbox` outcomes, oldest first. Empty opens an empty
+    /// relay, the response every non-exec test already got.
+    exec_outcomes: Arc<Mutex<VecDeque<ExecOutcome>>>,
+    /// The `x-openshell-replica` header of every `exec_sandbox` call, in call
+    /// order, so a test can assert where each resend was routed.
+    exec_requests: Arc<Mutex<Vec<Option<String>>>>,
     expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     expose_service_supports_http2: Arc<AtomicBool>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
@@ -155,6 +164,15 @@ enum GetSandboxOutcome {
     /// A holder response without object metadata, as an unusual gateway would
     /// omit it.
     NoMetadata(SandboxPhase),
+}
+
+/// One scripted `exec_sandbox` outcome.
+enum ExecOutcome {
+    /// Reject the exec before a relay opens, as the gateway readiness gate
+    /// does.
+    Reject(Status),
+    /// Open a relay that reports a clean exit with this code.
+    Exit(i32),
 }
 
 #[tonic::async_trait]
@@ -345,12 +363,26 @@ impl OpenShell for TestOpenShell {
             ..Sandbox::default()
         };
         sandbox.set_phase(phase as i32);
-        Ok(Response::new(SandboxResponse {
+        let owner = self
+            .state
+            .get_sandbox_owner
+            .lock()
+            .await
+            .pop_front()
+            .flatten();
+        let mut response = Response::new(SandboxResponse {
             application_service_urls: HashMap::new(),
             gateway_service_urls: HashMap::new(),
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
-        }))
+        });
+        if let Some(owner) = owner {
+            response.metadata_mut().insert(
+                openshell_core::replica_routing::OWNER_REPLICA_HEADER,
+                owner.parse().expect("ascii owner replica"),
+            );
+        }
+        Ok(response)
     }
 
     async fn list_sandboxes(
@@ -947,12 +979,39 @@ impl OpenShell for TestOpenShell {
 
     async fn exec_sandbox(
         &self,
-        _request: tonic::Request<ExecSandboxRequest>,
+        request: tonic::Request<ExecSandboxRequest>,
     ) -> Result<Response<tonic::codegen::BoxStream<ExecSandboxEvent>>, Status> {
-        let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
-        )))
+        let replica = request
+            .metadata()
+            .get(openshell_core::replica_routing::ROUTE_REPLICA_HEADER)
+            .map(|value| value.to_str().expect("ascii replica header").to_string());
+        self.state.exec_requests.lock().await.push(replica);
+
+        let outcome = self.state.exec_outcomes.lock().await.pop_front();
+        match outcome {
+            Some(ExecOutcome::Reject(status)) => Err(status),
+            Some(ExecOutcome::Exit(code)) => {
+                let (tx, rx) = mpsc::channel(1);
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(Ok(ExecSandboxEvent {
+                            payload: Some(exec_sandbox_event::Payload::Exit(ExecSandboxExit {
+                                exit_code: code,
+                            })),
+                        }))
+                        .await;
+                });
+                Ok(Response::new(Box::pin(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                )))
+            }
+            None => {
+                let (_tx, rx) = mpsc::channel(1);
+                Ok(Response::new(Box::pin(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                )))
+            }
+        }
     }
 
     async fn update_config(
@@ -3663,6 +3722,54 @@ async fn run_cli_sandbox_create_with_xdg_and_env(
     .unwrap()
 }
 
+/// Run `sandbox exec` through the CLI binary.
+///
+/// `Command::output` gives the child a closed stdin, so the exec takes the
+/// single-request path whose pre-relay rejection this suite exercises.
+async fn run_cli_sandbox_exec(server: &TestServer, extra_args: &[&str]) -> std::process::Output {
+    let xdg_dir = helpers::tempdir().unwrap();
+    prepare_cli_xdg(server, &xdg_dir);
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
+    for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("OPENSHELL_")) {
+        cmd.env_remove(&key);
+    }
+    cmd.args([
+        "--gateway",
+        "openshell",
+        "--gateway-endpoint",
+        &server.endpoint,
+        "--color",
+        "never",
+        "sandbox",
+        "exec",
+        "--name",
+        "test-sandbox",
+        "--no-tty",
+        "--no-login-shell",
+    ])
+    .args(extra_args)
+    .arg("--")
+    .arg("test-command")
+    .env("XDG_CONFIG_HOME", xdg_dir.path())
+    .env("HOME", xdg_dir.path())
+    .output()
+    .await
+    .unwrap()
+}
+
+/// Collapse an error report to one line for substring matching.
+///
+/// miette wraps the report to the terminal width and prefixes each wrapped
+/// line with a gutter, so a wrapped message would otherwise split the text a
+/// test looks for.
+fn flatten_report(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .filter(|token| !matches!(*token, "│" | "×"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 async fn run_cli_sandbox_create(
     server: &TestServer,
     name: &str,
@@ -5814,6 +5921,188 @@ async fn sandbox_create_first_attempt_cleanup_wait_exhaustion_is_annotated() {
             assert_eq!(create_requests(&server).await.len(), 1);
         })
         .await;
+}
+
+#[tokio::test]
+async fn sandbox_exec_rewait_resends_once_when_a_ready_read_goes_stale_before_the_relay() {
+    // The initial Ready read went stale: the gateway's own readiness gate
+    // rejects the exec before any relay opens, proving the command never
+    // started. With the wait on, the CLI must re-fetch the sandbox, wait for it
+    // to come back Ready, and resend the exec exactly once.
+    let server = run_server().await;
+    {
+        let mut outcomes = server.openshell.state.exec_outcomes.lock().await;
+        outcomes.push_back(ExecOutcome::Reject(Status::failed_precondition(
+            "sandbox is not ready",
+        )));
+        outcomes.push_back(ExecOutcome::Exit(0));
+    }
+    {
+        // Both the initial read and the re-fetch see Ready; only the exec
+        // between them is rejected.
+        let mut phases = server.openshell.state.get_sandbox_phases.lock().await;
+        phases.push_back(SandboxPhase::Ready);
+        phases.push_back(SandboxPhase::Ready);
+    }
+    {
+        // The re-fetch reports the new owner replica, which the resent exec
+        // must route to.
+        let mut owner = server.openshell.state.get_sandbox_owner.lock().await;
+        owner.push_back(None);
+        owner.push_back(Some("openshell-2"));
+    }
+
+    let output = run_cli_sandbox_exec(&server, &[]).await;
+    assert!(
+        output.status.success(),
+        "the rejected exec should be resent after the wait: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        *server.openshell.state.exec_requests.lock().await,
+        vec![None, Some("openshell-2".to_string())],
+        "the exec must be resent exactly once, routed to the re-fetched owner"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_exec_does_not_rewait_without_a_wait() {
+    // Without a wait the gateway's readiness rejection stays fatal: deleting
+    // the re-wait block must not change this case.
+    let server = run_server().await;
+    {
+        let mut outcomes = server.openshell.state.exec_outcomes.lock().await;
+        outcomes.push_back(ExecOutcome::Reject(Status::failed_precondition(
+            "sandbox is not ready",
+        )));
+        outcomes.push_back(ExecOutcome::Exit(0));
+    }
+
+    let output = run_cli_sandbox_exec(&server, &["--no-exec-wait"]).await;
+    assert!(!output.status.success(), "the rejection must stay fatal");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("sandbox is not ready"), "{stderr}");
+    assert_eq!(
+        server.openshell.state.exec_requests.lock().await.len(),
+        1,
+        "--no-exec-wait must not resend the exec"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_exec_does_not_rewait_on_a_failure_that_is_not_the_gateways_readiness_gate() {
+    // The same message under a different code does not prove the command never
+    // started, so it must not trigger a resend.
+    let server = run_server().await;
+    {
+        let mut outcomes = server.openshell.state.exec_outcomes.lock().await;
+        outcomes.push_back(ExecOutcome::Reject(Status::internal(
+            "sandbox is not ready",
+        )));
+        outcomes.push_back(ExecOutcome::Exit(0));
+    }
+
+    let output = run_cli_sandbox_exec(&server, &[]).await;
+    assert!(
+        !output.status.success(),
+        "only the readiness gate is retryable"
+    );
+    assert_eq!(
+        server.openshell.state.exec_requests.lock().await.len(),
+        1,
+        "a non-gateway failure must not be resent"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_exec_wait_retries_a_transient_read_failure() {
+    // The edge proxy answers `unavailable` while gateway replicas roll. A read
+    // that fails that way says nothing about the sandbox, so the wait must poll
+    // again within the same budget instead of failing the exec.
+    let server = run_server().await;
+    {
+        // The name read sees Provisioning, so the wait polls at least once.
+        let mut script = server.openshell.state.get_sandbox_script.lock().await;
+        script.push_back(GetSandboxOutcome::Phase(SandboxPhase::Provisioning));
+    }
+    {
+        let mut failures = server.openshell.state.get_sandbox_failures.lock().await;
+        failures.push_back(Status::unavailable("no healthy upstream"));
+    }
+    {
+        let mut outcomes = server.openshell.state.exec_outcomes.lock().await;
+        outcomes.push_back(ExecOutcome::Exit(0));
+    }
+
+    let output = run_cli_sandbox_exec(&server, &["--exec-wait-timeout", "10"]).await;
+    assert!(
+        output.status.success(),
+        "a transient readiness read must not fail the exec: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        server.openshell.state.exec_requests.lock().await.len(),
+        1,
+        "the exec must still be issued exactly once"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_exec_wait_timeout_names_the_budget_and_the_last_waitable_phase() {
+    // A sandbox stuck in Provisioning past the budget must fail with the wait
+    // annotation, never with a bare terminal-state message.
+    let server = run_server().await;
+    {
+        let mut phases = server.openshell.state.get_sandbox_phases.lock().await;
+        for _ in 0..4 {
+            phases.push_back(SandboxPhase::Provisioning);
+        }
+    }
+
+    let output = run_cli_sandbox_exec(&server, &["--exec-wait-timeout", "1"]).await;
+    assert!(
+        !output.status.success(),
+        "a sandbox stuck provisioning must time out"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&output.stderr);
+    assert!(flat.contains("(phase: Provisioning)"), "{stderr}");
+    assert!(
+        flat.contains("(exec wait stopped after ")
+            && flat.contains("last observed phase: Provisioning)"),
+        "an exhausted wait must name its budget and last phase: {stderr}"
+    );
+    assert_eq!(
+        server.openshell.state.exec_requests.lock().await.len(),
+        0,
+        "the exec must never be issued before the sandbox is ready"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_exec_not_ready_failure_omits_the_wait_suffix_for_a_terminal_phase() {
+    // A Stopped sandbox cannot reach Ready without a start, so the wait never
+    // begins and the failure must not claim one ran out.
+    let server = run_server().await;
+    {
+        let mut phases = server.openshell.state.get_sandbox_phases.lock().await;
+        phases.push_back(SandboxPhase::Stopped);
+    }
+
+    let output = run_cli_sandbox_exec(&server, &["--exec-wait-timeout", "5"]).await;
+    assert!(!output.status.success(), "a stopped sandbox must fail fast");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&output.stderr);
+    assert!(flat.contains("(phase: Stopped)"), "{stderr}");
+    assert!(
+        !flat.contains("exec wait stopped after"),
+        "a terminal phase never had a wait to exhaust: {stderr}"
+    );
+    assert_eq!(
+        server.openshell.state.exec_requests.lock().await.len(),
+        0,
+        "the exec must never be issued to a terminal sandbox"
+    );
 }
 
 #[tokio::test]

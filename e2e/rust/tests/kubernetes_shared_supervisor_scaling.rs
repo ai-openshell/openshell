@@ -28,15 +28,14 @@ use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::time::Duration;
 
-use futures_util::future::join_all;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use shared_supervisor::{
-    GATEWAY_SELECTOR, HostEndpoint, MainProcess, SUPERVISOR_COMPONENT, TAKEOVER, call_host,
-    counts_past, create, gateway_log_lines, generation, helm_command, is_takeover, kubectl_json,
-    main_process, owner_of, policy, release_namespace, supervisor_pod_items, supervisor_pods,
-    try_call_host, wait_for_owner, wait_until_attached,
+    EXEC_PROBE_TIMEOUT, GATEWAY_SELECTOR, HostEndpoint, MainProcess, ProbeOptions,
+    SUPERVISOR_COMPONENT, SampleBounds, TAKEOVER, call_host, check_samples, counts_past, create,
+    gateway_log_lines, generation, helm_command, is_takeover, kubectl_json, main_process, owner_of,
+    policy, release_namespace, supervisor_pod_items, supervisor_pods, wait_for_owner,
+    wait_until_attached, while_probing,
 };
-use tokio::time::Instant;
 
 /// Sandboxes created, at most, until one lands on the new member. The ring
 /// places each sandbox by its random server-assigned ID, so placements can
@@ -261,131 +260,26 @@ async fn scale_pool(replicas: usize) -> BTreeMap<String, String> {
     .unwrap_or_else(|_| panic!("the supervisor pool did not settle at {replicas} members"))
 }
 
-/// What the probes of one sandbox saw during a transition.
-#[derive(Debug, Default)]
-struct Samples {
-    exec_ok: usize,
-    exec_failures: Vec<String>,
-    network_ok: usize,
-    network_failures: Vec<String>,
-    /// Longest time without a successful exec probe.
-    exec_outage: Duration,
-    /// Longest time without a successful network probe.
-    network_outage: Duration,
-    last: Option<MainProcess>,
-}
-
-/// Probe `sandbox` every [`PROBE_INTERVAL`] until `stop`: its main process
-/// must stay `baseline`'s and its counter must never go back; record how
-/// long exec and the policy-mediated call to the host endpoint fail.
-async fn sample(
-    sandbox: &SandboxGuard,
-    baseline: &MainProcess,
-    port: u16,
-    mut stop: tokio::sync::watch::Receiver<bool>,
-) -> Samples {
-    let mut samples = Samples::default();
-    let mut last_exec = Instant::now();
-    let mut last_network = Instant::now();
-    let mut counter = baseline.counter;
-    loop {
-        match main_process(sandbox).await {
-            Ok(current) => {
-                assert_eq!(
-                    (current.pid, current.start_ticks),
-                    (baseline.pid, baseline.start_ticks),
-                    "{}'s main process was replaced: {baseline:?} then {current:?}",
-                    sandbox.name
-                );
-                assert!(
-                    current.counter >= counter,
-                    "{}'s in-memory counter went back from {counter} to {}",
-                    sandbox.name,
-                    current.counter
-                );
-                counter = current.counter;
-                samples.exec_outage = samples.exec_outage.max(last_exec.elapsed());
-                last_exec = Instant::now();
-                samples.exec_ok += 1;
-                samples.last = Some(current);
-            }
-            Err(error) => samples.exec_failures.push(error),
-        }
-        match try_call_host(sandbox, port).await {
-            Ok(result) if result == "HA_OK" => {
-                samples.network_outage = samples.network_outage.max(last_network.elapsed());
-                last_network = Instant::now();
-                samples.network_ok += 1;
-            }
-            Ok(result) => samples.network_failures.push(result),
-            Err(error) => samples.network_failures.push(error),
-        }
-        if *stop.borrow() {
-            break;
-        }
-        tokio::select! {
-            () = tokio::time::sleep(PROBE_INTERVAL) => {}
-            _ = stop.changed() => {}
-        }
+/// How these probes run: exec without a readiness wait (today's instant
+/// failure) and one policy-mediated call per round.
+fn probe_options(port: u16) -> ProbeOptions {
+    ProbeOptions {
+        interval: PROBE_INTERVAL,
+        port: Some(port),
+        exec_wait_timeout_secs: None,
+        exec_probe_timeout: EXEC_PROBE_TIMEOUT,
     }
-    samples.exec_outage = samples.exec_outage.max(last_exec.elapsed());
-    samples.network_outage = samples.network_outage.max(last_network.elapsed());
-    samples
 }
 
-/// Run `transition` while probing every sandbox, and keep probing for
-/// [`SETTLE`] after it finished.
-async fn while_probing<T>(
-    sandboxes: &[(&SandboxGuard, MainProcess)],
-    port: u16,
-    transition: impl Future<Output = T>,
-) -> (T, Vec<Samples>) {
-    let (stop, stopped) = tokio::sync::watch::channel(false);
-    let samplers = join_all(
-        sandboxes
-            .iter()
-            .map(|(sandbox, baseline)| sample(sandbox, baseline, port, stopped.clone())),
-    );
-    let driver = async {
-        let outcome = transition.await;
-        tokio::time::sleep(SETTLE).await;
-        stop.send_replace(true);
-        outcome
-    };
-    tokio::join!(driver, samplers)
-}
-
-/// Check what the probes of `sandbox` saw against `bound`.
-fn check_samples(phase: &str, sandbox: &SandboxGuard, samples: &Samples, bound: Duration) {
-    eprintln!(
-        "{phase}: {} exec {} ok / {} failed (longest outage {:?}), network {} ok / {} failed (longest outage {:?})",
-        sandbox.name,
-        samples.exec_ok,
-        samples.exec_failures.len(),
-        samples.exec_outage,
-        samples.network_ok,
-        samples.network_failures.len(),
-        samples.network_outage
-    );
-    assert!(
-        samples.exec_ok > 0 && samples.network_ok > 0,
-        "{phase}: {} never answered: {samples:?}",
-        sandbox.name
-    );
-    assert!(
-        samples.exec_outage <= bound,
-        "{phase}: exec on {} failed for {:?}, longer than {bound:?}: {:?}",
-        sandbox.name,
-        samples.exec_outage,
-        samples.exec_failures
-    );
-    assert!(
-        samples.network_outage <= bound,
-        "{phase}: networking from {} failed for {:?}, longer than {bound:?}: {:?}",
-        sandbox.name,
-        samples.network_outage,
-        samples.network_failures
-    );
+/// What a staying or moving sandbox must satisfy: only the outage bound
+/// differs between the two.
+fn sample_bounds(outage: Duration) -> SampleBounds {
+    SampleBounds {
+        exec_outage: outage,
+        network_outage: outage,
+        exec_failure_allowance: None,
+        exec_probe: None,
+    }
 }
 
 /// A sandbox under test and what it must keep.
@@ -481,11 +375,17 @@ async fn scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running() {
     // Phase 2: scale to two members. The new member joins; nothing moves.
     let (two_members, samples) = while_probing(
         &[(&a.sandbox, a.baseline.clone())],
-        endpoint.port,
+        probe_options(endpoint.port),
+        SETTLE,
         scale_pool(2),
     )
     .await;
-    check_samples("scale up", &a.sandbox, &samples[0], STAYING_OUTAGE);
+    check_samples(
+        "scale up",
+        &a.sandbox,
+        &samples[0],
+        sample_bounds(STAYING_OUTAGE),
+    );
     assert_eq!(
         two_members.get(&first_member),
         initial.get(&first_member),
@@ -550,7 +450,8 @@ async fn scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running() {
             (&a.sandbox, a.baseline.clone()),
             (&b.sandbox, b.baseline.clone()),
         ],
-        endpoint.port,
+        probe_options(endpoint.port),
+        SETTLE,
         scale_pool(1),
     )
     .await;
@@ -591,7 +492,7 @@ async fn scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running() {
             },
             &tracked.sandbox,
             samples,
-            if moved { MOVING_OUTAGE } else { STAYING_OUTAGE },
+            sample_bounds(if moved { MOVING_OUTAGE } else { STAYING_OUTAGE }),
         );
     }
     for route in &handed_off {

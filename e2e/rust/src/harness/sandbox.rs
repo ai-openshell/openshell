@@ -482,6 +482,11 @@ impl SandboxGuard {
     /// Stdout and stderr are captured and returned together; PTY allocation
     /// is disabled so the call is suitable for non-interactive setups.
     ///
+    /// The readiness wait is pinned to today's instant failure with
+    /// `--no-exec-wait`: the CLI's default-on bounded wait would otherwise
+    /// re-time every suite that probes exec during churn. Use
+    /// [`SandboxGuard::exec_with_wait_timeout`] to opt in.
+    ///
     /// # Arguments
     ///
     /// * `argv` — Command and arguments to execute (passed after `--`).
@@ -490,13 +495,44 @@ impl SandboxGuard {
     ///
     /// Returns an error if the CLI exits non-zero.
     pub async fn exec(&self, argv: &[&str]) -> Result<String, String> {
+        self.exec_with_wait_timeout(argv, None).await
+    }
+
+    /// Run a one-shot command, opting into the CLI's bounded readiness wait.
+    ///
+    /// `wait_timeout_secs` is `sandbox exec --exec-wait-timeout`'s budget, so
+    /// the probe waits for a supervisor takeover to finish instead of failing
+    /// on a sandbox that is momentarily `Provisioning` or `Starting`. `None`
+    /// keeps `--no-exec-wait`, today's instant failure.
+    ///
+    /// # Arguments
+    ///
+    /// * `argv` — Command and arguments to execute (passed after `--`).
+    /// * `wait_timeout_secs` — Readiness-wait budget in seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CLI exits non-zero.
+    pub async fn exec_with_wait_timeout(
+        &self,
+        argv: &[&str],
+        wait_timeout_secs: Option<u32>,
+    ) -> Result<String, String> {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox")
             .arg("exec")
             .arg("--name")
             .arg(&self.name)
-            .arg("--no-tty")
-            .arg("--");
+            .arg("--no-tty");
+        match wait_timeout_secs {
+            Some(secs) => {
+                cmd.arg("--exec-wait-timeout").arg(secs.to_string());
+            }
+            None => {
+                cmd.arg("--no-exec-wait");
+            }
+        }
+        cmd.arg("--");
         for arg in argv {
             cmd.arg(arg);
         }

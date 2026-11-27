@@ -284,7 +284,12 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
 fn require_ready_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
     match SandboxPhase::try_from(sandbox.phase()).ok() {
         Some(SandboxPhase::Ready) => Ok(()),
-        _ => Err(Status::failed_precondition("sandbox is not ready")),
+        // The CLI re-waits on this rejection, so attach the machine-readable
+        // reason clients match on instead of relying on the prose.
+        _ => Err(openshell_core::rpc_error::failed_precondition(
+            openshell_core::rpc_error::SANDBOX_NOT_READY,
+            "sandbox is not ready",
+        )),
     }
 }
 
@@ -4477,6 +4482,24 @@ mod tests {
         assert_eq!(exec_loop_result(Some(0), true).unwrap(), 0);
         assert!(exec_loop_result(Some(0), false).is_err());
         assert!(exec_loop_result(None, true).is_err());
+    }
+
+    #[test]
+    fn exec_readiness_rejection_carries_the_structured_reason() {
+        let mut ready = Sandbox::default();
+        ready.set_phase(SandboxPhase::Ready as i32);
+        require_ready_sandbox(&ready).expect("a Ready sandbox is executable");
+
+        let mut provisioning = Sandbox::default();
+        provisioning.set_phase(SandboxPhase::Provisioning as i32);
+        let status = require_ready_sandbox(&provisioning).expect_err("Provisioning is not Ready");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), "sandbox is not ready");
+        let details =
+            openshell_core::rpc_error::decode_details(&status).expect("structured error details");
+        let info = details.error_info().expect("error reason");
+        assert_eq!(info.reason, openshell_core::rpc_error::SANDBOX_NOT_READY);
+        assert_eq!(info.domain, openshell_core::rpc_error::ERROR_DOMAIN);
     }
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_compute_driver,

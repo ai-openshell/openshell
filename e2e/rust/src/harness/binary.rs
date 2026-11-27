@@ -46,9 +46,16 @@ pub fn openshell_bin() -> PathBuf {
 ///
 /// The command has `kill_on_drop(true)` set so that background child processes
 /// are cleaned up when the handle is dropped.
+///
+/// It also pins `OPENSHELL_EXEC_WAIT_TIMEOUT=0`, so every harness-spawned CLI
+/// keeps the pre-wait instant `sandbox exec` failure unless a call site opts in
+/// with an explicit `--exec-wait-timeout` (the flag wins over the environment).
+/// Otherwise the CLI's default-on bounded wait would re-time suites that probe
+/// exec during churn.
 pub fn openshell_cmd() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(openshell_bin());
     cmd.kill_on_drop(true);
+    cmd.env("OPENSHELL_EXEC_WAIT_TIMEOUT", "0");
     cmd
 }
 

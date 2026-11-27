@@ -19,6 +19,9 @@ pub const ERROR_DOMAIN: &str = "openshell.nvidia.com";
 /// Reason reported when a request lost the mutation lock budget.
 pub const MUTATION_LOCK_TIMEOUT: &str = "MUTATION_LOCK_TIMEOUT";
 
+/// Reason reported when the sandbox is not ready to start the requested work.
+pub const SANDBOX_NOT_READY: &str = "SANDBOX_NOT_READY";
+
 /// Decode supported details without trusting inconsistent envelopes or delays.
 /// Unknown and malformed details remain available on the original status.
 pub fn decode_details(status: &Status) -> Option<ErrorDetails> {

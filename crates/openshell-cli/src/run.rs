@@ -45,6 +45,7 @@ use crate::tls::{
     GrpcClient, TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to, with_owner_hint,
 };
 use futures::StreamExt;
+use futures::future::{BoxFuture, FutureExt};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
     GatewayMetadata, clear_last_sandbox_if_matches, get_gateway_metadata, save_last_sandbox,
@@ -53,27 +54,34 @@ use openshell_core::create_retry::{
     AlreadyExistsPlan, CleanupPhase, HolderProvenance, RetryPlan, cleanup_wait_delay,
     plan_already_exists, plan_retry, retry_stopped_suffix,
 };
+use openshell_core::exec_wait::{
+    ExecWaitPlan, exec_wait_is_waitable, exec_wait_poll_delay, exec_wait_stopped_suffix,
+    plan_exec_wait,
+};
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
     ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
     CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecSandboxRequest,
-    ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
-    GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
-    ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
-    ResumeSandboxRequest, RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase,
-    SandboxPolicy, SandboxResources, SandboxResponse, SandboxRestartPolicy, SandboxServiceExposure,
-    SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig,
-    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
-    ServiceBackendHttpVersion, ServiceEndpointResponse, SettingScope, StartSandboxRequest,
-    StopSandboxRequest, SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
+    DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, GetCurrentUserRequest,
+    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest,
+    GpuResourceRequirements, ListSandboxPoliciesRequest, ListSandboxTemplatesRequest,
+    ListSandboxesRequest, ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest,
+    ResourceRequirements, ResumeSandboxRequest, RevokeSshSessionRequest, Sandbox, SandboxCondition,
+    SandboxPhase, SandboxPolicy, SandboxResources, SandboxResponse, SandboxRestartPolicy,
+    SandboxServiceExposure, SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
+    ServiceAuthorizationMode, ServiceBackendHttpVersion, ServiceEndpointResponse, SettingScope,
+    StartSandboxRequest, StopSandboxRequest, SuspendSandboxRequest, TcpForwardFrame,
+    TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event,
+    tcp_forward_init,
 };
-use openshell_core::rpc_error::{MUTATION_LOCK_TIMEOUT, decode_details, is_mutation_lock_timeout};
+use openshell_core::rpc_error::{
+    MUTATION_LOCK_TIMEOUT, SANDBOX_NOT_READY, decode_details, is_mutation_lock_timeout,
+};
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
@@ -513,6 +521,43 @@ impl Default for SandboxCreateConfig<'_> {
 /// cannot build a budget that overflows the retry deadline.
 const MAX_CREATE_RETRY_TIMEOUT_SECS: u64 = 86_400;
 
+/// Upper bound on `OPENSHELL_EXEC_WAIT_TIMEOUT`, for the same reason.
+const MAX_EXEC_WAIT_TIMEOUT_SECS: u64 = 86_400;
+
+/// Default `sandbox exec` readiness wait: it covers the observed ten to
+/// twenty seconds of a supervisor takeover with headroom.
+const DEFAULT_EXEC_WAIT_TIMEOUT_SECS: u64 = 45;
+
+/// Resolve a wall-clock budget from the flag value and an environment variable.
+///
+/// The flag wins; the environment follows the `OPENSHELL_PROVISION_TIMEOUT`
+/// precedent; `default_secs` applies when neither is set. Both sources are
+/// clamped to `ceiling`, so neither can build a budget that runs without
+/// bound. A zero budget disables the wait it feeds.
+fn resolve_budget(
+    flag_secs: Option<u32>,
+    env_var: &str,
+    default_secs: u64,
+    ceiling: u64,
+) -> Duration {
+    if let Some(secs) = flag_secs {
+        return Duration::from_secs(u64::from(secs).min(ceiling));
+    }
+    let secs = std::env::var(env_var).ok().map_or(default_secs, |value| {
+        // An all-digits value that overflows `u64` is still a budget, not
+        // garbage: clamp it to the ceiling instead of falling back to the
+        // default.
+        value.parse::<u64>().unwrap_or_else(|_| {
+            if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+                u64::MAX
+            } else {
+                default_secs
+            }
+        })
+    });
+    Duration::from_secs(secs.min(ceiling))
+}
+
 /// Resolve the create-retry budget from the flag value and the environment.
 ///
 /// The flag wins; `OPENSHELL_CREATE_RETRY_TIMEOUT` follows the
@@ -521,24 +566,28 @@ const MAX_CREATE_RETRY_TIMEOUT_SECS: u64 = 86_400;
 /// selects. Both sources are clamped to 24 hours, so neither can build a
 /// budget that runs without bound.
 fn resolve_create_retry_timeout(flag_secs: Option<u32>) -> Duration {
-    if let Some(secs) = flag_secs {
-        return Duration::from_secs(u64::from(secs).min(MAX_CREATE_RETRY_TIMEOUT_SECS));
-    }
-    let secs = std::env::var("OPENSHELL_CREATE_RETRY_TIMEOUT")
-        .ok()
-        .map_or(60, |value| {
-            // An all-digits value that overflows `u64` is still a budget, not
-            // garbage: clamp it to the ceiling instead of falling back to the
-            // default.
-            value.parse::<u64>().unwrap_or_else(|_| {
-                if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-                    u64::MAX
-                } else {
-                    60
-                }
-            })
-        });
-    Duration::from_secs(secs.min(MAX_CREATE_RETRY_TIMEOUT_SECS))
+    resolve_budget(
+        flag_secs,
+        "OPENSHELL_CREATE_RETRY_TIMEOUT",
+        60,
+        MAX_CREATE_RETRY_TIMEOUT_SECS,
+    )
+}
+
+/// Resolve the `sandbox exec` readiness-wait budget from the flag value and
+/// the environment.
+///
+/// The flag wins; `OPENSHELL_EXEC_WAIT_TIMEOUT` follows the create-retry
+/// precedent; the default waits 45 seconds. A zero budget disables the wait,
+/// which `--no-exec-wait` selects and `--exec-wait-timeout 0` also expresses.
+/// Both sources are clamped to 24 hours.
+fn resolve_exec_wait_timeout(flag_secs: Option<u32>) -> Duration {
+    resolve_budget(
+        flag_secs,
+        "OPENSHELL_EXEC_WAIT_TIMEOUT",
+        DEFAULT_EXEC_WAIT_TIMEOUT_SECS,
+        MAX_EXEC_WAIT_TIMEOUT_SECS,
+    )
 }
 
 /// Deadline `budget` from now, saturating rather than panicking when the
@@ -554,13 +603,13 @@ fn deadline_after(budget: Duration) -> Instant {
     }
 }
 
-/// Seed for create-retry jitter, drawn once per create call.
+/// Seed for client-wait jitter, drawn once per command invocation.
 ///
 /// `RandomState::new()` mixes a per-process and per-thread counter, so separate
-/// CLI invocations retrying the same sandbox name pick different jitter.
-/// Deriving it from the sandbox name instead would make every contender
-/// re-collide in lockstep.
-fn create_retry_seed() -> u64 {
+/// CLI invocations waiting on the same sandbox pick different jitter. Deriving
+/// it from the sandbox name instead would make every contender re-collide in
+/// lockstep.
+fn jitter_seed() -> u64 {
     use std::hash::{BuildHasher, Hasher};
 
     std::collections::hash_map::RandomState::new()
@@ -1245,7 +1294,7 @@ pub async fn sandbox_create(
             &mut client,
             request,
             workspace,
-            CreateRetry::new(create_retry_timeout, create_retry_seed()),
+            CreateRetry::new(create_retry_timeout, jitter_seed()),
         ))
         .await?
     };
@@ -2518,6 +2567,354 @@ fn piped_stdin_limit_error() -> miette::Report {
     miette::miette!("piped stdin exceeds the 4 MiB limit; use `sandbox upload` for larger input")
 }
 
+/// The gateway's pre-relay readiness rejection.
+///
+/// The server's readiness gate returns `failed_precondition` with the
+/// [`SANDBOX_NOT_READY`] reason before it opens a relay, so the command
+/// provably never started. The CLI's own readiness failure carries
+/// `(phase: ...)` and a hint instead, which keeps the two distinguishable.
+///
+/// Older gateways send only the bare message without error details, so that
+/// exact message stays a fallback; a newer gateway's structured reason is
+/// authoritative and survives wording drift on either side.
+const SERVER_NOT_READY_MESSAGE: &str = "sandbox is not ready";
+
+/// The machine-readable reason the gateway attached to `status`, when present.
+fn status_reason(status: &Status) -> Option<String> {
+    Some(decode_details(status)?.error_info()?.reason.clone())
+}
+
+/// Whether `status` is the gateway's readiness gate, before any relay opened.
+fn server_readiness_rejection(status: &Status) -> bool {
+    if status.code() != Code::FailedPrecondition {
+        return false;
+    }
+    status_reason(status).map_or_else(
+        || status.message() == SERVER_NOT_READY_MESSAGE,
+        |reason| reason == SANDBOX_NOT_READY,
+    )
+}
+
+/// Wall-clock budget and jitter seed shared by one exec readiness wait.
+#[derive(Debug, Clone, Copy)]
+struct ExecWait {
+    budget: Duration,
+    deadline: Instant,
+    seed: u64,
+}
+
+impl ExecWait {
+    fn new(budget: Duration, seed: u64) -> Self {
+        Self {
+            budget,
+            deadline: deadline_after(budget),
+            seed,
+        }
+    }
+
+    /// Time left for polls.
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// Time spent waiting so far.
+    fn elapsed(&self) -> Duration {
+        self.budget.saturating_sub(self.remaining())
+    }
+}
+
+/// Resolve the sandbox by name and learn which gateway replica owns it.
+///
+/// Errors stay [`Status`] so a wait loop can tell a transient read failure from
+/// a fatal one before the caller turns it into a report.
+async fn fetch_sandbox(
+    client: &mut GrpcClient,
+    name: &str,
+    workspace: &str,
+) -> std::result::Result<(Sandbox, Option<AsciiMetadataValue>), Status> {
+    let response = client
+        .get_sandbox(with_owner_hint(GetSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        }))
+        .await?;
+    let replica = owner_replica(&response);
+    let sandbox = response
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    Ok((sandbox, replica))
+}
+
+/// Exec's readiness failure, with the wait outcome when a bounded wait ended
+/// without reaching `Ready`.
+fn sandbox_not_ready_report(
+    name: &str,
+    phase: SandboxPhase,
+    wait_suffix: Option<&str>,
+) -> miette::Report {
+    miette::miette!(
+        "sandbox '{name}' is not ready (phase: {}){}; wait for it to reach Ready state",
+        phase_name(phase as i32),
+        wait_suffix.unwrap_or_default()
+    )
+}
+
+/// Exec's readiness failure when the rewait's entry read never observed a
+/// phase.
+///
+/// Naming the pre-rejection snapshot here would contradict itself with "not
+/// ready (phase: Ready)", and the rewait's own span is the time it can
+/// honestly report.
+fn rewait_stopped_report(name: &str, waited: Duration) -> miette::Report {
+    miette::miette!(
+        "sandbox '{name}' is not ready; the readiness re-check after the gateway rejected the \
+         exec stopped after {}s without observing a phase; wait for it to reach Ready state",
+        waited.as_secs()
+    )
+}
+
+/// Wait until `sandbox` reaches `Ready`, or stop on a phase exec cannot use.
+///
+/// `sandbox` is the snapshot from the name resolution. With `wait`, polls
+/// `GetSandbox` with the shared jittered backoff until the sandbox is `Ready`
+/// or the budget runs out; without it, only an already-`Ready` snapshot passes,
+/// which preserves the instant failure `--no-exec-wait` selects. Every phase
+/// other than `Provisioning` and `Starting` fails immediately, so a stopped or
+/// suspended sandbox cannot burn the budget. Progress lines go to stderr so
+/// structured stdout stays parseable. Returns the ready snapshot and the owner
+/// replica the latest read reported.
+async fn wait_for_sandbox_ready(
+    client: &mut GrpcClient,
+    mut sandbox: Sandbox,
+    workspace: &str,
+    wait: Option<ExecWait>,
+) -> Result<(Sandbox, Option<AsciiMetadataValue>)> {
+    let name = sandbox.object_name().to_string();
+    let mut replica = None;
+    let mut poll_attempt: u32 = 0;
+    loop {
+        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+        let plan = match wait {
+            Some(wait) => plan_exec_wait(phase, poll_attempt, wait.seed, wait.remaining()),
+            None if phase == SandboxPhase::Ready => ExecWaitPlan::Proceed,
+            None => ExecWaitPlan::Stop,
+        };
+        match plan {
+            ExecWaitPlan::Proceed => return Ok((sandbox, replica)),
+            ExecWaitPlan::Stop => {
+                // Name the wait only when the sandbox was waitable: a stopped
+                // or suspended phase never had a wait to exhaust.
+                let suffix = wait
+                    .filter(|_| exec_wait_is_waitable(phase))
+                    .map(|wait| exec_wait_stopped_suffix(wait.elapsed(), phase_name(phase as i32)));
+                return Err(sandbox_not_ready_report(&name, phase, suffix.as_deref()));
+            }
+            ExecWaitPlan::Sleep(delay) => {
+                let wait = wait.expect("only a configured wait polls");
+                eprintln!(
+                    "waiting for sandbox '{name}' to become ready (phase: {}); budget {} left",
+                    phase_name(phase as i32),
+                    format_retry_budget(wait.remaining())
+                );
+                tokio::time::sleep(delay).await;
+                poll_attempt = poll_attempt.saturating_add(1);
+                let remaining = wait.remaining();
+                if remaining.is_zero() {
+                    // A late timer wake must not start a read outside the
+                    // budget.
+                    return Err(sandbox_not_ready_report(
+                        &name,
+                        phase,
+                        Some(&exec_wait_stopped_suffix(
+                            wait.elapsed(),
+                            phase_name(phase as i32),
+                        )),
+                    ));
+                }
+                // Bound the read itself: a stuck GetSandbox must not keep the
+                // exec pending past its budget.
+                let observed = match tokio::time::timeout(
+                    remaining,
+                    fetch_sandbox(client, &name, workspace),
+                )
+                .await
+                {
+                    Err(_elapsed) => {
+                        return Err(sandbox_not_ready_report(
+                            &name,
+                            phase,
+                            Some(&exec_wait_stopped_suffix(
+                                wait.elapsed(),
+                                phase_name(phase as i32),
+                            )),
+                        ));
+                    }
+                    // A transient read failure says nothing about the
+                    // sandbox: ask again after the next poll interval
+                    // while the budget allows. The loop's own plan sleeps
+                    // that interval and stops once it no longer fits, and
+                    // the edge proxy answers `unavailable` while gateway
+                    // replicas roll.
+                    Ok(Err(transient)) if transient.code() == Code::Unavailable => {
+                        eprintln!(
+                            "sandbox '{name}' readiness status unavailable; retrying (budget {} left)",
+                            format_retry_budget(wait.remaining()),
+                        );
+                        continue;
+                    }
+                    Ok(result) => result.into_diagnostic()?,
+                };
+                let (observed, owner) = observed;
+                sandbox = observed;
+                if owner.is_some() {
+                    replica = owner;
+                }
+            }
+        }
+    }
+}
+
+/// Re-enter the bounded wait after the gateway's pre-relay readiness
+/// rejection.
+///
+/// The rejection proves the command never started, so a caller may resend it
+/// once after the sandbox comes back. The entry read is bounded by the wait's
+/// remaining budget: a hung `GetSandbox` must not hold the exec past it. Every
+/// failure carries the original gate rejection as context, so the user sees
+/// both what rejected the exec and what ended the wait.
+///
+/// The future is boxed so it does not bloat every caller's state machine, the
+/// way the gateway boxes its create handler.
+fn rewait_after_readiness_rejection<'a>(
+    client: &'a mut GrpcClient,
+    name: &'a str,
+    workspace: &'a str,
+    wait: ExecWait,
+    rejection: &'a Status,
+) -> BoxFuture<'a, Result<Option<AsciiMetadataValue>>> {
+    let context = format!(
+        "the exec was first rejected by the gateway readiness gate: {}",
+        rejection.message()
+    );
+    async move {
+        // Only the entry read can stop the rewait before the shared wait loop
+        // takes over, and it observes no phase: reporting the pre-rejection
+        // snapshot here would contradict itself with "not ready (phase:
+        // Ready)", and charging the whole exec wait's elapsed time would
+        // overstate this re-check.
+        let rewait_started = Instant::now();
+        let stopped = move || rewait_stopped_report(name, rewait_started.elapsed());
+        let outcome = async {
+            let mut poll_attempt: u32 = 0;
+            let (observed, fetched_owner) = loop {
+                let remaining = wait.remaining();
+                if remaining.is_zero() {
+                    return Err(stopped());
+                }
+                let fetched =
+                    match tokio::time::timeout(remaining, fetch_sandbox(client, name, workspace))
+                        .await
+                    {
+                        Err(_elapsed) => return Err(stopped()),
+                        Ok(fetched) => fetched,
+                    };
+                match fetched {
+                    Ok(fetched) => break fetched,
+                    // The edge proxy answers `unavailable` while gateway
+                    // replicas roll, which is exactly when this wait
+                    // re-enters. Mirror the main loop's tolerance exactly:
+                    // the shared jittered poll delay, and the wall-clock
+                    // budget as the only bound — no attempt cap, which could
+                    // only truncate the budget the caller advertised.
+                    Err(transient) if transient.code() == Code::Unavailable => {
+                        let delay = exec_wait_poll_delay(poll_attempt, wait.seed);
+                        if delay >= wait.remaining() {
+                            return Err(stopped());
+                        }
+                        tokio::time::sleep(delay).await;
+                        poll_attempt = poll_attempt.saturating_add(1);
+                    }
+                    Err(fatal) => {
+                        // Keep the status diagnostic the main loop would show.
+                        let failed: std::result::Result<_, Status> = Err(fatal);
+                        return failed.into_diagnostic();
+                    }
+                }
+            };
+            let (_, polled_owner) =
+                wait_for_sandbox_ready(client, observed, workspace, Some(wait)).await?;
+            Ok(polled_owner.or(fetched_owner))
+        }
+        .await;
+        outcome.wrap_err(context)
+    }
+    .boxed()
+}
+
+/// Send one exec request, retrying once without routing when no gateway
+/// received it.
+async fn send_exec(
+    client: &mut GrpcClient,
+    request: ExecSandboxRequest,
+    replica: Option<&AsciiMetadataValue>,
+) -> std::result::Result<tonic::Response<tonic::Streaming<ExecSandboxEvent>>, Status> {
+    let retry = replica.is_some().then(|| request.clone());
+    match (
+        client.exec_sandbox(routed_to(request, replica)).await,
+        retry,
+    ) {
+        (Err(status), Some(unrouted)) if retry_unrouted(replica, &status) => {
+            client.exec_sandbox(unrouted).await
+        }
+        (response, _) => response,
+    }
+}
+
+/// Raw interactive exec response, kept un-converted so a caller can still
+/// classify a gateway readiness rejection.
+type InteractiveExecResponse =
+    std::result::Result<tonic::Response<tonic::Streaming<ExecSandboxEvent>>, Status>;
+
+/// Send one interactive exec request, retrying once without routing when no
+/// gateway received it.
+///
+/// Returns the input sender the caller must keep alive for the stream's
+/// lifetime, alongside the raw response. Both the first attempt and the
+/// post-readiness resend go through here so the unrouted fallback cannot
+/// drift between them.
+async fn send_exec_interactive(
+    client: &mut GrpcClient,
+    start: &ExecSandboxInput,
+    replica: Option<&AsciiMetadataValue>,
+) -> Result<(
+    tokio::sync::mpsc::Sender<ExecSandboxInput>,
+    InteractiveExecResponse,
+)> {
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+    tx.send(start.clone()).await.into_diagnostic()?;
+    let response = client
+        .exec_sandbox_interactive(routed_to(ReceiverStream::new(rx), replica))
+        .await;
+    if let Err(status) = &response
+        && retry_unrouted(replica, status)
+    {
+        // No gateway received the first request, so the unrouted retry cannot
+        // double-start the command.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+        tx.send(start.clone()).await.into_diagnostic()?;
+        let retried = client
+            .exec_sandbox_interactive(ReceiverStream::new(rx))
+            .await;
+        return Ok((tx, retried));
+    }
+    Ok((tx, response))
+}
+
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
 /// Returns the remote command's exit code, or an error if the event stream
@@ -2529,6 +2926,7 @@ pub async fn sandbox_exec_grpc(
     command: &[String],
     workdir: Option<&str>,
     timeout_seconds: u32,
+    exec_wait_timeout_secs: Option<u32>,
     tty_override: Option<bool>,
     environment: &HashMap<String, String>,
     no_login_shell: bool,
@@ -2538,29 +2936,22 @@ pub async fn sandbox_exec_grpc(
     let mut client = grpc_client(server, tls).await?;
 
     // Resolve sandbox name to id.
-    let response = client
-        .get_sandbox(with_owner_hint(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
-            )),
-        }))
+    let (sandbox, fetched_replica) = fetch_sandbox(&mut client, name, workspace)
         .await
         .into_diagnostic()?;
-    let replica = owner_replica(&response);
-    let sandbox = response
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+    let exec_wait_budget = resolve_exec_wait_timeout(exec_wait_timeout_secs);
+    let exec_wait =
+        (!exec_wait_budget.is_zero()).then(|| ExecWait::new(exec_wait_budget, jitter_seed()));
 
-    // Verify the sandbox is ready before issuing the exec.
-    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
-        return Err(miette::miette!(
-            "sandbox '{}' is not ready (phase: {}); wait for it to reach Ready state",
-            name,
-            phase_name(sandbox.phase())
-        ));
-    }
+    // Wait for the sandbox to come back before collecting stdin or issuing
+    // anything: exec is not idempotent and piped input cannot be replayed. A
+    // supervisor takeover leaves a shared sandbox in `Provisioning` or
+    // `Starting` for ten to twenty seconds, and failing on the first
+    // observation turns that window into an instant error. Without a budget
+    // this only keeps the previous fail-fast behavior.
+    let (sandbox, polled_replica) =
+        wait_for_sandbox_ready(&mut client, sandbox, workspace, exec_wait).await?;
+    let mut replica = polled_replica.or(fetched_replica);
 
     // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
     let stdin_is_terminal = std::io::stdin().is_terminal();
@@ -2627,6 +3018,7 @@ pub async fn sandbox_exec_grpc(
         return sandbox_exec_streaming_grpc(
             client,
             &sandbox,
+            workspace,
             command,
             workdir,
             timeout_seconds,
@@ -2637,25 +3029,37 @@ pub async fn sandbox_exec_grpc(
             std::mem::take(&mut request.stdin),
             stdin_rest,
             replica.as_ref(),
+            exec_wait,
         )
         .await;
     }
 
-    // Make the streaming gRPC call.
-    let retry = replica.is_some().then(|| request.clone());
-    let mut stream = match (
-        client
-            .exec_sandbox(routed_to(request, replica.as_ref()))
-            .await,
-        retry,
-    ) {
-        (Err(status), Some(request)) if retry_unrouted(replica.as_ref(), &status) => {
-            client.exec_sandbox(request).await
+    // Send the exec, retrying once without routing only when no gateway
+    // received it.
+    //
+    // A Ready read can go stale before the gateway sees the request: when the
+    // supervisor died in that window, the gateway rejects with its own
+    // readiness gate before it opens the relay, so the command provably never
+    // started and nothing has been streamed. Wait again within the same budget
+    // in that one case, when the wait is on, and send the exec once more. Every
+    // other failure, including a relay timeout and a post-stream error, stays
+    // fatal.
+    let mut resend = exec_wait.map(|_| request.clone());
+    let mut response = send_exec(&mut client, request, replica.as_ref()).await;
+    let rejection = response
+        .as_ref()
+        .err()
+        .filter(|status| server_readiness_rejection(status))
+        .cloned();
+    if let (Some(wait), Some(request), Some(rejection)) = (exec_wait, resend.take(), rejection) {
+        if let Some(owner) =
+            rewait_after_readiness_rejection(&mut client, name, workspace, wait, &rejection).await?
+        {
+            replica = Some(owner);
         }
-        (response, _) => response,
+        response = send_exec(&mut client, request, replica.as_ref()).await;
     }
-    .into_diagnostic()?
-    .into_inner();
+    let mut stream = response.into_diagnostic()?.into_inner();
 
     // Stream output to terminal in real-time.
     let mut exit_code = 0i32;
@@ -3119,6 +3523,7 @@ impl Drop for TaskGuard {
 async fn sandbox_exec_streaming_grpc(
     mut client: GrpcClient,
     sandbox: &Sandbox,
+    workspace: &str,
     command: &[String],
     workdir: Option<&str>,
     timeout_seconds: u32,
@@ -3129,11 +3534,11 @@ async fn sandbox_exec_streaming_grpc(
     stdin_prefix: Vec<u8>,
     stdin_rest: Option<tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
     replica: Option<&AsciiMetadataValue>,
+    exec_wait: Option<ExecWait>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
-    use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
-    use tokio_stream::wrappers::ReceiverStream;
+    use openshell_core::proto::exec_sandbox_input;
 
     let (cols, rows) = if tty {
         local_terminal_size().unwrap_or((80, 24))
@@ -3161,24 +3566,35 @@ async fn sandbox_exec_streaming_grpc(
         })),
     };
 
-    let (mut input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
-    input_tx.send(start.clone()).await.into_diagnostic()?;
-    let mut stream = match client
-        .exec_sandbox_interactive(routed_to(ReceiverStream::new(input_rx), replica))
-        .await
-    {
-        Err(status) if retry_unrouted(replica, &status) => {
-            let (tx, rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
-            tx.send(start).await.into_diagnostic()?;
-            input_tx = tx;
-            client
-                .exec_sandbox_interactive(ReceiverStream::new(rx))
-                .await
-        }
-        response => response,
+    let (mut input_tx, mut response) = send_exec_interactive(&mut client, &start, replica).await?;
+
+    // A Ready read can go stale before the gateway sees the start message, so
+    // the gateway can reject with its own readiness gate before it opens the
+    // relay: the command provably never started. The start message and the
+    // collected stdin prefix are replayable, so wait again within the same
+    // budget and resend once. Piped stdin that is still open (`stdin_rest`) is
+    // not replayable — its receiver is consumed once into the input channel —
+    // so that rejection stays fatal, as does every post-stream failure.
+    let rejection = response
+        .as_ref()
+        .err()
+        .filter(|status| server_readiness_rejection(status))
+        .cloned();
+    if let (Some(wait), Some(rejection), true) = (exec_wait, rejection, stdin_rest.is_none()) {
+        let owner = rewait_after_readiness_rejection(
+            &mut client,
+            sandbox.object_name(),
+            workspace,
+            wait,
+            &rejection,
+        )
+        .await?;
+        let (tx, resend) =
+            send_exec_interactive(&mut client, &start, owner.as_ref().or(replica)).await?;
+        input_tx = tx;
+        response = resend;
     }
-    .into_diagnostic()?
-    .into_inner();
+    let mut stream = response.into_diagnostic()?.into_inner();
 
     // Raw mode is only appropriate for an interactive terminal, not a pipe.
     let raw_guard = if tty && stdin_is_terminal {
@@ -7688,16 +8104,17 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 mod tests {
     use super::{
         CreateAttemptPlan, CreateRetry, ForwardTcpConnectionError, MAX_CREATE_RETRY_TIMEOUT_SECS,
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, create_retry_annotation,
-        deadline_after, format_endpoint, format_log_line, forward_requires_session_token,
-        git_sync_files, has_main_process_result, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_driver_config_json, parse_env_from_pairs,
-        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
-        proto_execution_timeout, provisioning_blocker_message, provisioning_timeout_message,
-        relay_local_socket, resolve_create_retry_timeout, resolve_from,
-        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
-        service_endpoint_to_json, service_status_error, service_url_for_gateway,
-        workspace_member_to_json,
+        MAX_EXEC_WAIT_TIMEOUT_SECS, PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
+        create_retry_annotation, deadline_after, format_endpoint, format_log_line,
+        forward_requires_session_token, git_sync_files, has_main_process_result,
+        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_driver_config_json,
+        parse_env_from_pairs, parse_secret_material_env_pairs, policy_revision_list_json,
+        policy_revision_to_json, proto_execution_timeout, provisioning_blocker_message,
+        provisioning_timeout_message, relay_local_socket, resolve_create_retry_timeout,
+        resolve_exec_wait_timeout, resolve_from, rewait_stopped_report,
+        rootfs_tar_sources_supported_for_gateway, sandbox_not_ready_report, sandbox_should_persist,
+        sandbox_upload_plan, server_readiness_rejection, service_endpoint_to_json,
+        service_status_error, service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
 
@@ -7952,6 +8369,155 @@ mod tests {
                 });
         }
     }
+
+    #[test]
+    fn exec_wait_timeout_prefers_the_flag_then_the_environment() {
+        assert_eq!(resolve_exec_wait_timeout(Some(5)), Duration::from_secs(5));
+        assert_eq!(
+            resolve_exec_wait_timeout(Some(0)),
+            Duration::ZERO,
+            "--exec-wait-timeout 0 disables the wait like --no-exec-wait"
+        );
+        assert_eq!(
+            resolve_exec_wait_timeout(Some(u32::MAX)),
+            Duration::from_secs(MAX_EXEC_WAIT_TIMEOUT_SECS),
+            "the flag is clamped to 24 hours like the environment"
+        );
+        Environment::new()
+            .set("OPENSHELL_EXEC_WAIT_TIMEOUT", "7")
+            .run(|| {
+                assert_eq!(
+                    resolve_exec_wait_timeout(None),
+                    Duration::from_secs(7),
+                    "the environment supplies the budget when the flag is absent"
+                );
+                assert_eq!(
+                    resolve_exec_wait_timeout(Some(3)),
+                    Duration::from_secs(3),
+                    "the flag wins over the environment"
+                );
+            });
+        Environment::new()
+            .remove("OPENSHELL_EXEC_WAIT_TIMEOUT")
+            .run(|| {
+                assert_eq!(
+                    resolve_exec_wait_timeout(None),
+                    Duration::from_secs(45),
+                    "the wait stays on by default"
+                );
+            });
+        Environment::new()
+            .set("OPENSHELL_EXEC_WAIT_TIMEOUT", "0")
+            .run(|| {
+                assert_eq!(
+                    resolve_exec_wait_timeout(None),
+                    Duration::ZERO,
+                    "a zero environment budget disables the wait"
+                );
+            });
+        for value in ["90000", "18446744073709551615", "18446744073709551616"] {
+            Environment::new()
+                .set("OPENSHELL_EXEC_WAIT_TIMEOUT", value)
+                .run(|| {
+                    assert_eq!(
+                        resolve_exec_wait_timeout(None),
+                        Duration::from_secs(MAX_EXEC_WAIT_TIMEOUT_SECS),
+                        "an oversized environment budget is clamped to 24 hours, \
+                         including a value above u64::MAX"
+                    );
+                });
+        }
+        for value in ["abc", "-1"] {
+            Environment::new()
+                .set("OPENSHELL_EXEC_WAIT_TIMEOUT", value)
+                .run(|| {
+                    assert_eq!(
+                        resolve_exec_wait_timeout(None),
+                        Duration::from_secs(45),
+                        "an unparseable environment budget falls back to the default"
+                    );
+                });
+        }
+    }
+
+    #[test]
+    fn only_the_gateways_pre_relay_rejection_counts_as_not_ready() {
+        // The current gateway attaches SANDBOX_NOT_READY, so the classification
+        // holds even if either side rewords the prose.
+        assert!(server_readiness_rejection(
+            &openshell_core::rpc_error::failed_precondition(
+                openshell_core::rpc_error::SANDBOX_NOT_READY,
+                "sandbox is not ready"
+            )
+        ));
+        assert!(server_readiness_rejection(
+            &openshell_core::rpc_error::failed_precondition(
+                openshell_core::rpc_error::SANDBOX_NOT_READY,
+                "sandbox not ready yet"
+            )
+        ));
+        // A structured reason under another name is a different rejection, even
+        // when its prose happens to match the gate's.
+        assert!(!server_readiness_rejection(
+            &openshell_core::rpc_error::failed_precondition(
+                "SOMETHING_ELSE",
+                "sandbox is not ready"
+            )
+        ));
+        // An older gateway sends only the bare message, so keep the exact-match
+        // fallback for it.
+        assert!(server_readiness_rejection(&Status::failed_precondition(
+            "sandbox is not ready"
+        )));
+        // The CLI's own failure carries the phase and a hint; it must never be
+        // mistaken for the gateway's pre-start rejection.
+        assert!(!server_readiness_rejection(&Status::failed_precondition(
+            "sandbox 'a' is not ready (phase: Provisioning); wait for it to reach Ready state"
+        )));
+        for other in [
+            Status::unavailable("sandbox is not ready"),
+            Status::internal("sandbox is not ready"),
+        ] {
+            assert!(
+                !server_readiness_rejection(&other),
+                "only failed_precondition is the readiness gate"
+            );
+        }
+    }
+
+    #[test]
+    fn not_ready_report_appends_the_wait_suffix_only_when_given_one() {
+        use openshell_core::proto::SandboxPhase;
+
+        // A terminal phase never had a wait, so its failure carries no suffix.
+        assert_eq!(
+            sandbox_not_ready_report("x", SandboxPhase::Stopped, None).to_string(),
+            "sandbox 'x' is not ready (phase: Stopped); wait for it to reach Ready state"
+        );
+        // A waitable phase whose wait ran out names the budget and last phase
+        // without turning the timeout into a terminal-state message.
+        assert_eq!(
+            sandbox_not_ready_report(
+                "x",
+                SandboxPhase::Provisioning,
+                Some(" (exec wait stopped after 45s; last observed phase: Provisioning)"),
+            )
+            .to_string(),
+            "sandbox 'x' is not ready (phase: Provisioning) (exec wait stopped after 45s; last observed phase: Provisioning); wait for it to reach Ready state"
+        );
+    }
+
+    #[test]
+    fn rewait_stopped_report_never_names_the_pre_rejection_phase() {
+        // The rewait's entry read can stop before it observes a phase, and the
+        // snapshot that passed the wait is always Ready; naming it would
+        // produce a contradictory "not ready (phase: Ready)".
+        let message = rewait_stopped_report("x", Duration::from_secs(3)).to_string();
+        assert!(message.contains("after 3s"), "{message}");
+        assert!(message.contains("without observing a phase"), "{message}");
+        assert!(!message.contains("phase: Ready"), "{message}");
+    }
+
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::{
         parse_credential_expiry_pairs, parse_credential_pairs, progress_step_from_metadata,

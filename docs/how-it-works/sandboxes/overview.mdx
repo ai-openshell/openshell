@@ -373,6 +373,8 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 | `--no-tty`        | Disable TTY allocation even when attached to a terminal. |
 | `--no-login-shell`| Run the command without sourcing shell login startup files. |
 | `--env`           | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+| `--exec-wait-timeout` | Seconds to wait for the sandbox to become `Ready` before running the command (default: 45, or `OPENSHELL_EXEC_WAIT_TIMEOUT`). `0` disables the wait. |
+| `--no-exec-wait`  | Fail immediately when the sandbox is not `Ready`.        |
 
 ### Skip shell startup files
 
@@ -1228,6 +1230,8 @@ stopped sandbox repeats configuration admission before launching its workload.
 Image preparation and initial supervisor startup have an absolute deadline of 1800 seconds by default, independently of the CLI wait timeout. `sandbox create --timeout <seconds>` sets how long the CLI waits without provisioning progress (300 seconds by default); it does not change the gateway deadline. Operators can set `image_preparation_timeout_seconds` in `[openshell.gateway]` to any value from 1 through 86400. Each new create or explicit start stores its deadline. Progress events, configuration edits, and gateway or driver restarts cannot extend it. Changing the gateway setting affects new attempts only.
 
 `sandbox create` retries when the gateway reports that the create lost the mutation lock, for 60 seconds by default. Set the budget with `--create-retry-timeout <seconds>` or `OPENSHELL_CREATE_RETRY_TIMEOUT` (both clamped to 24 hours), or pass `--no-create-retry` to fail on the first busy reply. Retry progress goes to stderr.
+
+`sandbox exec` likewise waits before running the command when the sandbox is `Provisioning` or `Starting`, such as while a supervisor takeover finishes, for 45 seconds by default. Set the budget with `--exec-wait-timeout <seconds>` or `OPENSHELL_EXEC_WAIT_TIMEOUT` (both clamped to 24 hours; `0` disables the wait), or pass `--no-exec-wait`. Every other phase still fails immediately.
 
 The first authenticated configuration report from the current supervisor ends preparation and starts a separate admission repair window (300 seconds by default). A slow image download therefore does not consume time reserved for fixing policy. During admission, an effective policy, settings, provider, profile, or attachment change resets the window from its stored change time. The first failed configuration load for that change grants another full window. Repeated failures, duplicate reports, and reconnects do not extend it; reaching `Ready` clears it.
 

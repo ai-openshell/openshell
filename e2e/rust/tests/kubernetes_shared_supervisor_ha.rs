@@ -25,12 +25,15 @@ mod shared_supervisor;
 use std::process::Stdio;
 use std::time::Duration;
 
+use openshell_e2e::harness::cli::run_cli;
+use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use shared_supervisor::{
-    EXEC_PROBE_TIMEOUT, GATEWAY_SELECTOR, HostEndpoint, SUPERVISOR_CONTAINER, call_host,
-    counts_past, create, gateway_log_lines, generation, is_takeover, kill_abruptly, kubectl,
-    kubectl_command, main_process, owner_of, policy, release_namespace, supervisor_pods,
-    wait_for_owner, wait_until_attached,
+    EXEC_PROBE_TIMEOUT, GATEWAY_SELECTOR, HostEndpoint, MainProcess, ProbeOptions,
+    SUPERVISOR_CONTAINER, SampleBounds, Samples, call_host, check_samples, counts_past, create,
+    gateway_log_lines, generation, is_takeover, kill_abruptly, kubectl, kubectl_command,
+    kubectl_json, main_process, owner_of, policy, release_namespace, supervisor_pods,
+    wait_for_owner, wait_until_attached, while_probing,
 };
 use tokio::io::AsyncBufReadExt as _;
 
@@ -49,6 +52,107 @@ const PLACEMENT_ATTEMPTS: usize = 32;
 const EXPIRY_EVIDENCE: Duration = Duration::from_secs(10);
 /// What a supervisor logs as it begins to leave the pool.
 const LEAVING: &str = "pool member is leaving";
+/// The readiness-wait budget these regression scenarios opt into: the CLI's
+/// 45-second default, enough for the ten- to twenty-second takeover with
+/// headroom.
+const EXEC_WAIT_SECS: u32 = 45;
+/// Bound on one waited exec probe: [`EXEC_WAIT_SECS`] plus 30 seconds of
+/// margin for process startup and the command.
+const EXEC_WAIT_PROBE_TIMEOUT: Duration = Duration::from_secs(75);
+/// Interval between probes of a sandbox during the churn window.
+const CHURN_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+/// Probing continues this long after the transition returned.
+const CHURN_SETTLE: Duration = Duration::from_secs(15);
+/// Exec failures a genuine Ready-read/exec race may still cost the fixed CLI.
+/// The pre-fix CLI fails every probe in the takeover window, so the abrupt-kill
+/// scenario fails this assertion there.
+const EXEC_RACE_ALLOWANCE: usize = 2;
+/// Bound on a sandbox recovering from a supervisor Deployment rollout: both
+/// members restart, so each sandbox waits for a fresh session plus the wait
+/// budget. Size it from the lane's observed recovery, not from the budget
+/// alone.
+const ROLLOUT_RECOVERY_DEADLINE: Duration = Duration::from_mins(4);
+
+/// How these regression scenarios probe: exec only, opting into the CLI's
+/// readiness wait so a takeover is waited out instead of failing instantly.
+fn takeover_probe_options() -> ProbeOptions {
+    ProbeOptions {
+        interval: CHURN_PROBE_INTERVAL,
+        port: None,
+        exec_wait_timeout_secs: Some(EXEC_WAIT_SECS),
+        exec_probe_timeout: EXEC_WAIT_PROBE_TIMEOUT,
+    }
+}
+
+/// Bounds for one sandbox that recovered from the churn.
+fn takeover_bounds(recovery: Duration) -> SampleBounds {
+    SampleBounds {
+        exec_outage: recovery,
+        network_outage: recovery,
+        exec_failure_allowance: Some(EXEC_RACE_ALLOWANCE),
+        exec_probe: Some(EXEC_WAIT_PROBE_TIMEOUT),
+    }
+}
+
+/// Poll a non-waiting exec probe until it succeeds, or return the last failure
+/// once `deadline` passes.
+async fn wait_for_exec(sandbox: &SandboxGuard, deadline: Duration) -> Result<MainProcess, String> {
+    let mut last = String::from("exec never ran");
+    tokio::time::timeout(deadline, async {
+        loop {
+            match main_process(sandbox).await {
+                Ok(current) => return current,
+                Err(error) => last = error,
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    })
+    .await
+    .map_err(|_| last)
+}
+
+/// The sandbox's phase as the CLI's structured output reports it, retried
+/// briefly so a gateway read during churn does not decide the verdict.
+async fn sandbox_phase(sandbox: &SandboxGuard) -> Option<String> {
+    for _ in 0..5 {
+        let (output, code) = run_cli(&["sandbox", "get", &sandbox.name, "--output", "json"]).await;
+        if code == 0
+            && let Some(phase) = serde_json::from_str::<serde_json::Value>(&strip_ansi(&output))
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("phase")
+                        .and_then(|phase| phase.as_str())
+                        .map(ToOwned::to_owned)
+                })
+        {
+            return Some(phase);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    None
+}
+
+/// Whether the sandbox ended up `Stopped`, read from its structured phase
+/// rather than from CLI error prose, whose wording can drift.
+///
+/// A rolling restart can leave a pool sandbox `Stopped`, which is a separate,
+/// unconfirmed failure tracked under the issue's AC (c): the scenario reports
+/// it loudly from `stopped_sandbox_verdict` instead of failing on it.
+async fn left_stopped(sandbox: &SandboxGuard) -> bool {
+    sandbox_phase(sandbox).await.as_deref() == Some("Stopped")
+}
+
+/// Report a rollout sandbox that never came back because it was left `Stopped`.
+fn stopped_sandbox_verdict(sandbox: &SandboxGuard, samples: &Samples) {
+    eprintln!(
+        "KNOWN FAILURE (AC (c) of #5659, not this test): {} was left Stopped by the rollout; \
+         {} exec probes failed: {:?}",
+        sandbox.name,
+        samples.exec_failures.len(),
+        samples.exec_failures
+    );
+}
 
 /// Lines a supervisor Pod logs from its start until its container ends.
 struct FollowedLogs {
@@ -522,15 +626,14 @@ async fn gateway_workload() -> String {
 }
 
 async fn rollout(action: &str, workload: &str) {
-    kubectl(&[
-        "-n",
-        &release_namespace(),
-        "rollout",
-        action,
-        workload,
-        "--timeout=300s",
-    ])
-    .await;
+    let namespace = release_namespace();
+    // `rollout status` waits for the rollout with --timeout; `rollout
+    // restart` only records the restart and rejects the flag.
+    let mut args = vec!["-n", &namespace, "rollout", action, workload];
+    if action == "status" {
+        args.push("--timeout=300s");
+    }
+    kubectl(&args).await;
 }
 
 async fn force_delete(pod: &str) {
@@ -685,4 +788,191 @@ async fn pool_sessions_follow_their_supervisors_gateway() {
 
     forward.ensure().await;
     drop(sandboxes);
+}
+
+/// Exec keeps working across an abrupt supervisor kill, and the CLI waits out
+/// the takeover instead of failing on the first `Provisioning` read.
+///
+/// The discriminating assertion is the failure count: on the pre-fix CLI every
+/// probe in the takeover window fails, far above the race allowance, while on
+/// the fixed CLI a probe started before the recovery waits for it and succeeds.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn exec_survives_an_abrupt_supervisor_kill() {
+    let members = supervisor_pods().await;
+    assert!(
+        members.len() >= 2,
+        "the supervisor pool needs at least two running members: {members:?}"
+    );
+    wait_until_attached(&members).await;
+    let endpoint = HostEndpoint::start().await;
+    let policy = policy(endpoint.port);
+
+    let mut sandbox = create(&policy).await;
+    let generation_before = generation(&sandbox.name).await;
+    let owner_before = wait_for_owner(&generation_before.route).await;
+    let baseline = main_process(&sandbox)
+        .await
+        .expect("main process before the kill");
+
+    let (moved_after, samples) = while_probing(
+        &[(&sandbox, baseline.clone())],
+        takeover_probe_options(),
+        CHURN_SETTLE,
+        async {
+            let killed_at = tokio::time::Instant::now();
+            let killed = kill_abruptly(&owner_before).await;
+            eprintln!("supervisor {owner_before} killed: {killed}");
+            // The churn window ends when another member admits the route; the
+            // probes keep running through it and through the settle period.
+            tokio::time::timeout(RECOVERY_DEADLINE, async {
+                loop {
+                    if owner_of(&generation_before.route)
+                        .await
+                        .is_some_and(|owner| owner != owner_before)
+                    {
+                        return killed_at.elapsed();
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "no other member admitted {} within {RECOVERY_DEADLINE:?}",
+                    sandbox.name
+                )
+            })
+        },
+    )
+    .await;
+
+    check_samples(
+        "abrupt supervisor kill",
+        &sandbox,
+        &samples[0],
+        takeover_bounds(RECOVERY_DEADLINE),
+    );
+
+    // Exec answers again after settle, on the same adopted process.
+    let after = wait_for_exec(&sandbox, RECOVERY_DEADLINE)
+        .await
+        .unwrap_or_else(|last| {
+            panic!(
+                "{} never answered exec again after the kill: {last}",
+                sandbox.name
+            )
+        });
+    assert_eq!(
+        (after.pid, after.start_ticks),
+        (baseline.pid, baseline.start_ticks),
+        "the main process was restarted, not adopted"
+    );
+    assert_eq!(
+        generation(&sandbox.name).await,
+        generation_before,
+        "the workload Pod or runtime generation changed"
+    );
+    let new_owner = wait_for_owner(&generation_before.route).await;
+    assert_ne!(new_owner, owner_before, "the lost Pod cannot own the route");
+    eprintln!(
+        "{} moved to {new_owner} {moved_after:?} after the kill and answers exec",
+        sandbox.name
+    );
+
+    sandbox.cleanup().await;
+}
+
+/// Exec keeps working across a rollout restart of the supervisor Deployment.
+///
+/// The per-sandbox verdict sizes recovery from observed behavior: a sandbox
+/// that comes back within the bound must satisfy the exec assertions, while one
+/// the rollout leaves `Stopped` is reported as the known AC (c) failure and
+/// counted separately instead of failing this test.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn exec_survives_a_supervisor_rollout_restart() {
+    let members = supervisor_pods().await;
+    assert!(
+        members.len() >= 2,
+        "the supervisor pool needs at least two running members: {members:?}"
+    );
+    wait_until_attached(&members).await;
+    let supervisor = format!("deployment.apps/{}-supervisor", release());
+    let endpoint = HostEndpoint::start().await;
+    let policy = policy(endpoint.port);
+
+    // Two sandboxes so the per-sandbox verdict can come out differently.
+    let mut tracked = Vec::new();
+    for _ in 0..2 {
+        let sandbox = create(&policy).await;
+        let generation_before = generation(&sandbox.name).await;
+        let baseline = main_process(&sandbox)
+            .await
+            .expect("main process before the rollout");
+        tracked.push((sandbox, generation_before, baseline));
+    }
+    let probes = tracked
+        .iter()
+        .map(|(sandbox, _, baseline)| (sandbox, baseline.clone()))
+        .collect::<Vec<_>>();
+    let ((), samples) = while_probing(&probes, takeover_probe_options(), CHURN_SETTLE, async {
+        rollout("restart", &supervisor).await;
+        rollout("status", &supervisor).await;
+    })
+    .await;
+
+    let mut recovered = Vec::new();
+    let mut stopped = Vec::new();
+    for ((mut sandbox, generation_before, baseline), samples) in tracked.into_iter().zip(&samples) {
+        match wait_for_exec(&sandbox, ROLLOUT_RECOVERY_DEADLINE).await {
+            Ok(after) => {
+                assert_eq!(
+                    (after.pid, after.start_ticks),
+                    (baseline.pid, baseline.start_ticks),
+                    "{}'s main process was restarted, not adopted",
+                    sandbox.name
+                );
+                assert_eq!(
+                    generation(&sandbox.name).await,
+                    generation_before,
+                    "{}'s workload Pod or runtime generation changed",
+                    sandbox.name
+                );
+                check_samples(
+                    "supervisor rollout",
+                    &sandbox,
+                    samples,
+                    takeover_bounds(ROLLOUT_RECOVERY_DEADLINE),
+                );
+                recovered.push(sandbox.name.clone());
+            }
+            Err(last) => {
+                if left_stopped(&sandbox).await {
+                    stopped_sandbox_verdict(&sandbox, samples);
+                    stopped.push(sandbox.name.clone());
+                } else {
+                    panic!(
+                        "{} did not answer exec within {ROLLOUT_RECOVERY_DEADLINE:?} after the rollout: {last}; failures: {:?}",
+                        sandbox.name, samples.exec_failures
+                    );
+                }
+            }
+        }
+        sandbox.cleanup().await;
+    }
+    assert!(
+        !recovered.is_empty(),
+        "no sandbox survived the rollout (recovered: {recovered:?}, stopped: {stopped:?})"
+    );
+    assert_eq!(
+        recovered.len() + stopped.len(),
+        2,
+        "every tracked sandbox must get a verdict (recovered: {recovered:?}, stopped: {stopped:?})"
+    );
+    eprintln!(
+        "rollout: {} recovered, {} left Stopped (known AC (c) failure)",
+        recovered.len(),
+        stopped.len()
+    );
 }

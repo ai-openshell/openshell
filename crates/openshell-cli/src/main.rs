@@ -1874,6 +1874,19 @@ enum SandboxCommands {
         #[arg(long)]
         no_login_shell: bool,
 
+        /// Seconds to wait for the sandbox to become Ready before running the
+        /// command (default: 45, or `OPENSHELL_EXEC_WAIT_TIMEOUT`). Only a
+        /// sandbox in Provisioning or Starting waits, such as during a
+        /// supervisor takeover; every other phase fails immediately. `0`
+        /// disables the wait, like `--no-exec-wait`.
+        #[arg(long, value_name = "SECONDS", overrides_with = "no_exec_wait")]
+        exec_wait_timeout: Option<u32>,
+
+        /// Fail immediately when the sandbox is not Ready instead of waiting
+        /// for a supervisor takeover to finish.
+        #[arg(long, overrides_with = "exec_wait_timeout")]
+        no_exec_wait: bool,
+
         /// Set a non-secret environment variable for the command.
         /// Do not use this option for API keys, tokens, or other secrets; attach
         /// a provider to the sandbox instead. Repeatable.
@@ -3913,6 +3926,8 @@ async fn run_async() -> Result<()> {
                             envs,
                             command,
                             no_login_shell,
+                            exec_wait_timeout,
+                            no_exec_wait,
                         } => {
                             let name =
                                 resolve_sandbox_name(name.or(sandbox), &ctx.name, &cli.workspace)?;
@@ -3924,6 +3939,15 @@ async fn run_async() -> Result<()> {
                             } else {
                                 None // auto-detect
                             };
+                            // Resolve --exec-wait-timeout / --no-exec-wait. A
+                            // zero budget disables the wait; the environment
+                            // and the 45s default are applied in
+                            // `run::sandbox_exec_grpc`.
+                            let exec_wait_timeout_secs = if no_exec_wait {
+                                Some(0)
+                            } else {
+                                exec_wait_timeout
+                            };
                             let env_map = run::parse_env_pairs(&envs)?;
                             let exit_code = run::sandbox_exec_grpc(
                                 endpoint,
@@ -3931,6 +3955,7 @@ async fn run_async() -> Result<()> {
                                 &command,
                                 workdir.as_deref(),
                                 timeout,
+                                exec_wait_timeout_secs,
                                 tty_override,
                                 &env_map,
                                 no_login_shell,
@@ -6836,6 +6861,61 @@ mod tests {
         assert_eq!(
             create_retry_flags(&["--create-retry-timeout", "30", "--no-create-retry"]),
             (None, true)
+        );
+    }
+
+    fn exec_wait_flags(args: &[&str]) -> (Option<u32>, bool) {
+        let cli = Cli::try_parse_from(
+            ["openshell", "sandbox", "exec", "test-sandbox"]
+                .into_iter()
+                .chain(args.iter().copied())
+                .chain(["--", "true"]),
+        )
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Exec {
+                        exec_wait_timeout,
+                        no_exec_wait,
+                        ..
+                    }),
+                ..
+            }) => (exec_wait_timeout, no_exec_wait),
+            other => panic!("expected SandboxCommands::Exec, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_exec_wait_flags_parse() {
+        assert_eq!(
+            exec_wait_flags(&["--exec-wait-timeout", "5"]),
+            (Some(5), false)
+        );
+        assert_eq!(
+            exec_wait_flags(&["--exec-wait-timeout", "0"]),
+            (Some(0), false),
+            "a zero budget must parse: it disables the wait like --no-exec-wait"
+        );
+        assert_eq!(exec_wait_flags(&["--no-exec-wait"]), (None, true));
+        assert_eq!(
+            exec_wait_flags(&[]),
+            (None, false),
+            "neither flag leaves both unset so the 45s default applies"
+        );
+    }
+
+    #[test]
+    fn sandbox_exec_wait_flags_use_the_last_one_given() {
+        assert_eq!(
+            exec_wait_flags(&["--no-exec-wait", "--exec-wait-timeout", "5"]),
+            (Some(5), false),
+            "a later --exec-wait-timeout must clear an earlier --no-exec-wait"
+        );
+        assert_eq!(
+            exec_wait_flags(&["--exec-wait-timeout", "5", "--no-exec-wait"]),
+            (None, true),
+            "a later --no-exec-wait must clear an earlier --exec-wait-timeout"
         );
     }
 

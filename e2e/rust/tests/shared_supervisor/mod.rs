@@ -8,9 +8,12 @@
 //! Each test binary uses a subset.
 #![allow(dead_code)]
 
+use std::future::Future;
 use std::process::Stdio;
 use std::time::Duration;
 
+use futures_util::future::join_all;
+use openshell_e2e::harness::container::ContainerEngine;
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
@@ -60,20 +63,34 @@ pub const NETWORK_PROBE_TIMEOUT: Duration = Duration::from_secs(40);
 /// Run `command` in a cluster node's container; k3d and kind name node
 /// containers after their nodes.
 async fn node_exec(node: &str, command: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new("docker")
+    // kind runs on Docker in CI and on Podman on some dev hosts; resolve the
+    // engine the same way the rest of the harness does instead of assuming
+    // Docker, or every node-level kill fails with "No such file or directory".
+    let engine = ContainerEngine::from_env()
+        .map_err(|error| format!("container engine for exec into kind node {node}: {error}"))?;
+    let name = engine.name().to_string();
+    let mut process = engine.command();
+    // The Kubernetes gateway wrapper scopes XDG_CONFIG_HOME and XDG_DATA_HOME
+    // to its per-run workdir, which points a rootless Podman at a per-run
+    // container store. The kind nodes live in the user's real store, so an
+    // exec into them must drop that scoping; Docker ignores both variables.
+    process
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
         .arg("exec")
         .arg(node)
         .args(command)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = tokio::process::Command::from(process)
         .output()
         .await
-        .map_err(|error| format!("docker exec {node} {command:?}: {error}"))?;
+        .map_err(|error| format!("{name} exec {node} {command:?}: {error}"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
         Err(format!(
-            "docker exec {node} {command:?}: {}",
+            "{name} exec {node} {command:?}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
@@ -592,18 +609,35 @@ pub struct MainProcess {
 
 /// One bounded exec probe of the main process.
 pub async fn main_process(sandbox: &SandboxGuard) -> Result<MainProcess, String> {
+    main_process_with_wait(sandbox, None, EXEC_PROBE_TIMEOUT).await
+}
+
+/// One bounded exec probe of the main process, opting into the CLI's readiness
+/// wait.
+///
+/// `wait_timeout_secs` is `sandbox exec --exec-wait-timeout`'s budget; `None`
+/// keeps today's instant failure. `probe_timeout` bounds the whole CLI call, so
+/// it must cover the readiness wait plus the command.
+pub async fn main_process_with_wait(
+    sandbox: &SandboxGuard,
+    wait_timeout_secs: Option<u32>,
+    probe_timeout: Duration,
+) -> Result<MainProcess, String> {
     let output = tokio::time::timeout(
-        EXEC_PROBE_TIMEOUT,
-        sandbox.exec(&[
-            "sh",
-            "-c",
-            "pid=$(cat /tmp/ha-main.pid) && echo pid=$pid && \
-             echo start=$(cut -d')' -f2 /proc/$pid/stat | awk '{print $20}') && \
-             echo counter=$(cat /tmp/ha-counter)",
-        ]),
+        probe_timeout,
+        sandbox.exec_with_wait_timeout(
+            &[
+                "sh",
+                "-c",
+                "pid=$(cat /tmp/ha-main.pid) && echo pid=$pid && \
+                 echo start=$(cut -d')' -f2 /proc/$pid/stat | awk '{print $20}') && \
+                 echo counter=$(cat /tmp/ha-counter)",
+            ],
+            wait_timeout_secs,
+        ),
     )
     .await
-    .map_err(|_| format!("exec did not finish within {EXEC_PROBE_TIMEOUT:?}"))??;
+    .map_err(|_| format!("exec did not finish within {probe_timeout:?}"))??;
     let field = |key: &str| {
         output
             .lines()
@@ -638,6 +672,211 @@ pub async fn counts_past(sandbox: &SandboxGuard, previous: &MainProcess) -> Main
     })
     .await
     .unwrap_or_else(|_| panic!("{} stopped counting after {previous:?}", sandbox.name))
+}
+
+/// How `sample` probes a sandbox.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeOptions {
+    /// Interval between probe rounds.
+    pub interval: Duration,
+    /// Host endpoint port for the policy-mediated probe; `None` samples exec
+    /// only.
+    pub port: Option<u16>,
+    /// Readiness-wait budget each exec probe opts into. `None` keeps the
+    /// CLI's instant failure, which is what every suite that probes during
+    /// churn used before the wait existed.
+    pub exec_wait_timeout_secs: Option<u32>,
+    /// Bound on one exec probe, covering any readiness wait.
+    pub exec_probe_timeout: Duration,
+}
+
+/// What the probes of one sandbox saw during a transition.
+#[derive(Debug, Default)]
+pub struct Samples {
+    pub exec_ok: usize,
+    pub exec_failures: Vec<String>,
+    pub network_ok: usize,
+    pub network_failures: Vec<String>,
+    /// Longest time without a successful exec probe.
+    pub exec_outage: Duration,
+    /// Longest time without a successful network probe.
+    pub network_outage: Duration,
+    /// Longest successful exec probe, readiness wait included.
+    pub slowest_exec: Duration,
+    /// Whether the network probe ran at all.
+    pub network_probed: bool,
+    pub last: Option<MainProcess>,
+}
+
+/// Probe `sandbox` every [`ProbeOptions::interval`] until `stop`: its main
+/// process must stay `baseline`'s and its counter must never go back; record
+/// how long exec, and the policy-mediated call to the host endpoint when a
+/// port is given, fail.
+pub async fn sample(
+    sandbox: &SandboxGuard,
+    baseline: &MainProcess,
+    options: ProbeOptions,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Samples {
+    let mut samples = Samples {
+        network_probed: options.port.is_some(),
+        ..Samples::default()
+    };
+    let mut last_exec = tokio::time::Instant::now();
+    let mut last_network = tokio::time::Instant::now();
+    let mut counter = baseline.counter;
+    loop {
+        let started = tokio::time::Instant::now();
+        match main_process_with_wait(
+            sandbox,
+            options.exec_wait_timeout_secs,
+            options.exec_probe_timeout,
+        )
+        .await
+        {
+            Ok(current) => {
+                assert_eq!(
+                    (current.pid, current.start_ticks),
+                    (baseline.pid, baseline.start_ticks),
+                    "{}'s main process was replaced: {baseline:?} then {current:?}",
+                    sandbox.name
+                );
+                assert!(
+                    current.counter >= counter,
+                    "{}'s in-memory counter went back from {counter} to {}",
+                    sandbox.name,
+                    current.counter
+                );
+                counter = current.counter;
+                samples.exec_outage = samples.exec_outage.max(last_exec.elapsed());
+                samples.slowest_exec = samples.slowest_exec.max(started.elapsed());
+                last_exec = tokio::time::Instant::now();
+                samples.exec_ok += 1;
+                samples.last = Some(current);
+            }
+            Err(error) => samples.exec_failures.push(error),
+        }
+        if let Some(port) = options.port {
+            match try_call_host(sandbox, port).await {
+                Ok(result) if result == "HA_OK" => {
+                    samples.network_outage = samples.network_outage.max(last_network.elapsed());
+                    last_network = tokio::time::Instant::now();
+                    samples.network_ok += 1;
+                }
+                Ok(result) => samples.network_failures.push(result),
+                Err(error) => samples.network_failures.push(error),
+            }
+        }
+        if *stop.borrow() {
+            break;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(options.interval) => {}
+            _ = stop.changed() => {}
+        }
+    }
+    samples.exec_outage = samples.exec_outage.max(last_exec.elapsed());
+    if samples.network_probed {
+        samples.network_outage = samples.network_outage.max(last_network.elapsed());
+    }
+    samples
+}
+
+/// Run `transition` while probing every sandbox, and keep probing for `settle`
+/// after it finished.
+pub async fn while_probing<T>(
+    sandboxes: &[(&SandboxGuard, MainProcess)],
+    options: ProbeOptions,
+    settle: Duration,
+    transition: impl Future<Output = T>,
+) -> (T, Vec<Samples>) {
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let samplers = join_all(
+        sandboxes
+            .iter()
+            .map(|(sandbox, baseline)| sample(sandbox, baseline, options, stopped.clone())),
+    );
+    let driver = async {
+        let outcome = transition.await;
+        tokio::time::sleep(settle).await;
+        stop.send_replace(true);
+        outcome
+    };
+    tokio::join!(driver, samplers)
+}
+
+/// What a sampling run must satisfy.
+#[derive(Debug, Clone, Copy)]
+pub struct SampleBounds {
+    /// Longest a sandbox may go without a successful exec probe.
+    pub exec_outage: Duration,
+    /// Longest a sandbox may go without a successful policy-mediated call.
+    pub network_outage: Duration,
+    /// Exec failures a genuine read/exec race may still produce. `None` keeps
+    /// the older suites' no-allowance check.
+    pub exec_failure_allowance: Option<usize>,
+    /// Longest a successful exec probe may take, readiness wait included.
+    pub exec_probe: Option<Duration>,
+}
+
+/// Check what the probes of `sandbox` saw against `bounds`.
+pub fn check_samples(phase: &str, sandbox: &SandboxGuard, samples: &Samples, bounds: SampleBounds) {
+    eprintln!(
+        "{phase}: {} exec {} ok / {} failed (longest outage {:?}, slowest probe {:?}), network {} ok / {} failed (longest outage {:?})",
+        sandbox.name,
+        samples.exec_ok,
+        samples.exec_failures.len(),
+        samples.exec_outage,
+        samples.slowest_exec,
+        samples.network_ok,
+        samples.network_failures.len(),
+        samples.network_outage
+    );
+    assert!(
+        samples.exec_ok > 0,
+        "{phase}: {} never answered an exec probe: {samples:?}",
+        sandbox.name
+    );
+    if samples.network_probed {
+        assert!(
+            samples.network_ok > 0,
+            "{phase}: {} never answered a network probe: {samples:?}",
+            sandbox.name
+        );
+        assert!(
+            samples.network_outage <= bounds.network_outage,
+            "{phase}: networking from {} failed for {:?}, longer than {:?}: {:?}",
+            sandbox.name,
+            samples.network_outage,
+            bounds.network_outage,
+            samples.network_failures
+        );
+    }
+    assert!(
+        samples.exec_outage <= bounds.exec_outage,
+        "{phase}: exec on {} failed for {:?}, longer than {:?}: {:?}",
+        sandbox.name,
+        samples.exec_outage,
+        bounds.exec_outage,
+        samples.exec_failures
+    );
+    if let Some(allowance) = bounds.exec_failure_allowance {
+        assert!(
+            samples.exec_failures.len() <= allowance,
+            "{phase}: {} failed {} exec probes, more than the {allowance} a race may cost: {:?}",
+            sandbox.name,
+            samples.exec_failures.len(),
+            samples.exec_failures
+        );
+    }
+    if let Some(probe) = bounds.exec_probe {
+        assert!(
+            samples.slowest_exec <= probe,
+            "{phase}: {}'s slowest successful exec probe took {:?}, longer than {probe:?}",
+            sandbox.name,
+            samples.slowest_exec
+        );
+    }
 }
 
 /// Host endpoint that answers every request with `HA_OK`.

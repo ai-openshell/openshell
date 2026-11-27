@@ -234,13 +234,17 @@ fn retry_delay_floor(server_delay: Option<Duration>) -> Duration {
 ///
 /// A server-supplied delay is a minimum the client promised to honor, so a
 /// delay above the ceiling stays binding instead of being silently shortened.
-fn backoff_floor(base: Duration, step: u32, cap: Duration) -> Duration {
+/// Shared with [`crate::exec_wait`] so both client waits back off the same way.
+pub(crate) fn backoff_floor(base: Duration, step: u32, cap: Duration) -> Duration {
     let factor = 1_u32 << step.min(31);
     base.saturating_mul(factor).min(cap.max(base))
 }
 
 /// Jitter for one attempt, proportional to the delay: at most half of it.
-fn jitter(seed: u64, attempt: u32, delay: Duration) -> Duration {
+///
+/// Shared with [`crate::exec_wait`] so concurrent clients spread their polls
+/// and retries the same way.
+pub(crate) fn jitter(seed: u64, attempt: u32, delay: Duration) -> Duration {
     let bound = delay / 2;
     let bound_nanos = u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX);
     if bound_nanos == 0 {
@@ -250,7 +254,7 @@ fn jitter(seed: u64, attempt: u32, delay: Duration) -> Duration {
 }
 
 /// `SplitMix64` finalizer: deterministic mixing without a dependency.
-fn mix(mut value: u64) -> u64 {
+pub(crate) fn mix(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
