@@ -685,42 +685,6 @@ jobs:
       - name: Lint
         run: mise run markdown:lint
 
-  typescript-sdk-freeze:
-    name: TypeScript SDK Freeze
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Reject changes to the TypeScript SDK
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          # See the Python SDK freeze: diff the PR head, not the merge commit.
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          # The package is a stub that re-exports @ai-openshell/sdk. Its files stay
-          # editable so the stub and its moved notice can be maintained.
-          changed=$(git diff --no-renames --name-only --diff-filter=d "${BASE_SHA}...${HEAD_SHA}" -- sdk/typescript \
-            ':(exclude)sdk/typescript/package.json' \
-            ':(exclude)sdk/typescript/README.md' \
-            ':(exclude)sdk/typescript/index.js' \
-            ':(exclude)sdk/typescript/index.d.ts' \
-            ':(exclude)sdk/typescript/raw.js' \
-            ':(exclude)sdk/typescript/raw.d.ts')
-          if [ -z "$changed" ]; then
-            echo "No added or changed TypeScript SDK files."
-            exit 0
-          fi
-          echo "::error title=TypeScript SDK moved::Open TypeScript SDK changes at https://github.com/ai-openshell/sdk-typescript. Drop sdk/typescript changes from this PR. Core proto changes need no TypeScript bindings here; sdk-typescript generates them from core releases."
-          echo "Changed TypeScript SDK files:"
-          echo "$changed"
-          exit 1
-
   install-script:
     name: install.sh
     runs-on: ubuntu-latest

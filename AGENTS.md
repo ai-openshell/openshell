@@ -71,7 +71,6 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
 | `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
 | `python/openshell/` | Python SDK (frozen) | Moved to ai-openshell/sdk-python; kept until removal |
-| `sdk/typescript/` | TypeScript SDK stub (deprecated) | `@nvidia/openshell-sdk` re-exports `@ai-openshell/sdk` from ai-openshell/sdk-typescript |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `tests/testkit/` | E2E testkit | Support library and `#[testkit::test]` attribute for SDK-driven E2E suites |
 | `tests/suites/` | E2E suites | One directory per test family, such as `conformance` |
