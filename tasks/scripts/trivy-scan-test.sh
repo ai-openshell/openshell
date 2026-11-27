@@ -147,6 +147,7 @@ EOF
 # Use embedded checks so this regression needs no network or cached database.
 expect_status 0 "scan a kube-system workload and networking permissions" \
   trivy config --skip-version-check --skip-check-update --quiet \
+  --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
   --cache-dir "${TMP_DIR}/trivy-cache" --ignorefile "${REPO_ROOT}/.trivyignore.yaml" \
   --format json --output "${TMP_DIR}/namespaces.json" "${TMP_DIR}/namespaces"
 if ! jq -e '
