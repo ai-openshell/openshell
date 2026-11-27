@@ -3795,7 +3795,7 @@ fn parent_column_label(
 /// PARENT column labels by parent id. A parent listed in the same response
 /// needs no lookup; any other is looked up once by name.
 async fn parent_column_labels(
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     sandboxes: &[Sandbox],
 ) -> HashMap<String, String> {
     let mut labels = HashMap::new();

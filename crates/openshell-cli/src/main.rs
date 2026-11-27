@@ -261,9 +261,11 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
 async fn mcp_client(
     gateway: &Option<String>,
     gateway_endpoint: &Option<String>,
+    allow_endpoint_override: bool,
     tls: TlsOptions,
 ) -> std::result::Result<openshell_sdk::OpenShellClient, String> {
-    let ctx = resolve_gateway(gateway, gateway_endpoint).map_err(|error| error.to_string())?;
+    let ctx = resolve_gateway(gateway, gateway_endpoint, allow_endpoint_override)
+        .map_err(|error| error.to_string())?;
     let mut tls = tls.with_gateway_name(&ctx.name);
     if let Some(error) = apply_auth_with_status(&mut tls, &ctx.name) {
         return Err(error);
@@ -293,6 +295,7 @@ async fn mcp_client(
 async fn mcp_serve(
     gateway: &Option<String>,
     gateway_endpoint: &Option<String>,
+    allow_endpoint_override: bool,
     tls: TlsOptions,
     workspace: String,
 ) -> Result<()> {
@@ -300,7 +303,7 @@ async fn mcp_serve(
     let client = std::sync::Arc::new(openshell_cli::mcp_bridge::LazyClient::new(move || {
         let (gateway, gateway_endpoint, tls) =
             (gateway.clone(), gateway_endpoint.clone(), tls.clone());
-        async move { mcp_client(&gateway, &gateway_endpoint, tls).await }
+        async move { mcp_client(&gateway, &gateway_endpoint, allow_endpoint_override, tls).await }
     }));
     // Try once at start so a missing login shows on stderr straight away.
     if let Err(error) = client.get().await {
@@ -3148,7 +3151,14 @@ async fn run_async() -> Result<()> {
         Some(Commands::Mcp {
             command: Some(McpCommands::Serve),
         }) => {
-            mcp_serve(&cli.gateway, &cli.gateway_endpoint, tls, cli.workspace).await?;
+            mcp_serve(
+                &cli.gateway,
+                &cli.gateway_endpoint,
+                explicit_gateway == explicit_endpoint,
+                tls,
+                cli.workspace,
+            )
+            .await?;
         }
         Some(Commands::Mcp { command: None }) => {
             Cli::command()

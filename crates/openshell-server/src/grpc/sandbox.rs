@@ -9478,7 +9478,7 @@ mod tests {
     async fn call_mcp_as(
         state: &Arc<ServerState>,
         caller: crate::auth::principal::Principal,
-        authz_policy: Option<crate::auth::authz::AuthzPolicy>,
+        authz_policy: Option<AuthzPolicy>,
         workspace: Option<&str>,
         tool: &str,
         arguments: serde_json::Value,
@@ -9495,7 +9495,7 @@ mod tests {
     async fn post_mcp_as(
         state: &Arc<ServerState>,
         caller: crate::auth::principal::Principal,
-        authz_policy: Option<crate::auth::authz::AuthzPolicy>,
+        authz_policy: Option<AuthzPolicy>,
         workspace: Option<&str>,
         body: serde_json::Value,
     ) -> serde_json::Value {
@@ -10611,7 +10611,7 @@ mod tests {
                 display_name: None,
                 roles: roles.iter().map(ToString::to_string).collect(),
                 scopes: Vec::new(),
-                provider: crate::auth::identity::IdentityProvider::Oidc,
+                provider: IdentityProvider::Oidc,
             },
         })
     }
@@ -10704,7 +10704,7 @@ mod tests {
         let state = member_checked_state().await;
         put_parent_record(&state, "lead", &[], None, false).await;
         put_member(&state, "carol").await;
-        let policy = || crate::auth::authz::AuthzPolicy {
+        let policy = || AuthzPolicy {
             admin_role: "openshell-admin".to_string(),
             user_role: "openshell-user".to_string(),
             scopes_enabled: false,

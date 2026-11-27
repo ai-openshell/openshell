@@ -323,7 +323,7 @@ impl OpenShellClient {
         options: CreateRetryOptions,
     ) -> Result<SandboxRef> {
         let request = create_sandbox_request(spec);
-        self.create_with_retry(request, "default", options).await
+        Box::pin(self.create_with_retry(request, "default", options)).await
     }
 
     /// Create a new sandbox from a workload template, retrying while the
@@ -338,7 +338,7 @@ impl OpenShellClient {
         options: CreateRetryOptions,
     ) -> Result<SandboxRef> {
         let request = create_sandbox_from_template_request(spec);
-        self.create_with_retry(request, "default", options).await
+        Box::pin(self.create_with_retry(request, "default", options)).await
     }
 
     /// Create a reusable sandbox template in the default workspace.
@@ -1479,9 +1479,11 @@ impl WorkspaceScopedClient {
     ) -> Result<SandboxRef> {
         let mut request = create_sandbox_request(spec);
         request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
-        self.client
-            .create_with_retry(request, &self.workspace, options)
-            .await
+        Box::pin(
+            self.client
+                .create_with_retry(request, &self.workspace, options),
+        )
+        .await
     }
 
     /// Create a new sandbox from a template in this workspace, retrying while
@@ -1493,9 +1495,11 @@ impl WorkspaceScopedClient {
     ) -> Result<SandboxRef> {
         let mut request = create_sandbox_from_template_request(spec);
         request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
-        self.client
-            .create_with_retry(request, &self.workspace, options)
-            .await
+        Box::pin(
+            self.client
+                .create_with_retry(request, &self.workspace, options),
+        )
+        .await
     }
 
     /// Create a reusable sandbox template in this workspace.
