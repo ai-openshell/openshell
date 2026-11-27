@@ -128,6 +128,32 @@ struct Message {
     text: String,
 }
 
+#[tokio::test]
+async fn http2_frontend_filters_reserved_cookies_from_http1_backend() {
+    let f = fixture();
+    let mut client = http2_client(&f).await;
+    let response = client
+        .send_request(
+            Request::get(format!("https://{HOST}/close"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookies: Vec<_> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(cookies, vec!["app=session; HttpOnly"]);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "upstream closed"
+    );
+}
+
 struct Echo(Arc<Notify>);
 
 struct NotifyOnDrop(Arc<Notify>);
@@ -181,9 +207,18 @@ impl rpc_test::BoundaryLoopbackConnector for GrpcBackend {
                     assert_eq!(request.version(), Version::HTTP_2);
                     assert_eq!(request.headers()[header::TE], "trailers");
                     assert_eq!(request.headers()["grpc-timeout"], "30000000u");
-                    let response = tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                    let mut response = tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
                         .streaming(Echo(cancelled), request)
                         .await;
+                    for cookie in [
+                        "__Host-openshell-service-login=untrusted; Secure; Path=/",
+                        "__Host-openshell-service-session=untrusted; Secure; Path=/",
+                        "app=session; HttpOnly",
+                    ] {
+                        response
+                            .headers_mut()
+                            .append(header::SET_COOKIE, cookie.parse().unwrap());
+                    }
                     Ok::<_, std::convert::Infallible>(response)
                 }
             });
@@ -237,15 +272,22 @@ async fn native_grpc_streams_preserve_deadlines_status_and_per_stream_cancellati
         let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
         request.set_timeout(Duration::from_secs(30));
         grpc.ready().await.unwrap();
-        let mut response = grpc
+        let response = grpc
             .streaming(
                 request,
                 http::uri::PathAndQuery::from_static("/test.Echo/Stream"),
                 tonic_prost::ProstCodec::<Message, Message>::default(),
             )
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
+        let cookies: Vec<_> = response
+            .metadata()
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["app=session; HttpOnly"]);
+        let mut response = response.into_inner();
         assert_eq!(response.message().await.unwrap().unwrap().text, "hello");
         calls.push((tx, response));
     }
