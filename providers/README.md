@@ -21,13 +21,19 @@ Configure its `github-app-installation` refresh with explicit repository IDs and
 permissions, and supply the private key through secret refresh material. See the
 [provider documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles#github-app-installation-tokens).
 
-Or import the whole directory:
+To import several profiles, put compatible copies in a separate directory:
 
 ```shell
-openshell provider profile import --from providers --global
+openshell provider profile import --from ./selected-profiles --global
 ```
 
 Drop `--global` to import into the current workspace instead.
+
+The `google-cloud.yaml` example requires the supervisor's metadata service in
+a Linux sandbox using Docker, Podman, Kubernetes, or VM. Windows/MXC does not
+provide this service. Import and attachment do not check runtime support, so
+verify it before using the profile. The Vertex example uses bearer-token
+authentication and does not require the metadata service.
 
 ## Read the header before importing
 
@@ -53,6 +59,9 @@ workload, and import your copy.
   injection safe.
 - Keep `endpoints` limited to the hosts the credential should reach. A
   credential is only sent to the endpoints its profile declares.
+- Review non-secret `environment` defaults and `discovery.config_env_vars`.
+  Renaming the profile preserves these declarations. Check the header for
+  runtime requirements before using your copy.
 - Run `openshell provider profile lint` before importing.
 
 See [Provider profiles](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles) for the
