@@ -435,9 +435,7 @@ mod tests {
 
     #[test]
     fn preparation_failure_does_not_wait_for_other_workers() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
-        let address = listener.local_addr().expect("test listener address");
-        drop(listener);
+        let address = "127.0.0.1:0".parse().unwrap();
 
         assert!(run_worker(Protocol::TcpStream, address, 1, 1, 2, 8).is_err());
     }

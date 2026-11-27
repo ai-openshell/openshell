@@ -4982,11 +4982,8 @@ mod tests {
 
     #[test]
     fn tcp_readiness_listener_accepts_ipv4_regardless_of_bindv6only() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|reserved| reserved.local_addr())
-            .expect("reserve loopback port")
-            .port();
-        let listener = bind_readiness_tcp(port).expect("bind readiness listener");
+        let listener = bind_readiness_tcp(0).expect("bind readiness listener");
+        let port = listener.local_addr().expect("readiness address").port();
         if listener.local_addr().expect("local address").is_ipv6() {
             assert!(
                 !socket2::SockRef::from(&listener)

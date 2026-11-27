@@ -606,9 +606,7 @@ mod unix {
     /// Point the gateway lookup at a closed port, away from any registered
     /// gateways.
     fn without_gateway(mut command: Command, config: &Path) -> Command {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let endpoint = format!("http://{}", closed.local_addr().expect("address"));
-        drop(closed);
+        let endpoint = "http://127.0.0.1:0";
         command
             .env("XDG_CONFIG_HOME", config)
             .env("OPENSHELL_GATEWAY_ENDPOINT", endpoint)

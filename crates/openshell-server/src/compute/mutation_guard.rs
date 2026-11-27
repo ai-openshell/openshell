@@ -896,12 +896,13 @@ mod tests {
         const TIMEOUTS: &str = "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}";
         const ERRORS: &str = "openshell_server_mutation_lock_errors_total{scope=\"sandbox\"}";
         let metrics = MetricsCapture::install();
-        let url = crate::persistence::PostgresStore::refusing_url_for_tests().await;
+        let (_listener, url) =
+            crate::persistence::PostgresStore::unresponsive_url_for_tests().await;
         let store = crate::persistence::PostgresStore::connect_lazy_for_tests(&url, 1);
         let runtime =
             super::super::new_test_runtime_for_driver(Arc::new(Store::Postgres(store)), "test")
                 .await;
-        // Leave enough time to open a lock connection, so the refusal is a
+        // Leave enough time to open a lock connection, so the acquisition failure is a
         // database error.
         runtime.set_mutation_lock_timeout_for_tests(
             crate::persistence::mutation_lock::LOCK_CONNECTION_MIN_BUDGET
@@ -917,7 +918,7 @@ mod tests {
                 "{detail}"
             ),
             Err(error) => panic!("expected a database error, got {error:?}"),
-            Ok(_) => panic!("nothing listens, yet the guard was acquired"),
+            Ok(_) => panic!("the database never answers, yet the guard was acquired"),
         }
         assert_eq!(metrics.value(TIMEOUTS), None);
         assert_eq!(metrics.value(ERRORS), Some(1));

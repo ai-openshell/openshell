@@ -52,6 +52,18 @@ mise run test:rust     # cargo test --workspace
 
 Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
 
+### TCP ports in tests
+
+Let test servers bind port `0` and keep the resulting listener alive. Binding a
+temporary listener, reading its port, and dropping it lets a parallel test claim
+the port before the test uses it.
+
+For a generic connection failure, use destination `127.0.0.1:0`: port zero cannot
+host a TCP listener. The error kind differs by OS, so do not assert a specific
+refusal error. For handshake or acquisition timeouts, keep a listener bound and
+never serve its connections. When a separate process must bind a selected port,
+retry only bind collisions with a fresh port and a bounded attempt count.
+
 ### PostgreSQL-backed tests
 
 Tests that need a real PostgreSQL server, such as advisory-lock concurrency
