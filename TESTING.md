@@ -14,7 +14,7 @@ mise run ci            # Everything: lint, compile checks, and tests
 crates/*/src/          # Inline #[cfg(test)] modules
 crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
-e2e/python/            # Python E2E tests (test_*.py prefix)
+e2e/workload/          # E2E Python image the sandboxes run python3, curl, and git from
 e2e/rust/              # Rust CLI E2E tests
 tests/testkit/         # Support library for SDK-driven E2E suites
 tests/suites/          # E2E suites, grouped by test family
@@ -175,8 +175,7 @@ by `OPENSHELL_BIN`. See
 tests.
 
 To run Python in a testkit sandbox, use `Sandbox::run_python` with a sandbox
-from `testkit::python_image()`, not the Python SDK's `exec_python` described
-under Python E2E. [Writing a sandbox client](tests/testkit/README.md#writing-a-sandbox-client)
+from `testkit::python_image()`. [Writing a sandbox client](tests/testkit/README.md#writing-a-sandbox-client)
 covers scripts that probe the network from inside a sandbox.
 
 The conformance crate also builds `openshell-conformance`, a program that
@@ -392,73 +391,24 @@ nix run .#openshell-test-runner -- run \
   --family continuity --disruption upgrade
 ```
 
-### Python E2E (`e2e/python/`)
+### E2E Python image (`e2e/workload/`)
 
-`mise run e2e:python` builds `openshell/e2e-python:dev` from
-`e2e/python/Dockerfile.workload` and selects it only for the test gateway.
-This Noble-based fixture supplies the `sandbox` user, Python tooling, Git,
-and a writable `/sandbox/.venv`. Its Python version comes from `.python-version`
-so cloudpickle code objects match the test runner. The production workload
-default remains the unmodified NVIDIA Ubuntu image.
+`mise run e2e:python-image:build` builds `openshell/e2e-python:dev` from
+`e2e/workload/Dockerfile`; `testkit::python_image()` and the Rust Docker
+harness select it for tests that need Python, Git, curl, openssl, or the
+`sandbox` user. This Noble-based fixture also has a writable `/sandbox/.venv`.
+Its Python version comes from `.python-version`. The production workload
+default remains the unmodified NVIDIA Ubuntu image. The GPU workload images
+in `e2e/gpu/` are separate; `mise run e2e:workloads:build` builds them.
 
-The Rust Docker harness also selects this fixture for tests that need tools
-or the named user. Explicit `--from` or `--template` arguments and the default-image
-tests retain their own image selection. Docker sandbox and support-container
-fixtures use the fixed image name; no workload-image override is needed.
-Podman, VM, and Kubernetes retain their existing pinned, pullable fixture and
-image setup. Conformance-only runs do not need the Docker fixture.
-Build the Docker fixture separately with `mise run e2e:workload:build`.
+Explicit `--from` or `--template` arguments and the default-image tests retain
+their own image selection. Docker sandbox and support-container fixtures use
+the fixed image name; no workload-image override is needed. Podman, VM, and
+Kubernetes retain their existing pinned, pullable fixture and image setup.
 
-Tests use the `sandbox` fixture from `conftest.py` to create real sandboxes:
-
-```python
-def test_exec_returns_stdout(sandbox):
-    with sandbox(delete_on_exit=True) as sb:
-        result = sb.exec(["echo", "hello"])
-        assert result.exit_code == 0
-        assert "hello" in result.stdout
-```
-
-#### `Sandbox.exec_python`
-
-`exec_python` serializes a Python callable with `cloudpickle`, sends it to the
-sandbox, and returns the result. Because cloudpickle serializes module-level
-functions by reference (which fails inside the sandbox), use one of these
-patterns:
-
-**Closures from factory functions:**
-
-```python
-def _make_adder():
-    def add(a, b):
-        return a + b
-    return add
-
-def test_addition(sandbox):
-    with sandbox(delete_on_exit=True) as sb:
-        result = sb.exec_python(_make_adder(), args=(2, 3))
-        assert result.stdout.strip() == "5"
-```
-
-**Bound methods on local classes:**
-
-```python
-def test_multiply(sandbox):
-    class Calculator:
-        def multiply(self, a, b):
-            return a * b
-
-    with sandbox(delete_on_exit=True) as sb:
-        result = sb.exec_python(Calculator().multiply, args=(6, 7))
-        assert result.stdout.strip() == "42"
-```
-
-#### Shared Fixtures (`e2e/python/conftest.py`)
-
-| Fixture | Scope | Purpose |
-|---|---|---|
-| `sandbox_client` | session | gRPC client connected to the active gateway |
-| `sandbox` | function | Factory returning a `Sandbox` context manager |
+Core has no Python E2E suite. The Python SDK's own E2E suite lives in
+[ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python) and runs
+against published core gateways.
 
 ### Rust CLI E2E (`e2e/rust/`)
 
@@ -500,7 +450,8 @@ Suites:
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
 - Conformance (`tests/suites/conformance`) - the testkit `conformance` crate:
   lifecycle, the CLI, persistent workspaces, file transfer, the policy
-  advisor, and credential gating. Driver E2E runs it with
+  advisor, credential gating, policy validation and enforcement (Landlock and
+  denied connections), and provider credential placement. Driver E2E runs it with
   `openshell-conformance` against the lane's gateway and writes a JUnit report
   under `results/`; set `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program,
   as Branch E2E does with the static build it makes once per architecture.
@@ -737,6 +688,17 @@ The `connect-ssh-supervision` feature suite
 supervises its `ssh` process: it reconnects after losing the SSH transport and
 forwards a SIGTERM to `ssh`. The tests find those processes in `/proc`, so they
 need a Linux test host. CI runs them on Docker rootful.
+
+The `gateway-mtls` feature suite (`tests/suites/features/gateway-mtls`) checks
+an mTLS gateway's user boundary: a client certificate from the gateway's CA
+authenticates a user, a CA-only client reaches only Health, and a foreign
+certificate or plaintext connection is refused. CI runs it against the deb
+gateway on Docker rootful and in the Docker E2E workflow. Run it against a
+local Docker gateway:
+
+```shell
+mise run e2e:gateway-mtls
+```
 
 Run the VM-backed Rust CLI e2e suite:
 
