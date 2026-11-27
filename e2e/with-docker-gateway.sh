@@ -138,6 +138,14 @@ if [ "${IMAGE_UPDATES_MODE}" = "1" ] && [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]
   exit 2
 fi
 
+# The gateway this wrapper starts reads OPENSHELL_CONFIG_DELIVERY_MODE; an
+# existing gateway ignores it and may poll, so a push lane could pass without
+# testing push.
+if [ -n "${OPENSHELL_CONFIG_DELIVERY_MODE:-}" ] && [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
+  echo "ERROR: OPENSHELL_CONFIG_DELIVERY_MODE requires a new gateway owned by this wrapper; unset OPENSHELL_GATEWAY_ENDPOINT." >&2
+  exit 2
+fi
+
 if [ "${OIDC_MODE}" = "1" ] && [ -z "${OIDC_ISSUER}" ]; then
   echo "ERROR: OPENSHELL_E2E_OIDC_ISSUER is required when OPENSHELL_E2E_OIDC_GATEWAY=1" >&2
   exit 2
