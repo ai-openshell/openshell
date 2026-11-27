@@ -17,7 +17,6 @@ use openshell_server::AcquiredRemoteDriverEndpoint;
 use crate::launcher::{self, ConfigureInputs, LaunchOutcome, LaunchRequest, PreflightFailure};
 
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
-const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
 const DRIVER_BIN_HINT: &str = "set driver_dir in [openshell.gateway], install it in a conventional libexec path such as ~/.local/libexec/openshell, /usr/libexec/openshell, or /usr/local/libexec{,/openshell}, or place it next to the gateway binary";
 
 /// The gateway's view of the `[openshell.drivers.vm]` table.
@@ -25,8 +24,7 @@ const DRIVER_BIN_HINT: &str = "set driver_dir in [openshell.gateway], install it
 pub struct VmLaunchPlan {
     /// Where to look for the driver binary before the conventional locations.
     pub driver_dir: Option<PathBuf>,
-    /// The driver's state directory, under which the gateway keeps the
-    /// private socket directory.
+    /// The driver's state directory.
     pub state_dir: PathBuf,
     /// The table to forward, without gateway-owned keys.
     pub table: String,
@@ -83,8 +81,15 @@ impl VmLaunchPlan {
         )
     }
 
-    fn socket_dir(&self) -> PathBuf {
-        self.state_dir.join(COMPUTE_DRIVER_SOCKET_RUN_DIR)
+    /// Per-user base for each launch's private socket directory.
+    ///
+    /// It lives under `/tmp`, not `state_dir`, so the socket path fits the
+    /// `sun_path` limit however deep `state_dir` is.
+    fn socket_dir() -> PathBuf {
+        PathBuf::from(format!(
+            "/tmp/os-{}-run",
+            rustix::process::geteuid().as_raw()
+        ))
     }
 }
 
@@ -191,7 +196,7 @@ pub async fn spawn(
             name: "vm",
             binary: &binary,
             table: &plan.table,
-            socket_dir: &plan.socket_dir(),
+            socket_dir: &VmLaunchPlan::socket_dir(),
             log_level: gateway_log_level,
         },
         configure,

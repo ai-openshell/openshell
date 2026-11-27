@@ -47,13 +47,10 @@ fn a_non_string_gateway_key_is_rejected() {
 }
 
 #[test]
-fn socket_dir_is_the_private_run_dir_under_the_state_dir() {
-    let plan =
-        VmLaunchPlan::from_table(table("state_dir = \"/tmp/openshell-vm-state\""), None).unwrap();
-    assert_eq!(
-        plan.socket_dir(),
-        PathBuf::from("/tmp/openshell-vm-state/run")
-    );
+fn socket_dir_is_short_and_outside_the_state_dir() {
+    assert!(VmLaunchPlan::socket_dir().starts_with("/tmp"));
+    let worst_case = PathBuf::from("/tmp/os-4294967295-run/abcdef/driver.sock");
+    openshell_core::socket_root::check_path_len(&worst_case).unwrap();
 }
 
 #[test]

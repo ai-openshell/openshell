@@ -67,6 +67,8 @@ pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
+#[cfg(unix)]
+pub mod socket_root;
 pub mod ssh_handoff;
 pub mod ssh_host_key;
 pub mod telemetry;
