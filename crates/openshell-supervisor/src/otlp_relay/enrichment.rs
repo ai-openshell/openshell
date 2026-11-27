@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Resource attribution for relayed agent traces.
+//! Resource attribution for relayed agent traces, logs, and metrics.
+//!
+//! The three export requests share one wire layout for this purpose: the
+//! repeated `ResourceSpans`, `ResourceLogs`, or `ResourceMetrics` entries are
+//! field 1 of the request and each carries its `Resource` in field 1, so the
+//! walk below serves every signal. Names in this module follow the trace
+//! schema.
 //!
 //! Every forwarded `ResourceSpans` entry carries exactly two supervisor-owned
 //! resource attributes. Agent-supplied values for those keys are always
@@ -113,9 +119,9 @@ pub enum EnrichError {
 impl std::fmt::Display for EnrichError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Malformed(error) => write!(f, "malformed ExportTraceServiceRequest: {error}"),
+            Self::Malformed(error) => write!(f, "malformed OTLP export request: {error}"),
             Self::TooManyResourceSpans => {
-                write!(f, "more than {MAX_RESOURCE_SPANS} resource_spans entries")
+                write!(f, "more than {MAX_RESOURCE_SPANS} resource entries")
             }
             Self::TooManyResourceAttributes => {
                 write!(f, "more than {MAX_RESOURCE_ATTRIBUTES} resource attributes")
@@ -168,7 +174,7 @@ fn enrich_to_vec(raw: &[u8], sandbox_id: &str) -> Result<Vec<u8>, EnrichError> {
         if tag == RESOURCE_SPANS_TAG {
             if wire_type != WireType::LengthDelimited {
                 return Err(EnrichError::Malformed(
-                    "resource_spans is not length-delimited".into(),
+                    "resource entry is not length-delimited".into(),
                 ));
             }
             entries += 1;
@@ -396,11 +402,52 @@ fn string_attribute(key: &str, value: &str) -> KeyValue {
 
 #[cfg(test)]
 pub mod test_util {
+    use openshell_otel_test_support::relay::string_attribute;
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::metrics::v1::ResourceMetrics;
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use prost::Message;
+
+    /// A logs and a metrics export, each with one resource that spoofs the
+    /// sandbox id. The log record's body is `agent-log`.
+    pub fn logs_and_metrics_requests() -> (ExportLogsServiceRequest, ExportMetricsServiceRequest) {
+        let resource = || {
+            Some(Resource {
+                attributes: vec![
+                    string_attribute("service.name", "unit-agent"),
+                    string_attribute(super::SANDBOX_ID_KEY, "evil"),
+                ],
+                ..Default::default()
+            })
+        };
+        let logs = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: resource(),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("agent-log".into())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let metrics = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: resource(),
+                ..Default::default()
+            }],
+        };
+        (logs, metrics)
+    }
 
     /// Builds a protobuf-encoded request with one span named `span_name` and
     /// the given string resource attributes.

@@ -544,6 +544,12 @@ pub const OTEL_EXPORTER_OTLP_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_COMPRESSION
 /// every trace export.
 pub const OTEL_EXPORTER_OTLP_TRACES_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION";
 
+/// Logs-specific compression variable, set to `none` like the traces one.
+pub const OTEL_EXPORTER_OTLP_LOGS_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION";
+
+/// Metrics-specific compression variable, set to `none` like the traces one.
+pub const OTEL_EXPORTER_OTLP_METRICS_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION";
+
 /// Reserved destination agent processes export OTLP to.
 ///
 /// This address is never routed. A workload `connect()` to any non-loopback
