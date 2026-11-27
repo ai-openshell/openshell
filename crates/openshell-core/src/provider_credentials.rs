@@ -276,6 +276,15 @@ fn split_static_credential_metadata(
     (metadata, grants)
 }
 
+/// Whether a token-grant credential opts in to the metadata emulator placeholder.
+fn has_gce_metadata_token_grant(
+    credentials: &HashMap<String, crate::proto::ProviderProfileCredential>,
+) -> bool {
+    credentials
+        .values()
+        .any(|credential| credential.gce_metadata_token && credential.token_grant.is_some())
+}
+
 impl ProviderCredentialState {
     pub fn from_environment(
         revision: u64,
@@ -894,6 +903,15 @@ impl ProviderCredentialState {
             && inner
                 .non_secret_environment_keys
                 .contains("GCE_METADATA_HOST");
+        // A gce_metadata_token credential has no gateway-projected config, so
+        // the supervisor points SDKs at its metadata emulator itself. A key the
+        // provider already sets, or one suppressed after an emulator failure,
+        // is left alone.
+        let has_grant_metadata = !has_gcp_metadata
+            && !env.contains_key("GCE_METADATA_HOST")
+            && !inner.suppressed_keys.contains("GCE_METADATA_HOST")
+            && has_gce_metadata_token_grant(&inner.current.dynamic_credentials);
+        let has_gcp_metadata = has_gcp_metadata || has_grant_metadata;
         if !has_gcp_metadata && inner.non_secret_environment_keys.is_empty() {
             return (inner.current.revision, env);
         }
@@ -1003,7 +1021,9 @@ impl ProviderCredentialState {
     ///
     /// Searches `google_cloud::TOKEN_ENV_KEYS` in priority order (SA before
     /// ADC) atomically to avoid inconsistency during credential
-    /// refresh. Returns `None` if no GCP token is configured or all are
+    /// refresh. Without a stored token, a `gce_metadata_token` token-grant
+    /// credential yields the reserved grant placeholder, which never resolves
+    /// to a value. Returns `None` if no GCP token is configured or all are
     /// expired. The `expires_in` defaults to 3600 when expiry is unknown.
     pub fn gcp_token_response(&self) -> Option<(String, i64)> {
         const DEFAULT_EXPIRES_IN: i64 = 3600;
@@ -1011,31 +1031,47 @@ impl ProviderCredentialState {
             .inner
             .read()
             .expect("provider credential state poisoned");
-        let resolver = inner.current_resolver.as_ref()?;
-        for key in crate::google_cloud::TOKEN_ENV_KEYS {
-            let Some(placeholder) = inner.current.child_env.get(*key).cloned() else {
-                continue;
-            };
-            if resolver.resolve_placeholder(&placeholder).is_none() {
-                continue;
+        if let Some(resolver) = inner.current_resolver.as_ref() {
+            for key in crate::google_cloud::TOKEN_ENV_KEYS {
+                let Some(placeholder) = inner.current.child_env.get(*key).cloned() else {
+                    continue;
+                };
+                if resolver.resolve_placeholder(&placeholder).is_none() {
+                    continue;
+                }
+                let expires_in = resolver.expires_at_ms_for_placeholder(&placeholder).map_or(
+                    DEFAULT_EXPIRES_IN,
+                    |expires_at_ms| {
+                        if expires_at_ms <= 0 {
+                            DEFAULT_EXPIRES_IN
+                        } else {
+                            let now = crate::time::now_ms();
+                            expires_at_ms.saturating_sub(now) / 1000
+                        }
+                    },
+                );
+                if expires_in <= 0 {
+                    continue;
+                }
+                return Some((placeholder, expires_in));
             }
-            let expires_in = resolver.expires_at_ms_for_placeholder(&placeholder).map_or(
-                DEFAULT_EXPIRES_IN,
-                |expires_at_ms| {
-                    if expires_at_ms <= 0 {
-                        DEFAULT_EXPIRES_IN
-                    } else {
-                        let now = crate::time::now_ms();
-                        expires_at_ms.saturating_sub(now) / 1000
-                    }
-                },
-            );
-            if expires_in <= 0 {
-                continue;
-            }
-            return Some((placeholder, expires_in));
         }
-        None
+        if !has_gce_metadata_token_grant(&inner.current.dynamic_credentials) {
+            return None;
+        }
+        let placeholder = crate::secrets::placeholder_for_env_key(
+            crate::google_cloud::TOKEN_GRANT_PLACEHOLDER_ENV_KEY,
+        );
+        // The placeholder must be worthless outside the grant: refuse to serve
+        // it if any installed value could resolve it.
+        let resolvable = [&inner.current_resolver, &inner.combined_resolver]
+            .into_iter()
+            .flatten()
+            .any(|resolver| resolver.resolve_placeholder(&placeholder).is_some());
+        (!resolvable).then_some((
+            placeholder,
+            crate::google_cloud::TOKEN_GRANT_PLACEHOLDER_EXPIRES_IN_SECONDS,
+        ))
     }
 
     pub fn install_environment(
@@ -3860,6 +3896,128 @@ mod tests {
             HashMap::new(),
         );
         assert!(state.gcp_token_response().is_none());
+    }
+
+    fn gce_metadata_grant(
+        opt_in: bool,
+    ) -> HashMap<String, crate::proto::ProviderProfileCredential> {
+        HashMap::from([(
+            "storage.googleapis.com:443:/**:owner:google:wif_token".to_string(),
+            crate::proto::ProviderProfileCredential {
+                name: "wif_token".to_string(),
+                auth_style: "bearer".to_string(),
+                gce_metadata_token: opt_in,
+                token_grant: Some(crate::proto::ProviderCredentialTokenGrant {
+                    token_endpoint: "https://sts.googleapis.com/v1/token".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )])
+    }
+
+    #[test]
+    fn gcp_token_response_serves_unresolvable_grant_placeholder() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            gce_metadata_grant(true),
+        );
+        let (placeholder, expires_in) = state
+            .gcp_token_response()
+            .expect("grant placeholder should be served");
+        assert_eq!(
+            placeholder,
+            crate::secrets::placeholder_for_env_key(google_cloud::TOKEN_GRANT_PLACEHOLDER_ENV_KEY)
+        );
+        assert_eq!(
+            expires_in,
+            google_cloud::TOKEN_GRANT_PLACEHOLDER_EXPIRES_IN_SECONDS
+        );
+        assert!(
+            state
+                .resolver()
+                .is_none_or(|resolver| resolver.resolve_placeholder(&placeholder).is_none()),
+            "the grant placeholder must never resolve to a value"
+        );
+
+        // Without the opt-in a grant-only installation serves no token.
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            gce_metadata_grant(false),
+        );
+        assert!(state.gcp_token_response().is_none());
+    }
+
+    #[test]
+    fn gcp_token_response_prefers_stored_token_over_grant_placeholder() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), "adc-tok".to_string())]),
+            HashMap::new(),
+            gce_metadata_grant(true),
+        );
+        let (placeholder, _) = state.gcp_token_response().unwrap();
+        assert_eq!(placeholder, "openshell:resolve:env:v1_GCP_ADC_ACCESS_TOKEN");
+    }
+
+    #[test]
+    fn gcp_token_response_refuses_grant_placeholder_that_resolves() {
+        let state = ProviderCredentialState::from_environment(
+            0,
+            HashMap::from([(
+                google_cloud::TOKEN_GRANT_PLACEHOLDER_ENV_KEY.to_string(),
+                "secret".to_string(),
+            )]),
+            HashMap::new(),
+            gce_metadata_grant(true),
+        );
+        assert!(state.gcp_token_response().is_none());
+    }
+
+    #[test]
+    fn child_env_points_sdks_at_metadata_emulator_for_gce_metadata_grant() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            gce_metadata_grant(true),
+        );
+        let env = state.child_env_with_gcp_resolved();
+        for key in ["GCE_METADATA_HOST", "GCE_METADATA_IP"] {
+            assert_eq!(
+                env.get(key).map(String::as_str),
+                Some(google_cloud::METADATA_LOOPBACK_ADDR),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            env.get("METADATA_SERVER_DETECTION").map(String::as_str),
+            Some("assume-present")
+        );
+
+        // Suppression after an emulator failure wins over the opt-in.
+        state.remove_env_key("GCE_METADATA_HOST");
+        assert!(
+            !state
+                .child_env_with_gcp_resolved()
+                .contains_key("GCE_METADATA_HOST")
+        );
+
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            gce_metadata_grant(false),
+        );
+        assert!(
+            !state
+                .child_env_with_gcp_resolved()
+                .contains_key("GCE_METADATA_HOST")
+        );
     }
 
     #[test]

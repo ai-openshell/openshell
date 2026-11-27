@@ -22,6 +22,8 @@ use crate::token_grant_failure::{
 pub const DEFAULT_CLIENT_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+/// RFC 8693 token type for a JWT, such as a SPIFFE JWT-SVID subject token.
+pub const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
 const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ERROR_CONTRACT: &str = "openshell.token-grant.v1";
 const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
@@ -207,7 +209,9 @@ pub async fn post_oauth_token_grant(
 /// RFC 8693 token-exchange form fields.
 pub struct TokenExchangeParams<'a> {
     /// Secret JWT client assertion sent only to the configured endpoint.
-    pub client_assertion: &'a str,
+    /// `None` sends no client authentication: neither `client_assertion` nor
+    /// `client_assertion_type` is included in the form.
+    pub client_assertion: Option<&'a str>,
     pub client_assertion_type: &'a str,
     /// Secret subject credential to exchange for a resource token.
     pub subject_token: &'a str,
@@ -221,25 +225,29 @@ pub struct TokenExchangeParams<'a> {
 ///
 /// Assembles the standard token-exchange form fields, applies defaults for
 /// `client_assertion_type`, `subject_token_type`, and `requested_token_type`,
-/// and conditionally includes `audience` and `scope`. A `request_id` is sent
-/// as the `x-openshell-request-id` header.
+/// and conditionally includes the client assertion, `audience` and `scope`.
+/// A `request_id` is sent as the `x-openshell-request-id` header.
 pub async fn post_oauth_token_exchange(
     client: &TokenGrantClient,
     token_endpoint: &str,
     params: &TokenExchangeParams<'_>,
     request_id: Option<&str>,
 ) -> Result<OAuthTokenResponse, TokenGrantFailure> {
-    let client_assertion_type = effective_client_assertion_type(params.client_assertion_type);
     let subject_token_type = effective_token_type(params.subject_token_type);
     let requested_token_type = effective_token_type(params.requested_token_type);
-    let form_params = vec![
-        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
-        ("client_assertion_type", client_assertion_type),
-        ("client_assertion", params.client_assertion),
+    let mut form_params = vec![("grant_type", TOKEN_EXCHANGE_GRANT_TYPE)];
+    if let Some(client_assertion) = params.client_assertion {
+        form_params.push((
+            "client_assertion_type",
+            effective_client_assertion_type(params.client_assertion_type),
+        ));
+        form_params.push(("client_assertion", client_assertion));
+    }
+    form_params.extend([
         ("subject_token", params.subject_token),
         ("subject_token_type", subject_token_type),
         ("requested_token_type", requested_token_type),
-    ];
+    ]);
     post_oauth_token_request(
         client,
         token_endpoint,
@@ -264,6 +272,94 @@ pub fn effective_token_type(token_type: &str) -> &str {
         ACCESS_TOKEN_TYPE
     } else {
         token_type
+    }
+}
+
+/// Subject token source resolved from a stored provider credential.
+pub const SUBJECT_TOKEN_SOURCE_PROVIDER_CREDENTIAL: &str = "provider_credential";
+/// Subject token source that is the sandbox's own JWT-SVID.
+pub const SUBJECT_TOKEN_SOURCE_JWT_SVID: &str = "jwt_svid";
+
+/// How a token grant uses the sandbox JWT-SVID, decided before any I/O.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenGrantFlow {
+    /// RFC 7523 client credentials with the SVID as client assertion.
+    ClientCredentials,
+    /// RFC 8693 exchange of a stored provider credential, with the SVID as
+    /// client assertion.
+    ProviderCredentialSubjectExchange,
+    /// RFC 8693 exchange of the SVID itself.
+    JwtSvidSubjectExchange { client_assertion: bool },
+}
+
+impl TokenGrantFlow {
+    /// Resolve the flow, failing closed on unknown or inconsistent settings.
+    ///
+    /// An empty subject source keeps the provider credential exchange, which
+    /// predates the field.
+    pub fn resolve(
+        grant_type: crate::proto::ProviderCredentialTokenGrantType,
+        subject_token_source: &str,
+        client_authentication: Option<
+            &crate::proto::ProviderCredentialTokenGrantClientAuthentication,
+        >,
+    ) -> Result<Self, TokenGrantFailure> {
+        use crate::proto::ProviderCredentialTokenGrantType as GrantType;
+        let configuration = || {
+            TokenGrantFailure::new(
+                TokenGrantFailureKind::Configuration,
+                TokenGrantStage::Configuration,
+            )
+        };
+        let client_assertion =
+            resolve_client_assertion(client_authentication).ok_or_else(configuration)?;
+        match (grant_type, subject_token_source.trim()) {
+            (GrantType::ClientCredentials | GrantType::Unspecified, _) if client_assertion => {
+                Ok(Self::ClientCredentials)
+            }
+            (GrantType::TokenExchange, "" | SUBJECT_TOKEN_SOURCE_PROVIDER_CREDENTIAL)
+                if client_assertion =>
+            {
+                Ok(Self::ProviderCredentialSubjectExchange)
+            }
+            (GrantType::TokenExchange, SUBJECT_TOKEN_SOURCE_JWT_SVID) => {
+                Ok(Self::JwtSvidSubjectExchange { client_assertion })
+            }
+            _ => Err(configuration()),
+        }
+    }
+}
+
+/// Whether client authentication sends a `client_assertion`.
+///
+/// Absent authentication keeps the original behavior, an assertion made from
+/// the sandbox JWT-SVID. Returns `None` for an unknown mechanism, an
+/// unsupported credential source, or a credential on mechanism `none`.
+pub fn resolve_client_assertion(
+    client_authentication: Option<&crate::proto::ProviderCredentialTokenGrantClientAuthentication>,
+) -> Option<bool> {
+    use crate::proto::ProviderCredentialTokenGrantClientAuthenticationMechanism as Mechanism;
+    let Some(authentication) = client_authentication else {
+        return Some(true);
+    };
+    let source = authentication
+        .credential
+        .as_ref()
+        .map_or("", |credential| credential.source.trim());
+    match Mechanism::try_from(authentication.mechanism).ok()? {
+        Mechanism::Unspecified | Mechanism::ClientAssertion => {
+            (source.is_empty() || source == SUBJECT_TOKEN_SOURCE_JWT_SVID).then_some(true)
+        }
+        Mechanism::None => (authentication.credential.is_none()).then_some(false),
+    }
+}
+
+/// Subject token type for a JWT-SVID subject; defaults to [`JWT_TOKEN_TYPE`].
+pub fn effective_jwt_svid_subject_token_type(subject_token_type: &str) -> &str {
+    if subject_token_type.trim().is_empty() {
+        JWT_TOKEN_TYPE
+    } else {
+        subject_token_type
     }
 }
 
@@ -885,7 +981,7 @@ mod tests {
             &client,
             &endpoint,
             &TokenExchangeParams {
-                client_assertion: "jwt-svid-token",
+                client_assertion: Some("jwt-svid-token"),
                 client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
                 subject_token: "subject-access-token",
                 subject_token_type: ACCESS_TOKEN_TYPE,
@@ -943,6 +1039,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_exchange_without_client_authentication_omits_client_assertion() {
+        let (endpoint, request) = token_endpoint_once(
+            "200 OK",
+            r#"{"access_token":"federated-token","token_type":"Bearer","expires_in":3599}"#,
+        )
+        .await;
+        let scopes = vec!["https://www.googleapis.com/auth/cloud-platform".to_string()];
+        let audience = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/spire";
+
+        let response = post_oauth_token_exchange(
+            &test_client(),
+            &endpoint,
+            &TokenExchangeParams {
+                client_assertion: None,
+                // Ignored without a client assertion.
+                client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                subject_token: "header.svid.signature",
+                subject_token_type: JWT_TOKEN_TYPE,
+                audience,
+                scopes: &scopes,
+                requested_token_type: ACCESS_TOKEN_TYPE,
+            },
+            None,
+        )
+        .await
+        .expect("token exchange should succeed");
+        let request = request.await.expect("endpoint task");
+
+        assert_eq!(response.access_token, "federated-token");
+        assert!(!request.form.contains_key("client_assertion"));
+        assert!(!request.form.contains_key("client_assertion_type"));
+        let expected = HashMap::from([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("audience", audience),
+            ("scope", "https://www.googleapis.com/auth/cloud-platform"),
+            ("requested_token_type", ACCESS_TOKEN_TYPE),
+            ("subject_token_type", JWT_TOKEN_TYPE),
+            ("subject_token", "header.svid.signature"),
+        ]);
+        assert_eq!(
+            request
+                .form
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<HashMap<_, _>>(),
+            expected
+        );
+    }
+
+    #[tokio::test]
     async fn token_exchange_applies_defaults_for_empty_type_fields() {
         let (endpoint, request) =
             token_endpoint_once("200 OK", r#"{"access_token":"exchanged-token"}"#).await;
@@ -952,7 +1098,7 @@ mod tests {
             &client,
             &endpoint,
             &TokenExchangeParams {
-                client_assertion: "jwt-svid-token",
+                client_assertion: Some("jwt-svid-token"),
                 client_assertion_type: "",
                 subject_token: "subject-token",
                 subject_token_type: "",

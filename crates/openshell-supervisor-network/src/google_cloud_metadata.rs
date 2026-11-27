@@ -6,7 +6,9 @@
 //! Implements a subset of the GCE instance metadata API so that GCP client
 //! libraries (Go, Python, Node.js) can obtain `OAuth2` tokens natively inside
 //! sandboxes. Tokens are served from the existing `ProviderCredentialState`
-//! store — no separate refresh mechanism is needed.
+//! store — no separate refresh mechanism is needed. A token-grant credential
+//! with `gce_metadata_token` gets a reserved placeholder that never resolves;
+//! the grant replaces it in the `Authorization` header on its endpoints.
 //!
 //! The sandbox broker relays the reserved loopback metadata destination to
 //! this supervisor-owned handler. SDKs discover it through `GCE_METADATA_HOST`;
@@ -688,6 +690,59 @@ mod tests {
         let (_, _, body) = route_request(&ctx, "GET", PATH_TOKEN, &flavor_headers());
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["expires_in"], 3600);
+    }
+
+    #[test]
+    fn gce_metadata_token_grant_serves_unresolvable_placeholder() {
+        let credential = openshell_core::proto::ProviderProfileCredential {
+            name: "wif_token".into(),
+            auth_style: "bearer".into(),
+            gce_metadata_token: true,
+            token_grant: Some(openshell_core::proto::ProviderCredentialTokenGrant {
+                token_endpoint: "https://sts.googleapis.com/v1/token".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ctx = MetadataContext::new(ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("*.googleapis.com:443:/**".to_string(), credential.clone())]),
+        ));
+        let (status, _, body) = route_request(&ctx, "GET", PATH_TOKEN, &flavor_headers());
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let token = json["access_token"].as_str().unwrap();
+        assert_eq!(
+            token,
+            openshell_core::secrets::placeholder_for_env_key(
+                openshell_core::google_cloud::TOKEN_GRANT_PLACEHOLDER_ENV_KEY
+            )
+        );
+        assert_eq!(
+            json["expires_in"],
+            openshell_core::google_cloud::TOKEN_GRANT_PLACEHOLDER_EXPIRES_IN_SECONDS
+        );
+        assert_eq!(json["token_type"], "Bearer");
+
+        // A grant-only installation without the opt-in still has no token.
+        let ctx = MetadataContext::new(ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "*.googleapis.com:443:/**".to_string(),
+                openshell_core::proto::ProviderProfileCredential {
+                    gce_metadata_token: false,
+                    ..credential
+                },
+            )]),
+        ));
+        assert_eq!(
+            route_request(&ctx, "GET", PATH_TOKEN, &flavor_headers()).0,
+            503
+        );
     }
 
     #[test]

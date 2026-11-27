@@ -2559,16 +2559,48 @@ enum ProviderCredentialTokenGrantType {
   PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE = 2;
 }
 
+// Mechanism used to authenticate to the token endpoint.
+enum ProviderCredentialTokenGrantClientAuthenticationMechanism {
+  // Treated as CLIENT_ASSERTION for backwards compatibility.
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_CLIENT_AUTHENTICATION_MECHANISM_UNSPECIFIED = 0;
+  // Send the credential as an RFC 7523 client_assertion.
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_CLIENT_AUTHENTICATION_MECHANISM_CLIENT_ASSERTION = 1;
+  // Send no client authentication. Only valid when the subject token is the
+  // sandbox JWT-SVID (subject_token.source "jwt_svid").
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_CLIENT_AUTHENTICATION_MECHANISM_NONE = 2;
+}
+
+// Credential used to authenticate to the token endpoint.
+message ProviderCredentialTokenGrantClientCredential {
+  // Credential source. Only "jwt_svid" (the sandbox JWT-SVID) is supported;
+  // an empty value selects it.
+  string source = 1;
+}
+
+// How the supervisor authenticates itself to the token endpoint. The mechanism
+// and the credential it uses are chosen independently.
+message ProviderCredentialTokenGrantClientAuthentication {
+  ProviderCredentialTokenGrantClientAuthenticationMechanism mechanism = 1;
+
+  // Credential used by the mechanism. Must be unset for mechanism NONE.
+  ProviderCredentialTokenGrantClientCredential credential = 2;
+}
+
 message ProviderCredentialTokenGrantSubjectToken {
-  // Source for the token exchange subject token. Phase one supports
-  // "provider_credential".
+  // Source for the token exchange subject token:
+  //   "provider_credential": the gateway exchanges the stored provider
+  //     credential named by `credential` (ExchangeProviderSubjectToken).
+  //   "jwt_svid": the supervisor sends its own SPIFFE JWT-SVID, fetched with
+  //     audience jwt_svid_audience, directly to the token endpoint.
   string source = 1;
 
-  // Provider credential key that stores the subject token.
+  // Provider credential key that stores the subject token. Required for
+  // "provider_credential"; must be empty for "jwt_svid".
   string credential = 2;
 
   // OAuth2 subject_token_type. If omitted, OpenShell uses
-  // urn:ietf:params:oauth:token-type:access_token.
+  // urn:ietf:params:oauth:token-type:access_token for "provider_credential"
+  // and urn:ietf:params:oauth:token-type:jwt for "jwt_svid".
   string subject_token_type = 3;
 }
 
@@ -2608,6 +2640,10 @@ message ProviderCredentialTokenGrant {
   // OAuth2 requested_token_type. If omitted for token_exchange, OpenShell uses
   // urn:ietf:params:oauth:token-type:access_token.
   string requested_token_type = 10;
+
+  // Client authentication sent to the token endpoint. If omitted, OpenShell
+  // sends the sandbox JWT-SVID as client_assertion.
+  ProviderCredentialTokenGrantClientAuthentication client_authentication = 11;
 }
 
 // Provider credential declaration.
@@ -2634,6 +2670,12 @@ message ProviderProfileCredential {
   // Gateway-managed refresh and token-grant credentials cannot opt in because
   // they require identity-bearing handles for authorization-epoch revocation.
   bool stable_placeholder = 12;
+  // Serve a non-secret placeholder access token for this token-grant
+  // credential from the sandbox GCE metadata emulator, so Google SDKs using
+  // Application Default Credentials send it as a bearer token. The token grant
+  // replaces it on the credential's endpoints; anywhere else the placeholder
+  // cannot be resolved and the request is refused.
+  bool gce_metadata_token = 13;
 }
 
 enum ProviderCredentialRefreshStrategy {

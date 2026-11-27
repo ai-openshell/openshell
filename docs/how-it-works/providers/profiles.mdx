@@ -819,7 +819,8 @@ OpenShell supports two dynamic grant types:
 | Grant type | Behavior |
 |---|---|
 | `client_credentials` | The supervisor requests a SPIFFE JWT-SVID from the local Workload API and sends it directly to `token_endpoint` as the OAuth2 client assertion. This is the default when `grant_type` is omitted. |
-| `token_exchange` | The supervisor first asks the gateway for an intermediate token. The request includes the supervisor JWT-SVID; the gateway verifies it, uses the SVID subject as the intermediate token audience, and exchanges the stored subject credential at the same `token_endpoint` using the gateway's own JWT-SVID as the client assertion. The supervisor then exchanges that intermediate token for the final upstream token using its own JWT-SVID as the client assertion. |
+| `token_exchange` with `subject_token.source: jwt_svid` | The sandbox JWT-SVID, requested with `jwt_svid_audience`, is sent as the RFC 8693 `subject_token` directly to `token_endpoint`. There is no intermediate exchange and no stored credential. A dedicated supervisor sends it without a gateway call; for shared supervisors the gateway sends the stable sandbox JWT-SVID. With `client_authentication.mechanism: none` the request carries no `client_assertion`, which is what Google Security Token Service expects for Workload Identity Federation. |
+| `token_exchange` with `subject_token.source: provider_credential` | The supervisor first asks the gateway for an intermediate token. The request includes the supervisor JWT-SVID; the gateway verifies it, uses the SVID subject as the intermediate token audience, and exchanges the stored subject credential at the same `token_endpoint` using the gateway's own JWT-SVID as the client assertion. The supervisor then exchanges that intermediate token for the final upstream token using its own JWT-SVID as the client assertion. |
 
 Create provider instances for token-grant-only profiles with `--runtime-credentials`. This records an empty provider instance and makes the runtime-resolved credential source explicit:
 
@@ -856,8 +857,11 @@ Token grant fields:
 | `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
 | `cache_ttl` | No | Protobuf-duration cache override, such as `300s`. Omission uses the token response expiry; `0s` disables caching. Shared supervisor grants require a positive override to be at least `1s` and cap it at the issuer and identity expiries. The legacy `cache_ttl_seconds` input remains accepted. |
 | `requested_token_type` | No | RFC 8693 `requested_token_type` sent during token exchange. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
-| `subject_token` | Required for `token_exchange` | Subject-token source used for the gateway-brokered intermediate exchange. Phase one supports `source: provider_credential`, where `credential` names another credential declared in the same profile. That referenced credential is broker-only and cannot declare workload injection metadata such as env vars, static placement, refresh, or token grant metadata. |
-| `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type` for the stored subject token. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
+| `subject_token` | Required for `token_exchange` | Subject-token source. `source: provider_credential` uses the gateway-brokered intermediate exchange, where `credential` names another credential declared in the same profile. That referenced credential is broker-only and cannot declare workload injection metadata such as env vars, static placement, refresh, or token grant metadata. `source: jwt_svid` uses the sandbox JWT-SVID as the subject token and requires `credential` to be empty. Other sources are rejected. |
+| `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type`. Defaults to `urn:ietf:params:oauth:token-type:access_token` for `provider_credential` and `urn:ietf:params:oauth:token-type:jwt` for `jwt_svid`. |
+| `client_authentication` | No | How the grant authenticates to the token endpoint, as an object with a `mechanism` and a `credential`. When omitted, the sandbox JWT-SVID is sent as `client_assertion`. |
+| `client_authentication.mechanism` | No | `client_assertion` (default) sends the credential as `client_assertion`. `none` omits `client_assertion` and `client_assertion_type`; it is only valid with `subject_token.source: jwt_svid` and cannot be combined with `client_assertion_type` or a `credential`. |
+| `client_authentication.credential.source` | No | Credential used by the mechanism. Only `jwt_svid` is supported, and it is the default for `client_assertion`. |
 | `audience_overrides` | No | Endpoint-specific final-exchange `audience` and `scopes` overrides selected by host, port, and path. These overrides do not affect the gateway intermediate exchange. |
 
 Dedicated supervisors use a local SPIFFE Workload API socket for the exchanges above. Shared supervisors use the gateway's [SPIFFE Broker API integration](/how-it-works/gateways/configuration#sandbox-identity-through-the-spiffe-broker-api): the gateway obtains the stable sandbox JWT-SVID and performs both exchanges, then returns only the final access token. The intermediate audience is the stable sandbox SPIFFE ID. Only the gateway mounts the Workload API socket, including for its own JWT-SVID in `token_exchange`.
@@ -865,6 +869,36 @@ Dedicated supervisors use a local SPIFFE Workload API socket for the exchanges a
 Token grants apply to HTTP traffic that the proxy can inspect. Token-grant profiles reject endpoints with `protocol: sql` or `tls: skip`, including when `allow_uninspected_credentials` is enabled, because those modes cannot inject the required HTTP credential. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
 
 The gateway authorizes the sandbox session and provider attachment on every request. In the dedicated path it also verifies the supervisor JWT-SVID issuer, audience, signature, and SPIFFE trust domain. In the shared path it resolves the configured credential itself and rechecks authorization before returning even a cached token.
+
+### Google Cloud Through SPIFFE
+
+A credential can set `gce_metadata_token: true` next to its `token_grant` so unmodified Google SDKs using Application Default Credentials work without a stored key. The supervisor sets `GCE_METADATA_HOST` for the workload and its GCE metadata emulator returns a fixed placeholder access token. The SDK sends it as `Authorization: Bearer <placeholder>`, and the token grant replaces that header on the credential's endpoints. The placeholder never resolves to a value, so a request that carries it anywhere else is refused. `gce_metadata_token` requires a `token_grant` and `auth_style: bearer` on the `Authorization` header. A stored Google access token (`GCP_SA_ACCESS_TOKEN` or `GCP_ADC_ACCESS_TOKEN`) takes precedence over the placeholder.
+
+```yaml
+id: google-cloud-spiffe
+display_name: Google Cloud (SPIFFE)
+credentials:
+  - name: wif_token
+    auth_style: bearer
+    header_name: Authorization
+    gce_metadata_token: true
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://sts.googleapis.com/v1/token
+      jwt_svid_audience: //iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/spire/providers/spire
+      audience: //iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/spire/providers/spire
+      scopes: [https://www.googleapis.com/auth/cloud-platform]
+      requested_token_type: urn:ietf:params:oauth:token-type:access_token
+      client_authentication:
+        mechanism: none
+      subject_token:
+        source: jwt_svid
+        subject_token_type: urn:ietf:params:oauth:token-type:jwt
+endpoints:
+  - { host: "*.googleapis.com", port: 443, protocol: rest, access: full }
+```
+
+The Workload Identity Federation provider must trust the SPIRE issuer, and IAM must grant the SPIFFE principal (`principal://iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/subject/<spiffe-id>`) access to the resources. Requests that need a Google service account rather than a federated principal are not supported by this flow.
 
 ### Token Grant Failures
 

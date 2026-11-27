@@ -52,6 +52,21 @@ pub const GCP_SERVICE_ACCOUNT_EMAIL_CONFIG_KEY: &str = "service_account_email";
 /// credential precedence.
 pub const TOKEN_ENV_KEYS: &[&str] = &["GCP_SA_ACCESS_TOKEN", "GCP_ADC_ACCESS_TOKEN"];
 
+/// Reserved key of the placeholder served for `gce_metadata_token` credentials.
+///
+/// No credential is stored under this key, so the placeholder never resolves:
+/// a token grant replaces it on the credential's endpoints, and anywhere else
+/// placeholder resolution refuses the request.
+pub const TOKEN_GRANT_PLACEHOLDER_ENV_KEY: &str = "OPENSHELL_GCE_METADATA_TOKEN_GRANT";
+
+/// `expires_in` reported for the token grant placeholder.
+///
+/// Equal to the longest lifetime of a cached grant token (3600 s cap minus the
+/// 30 s refresh skew), so an SDK never holds the placeholder longer than the
+/// supervisor would hold the token it stands for. The supervisor obtains the
+/// real token independently on each request, so the value only paces refresh.
+pub const TOKEN_GRANT_PLACEHOLDER_EXPIRES_IN_SECONDS: i64 = 3570;
+
 // ── Vertex-specific env vars ────────────────────────────────────────────────
 
 /// Env var injected to signal Vertex AI usage to Goose.

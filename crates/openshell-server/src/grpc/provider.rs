@@ -4961,7 +4961,7 @@ async fn exchange_provider_subject_token_inner(
     let token_response = perform_intermediate_token_exchange(
         &token_grant.token_endpoint,
         &TokenExchangeParams {
-            client_assertion: &gateway_jwt_svid,
+            client_assertion: Some(&gateway_jwt_svid),
             client_assertion_type: &token_grant.client_assertion_type,
             subject_token: &stored_subject_token,
             subject_token_type: &subject_token.subject_token_type,
@@ -6774,7 +6774,7 @@ pub(super) mod tests {
                 String::from_utf8_lossy(&request).to_ascii_lowercase()
             });
             let params = TokenExchangeParams {
-                client_assertion: SECRET,
+                client_assertion: Some(SECRET),
                 client_assertion_type: "",
                 subject_token: SECRET,
                 subject_token_type: "",
@@ -6899,6 +6899,7 @@ pub(super) mod tests {
             env_vars: Vec::new(),
             required: false,
             stable_placeholder: false,
+            gce_metadata_token: false,
             auth_style: "bearer".to_string(),
             header_name: "Authorization".to_string(),
             query_param: String::new(),
@@ -6916,6 +6917,7 @@ pub(super) mod tests {
                 subject_token: None,
                 scopes: vec!["openid".to_string()],
                 requested_token_type: String::new(),
+                client_authentication: None,
                 cache_ttl: Some(prost_types::Duration { seconds: 300, nanos: 0 }),
                 audience_overrides: service_audiences
                     .iter()
@@ -8174,6 +8176,7 @@ pub(super) mod tests {
             env_vars: vec![env_var.to_string()],
             required: true,
             stable_placeholder: false,
+            gce_metadata_token: false,
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             query_param: String::new(),
@@ -8245,6 +8248,7 @@ pub(super) mod tests {
             env_vars: vec![env_var.to_string()],
             required,
             stable_placeholder: false,
+            gce_metadata_token: false,
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             query_param: String::new(),
@@ -8262,6 +8266,7 @@ pub(super) mod tests {
             env_vars: Vec::new(),
             required: true,
             stable_placeholder: false,
+            gce_metadata_token: false,
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             query_param: String::new(),
@@ -8277,6 +8282,7 @@ pub(super) mod tests {
                 subject_token: None,
                 scopes: vec!["read".to_string()],
                 requested_token_type: String::new(),
+                client_authentication: None,
                 cache_ttl: Some(prost_types::Duration {
                     seconds: 300,
                     nanos: 0,
@@ -13540,6 +13546,7 @@ pub(super) mod tests {
                             token_grant_owners: Vec::new(),
                             required: true,
                             stable_placeholder: false,
+                            gce_metadata_token: false,
                             auth_style: "bearer".to_string(),
                             header_name: "authorization".to_string(),
                             query_param: String::new(),

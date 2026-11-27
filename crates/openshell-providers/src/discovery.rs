@@ -112,6 +112,7 @@ mod tests {
                     refresh: None,
                     path_template: String::new(),
                     token_grant: None,
+                    gce_metadata_token: false,
                 },
                 CredentialProfile {
                     name: "secondary".to_string(),
@@ -125,6 +126,7 @@ mod tests {
                     refresh: None,
                     path_template: String::new(),
                     token_grant: None,
+                    gce_metadata_token: false,
                 },
             ],
             endpoints: Vec::new(),
