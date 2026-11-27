@@ -270,6 +270,8 @@ jobs:
           cargo fmt --manifest-path tests/suites/conformance/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/suites/continuity/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/suites/drivers/podman/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/suites/drivers/kubernetes/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/suites/drivers/vm/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/suites/features/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/support/Cargo.toml --all -- --check
 
@@ -332,6 +334,8 @@ jobs:
           cargo clippy --locked --manifest-path tests/suites/conformance/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/suites/continuity/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/suites/drivers/podman/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/suites/drivers/kubernetes/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/suites/drivers/vm/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/suites/features/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/support/Cargo.toml --all-targets -- -D warnings
 
@@ -629,6 +633,37 @@ jobs:
 
       - name: Test accepted-work library, review-readiness, and issue labeling
         run: "mise run test:accepted-work ::: test:review-readiness ::: test:label-issue"
+  e2e-rust-freeze:
+    name: Rust E2E Freeze
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reject new Rust E2E tests
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Read current labels so a rerun picks up a maintainer's decision.
+          exception=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq 'any(.labels[]; .name == "test:e2e-rust-exception")')
+          if [[ "$exception" == true ]]; then
+            echo "Maintainer exception: test:e2e-rust-exception"
+            exit 0
+          fi
+          bash tasks/scripts/check-e2e-rust-freeze.sh "$BASE_SHA" "$HEAD_SHA"
+
   python-sdk-freeze:
     # The Python SDK moved to ai-openshell/sdk-python (#5287), which imported it
     # at v0.1.7. Its files stay only until core removes them, so PRs must not

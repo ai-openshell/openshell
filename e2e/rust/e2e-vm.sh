@@ -470,6 +470,16 @@ if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
   exit 0
 fi
 
+if [ -z "${E2E_TEST_OVERRIDE}" ]; then
+  echo "==> Running the VM driver suite"
+  # Conformance reads this list in its own subshell.
+  vm_unsupported="${OPENSHELL_TEST_UNSUPPORTED:-$("${ROOT}/tasks/scripts/suite-unsupported.sh" vm)}"
+  OPENSHELL_TEST_UNSUPPORTED="${vm_unsupported}" \
+  OPENSHELL_TEST_PYTHON_IMAGE="${OPENSHELL_TEST_PYTHON_IMAGE:-${E2E_PULLABLE_PYTHON_IMAGE}}" \
+    cargo nextest run --locked --manifest-path "${ROOT}/tests/suites/drivers/vm/Cargo.toml" \
+    --test-threads 1 --no-tests fail
+fi
+
 # Seed the catalog once for the whole lane. The profiles live in the gateway
 # for as long as it runs, and the import is create-only: a second import of
 # the same directory fails with "custom provider profile '<id>' already

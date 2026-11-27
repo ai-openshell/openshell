@@ -22,6 +22,67 @@ tests/tmachine/        # QEMU test machines, Ansible playbooks, and the Session 
 tests/runner/          # openshell-test-runner: runs a test family in a tmachine environment
 ```
 
+## E2E suite quickstart
+
+The suites in `tests/suites/` run against a real OpenShell gateway. Tests use
+`#[testkit::test]` to get a gateway client, run CLI commands, and clean up
+sandboxes. Testkit doesn't install the gateway or its dependencies.
+
+- **Conformance** checks public behavior that must work on every driver.
+  Tests [share a gateway](#what-a-conformance-test-may-assert) and run with
+  four nextest workers in CI, except on the VM host lane.
+- **Feature suites** check behavior that needs a service or gateway setting,
+  such as Keycloak. Each feature is a package in the `features` workspace.
+- **Driver suites** check behavior specific to one compute driver. Each driver
+  suite is its own workspace, such as `drivers/kubernetes`.
+
+See [Where a new test goes](#where-a-new-test-goes) before adding coverage.
+
+### Run against a local gateway
+
+With Docker available, `mise run e2e:testkit` starts a gateway and runs
+conformance. To use a gateway you've already set up, select it with
+`OPENSHELL_GATEWAY` (or use the active gateway) and run the suite with Cargo.
+For example, against a Kubernetes gateway:
+
+```shell
+cargo test --locked --manifest-path tests/suites/drivers/kubernetes/Cargo.toml
+```
+
+For a feature with extra dependencies, you must also provide its settings and
+fixtures. The [testkit README](tests/testkit/README.md) explains how tests
+find the gateway and CLI.
+
+### Run in the same environment as CI
+
+**tmachine** boots a VM, sets up the engine and any add-ons, and installs
+OpenShell. **`openshell-test-runner`** runs your selected suite in that VM
+using nextest. A [CI matrix row](.github/workflows/e2e-suites.yml) pairs
+the environment and installer with the family and, for features, the package.
+
+On a host with virtualization support, build the installer inputs once with
+`nix run .#build-artifacts`. Then run a feature or driver suite:
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful-keycloak --installer deb \
+  --family features --package keycloak-provider-refresh
+
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-k3s --installer k3s \
+  --family drivers/kubernetes --gateway tmachine
+```
+
+Use `--installer k3s-ha` for the Kubernetes HA row. For a single test, add
+`--filter 'test(kubernetes_sandbox_runs_a_command)'`. Results and logs go to
+`artifacts/test-results/` by default. See
+[Running suites in a tmachine environment](#running-suites-in-a-tmachine-environment-testsrunner)
+for prerequisites and options.
+
+The **VM driver** doesn't run nested inside tmachine. Run `mise run e2e:vm`
+on a supported VM host; it starts the VM-backed gateway and runs conformance
+and the VM driver suite with one worker each in CI.
+
 ## Rust Tests
 
 Unit tests live inline with `#[cfg(test)] mod tests` blocks. Integration tests
@@ -268,8 +329,8 @@ is one. CI rows can opt in with `test_threads`.
 `openshell-test-runner build --family <family> --out <dir>` builds a family's
 test bundle for the guest without booting a VM, and `run --bundle <dir>` runs
 it instead of building one. `--package` then selects the tests to run from the
-bundle, which must hold those packages. Branch E2E builds the `features` and
-`drivers/podman` bundles once and passes them to their rows this way. Two runs on one host
+bundle, which must hold those packages. Branch E2E builds the feature and driver
+bundles once and passes them to their rows this way. Two runs on one host
 need different `TMACHINE_SSH_PORT` values (default 2222). The installer
 inputs, such as the Debian package and the images, come from `artifacts/`,
 built by `nix run .#build-artifacts` or downloaded by CI.
@@ -460,7 +521,24 @@ def test_multiply(sandbox):
 | `sandbox_client` | session | gRPC client connected to the active gateway |
 | `sandbox` | function | Factory returning a `Sandbox` context manager |
 
+### Where a new test goes
+
+| If the test needs… | Put it here |
+|---|---|
+| A public contract that applies to every driver | `tests/suites/conformance` |
+| A service or fixed gateway setting | `tests/suites/features/<name>`; add a tmachine add-on if the setup is missing (see [Adding a feature suite](#adding-a-feature-suite)) |
+| Driver-specific behavior | `tests/suites/drivers/{docker,podman,kubernetes,vm}`. Kubernetes runs on `k3s` and `k3s-ha`; VM runs on the existing VM host lane. |
+| A GPU or a gateway restart or reconfiguration during the test | No home yet. Use [continuity suites](#continuity-suites-testssuitescontinuity) if the runner can apply the disruption between test phases. |
+
+For a GPU or mid-test restart or reconfiguration case that cannot move yet,
+link a porting issue under [#5281](https://github.com/ai-openshell/openshell/issues/5281)
+and ask a maintainer for `test:e2e-rust-exception`. After a label change, rerun
+the Rust E2E Freeze job so it reads the current labels.
+
 ### Rust CLI E2E (`e2e/rust/`)
+
+This tree is frozen to new tests. You can edit or delete existing tests.
+See [Where a new test goes](#where-a-new-test-goes) for alternatives.
 
 Rust-based e2e tests that exercise the `openshell` CLI binary as a subprocess.
 They live in the `openshell-e2e` crate and use a shared harness for sandbox

@@ -171,6 +171,7 @@ ocsf_emit!(event);
 ## Sandbox Infra Changes
 
 - If you change sandbox infrastructure, ensure the relevant sandbox e2e path succeeds.
+- For new E2E tests, see [Where a new test goes](TESTING.md#where-a-new-test-goes).
 
 ## Network Sockets
 
