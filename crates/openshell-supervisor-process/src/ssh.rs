@@ -480,7 +480,7 @@ pub async fn run_ssh_server(
     _shared_socket: bool,
     port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
     boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
-    _main_session: Option<Arc<MainSession>>,
+    main_session: Option<Arc<MainSession>>,
     host_key: PrivateKey,
 ) -> Result<()> {
     let config = ssh_server_config(host_key);
@@ -507,13 +507,14 @@ pub async fn run_ssh_server(
         let config = config.clone();
         let port_forward = port_forward.clone();
         let boundary_exec = boundary_exec.clone();
+        let main_session = main_session.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
                 stream,
                 config,
                 port_forward,
                 boundary_exec,
-                None,
+                main_session,
                 SSH_PEER_TIMEOUT,
             )
             .await
@@ -1726,7 +1727,7 @@ async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput
         MainOutput::Exit(code) => {
             let eof = handle.eof(channel).await.is_ok();
             let status = handle
-                .exit_status_request(channel, code.max(0).unsigned_abs())
+                .exit_status_request(channel, exit_code_to_wire(code))
                 .await
                 .is_ok();
             let close = handle.close(channel).await.is_ok();

@@ -26,8 +26,13 @@ under development and is not a production-qualified security boundary:
   Exclusive supervisor-mediated egress and live access revocation are unverified.
 - The loopback exception can expose unrelated host-local services to workloads.
   Treat the gateway host as trusted.
-- Foreground main-process attachment and ConPTY resize are unavailable. Create
-  command workloads with `--detach`.
+- A foreground `sandbox create -- <command>` without a terminal streams the
+  workload's stdout and stderr to the CLI and returns its exit code. An
+  interactive terminal (`--tty`) and ConPTY resize are unavailable; use
+  `--no-tty` or `--detach`.
+  Known limit: Windows `ssh.exe` (Win32-OpenSSH 9.5) does not exit after it
+  writes to a pipe, so redirect the CLI's stdout and stderr to files rather than
+  pipes when scripting a foreground create.
 - Gateway exit ends sandbox workloads, and there is no restart recovery. When
   the gateway process ends (a graceful stop with Ctrl-C, a crash, or a kill), the
   sandbox processes it started end with it, workloads included. After the gateway
@@ -114,8 +119,8 @@ Configure `compute_driver = "mxc"` and use the matching
 [Windows gateway configuration](https://github.com/NVIDIA/OpenShell/blob/windows/docs/how-it-works/gateways/configuration.mdx#configure-mxc)
 and [example gateway TOML](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/examples/mxc-gateway.toml).
 Command-based sandbox creation requires administrator opt-in with
-`allow_driver_config = true`, a workload command and working directory, and
-`--detach`. Use a sandbox policy to grant the required filesystem and network
+`allow_driver_config = true`, and a workload command and working directory. A
+foreground create needs `--no-tty`; `--tty` is rejected. Use a sandbox policy to grant the required filesystem and network
 access.
 
 ## Run additional commands and restart a sandbox

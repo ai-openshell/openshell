@@ -45,9 +45,9 @@ branch's `MXC agent launched` acknowledgement only after native spawn succeeds.
 
 The driver resolves its gateway endpoint and TLS server-name defaults from
 generic gateway inputs. The host supervisor authenticates its gateway session
-and retains main-process I/O. MXC has no foreground attachment adapter; create
-command workloads with `--detach`. Preflight rejects foreground attachment
-before provisioning. TCP readiness remains gated by authenticated session acceptance.
+and retains main-process I/O. Foreground attachment without a terminal is served by the in-process SSH server
+of the host supervisor; MXC has no ConPTY adapter, so preflight rejects a
+foreground `--tty` request before provisioning. TCP readiness remains gated by authenticated session acceptance.
 
 Windows boundary execution is implemented by the `openshell-mxc-boundary`
 library behind the dedicated `openshell-windows-sandbox.exe`. The compute driver does not

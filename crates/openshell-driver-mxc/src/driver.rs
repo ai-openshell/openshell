@@ -304,10 +304,10 @@ impl MxcComputeBackend {
         if sandbox
             .spec
             .as_ref()
-            .is_some_and(|spec| spec.await_main_process_attachment)
+            .is_some_and(|spec| spec.await_main_process_attachment && spec.tty)
         {
             return Err(tonic::Status::failed_precondition(
-                "MXC does not support foreground attachment to the main process. Create the sandbox with --detach.",
+                "MXC does not support an interactive terminal for the main process. Create the sandbox with --no-tty or --detach.",
             ));
         }
         openshell_core::resource_admission::check_sandbox_driver_config(
@@ -1931,21 +1931,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_attachment_is_rejected_before_provisioning() {
+    async fn foreground_terminal_attachment_is_rejected_before_provisioning() {
         let (backend, mut sandbox, _dir) = preflight_fixture();
-        sandbox.spec.as_mut().unwrap().command =
-            vec!["cmd.exe".into(), "/c".into(), "exit 0".into()];
-        sandbox.spec.as_mut().unwrap().await_main_process_attachment = true;
+        let spec = sandbox.spec.as_mut().unwrap();
+        spec.command = vec!["cmd.exe".into(), "/c".into(), "exit 0".into()];
+        spec.await_main_process_attachment = true;
+        spec.tty = true;
         let error = backend.validate_sandbox_create(&sandbox).unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(error.message().contains("--detach"));
+        assert!(error.message().contains("--no-tty"));
         let error = backend.create_sandbox(&sandbox).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(error.message().contains("foreground attachment"));
+        assert!(error.message().contains("interactive terminal"));
         assert!(backend.get_sandbox(&sandbox.id).await.is_none());
         assert!(!backend.config.state_dir.exists());
-        sandbox.spec.as_mut().unwrap().await_main_process_attachment = false;
-        assert!(backend.validate_sandbox_create(&sandbox).is_ok());
+    }
+
+    #[test]
+    fn non_terminal_foreground_and_detached_creates_are_admitted() {
+        let (backend, mut sandbox, _dir) = preflight_fixture();
+        let spec = sandbox.spec.as_mut().unwrap();
+        spec.command = vec!["cmd.exe".into(), "/c".into(), "exit 0".into()];
+        // Foreground without a terminal streams output over the SSH attachment.
+        for (await_attachment, tty) in [(true, false), (false, false), (false, true)] {
+            let spec = sandbox.spec.as_mut().unwrap();
+            spec.await_main_process_attachment = await_attachment;
+            spec.tty = tty;
+            assert!(
+                backend.validate_sandbox_create(&sandbox).is_ok(),
+                "await_main_process_attachment={await_attachment} tty={tty} must be admitted"
+            );
+        }
     }
 
     #[test]
