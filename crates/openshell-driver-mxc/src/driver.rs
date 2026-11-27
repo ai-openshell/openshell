@@ -519,6 +519,7 @@ impl MxcComputeBackend {
                 policy,
                 &MapCtx {
                     sandbox_id: sandbox_id.to_string(),
+                    backend: self.config.backend,
                     egress,
                 },
             )
