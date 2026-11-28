@@ -1497,6 +1497,121 @@ mod tests {
         assert!(!rejected.configuration_error.is_empty());
     }
 
+    /// Store `version` of a policy for `sandbox_id` as loaded.
+    async fn put_loaded_policy(state: &ServerState, sandbox_id: &str, version: i64, host: &str) {
+        use crate::policy_store::PolicyStoreExt as _;
+        use prost::Message as _;
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "api".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "api".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: host.to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        state
+            .store
+            .put_policy_revision(
+                &uuid::Uuid::new_v4().to_string(),
+                sandbox_id,
+                "default",
+                version,
+                &policy.encode_to_vec(),
+                &crate::grpc::policy::deterministic_policy_hash(&policy),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .update_policy_status(sandbox_id, version, "loaded", None, Some(1))
+            .await
+            .unwrap();
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        sandbox.set_current_policy_version(u32::try_from(version).unwrap());
+        state.store.put_message(&sandbox).await.unwrap();
+    }
+
+    /// Receive the next configuration update and acknowledge it, as a
+    /// supervisor does before it is sent another.
+    async fn next_applied_config(
+        harness: &mut SupervisorStreamHarness,
+        what: &str,
+    ) -> SandboxConfigSnapshot {
+        let message = next_update(harness, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|| panic!("{what}"));
+        let Some(gateway_message::Payload::ConfigUpdate(update)) = message.payload else {
+            panic!("expected a configuration update: {what}");
+        };
+        harness
+            .outbound
+            .send(openshell_core::proto::SupervisorMessage {
+                payload: Some(
+                    openshell_core::proto::supervisor_message::Payload::ConfigUpdateResult(
+                        session::applied_result(&update),
+                    ),
+                ),
+            })
+            .await
+            .unwrap();
+        update.sandbox_config.expect("sandbox configuration")
+    }
+
+    #[tokio::test]
+    async fn a_child_sync_pushes_the_new_copy_to_a_connected_child() {
+        let mut state = push_state().await;
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.enable_child_sandboxes = true;
+        inner.compute = inner.compute.clone().with_child_sandboxes(true);
+        put_sandbox(&state, "lead", &[]).await;
+        put_loaded_policy(&state, "lead", 1, "v1.example.com").await;
+        let worker = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "worker".into(),
+                name: "worker".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec::default()),
+            parent: Some(openshell_core::proto::SandboxParent {
+                name: "lead".into(),
+                id: "lead".into(),
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&worker).await.unwrap();
+        let (mut harness, _) = accepted_session(&state, "worker").await;
+        let allows = |config: SandboxConfigSnapshot, host: &str| {
+            config.configuration_admitted
+                && config
+                    .policy
+                    .expect("policy")
+                    .network_policies
+                    .values()
+                    .any(|rule| rule.endpoints.iter().any(|e| e.host == host))
+        };
+
+        crate::grpc::sync_all_children(&state).await.unwrap();
+        let first = next_applied_config(&mut harness, "update after the first copy").await;
+        assert!(allows(first, "v1.example.com"));
+
+        put_loaded_policy(&state, "lead", 2, "v2.example.com").await;
+        crate::grpc::sync_all_children(&state).await.unwrap();
+        let second = next_applied_config(&mut harness, "update after the second copy").await;
+        assert!(allows(second, "v2.example.com"));
+    }
+
     #[tokio::test]
     async fn provider_change_reaches_only_attached_sessions() {
         let state = push_state().await;

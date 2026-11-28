@@ -15,6 +15,7 @@
 mod binary_resolution;
 #[cfg(feature = "test-support")]
 pub mod conformance_support;
+pub mod gateway_mcp_door;
 #[cfg(all(test, feature = "experimental"))]
 use openshell_policy_cedar_runtime::cedar_only;
 mod google_cloud_metadata;

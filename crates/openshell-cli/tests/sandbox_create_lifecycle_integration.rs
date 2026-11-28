@@ -120,6 +120,9 @@ struct SandboxState {
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
     gateway_config_requests: Arc<AtomicUsize>,
     providers: Arc<Mutex<Vec<Provider>>>,
+    provider_create_requests: Arc<AtomicUsize>,
+    list_requests: Arc<Mutex<Vec<ListSandboxesRequest>>>,
+    list_response: Arc<Mutex<Vec<Sandbox>>>,
     template_create_requests: Arc<Mutex<Vec<CreateSandboxTemplateRequest>>>,
     template_get_requests: Arc<Mutex<Vec<GetSandboxTemplateRequest>>>,
     template_list_requests: Arc<Mutex<Vec<ListSandboxTemplatesRequest>>>,
@@ -355,9 +358,17 @@ impl OpenShell for TestOpenShell {
 
     async fn list_sandboxes(
         &self,
-        _request: tonic::Request<ListSandboxesRequest>,
+        request: tonic::Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        Ok(Response::new(ListSandboxesResponse::default()))
+        self.state
+            .list_requests
+            .lock()
+            .await
+            .push(request.into_inner());
+        Ok(Response::new(ListSandboxesResponse {
+            sandboxes: self.state.list_response.lock().await.clone(),
+            next_page_token: String::new(),
+        }))
     }
 
     async fn create_sandbox_template(
@@ -629,6 +640,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
+        self.state
+            .provider_create_requests
+            .fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(ProviderResponse::default()))
     }
 
@@ -1608,6 +1622,97 @@ async fn sandbox_delete_continues_after_entry_failure() {
     );
 }
 
+fn child_of_lead(name: &str, deleting: bool) -> Sandbox {
+    let mut child = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        }),
+        parent: Some(openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: "id-lead".to_string(),
+        }),
+        ..Sandbox::default()
+    };
+    let phase = if deleting {
+        SandboxPhase::Deleting
+    } else {
+        SandboxPhase::Ready
+    };
+    child.set_phase(phase as i32);
+    child
+}
+
+#[tokio::test]
+async fn sandbox_delete_waits_for_children_still_being_deleted() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+    let state = server.openshell.state.clone();
+    *state.list_response.lock().await = vec![child_of_lead("worker1", true)];
+    // The child's delete finishes once the CLI has seen it.
+    let finisher = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            while state.list_requests.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            state.list_response.lock().await.clear();
+        })
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run::sandbox_delete(
+            &server.endpoint,
+            &["lead".to_string()],
+            false,
+            "default",
+            &tls,
+            "openshell",
+        ),
+    )
+    .await
+    .expect("the wait ends once the child is gone")
+    .expect("the root is deleted");
+    finisher.await.unwrap();
+
+    let lists = state.list_requests.lock().await;
+    assert!(lists.len() >= 2, "listed again after the child was seen");
+    assert!(lists.iter().all(|request| request.parent == "lead"));
+    assert_eq!(deleted_names(&server).await, vec![vec!["lead".to_string()]]);
+}
+
+#[tokio::test]
+async fn sandbox_delete_does_not_wait_for_live_children() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+    let state = server.openshell.state.clone();
+    *state.list_response.lock().await = vec![
+        child_of_lead("worker1", true),
+        child_of_lead("worker2", false),
+    ];
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run::sandbox_delete(
+            &server.endpoint,
+            &["lead".to_string()],
+            false,
+            "default",
+            &tls,
+            "openshell",
+        ),
+    )
+    .await
+    .expect("a live child is reported by the gateway, not waited for")
+    .unwrap();
+
+    assert_eq!(state.list_requests.lock().await.len(), 1);
+    assert_eq!(deleted_names(&server).await, vec![vec!["lead".to_string()]]);
+}
+
 #[tokio::test]
 async fn sandbox_create_tolerates_an_unreachable_profile_catalog() {
     // The catalog's only consumer is the advisory credential warning, so a
@@ -1796,6 +1901,89 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
                 Some("2Gi")
             );
             assert!(!resources.fields.contains_key("requests"));
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn child_create_sends_provider_names_without_creating_providers() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    // Local credentials a root create would turn into a new provider.
+    test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("ANTHROPIC_API_KEY", "sk-test".to_string())],
+    )
+    .run_async(async {
+        let tls = test_tls(&server);
+        install_fake_ssh(&fake_ssh_dir);
+
+        run::sandbox_create(
+            &server.endpoint,
+            "openshell",
+            run::SandboxCreateConfig {
+                name: Some("worker"),
+                parent: Some("lead"),
+                providers: &["anthropic".into()],
+                auto_providers_override: Some(true),
+                command: &["echo".into(), "OK".into()],
+                ..test_config()
+            },
+            "default",
+            &tls,
+        )
+        .await
+        .expect("sandbox create should succeed");
+
+        assert_eq!(
+            server
+                .openshell
+                .state
+                .provider_create_requests
+                .load(Ordering::SeqCst),
+            0
+        );
+        let requests = create_requests(&server).await;
+        assert_eq!(requests[0].parent, "lead");
+        let spec = requests[0].spec.as_ref().unwrap();
+        assert_eq!(spec.providers, vec!["anthropic".to_string()]);
+        assert!(spec.policy.is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn child_create_refuses_a_policy_before_sending() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            let error = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("worker"),
+                    parent: Some("lead"),
+                    policy: Some("policy.yaml"),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("a child create with a policy should be refused");
+
+            assert_eq!(
+                error.to_string(),
+                "child sandboxes use their parent's policy; omit --policy"
+            );
+            assert!(create_requests(&server).await.is_empty());
         })
         .await;
 }
@@ -6155,4 +6343,52 @@ async fn sandbox_create_stops_a_missing_holder_retry_when_the_budget_is_spent() 
             );
         })
         .await;
+}
+
+fn listed_child(name: &str, parent: &str, parent_id: &str) -> Sandbox {
+    Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        }),
+        parent: Some(openshell_core::proto::SandboxParent {
+            name: parent.to_string(),
+            id: parent_id.to_string(),
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn sandbox_list_sends_the_parent_filter_and_labels_children() {
+    let server = run_server().await;
+    // The mock answers GetSandbox("lead") with id "id-lead", so worker1's
+    // parent is live and worker2's ("gone-id") was deleted.
+    *server.openshell.state.list_response.lock().await = vec![
+        listed_child("worker1", "lead", "id-lead"),
+        listed_child("worker2", "lead", "gone-id"),
+    ];
+    let tls = test_tls(&server);
+
+    run::sandbox_list(
+        &server.endpoint,
+        100,
+        "",
+        false,
+        false,
+        None,
+        Some("lead"),
+        "table",
+        "default",
+        false,
+        &tls,
+    )
+    .await
+    .expect("sandbox list should succeed");
+
+    let requests = server.openshell.state.list_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].parent, "lead");
 }

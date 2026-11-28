@@ -31,6 +31,7 @@ mod gateway_ocsf;
 mod gateway_ring;
 mod grpc;
 mod http;
+mod mcp;
 mod middleware;
 mod multiplex;
 mod network_trust;
@@ -469,6 +470,7 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
 }
 
 const METRICS_TLS_HANDSHAKE_WARNING_INTERVAL: Duration = Duration::from_mins(1);
+const CHILD_SANDBOX_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct MetricsTlsHandshakeLogState {
@@ -663,7 +665,9 @@ impl ServerState {
         let sandbox_identity =
             spiffe_broker::sandbox_identity_provider(&config).map_err(Error::config)?;
         let replica_id = compute::lease::replica_id();
-        let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
+        let compute = compute
+            .with_sandbox_updates(config.enable_sandbox_updates)
+            .with_child_sandboxes(config.enable_child_sandboxes);
         compute.configure_ssh_identities(credentials.clone());
         let service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(
             config.service_routing_discriminator().map(str::to_string),
@@ -1336,6 +1340,31 @@ pub(crate) async fn run_server(
     }
 
     startup_tx.send_replace(true);
+    // Bring children up to their roots now, for changes made while the
+    // gateway was down, and then every 30 seconds, for copies a failed or
+    // cancelled request or another replica left undone.
+    if config.enable_child_sandboxes {
+        let state = state.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(CHILD_SANDBOX_SYNC_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                if let Err(error) = grpc::sync_all_children(&state).await {
+                    warn!(error = %error, "child sandbox policy sync failed");
+                }
+            }
+        });
+    }
     // The poller and sweeper exist to observe writes made by other replicas.
     // Single-replica backends have none, so they would only add load.
     if !store.is_single_replica() {

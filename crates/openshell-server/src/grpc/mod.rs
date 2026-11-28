@@ -14,6 +14,7 @@ mod sandbox;
 pub mod secret;
 pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
+pub use sandbox::sync_all_children;
 mod service;
 pub mod service_advertisement;
 pub mod service_discovery;

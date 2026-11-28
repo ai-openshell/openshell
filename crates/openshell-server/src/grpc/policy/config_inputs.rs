@@ -10,6 +10,8 @@
 //! independent, not one database transaction, and credential values are
 //! resolved later by the provider builder alone.
 
+use std::sync::Arc;
+
 use openshell_core::proto::Sandbox;
 use tonic::Status;
 
@@ -44,10 +46,15 @@ impl SandboxConfigInputs {
 
 /// Load the inputs both configuration builders share. Independent reads run
 /// concurrently; a failure here fails every component built from them.
+///
+/// A child is checked against its parent's live record first, so every build
+/// serves it only providers its parent still has, whether or not a sync has
+/// reached it.
 pub async fn load_sandbox_config_inputs(
-    state: &ServerState,
-    sandbox: Sandbox,
+    state: &Arc<ServerState>,
+    mut sandbox: Sandbox,
 ) -> Result<SandboxConfigInputs, Status> {
+    super::super::sandbox::keep_parent_providers(state, &mut sandbox).await?;
     let store = state.store.as_ref();
     let workspace = sandbox.object_workspace();
     let provider_names = sandbox
