@@ -4722,6 +4722,8 @@ pub async fn sandbox_delete(
             println!("No sandboxes to delete.");
             return Ok(());
         }
+        // A root cannot be deleted while it has children.
+        sandboxes.sort_by_key(|sandbox| sandbox.parent.is_none());
         sandboxes
             .into_iter()
             .map(|s| s.object_name().to_string())
@@ -4742,6 +4744,7 @@ pub async fn sandbox_delete(
             }
         }
 
+        wait_for_child_deletes(&mut client, workspace, name).await;
         let response = match client
             .delete_sandbox(DeleteSandboxRequest {
                 request_id: String::new(),
@@ -4786,6 +4789,52 @@ pub async fn sandbox_delete(
     }
 
     aggregate_delete_failures("sandbox", &failures)
+}
+
+/// How long `sandbox delete` waits for a root's children to finish deleting.
+const CHILD_DELETE_WAIT: Duration = Duration::from_mins(2);
+
+/// Wait until a root has no children left whose delete has started, since the
+/// gateway refuses to delete a root while any child remains. Returns at once
+/// when a child is not being deleted or the children cannot be listed, and
+/// after [`CHILD_DELETE_WAIT`]; the delete then reports why it is refused.
+async fn wait_for_child_deletes(client: &mut GrpcClient, workspace: &str, name: &str) {
+    let deadline = Instant::now() + CHILD_DELETE_WAIT;
+    let mut announced = false;
+    loop {
+        let Ok(response) = client
+            .list_sandboxes(ListSandboxesRequest {
+                page_size: 1000,
+                page_token: String::new(),
+                label_selector: String::new(),
+                parent: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            })
+            .await
+        else {
+            return;
+        };
+        let children = response.into_inner().sandboxes;
+        let all_deleting = children
+            .iter()
+            .all(|child| child.phase() == SandboxPhase::Deleting as i32);
+        if children.is_empty() || !all_deleting || Instant::now() >= deadline {
+            return;
+        }
+        if !announced {
+            let noun = if children.len() == 1 {
+                "child sandbox"
+            } else {
+                "child sandboxes"
+            };
+            eprintln!(
+                "Waiting for {} {noun} of {name} to finish deleting",
+                children.len()
+            );
+            announced = true;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Stop a sandbox while retaining its persistent workspace.

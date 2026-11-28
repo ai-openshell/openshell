@@ -960,11 +960,7 @@ async fn check_parent_has_room(
         .await
         .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?;
     let usable = current.as_ref().is_some_and(|current| {
-        current.parent.is_none()
-            && current
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.deletion_time.is_none())
+        current.parent.is_none() && !crate::compute::is_being_deleted(current)
     });
     if !usable {
         return Err(Status::failed_precondition(format!(
@@ -8783,27 +8779,24 @@ mod tests {
         deleting: bool,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        state
-            .store
-            .put_message(&Sandbox {
-                metadata: Some(ObjectMeta {
-                    id: id.clone(),
-                    name: name.to_string(),
-                    workspace: "default".to_string(),
-                    deletion_time: deleting.then(|| {
-                        openshell_core::time::timestamp_from_millis(current_time_ms()).unwrap()
-                    }),
-                    ..Default::default()
-                }),
-                spec: Some(SandboxSpec {
-                    providers: providers.iter().map(ToString::to_string).collect(),
-                    ..Default::default()
-                }),
-                parent,
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: id.clone(),
+                name: name.to_string(),
+                workspace: "default".to_string(),
                 ..Default::default()
-            })
-            .await
-            .unwrap();
+            }),
+            spec: Some(SandboxSpec {
+                providers: providers.iter().map(ToString::to_string).collect(),
+                ..Default::default()
+            }),
+            parent,
+            ..Default::default()
+        };
+        if deleting {
+            sandbox.set_phase(SandboxPhase::Deleting as i32);
+        }
+        state.store.put_message(&sandbox).await.unwrap();
         put_policy_revision_with_status(
             state,
             &id,
@@ -9206,7 +9199,7 @@ mod tests {
             .unwrap()
             .expect("the refused parent still exists");
         assert!(
-            lead.metadata.unwrap().deletion_time.is_none(),
+            !crate::compute::is_being_deleted(&lead),
             "a refused delete must not mark the parent as deleting"
         );
     }
@@ -9247,10 +9240,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn children_already_being_deleted_do_not_block_the_parent() {
+    async fn a_child_still_being_deleted_blocks_the_parent() {
         let state = child_sandboxes_state().await;
         let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
-        put_parent_record(
+        let worker_id = put_parent_record(
             &state,
             "worker1",
             &[],
@@ -9262,9 +9255,23 @@ mod tests {
         )
         .await;
 
+        let err = handle_delete_sandbox_inner(&state, authed_request(delete_request("lead")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains(
+                "sandbox 'lead' has 1 child sandbox still being deleted; \
+                 try again once they are gone"
+            ),
+            "{}",
+            err.message()
+        );
+
+        state.store.delete("sandbox", &worker_id).await.unwrap();
         handle_delete_sandbox_inner(&state, authed_request(delete_request("lead")))
             .await
-            .expect("only deleting children remain, so the parent can be deleted");
+            .expect("once the child is gone, the parent can be deleted");
     }
 
     /// A root `lead` with one child `worker1`. Returns the child's id.
@@ -9329,8 +9336,8 @@ mod tests {
     }
 
     /// A root `lead` with a child `worker1` sharing provider `work-github`,
-    /// whose `lead` record is then removed, as a downgraded gateway or a
-    /// stalled delete can leave it. Returns both ids.
+    /// whose `lead` record is then removed, as a downgraded gateway can leave
+    /// it. Returns both ids.
     async fn orphaned_child(state: &Arc<ServerState>) -> (String, String) {
         let (lead_id, worker_id) = lead_and_child_sharing_a_provider(state).await;
         state

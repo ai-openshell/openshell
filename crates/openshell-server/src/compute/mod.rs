@@ -3893,15 +3893,6 @@ impl ComputeRuntime {
         })?
     }
 
-    /// Count a root's children that are not already being deleted.
-    async fn live_child_count(&self, parent: &Sandbox) -> Result<usize, Status> {
-        Ok(
-            count_children(&self.store, parent.object_workspace(), parent.object_id())
-                .await?
-                .live,
-        )
-    }
-
     async fn delete_sandbox_inner(
         &self,
         target: SandboxDeleteTarget,
@@ -3948,20 +3939,15 @@ impl ComputeRuntime {
         }
         // Checked under the root's mutation guard, which a child create on any
         // replica also takes on its parent, so a child cannot be added between
-        // this check and the delete. Children already being deleted do not
-        // block.
+        // this check and the delete. A child whose delete has started blocks
+        // too: until it finishes its compute resources may still run, and the
+        // root must not leave it without a parent.
         if self.child_sandboxes_enabled && current.parent.is_none() {
-            let live_children = self.live_child_count(&current).await?;
-            if live_children > 0 {
-                let noun = if live_children == 1 {
-                    "child sandbox"
-                } else {
-                    "child sandboxes"
-                };
-                return Err(Status::failed_precondition(format!(
-                    "sandbox '{}' has {live_children} {noun}; delete them first",
-                    target.sandbox_name
-                )));
+            let children =
+                count_children(&self.store, current.object_workspace(), current.object_id())
+                    .await?;
+            if children.total() > 0 {
+                return Err(root_has_children(&target.sandbox_name, children));
             }
         }
 
@@ -8786,13 +8772,33 @@ impl ChildCount {
     }
 }
 
+/// Why a root with children cannot be deleted yet.
+fn root_has_children(name: &str, children: ChildCount) -> Status {
+    let noun = |count: usize| {
+        if count == 1 {
+            "child sandbox"
+        } else {
+            "child sandboxes"
+        }
+    };
+    if children.live > 0 {
+        return Status::failed_precondition(format!(
+            "sandbox '{name}' has {} {}; delete them first",
+            children.live,
+            noun(children.live)
+        ));
+    }
+    Status::failed_precondition(format!(
+        "sandbox '{name}' has {} {} still being deleted; try again once they are gone",
+        children.being_deleted,
+        noun(children.being_deleted)
+    ))
+}
+
 /// Whether a sandbox's delete has started. It keeps its record, and its
 /// compute resources may still run, until the driver finishes.
 pub fn is_being_deleted(sandbox: &Sandbox) -> bool {
-    sandbox
-        .metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.deletion_time.is_some())
+    sandbox.phase() == SandboxPhase::Deleting as i32
 }
 
 /// Count a parent's children by scanning its workspace.

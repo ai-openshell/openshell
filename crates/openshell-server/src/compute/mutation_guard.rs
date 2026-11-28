@@ -1687,7 +1687,7 @@ mod tests {
             .expect("read the root")
             .expect("the refused root still exists");
         assert!(
-            lead.metadata.unwrap().deletion_time.is_none(),
+            !crate::compute::is_being_deleted(&lead),
             "a refused delete must not mark the root as deleting"
         );
 

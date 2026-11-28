@@ -78,6 +78,8 @@ openshell sandbox delete reviewer coder helper
 openshell sandbox delete lead
 ```
 
+A child still counts until its delete finishes. `sandbox delete` waits up to two minutes for a root's children to finish deleting before it deletes the root. If a child's delete is stuck, the root stays until the child is gone.
+
 A child's results live only inside the child, so this keeps one command from deleting work nobody has collected. If a child's parent record is gone, for example after a failure, the child keeps its last policy and loses all its providers. Delete it.
 
 ## MCP Tools

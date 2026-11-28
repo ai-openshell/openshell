@@ -1622,6 +1622,97 @@ async fn sandbox_delete_continues_after_entry_failure() {
     );
 }
 
+fn child_of_lead(name: &str, deleting: bool) -> Sandbox {
+    let mut child = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        }),
+        parent: Some(openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: "id-lead".to_string(),
+        }),
+        ..Sandbox::default()
+    };
+    let phase = if deleting {
+        SandboxPhase::Deleting
+    } else {
+        SandboxPhase::Ready
+    };
+    child.set_phase(phase as i32);
+    child
+}
+
+#[tokio::test]
+async fn sandbox_delete_waits_for_children_still_being_deleted() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+    let state = server.openshell.state.clone();
+    *state.list_response.lock().await = vec![child_of_lead("worker1", true)];
+    // The child's delete finishes once the CLI has seen it.
+    let finisher = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            while state.list_requests.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            state.list_response.lock().await.clear();
+        })
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run::sandbox_delete(
+            &server.endpoint,
+            &["lead".to_string()],
+            false,
+            "default",
+            &tls,
+            "openshell",
+        ),
+    )
+    .await
+    .expect("the wait ends once the child is gone")
+    .expect("the root is deleted");
+    finisher.await.unwrap();
+
+    let lists = state.list_requests.lock().await;
+    assert!(lists.len() >= 2, "listed again after the child was seen");
+    assert!(lists.iter().all(|request| request.parent == "lead"));
+    assert_eq!(deleted_names(&server).await, vec![vec!["lead".to_string()]]);
+}
+
+#[tokio::test]
+async fn sandbox_delete_does_not_wait_for_live_children() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+    let state = server.openshell.state.clone();
+    *state.list_response.lock().await = vec![
+        child_of_lead("worker1", true),
+        child_of_lead("worker2", false),
+    ];
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run::sandbox_delete(
+            &server.endpoint,
+            &["lead".to_string()],
+            false,
+            "default",
+            &tls,
+            "openshell",
+        ),
+    )
+    .await
+    .expect("a live child is reported by the gateway, not waited for")
+    .unwrap();
+
+    assert_eq!(state.list_requests.lock().await.len(), 1);
+    assert_eq!(deleted_names(&server).await, vec![vec!["lead".to_string()]]);
+}
+
 #[tokio::test]
 async fn sandbox_create_tolerates_an_unreachable_profile_catalog() {
     // The catalog's only consumer is the advisory credential warning, so a
