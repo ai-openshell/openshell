@@ -10,21 +10,11 @@
 
 use openshell_server::{DriverDetection, DriverDetectionContext};
 
-use crate::launcher::UnavailableRetry;
-use crate::local_driver::{BACKEND_RETRY_DELAY, LocalDriver};
-
-/// How many times a named Podman is started while its socket is unreachable.
-/// This keeps the bounded tolerance the in-process driver had, such as
-/// `podman.socket` restarting during a package upgrade.
-const START_ATTEMPTS: u32 = 6;
+use crate::local_driver::LocalDriver;
 
 pub const PODMAN: LocalDriver = LocalDriver {
     name: "podman",
     drop_legacy_keys: drop_legacy_gateway_port,
-    retry_unavailable: Some(UnavailableRetry {
-        attempts: START_ATTEMPTS,
-        delay: BACKEND_RETRY_DELAY,
-    }),
 };
 
 /// `main` accepted `gateway_port` and overwrote it with the gateway's
