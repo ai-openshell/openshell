@@ -146,7 +146,11 @@ impl CredentialDriver for TestStaticCredentialDriver {
             responses.push(ResolvedCredential {
                 request_id: request.request_id,
                 value,
-                expiration_time: None,
+                expiration_time: handle.metadata.get("test_expiration_ms").map(|expiry| {
+                    let expiry = expiry.parse().expect("test expiry in milliseconds");
+                    openshell_core::time::timestamp_from_millis(expiry)
+                        .expect("test expiry timestamp")
+                }),
             });
         }
 

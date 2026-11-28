@@ -663,7 +663,12 @@ impl ServerState {
         let sandbox_identity =
             spiffe_broker::sandbox_identity_provider(&config).map_err(Error::config)?;
         let replica_id = compute::lease::replica_id();
-        let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
+        let workload_identity = spiffe_broker::SupervisorWorkloadIdentity::from_config(&config)
+            .map_err(Error::config)?;
+        let compute = compute
+            .with_sandbox_updates(config.enable_sandbox_updates)
+            .with_provider_workload_identity(workload_identity)
+            .map_err(Error::config)?;
         compute.configure_ssh_identities(credentials.clone());
         let service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(
             config.service_routing_discriminator().map(str::to_string),
@@ -2404,6 +2409,15 @@ pub struct ComputeDriverBuildContext<'a> {
 }
 
 impl ComputeDriverBuildContext<'_> {
+    /// Whether the gateway requires launch-attested provider identities.
+    #[must_use]
+    pub fn requires_provider_workload_identity(&self) -> bool {
+        self.config
+            .driver_startup
+            .file
+            .is_some_and(|file| file.openshell.gateway.spiffe_workload_identity.is_some())
+    }
+
     /// The gateway's budget for preparing images, which includes the images
     /// a driver pulls while it is constructed.
     #[must_use]

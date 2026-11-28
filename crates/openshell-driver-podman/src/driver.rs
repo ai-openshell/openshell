@@ -3,17 +3,31 @@
 
 //! Podman compute driver.
 
-use crate::client::{ContainerListEntry, PodmanApiError, PodmanClient, VolumeInspect};
+use crate::client::{
+    ContainerInspect, ContainerListEntry, PodmanApiError, PodmanClient, VolumeInspect,
+};
 use crate::config::{PodmanComputeConfig, podman_image_pull_policy};
-use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
+use crate::container::{
+    self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig,
+    SupervisorConfiguration,
+};
 use crate::watcher::{
-    self, LifecycleEventFences, WatchStream, driver_sandbox_from_inspect,
-    driver_sandbox_from_list_entry,
+    self, LifecycleEventFences, ProviderContainment, WatchStream, driver_sandbox_from_inspect,
+    driver_sandbox_from_list_entry, is_sandbox_member, stop_provider_container,
 };
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::{
-    SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
-    temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
+    LABEL_PROVIDER_LAUNCH_SPIFFE_ID, PROVIDER_WORKLOAD_IDENTITY_PROBE,
+    PROVIDER_WORKLOAD_SOCKET_PROBE_PRESENT, PROVIDER_WORKLOAD_SOCKET_PROBE_UNAVAILABLE,
+    SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry,
+    projected_provider_spiffe_socket_path, supervisor_image_should_refresh,
+    temp_extract_container_name, validate_linux_elf_binary, validate_ordered_start_authentication,
+    write_cache_binary_atomic,
+};
+use openshell_core::extension_protocol::{
+    COMPUTE_ORDERED_PROVIDER_LAUNCH, COMPUTE_ORDERED_PROVIDER_START,
+    COMPUTE_ORDERED_PROVIDER_START_RECEIPT_LOOKUP, COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+    ExtensionFamily, extension_metadata,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -24,15 +38,23 @@ use openshell_core::network_trust::{
 };
 use openshell_core::proto::compute::v1::{
     CpuResourceCapabilities, DriverSandbox, GetCapabilitiesResponse, GpuResourceCapabilities,
-    GpuResourceRequirements, MemoryResourceCapabilities, ResourceCapabilities,
+    GpuResourceRequirements, MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
 };
 use openshell_core::{ComputeDriverError, NetworkSupervisorTrustBundle};
+use openshell_driver_sdk::{
+    ProviderLaunchReplay, ProviderStopMutation, legacy_provider_launch_outcome,
+    lock_existing_provider_launch, lookup_provider_launch_receipt,
+    ordered_provider_launch_operation, own_provider_launch_work, replay_provider_launch,
+    replay_provider_stop, run_provider_containment, try_provider_launch_lock,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::Digest;
+use tonic::{Response, Status};
 use tracing::{Instrument as _, debug, info, warn};
 
 const STOP_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -138,6 +160,9 @@ impl From<PodmanApiError> for ComputeDriverError {
         match value {
             PodmanApiError::Conflict(_) => Self::AlreadyExists,
             PodmanApiError::NotFound(_) => Self::NotFound,
+            PodmanApiError::Connection(_) | PodmanApiError::Timeout(_) => {
+                Self::BackendUnavailable(value.to_string())
+            }
             other => Self::Message(other.to_string()),
         }
     }
@@ -151,6 +176,8 @@ pub struct PodmanComputeDriver {
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
     lifecycle_event_fences: LifecycleEventFences,
+    provider_launch_state: Option<PathBuf>,
+    provider_workload_identity_supported: bool,
     /// Gateway-normalized destination trust held outside untrusted sandbox
     /// specs. Gateway-managed drivers receive the staged bundle from the
     /// gateway; standalone drivers self-source one from the
@@ -175,6 +202,114 @@ impl std::fmt::Debug for PodmanComputeDriver {
                 &self.network_trust_staging.is_some(),
             )
             .finish()
+    }
+}
+
+struct RetainedPodmanSandbox<'a> {
+    prepared_workload: Option<(
+        container::ResolvedPodmanImage,
+        openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
+    )>,
+    workload_id: &'a str,
+    predecessor: Option<&'a str>,
+    generation: &'a str,
+    token_secret: Option<&'a str>,
+    supervisor_image_id: Option<&'a str>,
+    gateway_ca: Option<&'a [u8]>,
+    proxy_auth: Option<(&'a str, &'a str)>,
+    mutation: Option<&'a PodmanLaunchMutation>,
+}
+
+struct PodmanLaunchMutation {
+    path: PathBuf,
+    id: uuid::Uuid,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PodmanLaunchCheckpoint {
+    operation: String,
+    workload: String,
+    stage: PodmanLaunchStage,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+enum PodmanLaunchStage {
+    Mutating,
+    Replacing {
+        predecessor: String,
+    },
+    Renaming {
+        predecessor: String,
+    },
+    Restoring {
+        predecessor: String,
+        #[serde(default)]
+        confirming_storage: bool,
+    },
+    Restored {
+        predecessor: String,
+    },
+}
+
+impl PodmanLaunchMutation {
+    async fn checkpoint(&self) -> Result<Option<PodmanLaunchCheckpoint>, Status> {
+        match tokio::fs::read_to_string(&self.path).await {
+            Ok(record) => {
+                let checkpoint = if record.starts_with('{') {
+                    serde_json::from_str(&record)
+                        .map_err(|_| Status::unavailable("invalid Podman launch checkpoint"))?
+                } else {
+                    // Existing checkpoints did not distinguish rename from later effects.
+                    let (operation, workload) = record
+                        .split_once('\n')
+                        .ok_or_else(|| Status::unavailable("invalid Podman launch checkpoint"))?;
+                    PodmanLaunchCheckpoint {
+                        operation: operation.to_string(),
+                        workload: workload.to_string(),
+                        stage: PodmanLaunchStage::Mutating,
+                    }
+                };
+                Ok((checkpoint.operation == self.id.to_string()).then_some(checkpoint))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Status::unavailable(format!(
+                "read Podman launch checkpoint: {error}"
+            ))),
+        }
+    }
+
+    async fn begin(&self, workload_id: &str) -> Result<(), ComputeDriverError> {
+        self.record(workload_id, PodmanLaunchStage::Mutating).await
+    }
+
+    async fn record(
+        &self,
+        workload_id: &str,
+        stage: PodmanLaunchStage,
+    ) -> Result<(), ComputeDriverError> {
+        let path = self.path.clone();
+        let record = PodmanLaunchCheckpoint {
+            operation: self.id.to_string(),
+            workload: workload_id.to_string(),
+            stage,
+        };
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let dir = path
+                .parent()
+                .expect("mutation checkpoint has a journal directory");
+            let mut file = tempfile::NamedTempFile::new_in(dir)?;
+            serde_json::to_writer(&mut file, &record)?;
+            file.as_file().sync_all()?;
+            file.persist(&path).map_err(|error| error.error)?;
+            std::fs::File::open(dir)?.sync_all()
+        })
+        .await
+        .map_err(|error| ComputeDriverError::BackendUnavailable(error.to_string()))?
+        .map_err(|error| {
+            ComputeDriverError::BackendUnavailable(format!(
+                "write Podman launch checkpoint: {error}"
+            ))
+        })
     }
 }
 
@@ -263,19 +398,8 @@ async fn cleanup_sandbox_resolver_secret(client: &PodmanClient, secret_name: &st
     }
 }
 
-/// Read the operator's proxy credentials file and stage it as a per-sandbox
-/// Podman secret, so the credentials reach the supervisor through a root-only
-/// mount rather than the container environment.
-///
-/// Fails closed: when `proxy_auth_file` is configured but cannot be read or
-/// does not hold a valid `user:pass` credential, the sandbox is not created.
-/// Credential validation is shared with the in-container supervisor through
-/// [`openshell_core::driver_utils::parse_upstream_proxy_credential`], so a
-/// credential staged here can never be rejected at supervisor startup.
-async fn create_sandbox_proxy_auth_secret(
-    client: &PodmanClient,
+async fn read_sandbox_proxy_auth(
     config: &PodmanComputeConfig,
-    sandbox: &DriverSandbox,
 ) -> Result<Option<String>, ComputeDriverError> {
     let Some(path) = config.proxy_auth_file.as_deref() else {
         return Ok(None);
@@ -290,18 +414,27 @@ async fn create_sandbox_proxy_auth_secret(
     })
     .await
     .map_err(|e| ComputeDriverError::Message(format!("proxy_auth_file read task failed: {e}")))?
-    .map_err(ComputeDriverError::Message)?;
+    .map_err(|error| ComputeDriverError::Message(format!("proxy_auth_file: {error}")))?;
     let credential =
         openshell_core::driver_utils::parse_upstream_proxy_credential(&raw).map_err(|err| {
             ComputeDriverError::InvalidArgument(format!("proxy_auth_file '{path}': {err}"))
         })?;
 
-    let secret_name = container::proxy_auth_secret_name(&sandbox.id);
+    Ok(Some(format!("{credential}\n")))
+}
+
+async fn create_sandbox_proxy_auth_secret(
+    client: &PodmanClient,
+    proxy_auth: Option<(&str, &str)>,
+) -> Result<Option<String>, ComputeDriverError> {
+    let Some((secret_name, credential)) = proxy_auth else {
+        return Ok(None);
+    };
     client
-        .create_secret(&secret_name, format!("{credential}\n").as_bytes())
+        .create_secret(secret_name, credential.as_bytes())
         .await
         .map_err(ComputeDriverError::from)?;
-    Ok(Some(secret_name))
+    Ok(Some(secret_name.to_string()))
 }
 
 /// Fail-closed readability check for the corporate proxy CA bundle.
@@ -347,6 +480,27 @@ async fn cleanup_sandbox_proxy_auth_secret(client: &PodmanClient, secret_name: &
             "Failed to remove Podman sandbox proxy-auth secret"
         );
     }
+}
+
+fn owned_proxy_auth_secret<'a>(
+    sandbox_id: &str,
+    supervisor: &'a ContainerInspect,
+) -> Option<&'a str> {
+    let base = container::proxy_auth_secret_name(sandbox_id);
+    supervisor
+        .config
+        .secrets
+        .iter()
+        .flatten()
+        .map(|secret| secret.name.as_str())
+        .find(|name| {
+            *name == base
+                || name
+                    .strip_prefix(&base)
+                    .and_then(|suffix| suffix.strip_prefix('-'))
+                    .and_then(|launch| uuid::Uuid::parse_str(launch).ok())
+                    .is_some()
+        })
 }
 
 async fn create_tls_secrets(
@@ -561,8 +715,19 @@ fn stage_operator_network_trust_artifact(
 impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(
+        config: PodmanComputeConfig,
+        network_trust: Option<NetworkSupervisorTrustBundle>,
+    ) -> Result<Self, PodmanApiError> {
+        Self::new_with_verified_provider_identity(config, network_trust, None).await
+    }
+
+    /// Start using the gateway's configured provider identity mode.
+    /// Without an explicit selection, an absolute Workload API socket allows
+    /// a standalone driver or older gateway to request verified capability.
+    pub async fn new_with_verified_provider_identity(
         mut config: PodmanComputeConfig,
         network_trust: Option<NetworkSupervisorTrustBundle>,
+        verified_provider_identity: Option<bool>,
     ) -> Result<Self, PodmanApiError> {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -697,7 +862,19 @@ impl PodmanComputeDriver {
             );
         }
 
-        let driver = Self {
+        let provider_launch_state = openshell_core::paths::openshell_state_dir()
+            .map_err(|error| ComputeDriverError::Precondition(error.to_string()))
+            .map(|path| path.join("podman/provider-launches"))
+            .and_then(|path| {
+                if path.is_absolute() {
+                    Ok(path)
+                } else {
+                    Err(ComputeDriverError::Precondition(
+                        "Podman provider launch state requires an absolute directory".into(),
+                    ))
+                }
+            });
+        let mut driver = Self {
             client,
             config,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
@@ -706,9 +883,32 @@ impl PodmanComputeDriver {
             )),
             gpu_inventory_refresh: Arc::new(local_podman_gpu_selector_state),
             lifecycle_event_fences: LifecycleEventFences::default(),
+            provider_launch_state: provider_launch_state.as_ref().ok().cloned(),
+            provider_workload_identity_supported: false,
             network_trust,
             network_trust_staging,
         };
+        if verified_provider_identity != Some(false)
+            && driver
+                .config
+                .provider_spiffe_workload_api_socket
+                .as_deref()
+                .is_some_and(Path::is_absolute)
+        {
+            let qualification = async {
+                driver.qualify_provider_workload_identity().await?;
+                openshell_core::paths::create_dir_restricted(&provider_launch_state?)
+                    .map_err(|error| ComputeDriverError::Precondition(error.to_string()))
+            }
+            .await;
+            match qualification {
+                Ok(()) => driver.provider_workload_identity_supported = true,
+                Err(error) => warn!(
+                    %error,
+                    "Podman driver cannot supply verified provider workload identity"
+                ),
+            }
+        }
         let reconciler = driver.clone();
         tokio::spawn(async move {
             loop {
@@ -747,11 +947,21 @@ impl PodmanComputeDriver {
             }),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
-            extension: Some(openshell_core::extension_protocol::extension_metadata(
-                openshell_core::extension_protocol::ExtensionFamily::Compute,
+            extension: Some(extension_metadata(
+                ExtensionFamily::Compute,
                 "openshell/podman",
                 openshell_core::VERSION,
-                [],
+                self.provider_workload_identity_supported
+                    .then(|| {
+                        [
+                            COMPUTE_PROVIDER_WORKLOAD_IDENTITY.to_string(),
+                            COMPUTE_ORDERED_PROVIDER_LAUNCH.to_string(),
+                            COMPUTE_ORDERED_PROVIDER_START.to_string(),
+                            COMPUTE_ORDERED_PROVIDER_START_RECEIPT_LOOKUP.to_string(),
+                        ]
+                    })
+                    .into_iter()
+                    .flatten(),
             )),
         })
     }
@@ -905,9 +1115,15 @@ impl PodmanComputeDriver {
             return Ok(());
         }
         let inspect = self.client.inspect_container(id).await?;
+        self.admit_inspected_container_resources(&inspect).await
+    }
+
+    async fn admit_inspected_container_resources(
+        &self,
+        inspect: &ContainerInspect,
+    ) -> Result<(), ComputeDriverError> {
         let labels = &inspect.config.labels;
-        let precondition =
-            |error: tonic::Status| ComputeDriverError::Precondition(error.message().into());
+        let precondition = |error: Status| ComputeDriverError::Precondition(error.message().into());
         openshell_core::resource_admission::check_config_provenance(
             self.config.allow_driver_config,
             labels
@@ -1021,6 +1237,9 @@ impl PodmanComputeDriver {
     /// Revalidate running grants every 30 seconds. Outages block launches but
     /// only confirmed denials stop existing workloads.
     async fn reconcile_resource_admission(&self) {
+        if self.config.allow_driver_config && !self.config.resource_admission.enabled {
+            return;
+        }
         let Ok(entries) = self
             .client
             .list_containers(&[LABEL_MANAGED_FILTER, crate::isolation::WORKLOAD_FILTER])
@@ -1028,19 +1247,113 @@ impl PodmanComputeDriver {
         else {
             return;
         };
+        let containment = self.provider_containment();
         for entry in entries.iter().filter(|entry| entry.state == "running") {
-            if let Err(ComputeDriverError::Precondition(reason)) =
-                self.admit_container_resources(&entry.id).await
+            let Ok(workload) = self.client.inspect_container(&entry.id).await else {
+                continue;
+            };
+            if workload.id == entry.id
+                && workload.state.running
+                && let Err(ComputeDriverError::Precondition(reason)) =
+                    self.admit_inspected_container_resources(&workload).await
             {
-                warn!(container = %entry.id, %reason, "Stopping sandbox after resource admission denial");
-                let _ = self.client.stop_container(&entry.id, 0).await;
-                if let Some(id) = entry.labels.get(LABEL_SANDBOX_ID) {
-                    let _ = self
-                        .client
-                        .stop_container(&crate::isolation::supervisor_name(id), 0)
-                        .await;
+                if let Err(error) = self
+                    .contain_admission_denial(&workload, &containment, &reason)
+                    .await
+                {
+                    warn!(container = %entry.id, %error, "Could not contain Podman admission denial");
                 }
             }
+        }
+    }
+
+    async fn contain_admission_denial(
+        &self,
+        observed: &ContainerInspect,
+        containment: &ProviderContainment,
+        reason: &str,
+    ) -> Result<(), Status> {
+        let Some(sandbox_id) = observed.config.labels.get(LABEL_SANDBOX_ID) else {
+            warn!(container = %observed.id, %reason, "Stopping sandbox after resource admission denial");
+            let _ = self.client.stop_container(&observed.id, 0).await;
+            return Ok(());
+        };
+        let supervisor_name = crate::isolation::supervisor_name(sandbox_id);
+        let supervisor = self.client.inspect_container(&supervisor_name).await;
+        let verified = supervisor.as_ref().is_ok_and(|inspect| {
+            inspect
+                .config
+                .labels
+                .contains_key(LABEL_PROVIDER_LAUNCH_SPIFFE_ID)
+        });
+        let Some(journal) = containment.journal(sandbox_id, verified).await? else {
+            warn!(container = %observed.id, %reason, "Stopping sandbox after resource admission denial");
+            let _ = self.client.stop_container(&observed.id, 0).await;
+            if let Ok(supervisor) = supervisor {
+                let _ = self.client.stop_container(&supervisor.id, 0).await;
+            }
+            return Ok(());
+        };
+        let Some(lock) = try_provider_launch_lock(journal.clone()).await? else {
+            return Ok(());
+        };
+        let Ok(current) = self.client.inspect_container(&observed.id).await else {
+            return Ok(());
+        };
+        if current.id != observed.id
+            || !current.state.running
+            || observed
+                .state
+                .started_at
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || current.state.started_at != observed.state.started_at
+            || !is_sandbox_member(&current, sandbox_id, "sandbox")
+        {
+            return Ok(());
+        }
+        let Err(ComputeDriverError::Precondition(reason)) =
+            self.admit_inspected_container_resources(&current).await
+        else {
+            return Ok(());
+        };
+        warn!(container = %current.id, %reason, "Stopping sandbox after resource admission denial");
+        let client = self.client.clone();
+        let sandbox_id = sandbox_id.clone();
+        run_provider_containment(journal, lock, async move {
+            let workload_stopped = stop_provider_container(&client, &current.id, 0).await;
+            // Identify the companion independently. A failed inspection leaves
+            // no supervisor Stop in flight and the workload Stop can settle.
+            let supervisor = match client.inspect_container(&supervisor_name).await {
+                Ok(inspect)
+                    if is_sandbox_member(&inspect, &sandbox_id, "supervisor")
+                        && crate::client::validate_name(&inspect.id).is_ok()
+                        && inspect.id != supervisor_name =>
+                {
+                    inspect
+                }
+                Ok(_) => {
+                    warn!(%sandbox_id, "Podman supervisor identity changed during containment");
+                    return workload_stopped;
+                }
+                Err(PodmanApiError::NotFound(_)) => return workload_stopped,
+                Err(error) => {
+                    warn!(%sandbox_id, %error, "Could not inspect Podman supervisor during containment");
+                    return workload_stopped;
+                }
+            };
+            let supervisor_stopped = !supervisor.state.running
+                || stop_provider_container(&client, &supervisor.id, 0).await;
+            workload_stopped && supervisor_stopped
+        })
+        .await?;
+        Ok(())
+    }
+
+    fn provider_containment(&self) -> ProviderContainment {
+        ProviderContainment {
+            state_root: self.provider_launch_state.clone(),
+            verified_supported: self.provider_workload_identity_supported,
         }
     }
 
@@ -1074,24 +1387,27 @@ impl PodmanComputeDriver {
         )
     )]
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeDriverError> {
-        self.create_sandbox_with_existing_token(sandbox, None, None, None)
-            .await
+        self.provision_sandbox(sandbox, None).await
     }
 
-    /// Provision a replacement while retaining the existing token secret.
-    /// Only stopped-pair reconciliation uses this; ordinary creates always
-    /// generate their own secret from the gateway's create credential.
-    async fn create_sandbox_with_existing_token(
+    async fn provision_sandbox(
         &self,
         sandbox: &DriverSandbox,
-        existing_token_secret: Option<&str>,
-        restart_generation: Option<&str>,
-        existing_workload_container_id: Option<&str>,
+        mut retained: Option<RetainedPodmanSandbox<'_>>,
     ) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let reuse_existing_resources = restart_generation.is_some();
-        let restart_generation =
-            restart_generation.map_or_else(|| uuid::Uuid::new_v4().to_string(), ToOwned::to_owned);
+        let (prepared_image, prepared_identity) = match retained
+            .as_mut()
+            .and_then(|old| old.prepared_workload.take())
+        {
+            Some((image, identity)) => (Some(image), Some(identity)),
+            None => (None, None),
+        };
+        let reuse_existing_resources = retained.is_some();
+        let existing_workload_container_id = retained.as_ref().map(|old| old.workload_id);
+        let existing_token_secret = retained.as_ref().and_then(|old| old.token_secret);
+        let supervisor_image_id = retained.as_ref().and_then(|old| old.supervisor_image_id);
+        let staged_gateway_ca = retained.as_ref().and_then(|old| old.gateway_ca);
         // The same immutable gateway snapshot is verified immediately before
         // any workload/supervisor pair is admitted. Do not turn a tampered
         // artifact into a runtime-only supervisor failure.
@@ -1112,6 +1428,16 @@ impl PodmanComputeDriver {
         // invalid.
         let name = validated_container_name(sandbox)?;
         let validated = self.validated_sandbox_create(sandbox).await?;
+        let launch_authentication = sandbox
+            .spec
+            .as_ref()
+            .filter(|spec| !spec.launch_authentication.is_empty())
+            .ok_or_else(|| {
+                ComputeDriverError::Precondition(
+                    "Podman sandbox launch authentication is required".to_string(),
+                )
+            })
+            .and_then(|spec| decode_launch_authentication(&spec.launch_authentication))?;
 
         let vol_name = container::volume_name(&sandbox.id);
 
@@ -1125,66 +1451,58 @@ impl PodmanComputeDriver {
         let resolved_image = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
-                // The sandbox runtime is shipped in a standalone OCI image.
-                // The driver extracts and verifies its binary before bind-mounting
-                // it into the workload container.
-                let sandbox_runtime_pull_policy =
-                    runtime_image_pull_policy(&self.config.sandbox_runtime_image);
-                info!(
-                    image = %self.config.sandbox_runtime_image,
-                    policy = sandbox_runtime_pull_policy,
-                    "Ensuring sandbox runtime image"
-                );
-                self.client
-                    .pull_image(
-                        &self.config.sandbox_runtime_image,
-                        sandbox_runtime_pull_policy,
-                    )
-                    .await
-                    .map_err(ComputeDriverError::from)?;
+                if let Some(image) = prepared_image {
+                    return Ok(image);
+                }
+                if !reuse_existing_resources {
+                    // The driver extracts and verifies the runtime binary before
+                    // bind-mounting it into a new workload container.
+                    let sandbox_runtime_pull_policy =
+                        runtime_image_pull_policy(&self.config.sandbox_runtime_image);
+                    info!(
+                        image = %self.config.sandbox_runtime_image,
+                        policy = sandbox_runtime_pull_policy,
+                        "Ensuring sandbox runtime image"
+                    );
+                    self.client
+                        .pull_image(
+                            &self.config.sandbox_runtime_image,
+                            sandbox_runtime_pull_policy,
+                        )
+                        .await?;
+                }
 
-                let supervisor_pull_policy =
-                    runtime_image_pull_policy(&self.config.supervisor_image);
-                info!(
-                    image = %self.config.supervisor_image,
-                    policy = supervisor_pull_policy,
-                    "Ensuring supervisor image"
-                );
-                self.client
-                    .pull_image(&self.config.supervisor_image, supervisor_pull_policy)
-                    .await
-                    .map_err(ComputeDriverError::from)?;
+                if supervisor_image_id.is_none() {
+                    let pull_policy = runtime_image_pull_policy(&self.config.supervisor_image);
+                    info!(
+                        image = %self.config.supervisor_image,
+                        policy = pull_policy,
+                        "Ensuring supervisor image"
+                    );
+                    self.client
+                        .pull_image(&self.config.supervisor_image, pull_policy)
+                        .await?;
+                }
 
                 // Podman does not pull the sandbox image on container creation.
-                let image = container::resolve_image(sandbox, &self.config);
-                if image.is_empty() {
-                    return Err(ComputeDriverError::Precondition(
-                        "no sandbox image configured: set default_image in \
-                         [openshell.drivers.podman] or provide an image in the sandbox template"
-                            .to_string(),
-                    ));
+                let image = self.required_sandbox_image(sandbox)?;
+                if let Some(existing) = existing_workload_container_id {
+                    // The retained workload already has its runtime binary and
+                    // image mounts. Resolve its pinned metadata for the supervisor.
+                    return self.resolve_retained_workload_image(existing, image).await;
                 }
+
                 let pull_policy = podman_image_pull_policy(self.config.image_pull_policy);
-                let resolved_image = if let Some(existing) = existing_workload_container_id {
-                    self.resolve_retained_workload_image(existing, image).await?
-                } else {
-                    info!(image = %image, policy = %pull_policy, "Ensuring sandbox image");
-                    self.client
-                        .pull_image(image, pull_policy)
-                        .await
-                        .map_err(ComputeDriverError::from)?;
-                    let inspected_image = self
-                        .client
-                        .inspect_image(image)
-                        .await
-                        .map_err(ComputeDriverError::from)?;
-                    if inspected_image.id.is_empty() {
-                        return Err(ComputeDriverError::Precondition(format!(
-                            "podman image '{image}' inspection did not return an immutable image ID"
-                        )));
-                    }
-                    container::ResolvedPodmanImage::from_inspect(image, inspected_image)?
-                };
+                info!(image = %image, policy = %pull_policy, "Ensuring sandbox image");
+                self.client.pull_image(image, pull_policy).await?;
+                let inspected_image = self.client.inspect_image(image).await?;
+                if inspected_image.id.is_empty() {
+                    return Err(ComputeDriverError::Precondition(format!(
+                        "podman image '{image}' inspection did not return an immutable image ID"
+                    )));
+                }
+                let resolved_image =
+                    container::ResolvedPodmanImage::from_inspect(image, inspected_image)?;
 
                 for mount_image in container::podman_driver_image_mount_sources(
                     sandbox,
@@ -1223,41 +1541,92 @@ impl PodmanComputeDriver {
             .resolved_host_gateway_ip()
             .map_err(ComputeDriverError::from)?;
 
-        let identity = self
-            .resolve_workload_identity(sandbox, &resolved_image.id, &resolved_image.oci_user)
-            .await?;
+        let identity = match prepared_identity {
+            Some(identity) => identity,
+            None => {
+                self.resolve_workload_identity(
+                    sandbox,
+                    &resolved_image.id,
+                    &resolved_image.oci_user,
+                )
+                .await?
+            }
+        };
         let channel_volume = crate::isolation::channel_volume_name(&sandbox.id);
         let control_volume = crate::isolation::control_volume_name(&sandbox.id);
         let mut runtime_config = self.config.clone();
-        runtime_config.sandbox_runtime_image = self
-            .client
-            .inspect_image(&self.config.sandbox_runtime_image)
-            .await?
-            .id;
-        if runtime_config.sandbox_runtime_image.is_empty() {
-            return Err(ComputeDriverError::Precondition(
-                "sandbox runtime image inspection returned no immutable image ID".into(),
-            ));
+        if !reuse_existing_resources {
+            runtime_config.sandbox_runtime_image = self
+                .client
+                .inspect_image(&self.config.sandbox_runtime_image)
+                .await?
+                .id;
+            if runtime_config.sandbox_runtime_image.is_empty() {
+                return Err(ComputeDriverError::Precondition(
+                    "sandbox runtime image inspection returned no immutable image ID".into(),
+                ));
+            }
         }
-        runtime_config.supervisor_image = self
-            .client
-            .inspect_image(&self.config.supervisor_image)
-            .await?
-            .id;
+        runtime_config.supervisor_image = match supervisor_image_id {
+            Some(id) => id.to_string(),
+            None => {
+                self.client
+                    .inspect_image(&self.config.supervisor_image)
+                    .await?
+                    .id
+            }
+        };
         if runtime_config.supervisor_image.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "supervisor image inspection returned no immutable image ID".into(),
             ));
         }
+        if !reuse_existing_resources
+            && launch_authentication
+                .supervisor
+                .provider_spiffe_id
+                .is_some()
+        {
+            self.probe_provider_supervisor(&runtime_config.supervisor_image, Some(&identity))
+                .await?;
+        }
+
+        let fresh_proxy_auth = if reuse_existing_resources {
+            None
+        } else {
+            read_sandbox_proxy_auth(&self.config).await?
+        };
+        let fresh_proxy_name = container::proxy_auth_secret_name(&sandbox.id);
+        let proxy_auth = retained
+            .as_ref()
+            .and_then(|old| old.proxy_auth)
+            .or_else(|| {
+                fresh_proxy_auth
+                    .as_deref()
+                    .map(|credential| (fresh_proxy_name.as_str(), credential))
+            });
+        if let Some(retained) = &retained
+            && let Some(mutation) = retained.mutation
+        {
+            // A replay before this point can restore the renamed predecessor
+            // without undoing any write to the retained sandbox's resources.
+            let stage = match retained.predecessor {
+                Some(predecessor) => PodmanLaunchStage::Replacing {
+                    predecessor: predecessor.to_string(),
+                },
+                None => PodmanLaunchStage::Mutating,
+            };
+            mutation.record(retained.workload_id, stage).await?;
+        }
 
         // Create the workspace volume and per-sandbox runtime files. During a
-        // stopped trust replacement, retain the named resources belonging to
+        // stopped supervisor replacement, retain the named resources belonging to
         // the old pair and reuse its resolver/token secrets.
         let (
             resolver_secret_name,
             resolver_secret_owned,
             token_secret_name,
-            proxy_auth_secret_name,
+            owned_proxy_auth_secret,
         ) = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
@@ -1281,7 +1650,8 @@ impl PodmanComputeDriver {
                         .map_err(ComputeDriverError::from)?
                     {
                         return Err(ComputeDriverError::Precondition(
-                            "Podman trust replacement requires the existing resolver secret".into(),
+                            "Podman supervisor replacement requires the existing resolver secret"
+                                .into(),
                         ));
                     }
                     false
@@ -1317,38 +1687,34 @@ impl PodmanComputeDriver {
                         }
                     }
                 };
-                let proxy_auth_secret_name =
-                    match create_sandbox_proxy_auth_secret(&self.client, &self.config, sandbox)
-                        .await
-                    {
-                        Ok(name) => name,
-                        Err(e) => {
-                            if !reuse_existing_resources && managed_workspace {
-                                let _ = self
-                                    .client
-                                    .remove_owned_volume(&vol_name, &sandbox.id)
-                                    .await;
-                            }
-                            if existing_token_secret.is_none()
-                                && let Some(secret) = token_secret_name.as_deref()
-                            {
-                                cleanup_sandbox_token_secret(&self.client, secret).await;
-                            }
-                            if resolver_secret_owned {
-                                cleanup_sandbox_resolver_secret(
-                                    &self.client,
-                                    &resolver_secret_name,
-                                )
+                let proxy_auth_secret =
+                    create_sandbox_proxy_auth_secret(&self.client, proxy_auth).await;
+                let owned_proxy_auth_secret = match proxy_auth_secret {
+                    Ok(name) => name,
+                    Err(e) => {
+                        if !reuse_existing_resources && managed_workspace {
+                            let _ = self
+                                .client
+                                .remove_owned_volume(&vol_name, &sandbox.id)
                                 .await;
-                            }
-                            return Err(e);
                         }
-                    };
+                        if existing_token_secret.is_none()
+                            && let Some(secret) = token_secret_name.as_deref()
+                        {
+                            cleanup_sandbox_token_secret(&self.client, secret).await;
+                        }
+                        if resolver_secret_owned {
+                            cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name)
+                                .await;
+                        }
+                        return Err(e);
+                    }
+                };
                 Ok((
                     resolver_secret_name,
                     resolver_secret_owned,
                     token_secret_name,
-                    proxy_auth_secret_name,
+                    owned_proxy_auth_secret,
                 ))
             }
             .await;
@@ -1363,7 +1729,7 @@ impl PodmanComputeDriver {
         .await?;
 
         // Clean up the volume and per-sandbox secrets on any failure past this
-        // point. Resources retained for a stopped trust replacement are left
+        // point. Resources retained for a stopped supervisor replacement are left
         // intact so the rollback path can restore the old pair.
         let channel_owned = std::sync::atomic::AtomicBool::new(false);
         let control_owned = std::sync::atomic::AtomicBool::new(false);
@@ -1396,7 +1762,7 @@ impl PodmanComputeDriver {
             {
                 cleanup_sandbox_token_secret(&self.client, secret).await;
             }
-            if let Some(secret) = proxy_auth_secret_name.as_deref() {
+            if let Some(secret) = owned_proxy_auth_secret.as_deref() {
                 cleanup_sandbox_proxy_auth_secret(&self.client, secret).await;
             }
         };
@@ -1405,66 +1771,43 @@ impl PodmanComputeDriver {
         async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
-                let gpu_devices = match self.resolve_gpu_cdi_devices(
-                    validated.gpu_requirements,
-                    &validated.driver_config,
-                    CdiGpuDefaultSelector::next_device_ids,
-                ) {
-                    Ok(devices) => devices,
-                    Err(e) => {
-                        cleanup_created().await;
-                        return Err(e);
-                    }
-                };
-                // Podman's image-volume support varies across libpod/runtime
-                // combinations. Always use the verified extraction cache so
-                // workload startup does not depend on type=image mounts.
-                let supervisor_bin_path =
-                    match extract_sandbox_bin(&self.client, &runtime_config).await {
-                        Ok(path) => Some(path),
+                let (gpu_devices, supervisor_bin_path) = if reuse_existing_resources {
+                    (None, None)
+                } else {
+                    let gpu_devices = match self.resolve_gpu_cdi_devices(
+                        validated.gpu_requirements,
+                        &validated.driver_config,
+                        CdiGpuDefaultSelector::next_device_ids,
+                    ) {
+                        Ok(devices) => devices,
                         Err(e) => {
                             cleanup_created().await;
                             return Err(e);
                         }
                     };
-
-                let tls_secret_names = self
-                    .config
-                    .tls_enabled()
-                    .then(|| container::tls_secret_names(&sandbox.id));
-                let tls_secrets_owned = if let Some(names) = &tls_secret_names {
-                    if reuse_existing_resources {
-                        // The renamed stopped pair still owns the per-sandbox
-                        // TLS secret under the same sandbox id, and the
-                        // gateway CA it carries is unchanged; the replacement
-                        // pair reuses it instead of colliding on the name.
-                        if !self
-                            .client
-                            .secret_exists(&names[0])
-                            .await
-                            .map_err(ComputeDriverError::from)?
-                        {
-                            return Err(ComputeDriverError::Precondition(
-                                "Podman trust replacement requires the existing TLS CA secret"
-                                    .into(),
-                            ));
-                        }
-                        false
-                    } else {
-                        if let Err(e) = create_tls_secrets(&self.client, &self.config, names).await
-                        {
+                    // Use the verified extraction cache so a new workload does
+                    // not depend on Podman's image-volume support.
+                    let supervisor_bin_path = match extract_sandbox_bin(&self.client, &runtime_config).await {
+                        Ok(path) => path,
+                        Err(e) => {
                             cleanup_created().await;
                             return Err(e);
                         }
-                        true
-                    }
-                } else {
-                    false
+                    };
+                    (gpu_devices, Some(supervisor_bin_path))
                 };
 
+                let tls_secret_names = (self.config.tls_enabled() && !reuse_existing_resources)
+                    .then(|| container::tls_secret_names(&sandbox.id));
+                if let Some(names) = &tls_secret_names
+                    && let Err(error) = create_tls_secrets(&self.client, &self.config, names).await
+                {
+                    cleanup_created().await;
+                    return Err(error);
+                }
                 let cleanup_all = || async {
                     cleanup_created().await;
-                    if tls_secrets_owned && let Some(names) = &tls_secret_names {
+                    if let Some(names) = &tls_secret_names {
                         cleanup_tls_secrets(&self.client, names).await;
                     }
                 };
@@ -1478,6 +1821,7 @@ impl PodmanComputeDriver {
                     image: &resolved_image,
                     supervisor_bin: supervisor_bin_path.as_deref(),
                     tls_secrets: tls_secret_names.as_ref(),
+                    staged_gateway_ca: staged_gateway_ca.is_some(),
                     network_trust: self.network_trust.as_ref(),
                     identity: &identity,
                 });
@@ -1488,12 +1832,17 @@ impl PodmanComputeDriver {
                         return Err(e);
                     }
                 };
+                if let Some(secret) = owned_proxy_auth_secret.as_deref() {
+                    specs.set_proxy_auth_secret(secret);
+                }
                 let mut created_workload = None;
                 let mut created_supervisor = None;
+                let mut previous_channel = None;
+                let mut workload_start_attempted = false;
                 let create_result = async {
-                    let identities = self.validate_user_volume_mounts_available(sandbox).await?;
-                    specs.record_resource_identities(&identities)?;
                     if !reuse_existing_resources {
+                        let identities = self.validate_user_volume_mounts_available(sandbox).await?;
+                        specs.record_resource_identities(&identities)?;
                         self.client
                             .create_owned_volume(
                                 &channel_volume,
@@ -1513,7 +1862,7 @@ impl PodmanComputeDriver {
                             .await?;
                         control_owned.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    // Supervisor-only trust reconciliation reuses the stopped
+                    // Supervisor-only reconciliation reuses the stopped
                     // workload container together with its volumes, secrets,
                     // and workspace data. Only the supervisor is replaced.
                     let workload_id = if let Some(existing) = existing_workload_container_id {
@@ -1526,24 +1875,21 @@ impl PodmanComputeDriver {
                     self.client.verify_isolation_fence(&workload_id).await?;
                     self.admit_container_resources(&workload_id).await?;
                     let child_env = podman_child_environment(sandbox, &resolved_image.environment);
-                    let launch_authentication = sandbox
-                        .spec
-                        .as_ref()
-                        .filter(|spec| !spec.launch_authentication.is_empty())
-                        .ok_or_else(|| {
-                            ComputeDriverError::Precondition(
-                                "Podman sandbox launch authentication is required".to_string(),
-                            )
-                        })
-                        .and_then(|spec| {
-                            decode_launch_authentication(&spec.launch_authentication)
-                        })?;
+                    if let Some(launch_spiffe_id) =
+                        &launch_authentication.supervisor.provider_launch_spiffe_id
+                    {
+                        specs.record_provider_launch(launch_spiffe_id);
+                    }
+                    let restart_generation = retained.as_ref().map_or(
+                        launch_authentication.supervisor.runtime_generation.as_str(),
+                        |old| old.generation,
+                    );
                     let archives = crate::isolation::bootstrap_archives(
                         crate::isolation::BootstrapArchivesInput {
                             runtime_initiated: true,
                             sandbox_id: &sandbox.id,
                             container_id: &workload_id,
-                            generation: &restart_generation,
+                            generation: restart_generation,
                             host_gateway_ip,
                             identity: &identity,
                             allow_extra_supplementary_groups:
@@ -1552,8 +1898,17 @@ impl PodmanComputeDriver {
                                 ),
                             child_env,
                             launch_authentication: &launch_authentication,
+                            gateway_ca: staged_gateway_ca,
                         },
                     )?;
+                    if existing_workload_container_id.is_some() {
+                        // Libpod includes the directory basename in a download.
+                        // Replay the archive at the channel root on failure.
+                        let snapshot = self.client
+                            .copy_from_container(&workload_id, crate::isolation::CHANNEL_SANDBOX_DIR)
+                            .await?;
+                        previous_channel = Some(crate::isolation::channel_rollback_archive(&snapshot)?);
+                    }
                     self.client
                         .copy_to_container(
                             &workload_id,
@@ -1561,7 +1916,9 @@ impl PodmanComputeDriver {
                             archives.channel,
                         )
                         .await?;
-                    if let Some(control) = archives.control {
+                    if existing_workload_container_id.is_none()
+                        && let Some(control) = archives.control
+                    {
                         self.client
                             .copy_to_container(
                                 &workload_id,
@@ -1583,26 +1940,78 @@ impl PodmanComputeDriver {
                     self.client
                         .copy_to_container(&supervisor_id, "/", archives.supervisor)
                         .await?;
-                    // Start the sandbox only after both containers and their
-                    // bootstrap material exist. It keeps the agent stopped
-                    // until the authenticated supervisor confirms the boundary.
+                    // The agent waits until the authenticated supervisor confirms the boundary.
+                    workload_start_attempted = true;
                     self.client.start_container(&workload_id).await?;
                     self.client.start_container(&supervisor_id).await?;
+                    if previous_channel.is_some() {
+                        tokio::time::timeout(
+                            crate::client::API_TIMEOUT,
+                            self.wait_for_supervisor_ready(&workload_id, &supervisor_id),
+                        )
+                        .await
+                        .map_err(|_| ComputeDriverError::Message(
+                            "replacement Podman supervisor did not become ready within the Podman API timeout".into(),
+                        ))??;
+                    }
                     Ok::<(), ComputeDriverError>(())
                 }
                 .await;
-                if create_result.is_err() {
+                if let Err(error) = create_result {
+                    let journaled = retained.as_ref().is_some_and(|old| old.mutation.is_some());
+                    let mut removal_error = None;
                     for id in [created_supervisor, created_workload].into_iter().flatten() {
-                        let _ = self.client.remove_container(&id, 0).await;
+                        if let Err(error) = self.client.remove_container(&id, 0).await
+                            && !matches!(error, PodmanApiError::NotFound(_))
+                        {
+                            removal_error = Some((id, error));
+                        }
                     }
-                }
-                match create_result {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        cleanup_all().await;
-                        Err(e)
+                    let restore = async {
+                        if let (Some(workload), Some(channel)) =
+                            (existing_workload_container_id, previous_channel)
+                        {
+                            if workload_start_attempted {
+                                let state = self.client.inspect_container(workload).await?.state;
+                                if state.running {
+                                    self.client.stop_container(workload, 0).await?;
+                                }
+                                if state.running || state.status == "stopping" {
+                                    let finished_at = self
+                                        .wait_for_container_stopped(&sandbox.id, workload)
+                                        .await?;
+                                    self.lifecycle_event_fences.record_previous_exit(
+                                        &sandbox.id,
+                                        finished_at.as_deref(),
+                                    );
+                                }
+                            }
+                            self.client
+                                .copy_to_container(workload, crate::isolation::CHANNEL_ROOT, channel)
+                                .await?;
+                        }
+                        Ok::<(), ComputeDriverError>(())
                     }
+                    .await;
+                    cleanup_all().await;
+                    if let Err(restore_error) = restore {
+                        let message = format!(
+                            "Podman supervisor replacement failed: {error}. Could not restore workload channel credentials: {restore_error}"
+                        );
+                        return Err(if journaled {
+                            ComputeDriverError::BackendUnavailable(message)
+                        } else {
+                            ComputeDriverError::Message(message)
+                        });
+                    }
+                    if let Some((id, removal_error)) = removal_error {
+                        return Err(ComputeDriverError::BackendUnavailable(format!(
+                            "Podman sandbox provisioning failed: {error}. Could not remove container {id}: {removal_error}"
+                        )));
+                    }
+                    return Err(error);
                 }
+                Ok(())
             }
             .await;
             phase_status.finish(result)
@@ -1643,7 +2052,9 @@ impl PodmanComputeDriver {
             .inspect_container(existing_workload_container_id)
             .await
             .map_err(ComputeDriverError::from)?;
-        let pinned_image = workload.config.image;
+        // Libpod may supply the image's first tag in Config.Image, even
+        // when the container was created by ID. Image pins the rootfs.
+        let pinned_image = workload.image;
         if pinned_image.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "retained Podman workload does not record its pinned image ID".into(),
@@ -1664,6 +2075,21 @@ impl PodmanComputeDriver {
             )));
         }
         container::ResolvedPodmanImage::from_inspect(requested_image, inspected_image)
+    }
+
+    fn required_sandbox_image<'a>(
+        &'a self,
+        sandbox: &'a DriverSandbox,
+    ) -> Result<&'a str, ComputeDriverError> {
+        let image = container::resolve_image(sandbox, &self.config);
+        if image.is_empty() {
+            return Err(ComputeDriverError::Precondition(
+                "no sandbox image configured: set default_image in \
+                 [openshell.drivers.podman] or provide an image in the sandbox template"
+                    .to_string(),
+            ));
+        }
+        Ok(image)
     }
 
     /// Resolve image accounts without executing any image-supplied program.
@@ -1770,7 +2196,7 @@ impl PodmanComputeDriver {
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(ComputeDriverError::Message(format!(
+                return Err(ComputeDriverError::BackendUnavailable(format!(
                     "container {container_id} for sandbox {sandbox_id} did not finish stopping within {timeout:?} (last state: {})",
                     inspect.state.status,
                 )));
@@ -1801,86 +2227,292 @@ impl PodmanComputeDriver {
             Ok(()) | Err(PodmanApiError::NotFound(_)) => {}
             Err(error) => return Err(error.into()),
         }
-        let container = container.ok_or(ComputeDriverError::NotFound)?;
-        let container_id = container.id;
-        if container.state == "stopping" {
-            let result = async {
-                let finished_at = self
-                    .wait_for_container_stopped(sandbox_id, &container_id)
-                    .await?;
-                self.lifecycle_event_fences
-                    .record_previous_exit(sandbox_id, finished_at.as_deref());
-                Ok(())
-            }
-            .await;
-            return span_status.finish(result);
-        }
-        if container.state != "running" {
-            return span_status.finish(Ok(()));
-        }
-        info!(sandbox_id = %sandbox_id, container = %container_id, "Stopping sandbox container");
-
-        let result = async {
-            self.client
-                .stop_container(&container_id, self.config.stop_timeout_secs)
-                .await
-                .map_err(ComputeDriverError::from)?;
-
-            // Podman can return from the stop request before inspect reports the
-            // container as exited. If start runs during that interval, the exit
-            // event from the previous run can arrive after the gateway has moved
-            // the same sandbox to Starting, causing it to regress to Error. Wait
-            // for the terminal container state before allowing a restart.
-            let finished_at = self
-                .wait_for_container_stopped(sandbox_id, &container_id)
-                .await?;
-
-            // Record the completed run before returning the stop RPC. The server
-            // may begin a restart as soon as this method returns, while Podman's
-            // stop/die event can still be queued. Recording the fence here keeps
-            // that delayed event from regressing the new run from Starting to
-            // Error. Keep the start-side recording as a fallback for restarts
-            // after a driver or gateway process restart.
-            self.lifecycle_event_fences
-                .record_previous_exit(sandbox_id, finished_at.as_deref());
-            Ok(())
-        }
-        .await;
-        span_status.finish(result)
+        span_status.finish(
+            self.stop_located_workload(sandbox_id, container, false)
+                .await,
+        )
     }
 
-    /// Whether the trusted supervisor of a sandbox predates the gateway's
-    /// current destination-trust bundle. A missing supervisor or a missing
-    /// generation label (a supervisor created before this labeling existed)
-    /// counts as stale: only the supervisor is recreated to refresh it, never
-    /// the workload or its data.
-    async fn supervisor_network_trust_stale(
+    async fn stop_located_workload(
         &self,
         sandbox_id: &str,
-    ) -> Result<bool, ComputeDriverError> {
+        container: Option<ContainerListEntry>,
+        ordered: bool,
+    ) -> Result<(), ComputeDriverError> {
+        let container = container.ok_or(ComputeDriverError::NotFound)?;
+        let container_id = container.id;
+        if !ordered && !matches!(container.state.as_str(), "running" | "stopping") {
+            return Ok(());
+        }
+        let finished_at = if container.state == "paused" {
+            self.kill_paused_and_wait(sandbox_id, &container_id).await?
+        } else {
+            if container.state != "stopping" {
+                info!(sandbox_id = %sandbox_id, container = %container_id, "Stopping sandbox container");
+                self.client
+                    .stop_container(&container_id, self.config.stop_timeout_secs)
+                    .await?;
+            }
+            self.wait_for_container_stopped(sandbox_id, &container_id)
+                .await?
+        };
+        // Wait for the terminal state because Podman can return before inspect
+        // reports the container as exited. Record the exit so a queued event
+        // cannot change the next run from Starting to Error.
+        self.lifecycle_event_fences
+            .record_previous_exit(sandbox_id, finished_at.as_deref());
+        Ok(())
+    }
+
+    async fn kill_paused_and_wait(
+        &self,
+        sandbox_id: &str,
+        container_id: &str,
+    ) -> Result<Option<String>, ComputeDriverError> {
+        // Kill a paused container without letting its processes resume.
+        self.client.kill_paused_container(container_id).await?;
+        self.wait_for_container_stopped(sandbox_id, container_id)
+            .await
+    }
+
+    async fn local_supervisor_image_id(&self) -> Result<Option<String>, ComputeDriverError> {
+        let inspected = match self
+            .client
+            .inspect_image(&self.config.supervisor_image)
+            .await
+        {
+            Err(PodmanApiError::NotFound(_)) => return Ok(None),
+            result => result?,
+        };
+        if inspected.id.is_empty() {
+            return Err(ComputeDriverError::Precondition(
+                "supervisor image inspection returned no immutable image ID".into(),
+            ));
+        }
+        Ok(Some(inspected.id))
+    }
+
+    async fn qualify_provider_workload_identity(&self) -> Result<(), ComputeDriverError> {
+        let validate = || {
+            use openshell_core::grpc_client::{
+                token_grant_gateway_endpoint, validate_attested_token_grant_transport,
+            };
+            let endpoint = token_grant_gateway_endpoint(&self.config.grpc_endpoint)?;
+            validate_attested_token_grant_transport(&endpoint)
+        };
+        validate().map_err(|_| ComputeDriverError::Precondition(
+            "verified provider workload identity needs a Podman supervisor gateway endpoint using HTTPS or a numeric loopback HTTP address".into(),
+        ))?;
+
+        let image = self
+            .resolve_provider_supervisor_image(self.local_supervisor_image_id().await?)
+            .await?;
+        self.probe_provider_supervisor(&image, None).await
+    }
+
+    async fn resolve_provider_supervisor_image(
+        &self,
+        local: Option<String>,
+    ) -> Result<String, ComputeDriverError> {
+        let image = &self.config.supervisor_image;
+        let selected = if local.is_none() || supervisor_image_should_refresh(image) {
+            match self
+                .client
+                .pull_image(image, runtime_image_pull_policy(image))
+                .await
+            {
+                Ok(()) => self.local_supervisor_image_id().await?,
+                Err(error) if local.is_some() => {
+                    warn!(%error, %image, "Verifying cached Podman supervisor image after refresh failed");
+                    local
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            local
+        };
+        selected.ok_or_else(|| {
+            ComputeDriverError::Precondition(format!(
+                "supervisor image '{image}' is missing after pull"
+            ))
+        })
+    }
+
+    async fn probe_provider_supervisor(
+        &self,
+        image_id: &str,
+        identity: Option<&openshell_isolation_interface::contract::ResolvedWorkloadIdentity>,
+    ) -> Result<(), ComputeDriverError> {
+        let probe_id = uuid::Uuid::new_v4();
+        // The startup probe tests the image's socket-check command with an
+        // absent path. Launch probes test the real mount in the engine under
+        // the UID, groups, and user namespace of the actual supervisor.
+        let mut spec = serde_json::json!({
+            "name": format!("openshell-provider-probe-{probe_id}"),
+            "image": image_id,
+            "entrypoint": [container::SUPERVISOR_IMAGE_ENTRYPOINT],
+            "command": [PROVIDER_WORKLOAD_IDENTITY_PROBE, format!("/.openshell-provider-probe-{probe_id}")],
+            "netns": {"nsmode": "none"},
+            "cap_drop": ["ALL"],
+            "no_new_privileges": true,
+            "read_only_filesystem": true,
+            "healthconfig": {"test": ["NONE"]},
+            "work_dir": "/",
+        });
+        if let Some(identity) = identity {
+            let missing_socket = || {
+                ComputeDriverError::Precondition(
+                    "Podman provider Workload API socket is not configured".into(),
+                )
+            };
+            let socket = self
+                .config
+                .provider_spiffe_workload_api_socket
+                .as_deref()
+                .ok_or_else(missing_socket)?;
+            let projected = projected_provider_spiffe_socket_path(socket)
+                .map_err(ComputeDriverError::Precondition)?;
+            let mount = container::provider_spiffe_workload_api_socket_mount(&self.config)
+                .ok_or_else(missing_socket)?;
+            let (user, groups, userns) = container::supervisor_process_identity(identity);
+            spec["command"] = serde_json::json!([PROVIDER_WORKLOAD_IDENTITY_PROBE, projected]);
+            spec["mounts"] = serde_json::json!([mount]);
+            spec["user"] = serde_json::json!(user);
+            spec["groups"] = serde_json::json!(groups);
+            spec["userns"] = serde_json::json!(userns);
+        }
+        let probe = self.client.create_typed_container(&spec).await?;
+        let status = async {
+            self.client.start_container(&probe).await?;
+            self.client.wait_for_container_exit(&probe).await
+        }
+        .await;
+        let cleanup = self.client.remove_container(&probe, 0).await;
+        match (identity.is_some(), status?) {
+            (false, PROVIDER_WORKLOAD_SOCKET_PROBE_UNAVAILABLE)
+            | (true, PROVIDER_WORKLOAD_SOCKET_PROBE_PRESENT) => {}
+            (true, PROVIDER_WORKLOAD_SOCKET_PROBE_UNAVAILABLE) => {
+                return Err(ComputeDriverError::Precondition(
+                    "Podman supervisor cannot see the configured Workload API Unix socket".into(),
+                ));
+            }
+            (_, status) => {
+                return Err(ComputeDriverError::Precondition(format!(
+                    "Podman supervisor image {image_id} did not report verified Workload API socket support (exit {status}). Select a matching supervisor image."
+                )));
+            }
+        }
+        cleanup?;
+        Ok(())
+    }
+
+    async fn wait_for_supervisor_ready(
+        &self,
+        workload: &str,
+        supervisor: &str,
+    ) -> Result<(), ComputeDriverError> {
+        // The supervisor binds its private socket after gateway admission.
+        loop {
+            if !self.client.inspect_container(workload).await?.state.running {
+                return Err(ComputeDriverError::Message(
+                    "Podman workload exited before the replacement supervisor became ready".into(),
+                ));
+            }
+            let state = self.client.inspect_container(supervisor).await?.state;
+            if !state.running {
+                return Err(ComputeDriverError::Message(format!(
+                    "replacement Podman supervisor exited before becoming ready (exit code {})",
+                    state.exit_code
+                )));
+            }
+            if self
+                .client
+                .container_path_exists(supervisor, crate::isolation::SUPERVISOR_HEALTH_SOCKET)
+                .await?
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn restart_generation(
+        &self,
+        supervisor: &str,
+        stored_generation: String,
+        expected_generation: &str,
+    ) -> Result<String, ComputeDriverError> {
+        if stored_generation == expected_generation {
+            return Ok(stored_generation);
+        }
+        // Older Create calls stored an independent UUID in restart metadata.
+        // The protected runtime descriptor already carries the gateway's
+        // generation, including for containers created before this change.
+        let archive = self
+            .client
+            .copy_from_container(supervisor, crate::isolation::RUNTIME_DESCRIPTOR_PATH)
+            .await?;
+        let bytes = extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
+        let descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                ComputeDriverError::Precondition(format!(
+                    "invalid Podman runtime descriptor: {error}"
+                ))
+            })?;
+        Ok(descriptor.generation)
+    }
+
+    /// Compare the supervisor's SPIFFE settings and any requested trust
+    /// generation with the current launch.
+    async fn supervisor_configuration(
+        &self,
+        sandbox_id: &str,
+        requires_provider_spiffe_id: bool,
+        expected_launch_spiffe_id: Option<&str>,
+        expected_trust_generation: Option<&str>,
+        expected_image_id: Option<&str>,
+    ) -> Result<SupervisorConfiguration, ComputeDriverError> {
         let supervisor = crate::isolation::supervisor_name(sandbox_id);
         match self.client.inspect_container(&supervisor).await {
-            Ok(inspect) => Ok(inspect
-                .config
-                .labels
-                .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
-                .map(String::as_str)
-                != Some(self.expected_network_trust_generation())),
-            Err(PodmanApiError::NotFound(_)) => Ok(true),
+            Ok(inspect)
+                if expected_trust_generation.is_some_and(|expected| {
+                    inspect
+                        .config
+                        .labels
+                        .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
+                        .map(String::as_str)
+                        != Some(expected)
+                }) =>
+            {
+                Ok(SupervisorConfiguration::Stale)
+            }
+            Ok(inspect) => Ok(container::provider_spiffe_configuration(
+                &self.config,
+                &inspect,
+                requires_provider_spiffe_id,
+                expected_launch_spiffe_id,
+                expected_image_id,
+            )),
+            Err(PodmanApiError::NotFound(_))
+                if expected_trust_generation.is_some() || requires_provider_spiffe_id =>
+            {
+                Ok(SupervisorConfiguration::Stale)
+            }
+            Err(PodmanApiError::NotFound(_)) => Ok(SupervisorConfiguration::Current),
             Err(error) => Err(error.into()),
         }
     }
 
-    /// Recreate only the trusted supervisor of a stopped pair so the start
-    /// picks up the gateway's current destination-trust bundle. The workload
-    /// container, its volumes, its secrets, and its workspace data are never
-    /// replaced: the additional CA bundle is mounted only into the supervisor.
-    async fn replace_supervisor_for_network_trust(
+    /// Recreate the trusted supervisor of a retained pair with the current
+    /// operator configuration. Reuse the workload container and its resources.
+    async fn replace_supervisor(
         &self,
         old_workload: &ContainerListEntry,
         durable_sandbox: &DriverSandbox,
         generation: &openshell_core::sandbox_generation::SandboxGenerationId,
         encoded_authentication: &[u8],
+        supervisor_image_id: Option<&str>,
+        mutation: Option<&PodmanLaunchMutation>,
     ) -> Result<(), ComputeDriverError> {
         if durable_sandbox.id
             != old_workload
@@ -1894,13 +2526,12 @@ impl PodmanComputeDriver {
         }
         if durable_sandbox.name.is_empty() || durable_sandbox.spec.is_none() {
             return Err(ComputeDriverError::Precondition(
-                "a durable sandbox provisioning snapshot is required for Podman supervisor trust reconciliation".into(),
+                "a durable sandbox provisioning snapshot is required to replace a Podman supervisor".into(),
             ));
         }
         if encoded_authentication.is_empty() {
             return Err(ComputeDriverError::Precondition(
-                "fresh launch authentication is required for Podman supervisor trust reconciliation"
-                    .into(),
+                "fresh launch authentication is required to replace a Podman supervisor".into(),
             ));
         }
         // Validate all untrusted fields before changing the old supervisor.
@@ -1910,28 +2541,87 @@ impl PodmanComputeDriver {
 
         let canonical_supervisor = crate::isolation::supervisor_name(&durable_sandbox.id);
         let previous_supervisor = match self.client.inspect_container(&canonical_supervisor).await {
-            Ok(inspect) if inspect.state.running => {
+            Ok(inspect)
+                if is_sandbox_member(&inspect, &durable_sandbox.id, "supervisor")
+                    && crate::client::validate_name(&inspect.id).is_ok()
+                    && inspect.id != canonical_supervisor =>
+            {
+                Some(inspect)
+            }
+            Ok(_) => {
                 return Err(ComputeDriverError::Precondition(
-                    "refusing to replace a running Podman supervisor during trust reconciliation"
-                        .into(),
+                    "Podman predecessor supervisor identity did not match the sandbox".into(),
                 ));
             }
-            Ok(inspect) => Some(inspect.id),
             Err(PodmanApiError::NotFound(_)) => None,
             Err(error) => return Err(error.into()),
         };
-
-        // Complete every remaining fallible preparation before the rename so
-        // a transient failure cannot return with the previous supervisor
-        // already moved to its rollback name, where a normal delete would
-        // never find it.
         let existing_token_name = container::token_secret_name(&durable_sandbox.id);
         let existing_token = self
             .client
             .secret_exists(&existing_token_name)
-            .await
-            .map_err(ComputeDriverError::from)?
+            .await?
             .then_some(existing_token_name.as_str());
+        let gateway_ca = if let Some(path) = &self.config.guest_tls_ca {
+            Some(tokio::fs::read(path).await.map_err(|error| {
+                ComputeDriverError::Message(format!("read TLS file '{}': {error}", path.display()))
+            })?)
+        } else {
+            None
+        };
+        let proxy_auth = read_sandbox_proxy_auth(&self.config)
+            .await
+            .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
+        let provider_launch = decode_launch_authentication(encoded_authentication)
+            .ok()
+            .and_then(|auth| auth.supervisor.provider_launch_spiffe_id)
+            .and_then(|id| id.rsplit('/').next()?.parse::<uuid::Uuid>().ok());
+        let replacement_id = provider_launch.unwrap_or_else(uuid::Uuid::new_v4);
+        let proxy_auth_secret = format!(
+            "{}-{replacement_id}",
+            container::proxy_auth_secret_name(&durable_sandbox.id)
+        );
+
+        let prepared_workload = if let Some(supervisor_image_id) = supervisor_image_id {
+            let requested_image = self.required_sandbox_image(durable_sandbox)?;
+            let image = self
+                .resolve_retained_workload_image(&old_workload.id, requested_image)
+                .await?;
+            let identity = self
+                .resolve_workload_identity(durable_sandbox, &image.id, &image.oci_user)
+                .await?;
+            self.probe_provider_supervisor(supervisor_image_id, Some(&identity))
+                .await?;
+            Some((image, identity))
+        } else {
+            None
+        };
+
+        if let Some(mutation) = mutation {
+            mutation.begin(&old_workload.id).await?;
+        }
+        if old_workload.state == "running" {
+            self.client.stop_container(&old_workload.id, 0).await?;
+        }
+        if matches!(old_workload.state.as_str(), "running" | "stopping") {
+            let finished_at = self
+                .wait_for_container_stopped(&durable_sandbox.id, &old_workload.id)
+                .await?;
+            self.lifecycle_event_fences
+                .record_previous_exit(&durable_sandbox.id, finished_at.as_deref());
+        }
+        if let Some(previous) = &previous_supervisor {
+            if previous.state.running {
+                self.client
+                    .stop_container(&previous.id, self.config.stop_timeout_secs)
+                    .await?;
+            }
+            if previous.state.running || previous.state.status == "stopping" {
+                self.wait_for_container_stopped(&durable_sandbox.id, &previous.id)
+                    .await?;
+            }
+        }
+
         let mut replacement = durable_sandbox.clone();
         replacement
             .spec
@@ -1939,81 +2629,662 @@ impl PodmanComputeDriver {
             .expect("validated durable snapshot has a spec")
             .launch_authentication = encoded_authentication.to_vec();
 
-        let supervisor_rollback_name =
-            format!("openshell-supervisor-rollback-{}", uuid::Uuid::new_v4());
-        if previous_supervisor.is_some()
-            && let Err(error) = self
-                .client
-                .rename_container(&canonical_supervisor, &supervisor_rollback_name)
+        let supervisor_rollback_name = provider_rollback_name(replacement_id);
+        if let Some(previous) = &previous_supervisor {
+            if let Some(mutation) = mutation {
+                mutation
+                    .record(
+                        &old_workload.id,
+                        PodmanLaunchStage::Renaming {
+                            predecessor: previous.id.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            self.client
+                .rename_container(&previous.id, &supervisor_rollback_name)
                 .await
-        {
-            return Err(error.into());
+                .map_err(|error| {
+                    if mutation.is_some() {
+                        // Libpod writes the name to its database before
+                        // c/storage can fail, even with a complete reply.
+                        ComputeDriverError::BackendUnavailable(error.to_string())
+                    } else {
+                        error.into()
+                    }
+                })?;
         }
 
         let provisioned = self
-            .create_sandbox_with_existing_token(
+            .provision_sandbox(
                 &replacement,
-                existing_token,
-                Some(generation.as_str()),
-                Some(&old_workload.id),
+                Some(RetainedPodmanSandbox {
+                    prepared_workload,
+                    workload_id: &old_workload.id,
+                    predecessor: previous_supervisor
+                        .as_ref()
+                        .map(|previous| previous.id.as_str()),
+                    generation: generation.as_str(),
+                    token_secret: existing_token,
+                    supervisor_image_id,
+                    gateway_ca: gateway_ca.as_deref(),
+                    proxy_auth: proxy_auth
+                        .as_deref()
+                        .map(|credential| (proxy_auth_secret.as_str(), credential)),
+                    mutation,
+                }),
             )
             .await;
         if let Err(error) = provisioned {
-            // The stopped workload and all of its resources were retained.
-            // Restore the canonical supervisor name so a failed replacement
-            // has no externally observable provisioning change.
-            if previous_supervisor.is_some()
-                && let Err(restore_error) = self
+            // Provisioning restores the retained workload's channel. Put the
+            // previous supervisor back under its canonical name for retry.
+            if let Some(previous) = &previous_supervisor {
+                if let Some(mutation) = mutation
+                    && let Some(checkpoint) = mutation.checkpoint().await.map_err(|status| {
+                        ComputeDriverError::BackendUnavailable(status.message().to_string())
+                    })?
+                    && matches!(checkpoint.stage, PodmanLaunchStage::Renaming { .. })
+                {
+                    mutation
+                        .record(
+                            &old_workload.id,
+                            PodmanLaunchStage::Restoring {
+                                predecessor: previous.id.clone(),
+                                confirming_storage: false,
+                            },
+                        )
+                        .await?;
+                }
+                if let Err(restore_error) = self
                     .client
-                    .rename_container(&supervisor_rollback_name, &canonical_supervisor)
+                    .rename_container(&previous.id, &canonical_supervisor)
                     .await
-            {
-                // The previous supervisor keeps the rollback name and must
-                // stay identifiable for operator cleanup. A later retry
-                // still succeeds: the canonical name is absent, so the
-                // replacement path recreates a fresh supervisor.
-                warn!(
-                    rollback_container = %supervisor_rollback_name,
-                    sandbox_id = %durable_sandbox.id,
-                    restore_error = %restore_error,
-                    "failed to restore the previous Podman supervisor after a failed trust refresh"
-                );
-                return Err(ComputeDriverError::Message(format!(
-                    "trust refresh failed and the previous supervisor could not be \
+                {
+                    // The previous supervisor keeps the rollback name and must
+                    // stay identifiable for operator cleanup. A later retry
+                    // still succeeds: the canonical name is absent, so the
+                    // replacement path recreates a fresh supervisor.
+                    warn!(
+                        rollback_container = %supervisor_rollback_name,
+                        sandbox_id = %durable_sandbox.id,
+                        restore_error = %restore_error,
+                        "failed to restore the previous Podman supervisor after a failed replacement"
+                    );
+                    let message = format!(
+                        "replacement failed and the previous supervisor could not be \
                      restored; the retained supervisor is named '{supervisor_rollback_name}' \
                      and can be removed manually: {restore_error}"
-                )));
+                    );
+                    return Err(if mutation.is_some() {
+                        ComputeDriverError::BackendUnavailable(message)
+                    } else {
+                        ComputeDriverError::Message(message)
+                    });
+                }
             }
             return Err(error);
         }
 
-        if previous_supervisor.is_some()
-            && let Err(error) = self
-                .client
-                .remove_container_preserving_volumes(&supervisor_rollback_name)
+        if let Some(previous) = &previous_supervisor {
+            if let Err(error) = self
+                .remove_retired_supervisor(&durable_sandbox.id, previous)
                 .await
-            && !matches!(error, PodmanApiError::NotFound(_))
-        {
-            // The replacement supervisor is running; the stopped rollback
-            // container is an identifiable orphan. Surface the failure so
-            // the orphan is not silently lost; a retry observes the fresh
-            // canonical supervisor and resumes the normal start path.
-            warn!(
-                rollback_container = %supervisor_rollback_name,
-                sandbox_id = %durable_sandbox.id,
-                remove_error = %error,
-                "failed to remove the previous Podman supervisor after a trust refresh"
-            );
-            return Err(ComputeDriverError::Message(format!(
-                "trust refresh succeeded but the previous supervisor could not be \
-                 removed; the orphaned supervisor is named '{supervisor_rollback_name}' \
-                 and can be removed manually: {error}"
-            )));
+            {
+                warn!(sandbox_id = %durable_sandbox.id, rollback_container = %supervisor_rollback_name, %error,
+                    "failed to remove the previous Podman supervisor after a replacement");
+            }
         }
         Ok(())
     }
 
+    /// Clean up the stopped predecessor after the replacement is ready.
+    async fn remove_retired_supervisor(
+        &self,
+        sandbox_id: &str,
+        predecessor: &ContainerInspect,
+    ) -> Result<(), PodmanApiError> {
+        match self
+            .client
+            .remove_container_preserving_volumes(&predecessor.id)
+            .await
+        {
+            Ok(()) | Err(PodmanApiError::NotFound(_)) => {
+                if let Some(secret) = owned_proxy_auth_secret(sandbox_id, predecessor) {
+                    cleanup_sandbox_proxy_auth_secret(&self.client, secret).await;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn start_sandbox_request(
+        &self,
+        request: StartSandboxRequest,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        if request.ordered_start_receipt_only {
+            let journal = self.provider_launch_journal(&request.sandbox_id)?;
+            return lookup_provider_launch_receipt(journal, request).await;
+        }
+        let authentication = (!request.launch_authentication.is_empty())
+            .then(|| decode_launch_authentication(&request.launch_authentication))
+            .transpose()?;
+        let launch = authentication
+            .as_ref()
+            .map(|authentication| {
+                match (
+                    authentication.supervisor.provider_spiffe_id.as_deref(),
+                    authentication
+                        .supervisor
+                        .provider_launch_spiffe_id
+                        .as_deref(),
+                ) {
+                    (Some(_), Some(launch)) => Ok(Some(launch)),
+                    (None, None) => Ok(None),
+                    _ => Err(Status::failed_precondition(
+                        "Podman provider launch requires both SPIFFE IDs",
+                    )),
+                }
+            })
+            .transpose()?
+            .flatten();
+        let Some((operation, legacy)) = ordered_provider_launch_operation(&request, launch)? else {
+            let lock = match &self.provider_launch_state {
+                Some(root) if crate::client::validate_name(&request.sandbox_id).is_ok() => {
+                    lock_existing_provider_launch(root.join(&request.sandbox_id)).await?
+                }
+                _ => None,
+            };
+            let journaled = lock.is_some();
+            let driver = self.clone();
+            let start = async move {
+                let _lock = lock;
+                driver
+                    .start_sandbox(
+                        &request.sandbox_id,
+                        &request.generation_id,
+                        &request.launch_authentication,
+                        request.sandbox.as_ref(),
+                    )
+                    .await
+            };
+            // An unordered restart of a previously verified sandbox still
+            // owns its existing journal if the requesting gateway disconnects.
+            if journaled {
+                own_provider_launch_work(start).await??;
+            } else {
+                start.await?;
+            }
+            return Ok(Response::new(StartSandboxResponse::default()));
+        };
+        if !self.provider_workload_identity_supported {
+            return Err(Status::failed_precondition(
+                "Podman driver cannot supply verified provider workload identity",
+            ));
+        }
+        let authentication = authentication.as_ref().ok_or_else(|| {
+            Status::failed_precondition("Podman provider launch requires launch authentication")
+        })?;
+        validate_ordered_start_authentication(
+            &request.sandbox_id,
+            &request.generation_id,
+            &operation,
+            authentication,
+        )?;
+        if request
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.id != request.sandbox_id)
+        {
+            return Err(Status::invalid_argument(
+                "ordered start snapshot does not match sandbox ID",
+            ));
+        }
+        let operation_id = operation.operation_id.parse::<uuid::Uuid>().map_err(|_| {
+            Status::invalid_argument("provider launch recovery requires a launch UUID")
+        })?;
+        let provider_launch_id = launch.map(str::to_owned).ok_or_else(|| {
+            Status::failed_precondition("Podman launch bundle has no provider launch SPIFFE ID")
+        })?;
+        let journal = self.provider_launch_journal(&request.sandbox_id)?;
+        let mutation = PodmanLaunchMutation {
+            path: journal.join("mutation"),
+            id: operation_id,
+        };
+        let driver = self.clone();
+        let response = replay_provider_launch(
+            journal,
+            operation,
+            request.settle_only,
+            move |replay| async move {
+                let checkpoint = mutation.checkpoint().await?;
+                if replay == ProviderLaunchReplay::Settle && checkpoint.is_none() {
+                    return Ok(Err(Status::deadline_exceeded(
+                        "Podman provider launch expired before changing the runtime",
+                    )));
+                }
+                if replay == ProviderLaunchReplay::Start
+                    || (replay == ProviderLaunchReplay::Resume && checkpoint.is_none())
+                {
+                    let started = driver
+                        .start_sandbox_recording_mutation(
+                            &request.sandbox_id,
+                            &request.generation_id,
+                            &request.launch_authentication,
+                            request.sandbox.as_ref(),
+                            Some(&mutation),
+                        )
+                        .await
+                        .map(|()| StartSandboxResponse::default())
+                        .map_err(Status::from);
+                    if started
+                        .as_ref()
+                        .err()
+                        .is_some_and(|err| err.code() == tonic::Code::Unavailable)
+                    {
+                        return Err(started.unwrap_err());
+                    }
+                    return Ok(started);
+                }
+                let checkpoint = checkpoint.ok_or_else(|| {
+                    Status::unavailable("completed Podman launch has no workload checkpoint")
+                })?;
+                if matches!(
+                    replay,
+                    ProviderLaunchReplay::Resume | ProviderLaunchReplay::Settle
+                ) && matches!(
+                    checkpoint.stage,
+                    PodmanLaunchStage::Renaming { .. }
+                        | PodmanLaunchStage::Restoring { .. }
+                        | PodmanLaunchStage::Restored { .. }
+                ) {
+                    return driver
+                        .restore_interrupted_rename(&request.sandbox_id, &mutation, checkpoint)
+                        .await;
+                }
+                driver
+                    .observe_provider_launch(
+                        &request.sandbox_id,
+                        &checkpoint,
+                        operation_id,
+                        &provider_launch_id,
+                        replay,
+                    )
+                    .await
+            },
+        )
+        .await?;
+        if legacy {
+            legacy_provider_launch_outcome(response)
+        } else {
+            Ok(response)
+        }
+    }
+
+    pub(crate) async fn stop_sandbox_request(
+        &self,
+        request: StopSandboxRequest,
+    ) -> Result<Response<StopSandboxResponse>, Status> {
+        if let Some(operation) = request.ordered_stop {
+            let journal = self.provider_launch_journal(&request.sandbox_id)?;
+            let driver = self.clone();
+            return replay_provider_stop(journal, operation, |mutation| async move {
+                driver
+                    .stop_ordered_sandbox(&request.sandbox_id, mutation)
+                    .await
+            })
+            .await;
+        }
+        self.stop_sandbox(&request.sandbox_id).await?;
+        Ok(Response::new(StopSandboxResponse::default()))
+    }
+
+    async fn stop_ordered_sandbox(
+        &self,
+        sandbox_id: &str,
+        mutation: ProviderStopMutation,
+    ) -> Result<(), Status> {
+        let container = self
+            .find_container(sandbox_id)
+            .await
+            .map_err(Status::from)?;
+        let (container, workload_inactive) = match container {
+            Some(mut container) if matches!(container.state.as_str(), "configured" | "created") => {
+                match self.client.inspect_container(&container.id).await {
+                    Ok(workload) => {
+                        if workload.id != container.id
+                            || !is_sandbox_member(&workload, sandbox_id, "sandbox")
+                        {
+                            return Err(Status::failed_precondition(
+                                "Podman workload identity did not match the sandbox",
+                            ));
+                        }
+                        // Podman can acknowledge Stop without changing a container
+                        // whose OCI process never started.
+                        container.state = workload.state.status;
+                        let inactive = !workload.state.running
+                            && matches!(container.state.as_str(), "configured" | "created");
+                        (Some(container), inactive)
+                    }
+                    Err(PodmanApiError::NotFound(_)) => (None, false),
+                    Err(error) => return Err(Status::from(ComputeDriverError::from(error))),
+                }
+            }
+            container => (container, false),
+        };
+        let supervisor_name = crate::isolation::supervisor_name(sandbox_id);
+        let supervisor = match self.client.inspect_container(&supervisor_name).await {
+            Ok(supervisor) => {
+                if !is_sandbox_member(&supervisor, sandbox_id, "supervisor")
+                    || crate::client::validate_name(&supervisor.id).is_err()
+                    || supervisor.id == supervisor_name
+                {
+                    return Err(Status::failed_precondition(
+                        "Podman supervisor identity did not match the sandbox",
+                    ));
+                }
+                let inactive = !supervisor.state.running
+                    && matches!(
+                        supervisor.state.status.as_str(),
+                        "configured" | "created" | "exited" | "stopped"
+                    );
+                let paused = supervisor.state.status == "paused";
+                (!inactive).then_some((supervisor.id, paused))
+            }
+            Err(PodmanApiError::NotFound(_)) => None,
+            Err(error) => return Err(Status::from(ComputeDriverError::from(error))),
+        };
+        if supervisor.is_some()
+            || (!workload_inactive
+                && container
+                    .as_ref()
+                    .is_some_and(|item| item.state != "stopping"))
+        {
+            mutation.begin().await?;
+        }
+        if let Some((supervisor, paused)) = supervisor {
+            let stopped = if paused {
+                match self.kill_paused_and_wait(sandbox_id, &supervisor).await {
+                    Ok(_) | Err(ComputeDriverError::NotFound) => true,
+                    Err(error) => {
+                        return Err(Status::unavailable(format!(
+                            "Podman paused supervisor stop outcome is unknown: {error}"
+                        )));
+                    }
+                }
+            } else {
+                stop_provider_container(&self.client, &supervisor, self.config.stop_timeout_secs)
+                    .await
+            };
+            if !stopped {
+                return Err(Status::unavailable(
+                    "Podman supervisor stop outcome is unknown",
+                ));
+            }
+        }
+        if workload_inactive {
+            return Ok(());
+        }
+        self.stop_located_workload(sandbox_id, container, true)
+            .await
+            .map_err(|error| match error {
+                ComputeDriverError::NotFound => {
+                    Status::not_found("Podman sandbox workload is absent")
+                }
+                error => {
+                    Status::unavailable(format!("Podman workload stop outcome is unknown: {error}"))
+                }
+            })
+    }
+
+    fn provider_launch_journal(&self, sandbox_id: &str) -> Result<PathBuf, Status> {
+        crate::client::validate_name(sandbox_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let directory = self.provider_launch_state.as_ref().ok_or_else(|| {
+            Status::failed_precondition("Podman provider launch state is unavailable")
+        })?;
+        Ok(directory.join(sandbox_id))
+    }
+
+    async fn restore_interrupted_rename(
+        &self,
+        sandbox_id: &str,
+        mutation: &PodmanLaunchMutation,
+        checkpoint: PodmanLaunchCheckpoint,
+    ) -> Result<Result<StartSandboxResponse, Status>, Status> {
+        let predecessor = match &checkpoint.stage {
+            PodmanLaunchStage::Renaming { predecessor }
+            | PodmanLaunchStage::Restoring { predecessor, .. }
+            | PodmanLaunchStage::Restored { predecessor } => predecessor,
+            PodmanLaunchStage::Mutating | PodmanLaunchStage::Replacing { .. } => {
+                return Err(Status::unavailable(
+                    "Podman replacement has later engine effects",
+                ));
+            }
+        };
+        let unavailable = |error: PodmanApiError| Status::unavailable(error.to_string());
+        let workload = self
+            .client
+            .inspect_container(&checkpoint.workload)
+            .await
+            .map_err(unavailable)?;
+        let prior = self
+            .client
+            .inspect_container(predecessor)
+            .await
+            .map_err(unavailable)?;
+        if workload.id != checkpoint.workload
+            || prior.id != *predecessor
+            || !container_is_stopped(&workload)
+            || !container_is_stopped(&prior)
+        {
+            return Err(Status::unavailable(
+                "could not confirm the stopped Podman workload and predecessor",
+            ));
+        }
+        let canonical = crate::isolation::supervisor_name(sandbox_id);
+        let rollback = provider_rollback_name(mutation.id);
+        let current_name = prior.name.trim_start_matches('/');
+        let confirming_storage = if matches!(checkpoint.stage, PodmanLaunchStage::Renaming { .. })
+            && current_name == rollback
+        {
+            match self.client.inspect_container(&canonical).await {
+                Err(PodmanApiError::NotFound(_)) => {}
+                Ok(_) => {
+                    return Err(Status::unavailable(
+                        "Podman replacement supervisor name is occupied",
+                    ));
+                }
+                Err(error) => return Err(unavailable(error)),
+            }
+            false
+        } else if matches!(
+            checkpoint.stage,
+            PodmanLaunchStage::Restoring {
+                confirming_storage: false,
+                ..
+            }
+        ) && current_name == canonical
+        {
+            // The database confirms the first restore ran. Reapply the
+            // canonical name by ID so Podman also confirms its storage write.
+            true
+        } else if matches!(checkpoint.stage, PodmanLaunchStage::Restored { .. })
+            && current_name == canonical
+        {
+            return Ok(Err(Status::failed_precondition(
+                "interrupted Podman replacement restored the previous supervisor for retry",
+            )));
+        } else {
+            // An earlier rename can still take effect after this observation.
+            return Err(Status::unavailable(
+                "could not confirm the interrupted Podman rename",
+            ));
+        };
+        mutation
+            .record(
+                &workload.id,
+                PodmanLaunchStage::Restoring {
+                    predecessor: predecessor.clone(),
+                    confirming_storage,
+                },
+            )
+            .await?;
+        if let Err(error) = self.client.rename_container(predecessor, &canonical).await {
+            if confirming_storage && matches!(&error, PodmanApiError::Api { .. }) {
+                // The engine acknowledged a failed request. A later retry can
+                // make another confirmation attempt without overlapping it.
+                mutation
+                    .record(
+                        &workload.id,
+                        PodmanLaunchStage::Restoring {
+                            predecessor: predecessor.clone(),
+                            confirming_storage: false,
+                        },
+                    )
+                    .await?;
+            }
+            return Err(unavailable(error));
+        }
+        mutation
+            .record(
+                &workload.id,
+                PodmanLaunchStage::Restored {
+                    predecessor: predecessor.clone(),
+                },
+            )
+            .await?;
+        Ok(Err(Status::failed_precondition(
+            "interrupted Podman replacement restored the previous supervisor for retry",
+        )))
+    }
+
+    async fn observe_provider_launch(
+        &self,
+        sandbox_id: &str,
+        checkpoint: &PodmanLaunchCheckpoint,
+        operation: uuid::Uuid,
+        launch: &str,
+        replay: ProviderLaunchReplay,
+    ) -> Result<Result<StartSandboxResponse, Status>, Status> {
+        let Some(workload) = self.find_container(sandbox_id).await? else {
+            return Ok(Err(Status::not_found("retained Podman workload is gone")));
+        };
+        if workload.id != checkpoint.workload {
+            return Err(Status::failed_precondition(
+                "retained Podman workload identity changed",
+            ));
+        }
+        let supervisor = match self
+            .client
+            .inspect_container(&crate::isolation::supervisor_name(sandbox_id))
+            .await
+        {
+            Ok(inspect)
+                if inspect.state.running
+                    && workload.state == "running"
+                    && inspect
+                        .config
+                        .labels
+                        .get(LABEL_PROVIDER_LAUNCH_SPIFFE_ID)
+                        .is_some_and(|id| id == launch) =>
+            {
+                inspect
+            }
+            Ok(_) | Err(PodmanApiError::NotFound(_))
+                if replay == ProviderLaunchReplay::ObserveCompleted =>
+            {
+                return Ok(Err(Status::not_found(
+                    "completed Podman provider launch is inactive",
+                )));
+            }
+            Ok(_) | Err(PodmanApiError::NotFound(_)) => {
+                return Err(Status::unavailable(
+                    "interrupted Podman provider launch has no active replacement to verify",
+                ));
+            }
+            Err(error) => return Err(Status::unavailable(error.to_string())),
+        };
+        if replay == ProviderLaunchReplay::Settle {
+            if !self
+                .client
+                .container_path_exists(&supervisor.id, crate::isolation::SUPERVISOR_HEALTH_SOCKET)
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?
+            {
+                return Err(Status::unavailable(
+                    "interrupted Podman provider launch is not ready",
+                ));
+            }
+        } else {
+            tokio::time::timeout(
+                crate::client::API_TIMEOUT,
+                self.wait_for_supervisor_ready(&workload.id, &supervisor.id),
+            )
+            .await
+            .map_err(|_| {
+                Status::unavailable("Podman provider launch is still waiting for readiness")
+            })?
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        }
+        let rollback = provider_rollback_name(operation);
+        let predecessor = match &checkpoint.stage {
+            PodmanLaunchStage::Replacing { predecessor } => Some(predecessor.as_str()),
+            _ => None,
+        };
+        let lookup = predecessor.or_else(|| {
+            matches!(
+                replay,
+                ProviderLaunchReplay::Resume | ProviderLaunchReplay::Settle
+            )
+            .then_some(rollback.as_str())
+        });
+        if let Some(lookup) = lookup {
+            let cleanup = match self.client.inspect_container(lookup).await {
+                Ok(old)
+                    if old.id != workload.id
+                        && old.id != supervisor.id
+                        && container_is_stopped(&old)
+                        && predecessor.is_none_or(|id| {
+                            old.id == id && old.name.trim_start_matches('/') == rollback
+                        }) =>
+                {
+                    self.remove_retired_supervisor(sandbox_id, &old).await
+                }
+                Ok(_) => {
+                    warn!(%sandbox_id, rollback_container = %rollback,
+                        "Skipping cleanup of an unexpected Podman rollback container");
+                    Ok(())
+                }
+                Err(PodmanApiError::NotFound(_)) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = cleanup {
+                warn!(%sandbox_id, rollback_container = %rollback, %error,
+                    "failed to remove the previous Podman supervisor after a replacement");
+            }
+        }
+        Ok(Ok(StartSandboxResponse::default()))
+    }
+
     /// Start a previously stopped sandbox container.
+    pub async fn start_sandbox(
+        &self,
+        sandbox_id: &str,
+        generation_id: &str,
+        encoded_authentication: &[u8],
+        durable_sandbox: Option<&DriverSandbox>,
+    ) -> Result<(), ComputeDriverError> {
+        self.start_sandbox_recording_mutation(
+            sandbox_id,
+            generation_id,
+            encoded_authentication,
+            durable_sandbox,
+            None,
+        )
+        .await
+    }
+
     #[tracing::instrument(
         name = "podman.start_sandbox",
         skip_all,
@@ -2023,12 +3294,13 @@ impl PodmanComputeDriver {
             sandbox.id = %sandbox_id,
         )
     )]
-    pub async fn start_sandbox(
+    async fn start_sandbox_recording_mutation(
         &self,
         sandbox_id: &str,
         generation_id: &str,
         encoded_authentication: &[u8],
         durable_sandbox: Option<&DriverSandbox>,
+        mutation: Option<&PodmanLaunchMutation>,
     ) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         // Verify before inspecting or modifying either member of the pair.
@@ -2042,6 +3314,15 @@ impl PodmanComputeDriver {
         let launch_authentication = (!encoded_authentication.is_empty())
             .then(|| decode_launch_authentication(encoded_authentication))
             .transpose()?;
+        let requires_provider_spiffe_id = launch_authentication
+            .as_ref()
+            .is_some_and(|authentication| authentication.supervisor.provider_spiffe_id.is_some());
+        let expected_launch_spiffe_id = launch_authentication.as_ref().and_then(|authentication| {
+            authentication
+                .supervisor
+                .provider_launch_spiffe_id
+                .as_deref()
+        });
         let container = self
             .find_container(sandbox_id)
             .await?
@@ -2049,63 +3330,98 @@ impl PodmanComputeDriver {
         self.admit_container_resources(&container.id).await?;
         let workload_running = container.state == "running";
         if workload_running {
-            let supervisor = self
-                .client
-                .inspect_container(&crate::isolation::supervisor_name(sandbox_id))
-                .await;
-            if supervisor
-                .as_ref()
-                .is_ok_and(|inspect| inspect.state.running)
-            {
+            let supervisor = crate::isolation::supervisor_name(sandbox_id);
+            let inspect = self.client.inspect_container(&supervisor).await;
+            if inspect.as_ref().is_ok_and(|inspect| inspect.state.running) {
                 let archive = self
                     .client
-                    .copy_from_container(
-                        &crate::isolation::supervisor_name(sandbox_id),
-                        crate::isolation::RESTART_METADATA_PATH,
-                    )
+                    .copy_from_container(&supervisor, crate::isolation::RESTART_METADATA_PATH)
                     .await?;
                 let bundle =
                     extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
                 let metadata = crate::isolation::restart_metadata_from_slice(&bundle)?;
-                if metadata.generation == generation.as_str() && encoded_authentication.is_empty() {
-                    return span_status.finish(Ok(()));
-                }
-                if metadata.generation != generation.as_str() {
+                let current_generation = self
+                    .restart_generation(&supervisor, metadata.generation, generation.as_str())
+                    .await?;
+                if current_generation != generation.as_str() {
                     return span_status.finish(Err(ComputeDriverError::Precondition(format!(
-                        "Podman sandbox is already running generation {}",
-                        metadata.generation
+                        "Podman sandbox is already running generation {current_generation}"
                     ))));
+                }
+                if encoded_authentication.is_empty() {
+                    return span_status.finish(Ok(()));
                 }
                 // A non-empty bundle for the same generation comes from
                 // gateway startup recovery. Restart both containers so the
                 // in-memory launch session changes atomically on both sides.
             }
-            self.client.stop_container(&container.id, 0).await?;
-            self.wait_for_container_stopped(sandbox_id, &container.id)
-                .await?;
         }
-        // A user-driven start of a stopped sandbox mints fresh launch
-        // credentials. When the trusted supervisor predates the gateway's
-        // current destination-trust bundle (including supervisors created
-        // before generation labels existed), recreate only the supervisor so
-        // stop/start picks up the current additional CA bundle. The workload
-        // container, its volumes, and its workspace data are never replaced.
-        // Recovery without fresh credentials and running sandboxes keep their
-        // existing supervisor and bundle unchanged.
-        if !workload_running
-            && launch_authentication.is_some()
-            && let Some(durable_sandbox) = durable_sandbox
-            && self.supervisor_network_trust_stale(sandbox_id).await?
+        // Reconcile SPIFFE projection on both restart paths, including after
+        // an operator removes it. Refresh trust on stop/start and when
+        // recovering a supervisor that will receive verified launch identity.
+        let expected_trust_generation = (!workload_running || requires_provider_spiffe_id)
+            .then(|| self.expected_network_trust_generation());
+        if launch_authentication.is_some()
+            && (requires_provider_spiffe_id || durable_sandbox.is_some())
         {
-            let result = self
-                .replace_supervisor_for_network_trust(
-                    &container,
-                    durable_sandbox,
-                    &generation,
-                    encoded_authentication,
+            let supervisor_image_id = if requires_provider_spiffe_id {
+                self.local_supervisor_image_id().await?
+            } else {
+                None
+            };
+            let configuration = if requires_provider_spiffe_id && supervisor_image_id.is_none() {
+                SupervisorConfiguration::Stale
+            } else {
+                self.supervisor_configuration(
+                    sandbox_id,
+                    requires_provider_spiffe_id,
+                    expected_launch_spiffe_id,
+                    expected_trust_generation,
+                    supervisor_image_id.as_deref(),
                 )
-                .await;
-            return span_status.finish(result);
+                .await?
+            };
+            if configuration != SupervisorConfiguration::Current {
+                let durable_sandbox = durable_sandbox.ok_or_else(|| {
+                    ComputeDriverError::Precondition(
+                        "a durable sandbox provisioning snapshot is required to replace a Podman supervisor for verified provider identity".into(),
+                    )
+                })?;
+                // A launch label rotation can reuse the local image.
+                let replacement_image_id = match (
+                    requires_provider_spiffe_id,
+                    configuration,
+                    supervisor_image_id,
+                ) {
+                    (false, _, _) => None,
+                    (true, SupervisorConfiguration::LaunchChanged, Some(image_id)) => {
+                        Some(image_id)
+                    }
+                    (true, _, local) => Some(self.resolve_provider_supervisor_image(local).await?),
+                };
+                let result = self
+                    .replace_supervisor(
+                        &container,
+                        durable_sandbox,
+                        &generation,
+                        encoded_authentication,
+                        replacement_image_id.as_deref(),
+                        mutation,
+                    )
+                    .await;
+                return span_status.finish(result);
+            }
+        }
+        if let Some(mutation) = mutation {
+            mutation.begin(&container.id).await?;
+        }
+        if workload_running {
+            self.client.stop_container(&container.id, 0).await?;
+            let finished_at = self
+                .wait_for_container_stopped(sandbox_id, &container.id)
+                .await?;
+            self.lifecycle_event_fences
+                .record_previous_exit(sandbox_id, finished_at.as_deref());
         }
         let container_id = container.id;
         info!(sandbox_id = %sandbox_id, container = %container_id, "Starting sandbox container");
@@ -2137,10 +3453,16 @@ impl PodmanComputeDriver {
                 extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
             let restart_metadata = crate::isolation::restart_metadata_from_slice(&bundle)?;
             if launch_authentication.is_none() {
-                if restart_metadata.generation != generation.as_str() {
+                let current_generation = self
+                    .restart_generation(
+                        &supervisor,
+                        restart_metadata.generation,
+                        generation.as_str(),
+                    )
+                    .await?;
+                if current_generation != generation.as_str() {
                     return Err(ComputeDriverError::Precondition(format!(
-                        "Podman sandbox is already provisioned for generation {}",
-                        restart_metadata.generation
+                        "Podman sandbox is already provisioned for generation {current_generation}"
                     )));
                 }
                 // A gateway crash can recover a persisted Starting transition
@@ -2172,6 +3494,7 @@ impl PodmanComputeDriver {
                         ),
                     child_env: restart_metadata.child_env,
                     launch_authentication: launch_authentication.as_ref().expect("checked above"),
+                    gateway_ca: None,
                 })?;
             self.client
                 .copy_to_container(
@@ -2219,6 +3542,11 @@ impl PodmanComputeDriver {
         }
 
         let supervisor = crate::isolation::supervisor_name(sandbox_id);
+        let owned_proxy_secret = match self.client.inspect_container(&supervisor).await {
+            Ok(inspect) => owned_proxy_auth_secret(sandbox_id, &inspect).map(str::to_owned),
+            Err(PodmanApiError::NotFound(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
         match self
             .client
             .remove_container(&supervisor, self.config.stop_timeout_secs)
@@ -2226,6 +3554,11 @@ impl PodmanComputeDriver {
         {
             Ok(()) | Err(PodmanApiError::NotFound(_)) => {}
             Err(error) => return Err(error.into()),
+        }
+        if let Some(secret) = owned_proxy_secret.as_deref()
+            && secret != container::proxy_auth_secret_name(sandbox_id)
+        {
+            cleanup_sandbox_proxy_auth_secret(&self.client, secret).await;
         }
         match self
             .client
@@ -2364,11 +3697,13 @@ impl PodmanComputeDriver {
             return Ok(None);
         };
         if entry.state == "running" {
-            Ok(watcher::inspect_workload(&self.client, &entry.id)
-                .await
-                .ok()
-                .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
-                .or_else(|| driver_sandbox_from_list_entry(entry)))
+            Ok(
+                watcher::inspect_workload(&self.client, &entry.id, &self.provider_containment())
+                    .await
+                    .ok()
+                    .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
+                    .or_else(|| driver_sandbox_from_list_entry(entry)),
+            )
         } else {
             Ok(driver_sandbox_from_list_entry(entry))
         }
@@ -2386,10 +3721,11 @@ impl PodmanComputeDriver {
             .map_err(ComputeDriverError::from)?;
 
         let mut sandboxes = Vec::with_capacity(entries.len());
+        let containment = self.provider_containment();
         for entry in &entries {
             if entry.state == "running" {
                 // Running containers need inspect for health check status.
-                match watcher::inspect_workload(&self.client, &entry.id).await {
+                match watcher::inspect_workload(&self.client, &entry.id, &containment).await {
                     Ok(inspect) => {
                         if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
                             sandboxes.push(sandbox);
@@ -2418,10 +3754,26 @@ impl PodmanComputeDriver {
 
     /// Start watching all managed sandbox containers.
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, ComputeDriverError> {
-        watcher::start_watch(self.client.clone(), self.lifecycle_event_fences.clone())
-            .await
-            .map_err(ComputeDriverError::from)
+        watcher::start_watch(
+            self.client.clone(),
+            self.lifecycle_event_fences.clone(),
+            self.provider_containment(),
+        )
+        .await
+        .map_err(ComputeDriverError::from)
     }
+}
+
+fn provider_rollback_name(operation: uuid::Uuid) -> String {
+    format!("openshell-supervisor-rollback-{operation}")
+}
+
+fn container_is_stopped(container: &ContainerInspect) -> bool {
+    !container.state.running
+        && matches!(
+            container.state.status.as_str(),
+            "exited" | "stopped" | "configured" | "created"
+        )
 }
 
 #[cfg(test)]
@@ -2455,6 +3807,8 @@ impl PodmanComputeDriver {
                 (refresh_inventory.clone(), allow_all_default_gpu)
             }),
             lifecycle_event_fences: LifecycleEventFences::default(),
+            provider_launch_state: None,
+            provider_workload_identity_supported: false,
             network_trust: None,
             network_trust_staging: None,
         }
@@ -2704,6 +4058,8 @@ mod tests {
                 gateway_expires_at: i64::MAX,
                 sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
                 sandbox_expires_at: i64::MAX,
+                provider_spiffe_id: None,
+                provider_launch_spiffe_id: None,
                 ssh_host_private_key: None,
                 traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
@@ -2799,7 +4155,7 @@ mod tests {
                 // created from an immutable image ID.
                 StubResponse::new(
                     StatusCode::OK,
-                    r#"{"Id":"ctr-retained","Name":"workload","State":{"Status":"exited","Running":false},"Config":{"Image":"sha256:pinned-image-id"}}"#,
+                    r#"{"Id":"ctr-retained","Name":"workload","Image":"sha256:pinned-image-id","State":{"Status":"exited","Running":false},"Config":{"Image":"app:test"}}"#,
                 ),
                 // Inspection of the pinned image by ID, not by its tag.
                 StubResponse::new(
@@ -2863,7 +4219,64 @@ mod tests {
         (old_workload, durable, generation)
     }
 
-    const REFRESH_STOPPED_SUPERVISOR: &str = r#"{"Id":"sup-1","Name":"supervisor","State":{"Status":"exited","Running":false},"Config":{"Image":"sha256:supervisor-image"}}"#;
+    const REFRESH_STOPPED_SUPERVISOR: &str = r#"{"Id":"sup-1","Name":"supervisor","Image":"sha256:supervisor-image","State":{"Status":"exited","Running":false},"Config":{"Image":"sha256:supervisor-image"}}"#;
+
+    fn retained_supervisor(sandbox_id: &str) -> serde_json::Value {
+        let mut supervisor: serde_json::Value =
+            serde_json::from_str(REFRESH_STOPPED_SUPERVISOR).unwrap();
+        supervisor["Config"]["Labels"] = serde_json::json!({
+            LABEL_SANDBOX_ID: sandbox_id,
+            crate::isolation::LABEL_ROLE: "supervisor",
+        });
+        supervisor
+    }
+
+    #[tokio::test]
+    async fn supervisor_refresh_rejects_foreign_running_predecessor() {
+        let sandbox_id = "sandbox-1";
+        let (workload, durable, generation) = refresh_fixture(sandbox_id);
+        let supervisor_name = crate::isolation::supervisor_name(sandbox_id);
+        let mut foreign = retained_supervisor("foreign-sandbox");
+        foreign["Name"] = supervisor_name.clone().into();
+        foreign["State"] = serde_json::json!({"Status": "running", "Running": true});
+        let (socket, requests, handle) = spawn_podman_stub(
+            "refresh-foreign-predecessor",
+            vec![
+                StubResponse::new(
+                    StatusCode::OK,
+                    serde_json::json!([{
+                        "Id": workload.id, "State": "exited", "Labels": workload.labels,
+                    }])
+                    .to_string(),
+                ),
+                StubResponse::new(StatusCode::OK, foreign.to_string()),
+                StubResponse::new(StatusCode::OK, foreign.to_string()),
+            ],
+        );
+
+        let error = test_driver(socket)
+            .start_sandbox(
+                sandbox_id,
+                generation.as_str(),
+                &encoded_launch_authentication(),
+                Some(&durable),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(&error, ComputeDriverError::Precondition(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("predecessor supervisor identity")
+        );
+        handle.await.unwrap();
+        let inspect = format!(
+            "GET {}",
+            api_path(&format!("/libpod/containers/{supervisor_name}/json"))
+        );
+        assert_eq!(requests.lock().unwrap()[1..], [inspect.clone(), inspect]);
+    }
 
     #[tokio::test]
     async fn supervisor_refresh_completes_fallible_prep_before_renaming() {
@@ -2873,7 +4286,7 @@ mod tests {
         let (socket, requests, handle) = spawn_podman_stub(
             "refresh-prep-before-rename",
             vec![
-                StubResponse::new(StatusCode::OK, REFRESH_STOPPED_SUPERVISOR),
+                StubResponse::new(StatusCode::OK, retained_supervisor("prep-1").to_string()),
                 StubResponse::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     r#"{"message":"transient secret lookup failure"}"#,
@@ -2883,7 +4296,7 @@ mod tests {
         let driver = test_driver(socket);
         let (old_workload, durable, generation) = refresh_fixture("prep-1");
         let result = driver
-            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .replace_supervisor(&old_workload, &durable, &generation, b"auth", None, None)
             .await;
         assert!(
             result.is_err(),
@@ -2895,34 +4308,286 @@ mod tests {
             !requests.iter().any(|request| request.contains("/rename")),
             "fallible preparation must complete before any rename: {requests:?}"
         );
+        drop(requests);
+
+        let path = tempfile::tempdir().unwrap();
+        let auth_file = path.path().join("proxy-auth");
+        for malformed in [false, true] {
+            if malformed {
+                fs::write(&auth_file, "invalid credential").unwrap();
+            }
+            let (socket, requests, handle) = spawn_podman_stub(
+                "refresh-invalid-proxy",
+                vec![
+                    StubResponse::new(StatusCode::OK, retained_supervisor("prep-1").to_string()),
+                    StubResponse::new(StatusCode::NOT_FOUND, ""), // old token
+                ],
+            );
+            let driver = test_driver_with_config(proxy_auth_config(socket, &auth_file));
+            let error = driver
+                .replace_supervisor(&old_workload, &durable, &generation, b"auth", None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, ComputeDriverError::Precondition(_)));
+            assert!(error.to_string().contains("proxy_auth_file"));
+            handle.await.unwrap();
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.starts_with("GET "))
+            );
+        }
+    }
+
+    fn consumed_channel_snapshot() -> Vec<u8> {
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o711);
+        archive
+            .append_data(&mut header, "sandbox", std::io::empty())
+            .unwrap();
+        archive.into_inner().unwrap()
+    }
+
+    fn archived_supervisor_file(archive: &[u8], path: &str) -> Vec<u8> {
+        let path = Path::new(path.trim_start_matches('/'));
+        let mut source = tar::Archive::new(archive);
+        let mut entry = source
+            .entries()
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().unwrap() == path)
+            .unwrap();
+        let mut header = entry.header().clone();
+        let mut target = tar::Builder::new(Vec::new());
+        target
+            .append_data(&mut header, path.file_name().unwrap(), &mut entry)
+            .unwrap();
+        target.into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn recovery_accepts_the_gateway_generation_in_a_legacy_supervisor_bundle() {
+        let sandbox_id = "legacy-1";
+        let container_id = "workload-legacy-1";
+        let launch_authentication = launch_authentication();
+        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+            1000,
+            1001,
+            vec![],
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let archive =
+            crate::isolation::bootstrap_archives(crate::isolation::BootstrapArchivesInput {
+                runtime_initiated: true,
+                sandbox_id,
+                container_id,
+                generation: "saved-podman-uuid",
+                host_gateway_ip: "127.0.0.1".parse().unwrap(),
+                identity: &identity,
+                allow_extra_supplementary_groups: false,
+                child_env: HashMap::new(),
+                launch_authentication: &launch_authentication,
+                gateway_ca: None,
+            })
+            .unwrap()
+            .supervisor;
+        let (socket, requests, handle) = spawn_podman_stub(
+            "legacy-recovery-generation",
+            vec![
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"[{"Id":"workload-legacy-1","State":"running"}]"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sup-1","Name":"supervisor","State":{"Status":"running","Running":true}}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    archived_supervisor_file(&archive, crate::isolation::RESTART_METADATA_PATH),
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    archived_supervisor_file(&archive, crate::isolation::RUNTIME_DESCRIPTOR_PATH),
+                ),
+            ],
+        );
+        test_driver(socket)
+            .start_sandbox(
+                sandbox_id,
+                launch_authentication.supervisor.runtime_generation.as_str(),
+                &[],
+                None,
+            )
+            .await
+            .expect("recovery should leave the matching generation running");
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(requests[2].ends_with("restart-metadata.json"));
+        assert!(requests[3].ends_with("runtime-descriptor.json"));
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
     }
 
     #[tokio::test]
     async fn supervisor_refresh_restores_canonical_name_when_replacement_fails() {
-        // The replacement create fails at its first image pull; the previous
-        // supervisor must be restored to the canonical name and must not be
-        // deleted, so a later retry observes the original stopped pair.
-        let (socket, requests, handle) = spawn_podman_stub(
-            "refresh-restore-on-failure",
-            vec![
-                StubResponse::new(StatusCode::OK, REFRESH_STOPPED_SUPERVISOR),
-                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"no secret"}"#),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
+        assert_supervisor_refresh_restores_channel(false, false).await;
+        assert_supervisor_refresh_restores_channel(true, false).await;
+        assert_supervisor_refresh_restores_channel(true, true).await;
+    }
+
+    async fn assert_supervisor_refresh_restores_channel(
+        workload_start_succeeds: bool,
+        supervisor_start_succeeds: bool,
+    ) {
+        // An existing proxy secret belongs to the retained supervisor. The
+        // old workload consumed its channel credentials during its last boot.
+        let sandbox_id = "restore-1";
+        let proxy_secret = container::proxy_auth_secret_name(sandbox_id);
+        let operation = uuid::Uuid::new_v4();
+        let replacement_secret = format!("{proxy_secret}-{operation}");
+        let mut authentication = launch_authentication();
+        authentication.supervisor.provider_spiffe_id =
+            Some("spiffe://example.test/openshell/gateway/g/sandbox/restore-1".into());
+        authentication.supervisor.provider_launch_spiffe_id = Some(format!(
+            "spiffe://example.test/openshell/gateway/g/sandbox/restore-1/launch/{operation}"
+        ));
+        let mut predecessor = retained_supervisor(sandbox_id);
+        predecessor["Config"]["Secrets"] = serde_json::json!([{"Name": proxy_secret}]);
+        let saved_channel = consumed_channel_snapshot();
+        let mut responses = vec![
+            StubResponse::new(StatusCode::OK, predecessor.to_string()),
+            StubResponse::new(StatusCode::NOT_FOUND, ""), // old token
+            StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"workload-restore-1","Name":"workload","Image":"sha256:sandbox","State":{"Status":"exited","Running":false},"Config":{"Image":"app:test"}}"#,
+            ),
+            image_response("sha256:sandbox"),
+            created_response("identity-reader"),
+            StubResponse::new(StatusCode::NOT_FOUND, ""), // reserved hierarchy absent
+            StubResponse::new(StatusCode::NOT_FOUND, ""), // optional passwd
+            StubResponse::new(StatusCode::NOT_FOUND, ""), // optional group
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove stopped reader
+            created_response("provider-probe"),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // start probe
+            StubResponse::new(
+                StatusCode::OK,
+                PROVIDER_WORKLOAD_SOCKET_PROBE_PRESENT.to_string(),
+            ),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove probe
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // rename old supervisor
+            StubResponse::new(StatusCode::OK, "{}"),       // existing resolver secret
+            StubResponse::new(StatusCode::CREATED, "{}").with_request_bytes(b"user:pass\n"),
+            fence_response(),
+            StubResponse::new(StatusCode::OK, saved_channel),
+            StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
+            created_response("new-supervisor").with_container_secret(replacement_secret.clone()),
+            StubResponse::new(StatusCode::OK, ""), // stage new supervisor archive
+        ];
+        if workload_start_succeeds {
+            responses.push(StubResponse::new(StatusCode::NO_CONTENT, "")); // start workload
+        }
+        let workload_running = r#"{"Id":"workload-restore-1","Name":"workload","State":{"Status":"running","Running":true}}"#;
+        let start_error = if supervisor_start_succeeds {
+            responses.extend([
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // start supervisor
+                StubResponse::new(StatusCode::OK, workload_running),
                 StubResponse::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    r#"{"message":"image pull failed"}"#,
+                    StatusCode::OK,
+                    r#"{"Id":"new-supervisor","Name":"supervisor","State":{"Status":"exited","Running":false,"ExitCode":78}}"#,
                 ),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
-            ],
-        );
-        let driver = test_driver(socket);
-        let (old_workload, durable, generation) = refresh_fixture("restore-1");
-        let result = driver
-            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
-            .await;
-        assert!(result.is_err(), "failed replacement must fail the refresh");
+            ]);
+            "replacement Podman supervisor exited before becoming ready"
+        } else {
+            let error = if workload_start_succeeds {
+                "supervisor start failed"
+            } else {
+                "workload start failed"
+            };
+            responses.push(StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, error));
+            error
+        };
+        responses.push(StubResponse::new(StatusCode::NO_CONTENT, "")); // remove new supervisor
+        if workload_start_succeeds {
+            responses.extend([
+                StubResponse::new(
+                    StatusCode::OK,
+                    workload_running,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // stop workload
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload-restore-1","Name":"workload","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"}}"#,
+                ),
+            ]);
+        } else {
+            responses.push(StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"workload-restore-1","Name":"workload","State":{"Status":"configured","Running":false}}"#,
+            ));
+        }
+        responses.extend([
+            StubResponse::new(StatusCode::OK, "").with_archive_members(&["sandbox", "sandbox"]),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove the new proxy secret
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // restore old supervisor name
+        ]);
+        let (socket, requests, handle) = spawn_podman_stub("refresh-restore-on-failure", responses);
+        let auth_file = write_proxy_auth_file("refresh-restore");
+        let mut config = proxy_auth_config(socket, &auth_file);
+        config.provider_spiffe_workload_api_socket = Some("/run/spire/agent.sock".into());
+        let driver = test_driver_with_config(config);
+        let (old_workload, durable, generation) = refresh_fixture(sandbox_id);
+        let error = driver
+            .replace_supervisor(
+                &old_workload,
+                &durable,
+                &generation,
+                &serde_json::to_vec(&authentication).unwrap(),
+                Some("sha256:supervisor"),
+                None,
+            )
+            .await
+            .expect_err("failed replacement must fail the refresh");
+        assert!(error.to_string().contains(start_error));
+        let _ = fs::remove_file(auth_file);
         handle.await.unwrap();
         let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .any(|request| request.contains("/workload-restore-1/stop")),
+            workload_start_succeeds,
+        );
+        assert!(requests.iter().any(|request| request.starts_with("POST ")
+            && request.ends_with(&format!("name={replacement_secret}"))));
+        assert!(requests.iter().any(
+            |request| request.starts_with("DELETE ") && request.ends_with(&replacement_secret)
+        ));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.starts_with("DELETE ") && request.ends_with(&proxy_secret))
+        );
+        let archive_upload = format!(
+            "PUT {}",
+            api_path("/libpod/containers/workload-restore-1/archive?path=%2F.openshell%2Fchannel")
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|req| **req == archive_upload)
+                .count(),
+            2
+        );
         let renames = requests
             .iter()
             .filter(|request| request.contains("/rename"))
@@ -2933,19 +4598,19 @@ mod tests {
             "expected rename to rollback and rename back: {requests:?}"
         );
         assert!(
-            renames[0].contains("openshell-supervisor-restore-1")
+            renames[0].contains("/sup-1/rename")
                 && renames[0].contains("openshell-supervisor-rollback-"),
             "first rename moves the canonical supervisor to the rollback name: {renames:?}"
         );
         assert!(
-            renames[1].contains("openshell-supervisor-rollback-")
+            renames[1].contains("/sup-1/rename")
                 && renames[1].contains("name=openshell-supervisor-restore-1"),
             "second rename restores the canonical name: {renames:?}"
         );
         assert!(
             !requests
                 .iter()
-                .any(|request| request.starts_with("DELETE") && request.contains("rollback")),
+                .any(|request| request.starts_with("DELETE") && request.contains("/sup-1?")),
             "the restored supervisor must not be deleted: {requests:?}"
         );
     }
@@ -2957,12 +4622,12 @@ mod tests {
         let (socket, _requests, handle) = spawn_podman_stub(
             "refresh-restore-failure-orphan",
             vec![
-                StubResponse::new(StatusCode::OK, REFRESH_STOPPED_SUPERVISOR),
+                StubResponse::new(StatusCode::OK, retained_supervisor("orphan-1").to_string()),
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"no secret"}"#),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 StubResponse::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    r#"{"message":"image pull failed"}"#,
+                    r#"{"message":"supervisor image pull failed"}"#,
                 ),
                 StubResponse::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2973,15 +4638,762 @@ mod tests {
         let driver = test_driver(socket);
         let (old_workload, durable, generation) = refresh_fixture("orphan-1");
         let error = driver
-            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .replace_supervisor(
+                &old_workload,
+                &durable,
+                &generation,
+                &encoded_launch_authentication(),
+                None,
+                None,
+            )
             .await
             .expect_err("restore failure must fail the refresh");
-        handle.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("stub should receive each rollback request")
+            .unwrap();
         let message = error.to_string();
         assert!(
             message.contains("openshell-supervisor-rollback-"),
             "error must name the orphaned rollback container: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_launch_rpc_rejects_unfenced_and_stale_requests() {
+        use openshell_core::proto::compute::v1::OrderedStart;
+
+        let state = tempfile::tempdir().unwrap();
+        let mut driver = test_driver(state.path().join("unused-podman.sock"));
+        driver.provider_launch_state = Some(state.path().to_owned());
+        let mut authentication =
+            decode_launch_authentication(&encoded_launch_authentication()).unwrap();
+        let sandbox = "sandbox-1";
+        let subject = format!(
+            "spiffe://example.test/openshell/gateway/{}/sandbox/{sandbox}",
+            authentication.gateway_id
+        );
+        let launch = uuid::Uuid::new_v4();
+        authentication.supervisor.provider_spiffe_id = Some(subject.clone());
+        authentication.supervisor.provider_launch_spiffe_id =
+            Some(format!("{subject}/launch/{launch}"));
+        let mut request = StartSandboxRequest {
+            sandbox_id: sandbox.into(),
+            generation_id: authentication.supervisor.runtime_generation.to_string(),
+            launch_authentication: serde_json::to_vec(&authentication).unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(
+            driver
+                .start_sandbox_request(request.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        request.provider_launch_revision = 2;
+        let unqualified = driver
+            .start_sandbox_request(request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(unqualified.code(), tonic::Code::FailedPrecondition);
+        assert!(unqualified.message().contains("cannot supply verified"));
+        assert!(!state.path().join(sandbox).exists());
+
+        let operation = OrderedStart {
+            operation_id: launch.to_string(),
+            revision: 2,
+        };
+        replay_provider_launch(
+            state.path().join(sandbox),
+            operation.clone(),
+            true,
+            |_| async { panic!("settle-only must not start an unapplied launch") },
+        )
+        .await
+        .unwrap();
+        let receipt = driver
+            .start_sandbox_request(StartSandboxRequest {
+                sandbox_id: sandbox.into(),
+                ordered_start: Some(operation),
+                ordered_start_receipt_only: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .ordered_start_result
+            .unwrap();
+        assert!(receipt.replayed);
+
+        driver.provider_workload_identity_supported = true;
+        request.provider_launch_revision = 1;
+        assert_eq!(
+            driver
+                .start_sandbox_request(request)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_launch_replay_restores_acknowledged_rename_before_provisioning() {
+        use openshell_core::proto::compute::v1::OrderedStart;
+
+        let sandbox_id = "sandbox-1";
+        let canonical = crate::isolation::supervisor_name(sandbox_id);
+        let state = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let operation = OrderedStart {
+            operation_id: id.to_string(),
+            revision: 1,
+        };
+        let journal = state.path().join(sandbox_id);
+        let mutation = PodmanLaunchMutation {
+            path: journal.join("mutation"),
+            id,
+        };
+        assert_eq!(
+            replay_provider_launch(journal, operation.clone(), false, move |_| async move {
+                mutation
+                    .record(
+                        "workload",
+                        PodmanLaunchStage::Renaming {
+                            predecessor: "sup-1".into(),
+                        },
+                    )
+                    .await?;
+                Err(Status::unavailable(
+                    "driver exited after Podman acknowledged the rename",
+                ))
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::Unavailable
+        );
+
+        let mut authentication = launch_authentication();
+        let subject = format!(
+            "spiffe://example.test/openshell/gateway/{}/sandbox/{sandbox_id}",
+            authentication.gateway_id
+        );
+        authentication.supervisor.provider_spiffe_id = Some(subject.clone());
+        authentication.supervisor.provider_launch_spiffe_id =
+            Some(format!("{subject}/launch/{id}"));
+        let old = serde_json::json!({
+            "Id": "sup-1", "Name": provider_rollback_name(id),
+            "State": {"Status": "exited", "Running": false},
+        });
+        let mut partial_restore = old.clone();
+        partial_restore["Name"] = serde_json::json!(&canonical);
+        let stopped_workload = StubResponse::new(
+            StatusCode::OK,
+            r#"{"Id":"workload","Name":"old-workload","State":{"Status":"exited","Running":false}}"#,
+        );
+        let (socket, requests, handle) = spawn_podman_stub(
+            "replay-acknowledged-rename",
+            vec![
+                stopped_workload.clone(),
+                StubResponse::new(StatusCode::OK, old.to_string()),
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // canonical name is free
+                StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "storage rename failed"),
+                stopped_workload,
+                // The Libpod DB already shows the canonical name.
+                StubResponse::new(StatusCode::OK, partial_restore.to_string()),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // restore acknowledged
+            ],
+        );
+        let mut driver = test_driver(socket);
+        driver.provider_launch_state = Some(state.path().to_owned());
+        driver.provider_workload_identity_supported = true;
+        let request = StartSandboxRequest {
+            sandbox_id: sandbox_id.into(),
+            generation_id: authentication.supervisor.runtime_generation.to_string(),
+            launch_authentication: serde_json::to_vec(&authentication).unwrap(),
+            ordered_start: Some(operation.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            driver
+                .start_sandbox_request(request.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        let receipt = driver
+            .start_sandbox_request(request.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .ordered_start_result
+            .unwrap();
+        assert_eq!(receipt.operation, Some(operation));
+        assert_eq!(receipt.code, tonic::Code::FailedPrecondition as i32);
+        handle.await.unwrap();
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.ends_with(&format!("/sup-1/rename?name={canonical}")))
+                .count(),
+            2
+        );
+        assert!(
+            driver
+                .start_sandbox_request(request)
+                .await
+                .unwrap()
+                .into_inner()
+                .ordered_start_result
+                .unwrap()
+                .replayed
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_podman_launch_requires_readiness_to_settle() {
+        use openshell_core::proto::compute::v1::OrderedStart;
+
+        let sandbox_id = "sandbox-1";
+        for (replay, ready) in [
+            (ProviderLaunchReplay::Resume, true),
+            (ProviderLaunchReplay::Settle, true),
+            (ProviderLaunchReplay::Settle, false),
+        ] {
+            let retry_retirement = replay == ProviderLaunchReplay::Resume;
+            let state = tempfile::tempdir().unwrap();
+            let operation_id = uuid::Uuid::new_v4();
+            let operation = OrderedStart {
+                operation_id: operation_id.to_string(),
+                revision: 1,
+            };
+            let journal = state.path().join(sandbox_id);
+            let mutation = PodmanLaunchMutation {
+                path: journal.join("mutation"),
+                id: operation_id,
+            };
+            let interrupted =
+                replay_provider_launch(journal, operation.clone(), false, move |_| async move {
+                    if retry_retirement {
+                        mutation
+                            .record(
+                                "workload",
+                                PodmanLaunchStage::Replacing {
+                                    predecessor: "sup-1".into(),
+                                },
+                            )
+                            .await?;
+                    } else {
+                        mutation.begin("workload").await?;
+                    }
+                    Err(Status::unavailable(
+                        "fixture launch interrupted before receipt",
+                    ))
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(interrupted.code(), tonic::Code::Unavailable);
+            let mut authentication = launch_authentication();
+            let subject = format!(
+                "spiffe://example.test/openshell/gateway/{}/sandbox/{sandbox_id}",
+                authentication.gateway_id
+            );
+            let launch = format!("{subject}/launch/{operation_id}");
+            authentication.supervisor.provider_spiffe_id = Some(subject);
+            authentication.supervisor.provider_launch_spiffe_id = Some(launch.clone());
+            let supervisor = serde_json::json!({
+                "Id": "new-supervisor",
+                "Name": "supervisor",
+                "State": {"Status": "running", "Running": true},
+                "Config": {"Labels": {(LABEL_PROVIDER_LAUNCH_SPIFFE_ID): launch}},
+            })
+            .to_string();
+            let mut responses = vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"workload","State":"running"}]"#),
+                StubResponse::new(StatusCode::OK, supervisor.clone()),
+            ];
+            if replay == ProviderLaunchReplay::Resume {
+                responses.extend([
+                    StubResponse::new(
+                        StatusCode::OK,
+                        r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true}}"#,
+                    ),
+                    StubResponse::new(StatusCode::OK, supervisor.clone()),
+                ]);
+            }
+            let rollback = provider_rollback_name(operation_id);
+            let old_proxy_secret = format!(
+                "{}-{}",
+                container::proxy_auth_secret_name(sandbox_id),
+                uuid::Uuid::new_v4()
+            );
+            let mut predecessor: serde_json::Value =
+                serde_json::from_str(REFRESH_STOPPED_SUPERVISOR).unwrap();
+            predecessor["Name"] = rollback.clone().into();
+            predecessor["Config"]["Secrets"] = serde_json::json!([{"Name": old_proxy_secret}]);
+            if ready {
+                responses.extend([
+                    StubResponse::new(StatusCode::OK, ""), // authenticated readiness socket
+                    StubResponse::new(StatusCode::OK, predecessor.to_string()),
+                    StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "rollback cleanup failed"),
+                ]);
+            } else {
+                responses.push(StubResponse::new(StatusCode::NOT_FOUND, ""));
+            }
+            if retry_retirement {
+                responses.extend([
+                    StubResponse::new(StatusCode::OK, r#"[{"Id":"workload","State":"running"}]"#),
+                    StubResponse::new(StatusCode::OK, supervisor.clone()),
+                    StubResponse::new(
+                        StatusCode::OK,
+                        r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true}}"#,
+                    ),
+                    StubResponse::new(StatusCode::OK, supervisor),
+                    StubResponse::new(StatusCode::OK, ""),
+                    StubResponse::new(StatusCode::OK, predecessor.to_string()),
+                    StubResponse::new(StatusCode::NO_CONTENT, ""),
+                    StubResponse::new(StatusCode::NO_CONTENT, ""),
+                ]);
+            }
+            let (socket, requests, handle) =
+                spawn_podman_stub("settle-after-cleanup-failure", responses);
+            let mut driver = test_driver(socket);
+            driver.provider_launch_state = Some(state.path().to_path_buf());
+            driver.provider_workload_identity_supported = true;
+            let request = StartSandboxRequest {
+                sandbox_id: sandbox_id.into(),
+                generation_id: authentication.supervisor.runtime_generation.to_string(),
+                launch_authentication: serde_json::to_vec(&authentication).unwrap(),
+                ordered_start: Some(operation.clone()),
+                settle_only: replay == ProviderLaunchReplay::Settle,
+                ..Default::default()
+            };
+            let result = driver.start_sandbox_request(request.clone()).await;
+            if ready {
+                let receipt = result
+                    .expect("ready pair must be settled")
+                    .into_inner()
+                    .ordered_start_result
+                    .unwrap();
+                assert_eq!(receipt.operation, Some(operation));
+                assert_eq!(receipt.code, tonic::Code::Ok as i32);
+            } else {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+            }
+            if retry_retirement {
+                let receipt = driver
+                    .start_sandbox_request(request)
+                    .await
+                    .expect("the active launch should remain acknowledged")
+                    .into_inner()
+                    .ordered_start_result
+                    .unwrap();
+                assert!(receipt.replayed);
+                assert_eq!(receipt.code, tonic::Code::Ok as i32);
+            }
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("stub should receive every scripted request")
+                .unwrap();
+            let requests = requests.lock().unwrap();
+            assert!(requests.iter().any(|request| request.starts_with("HEAD ")
+                && request.contains("supervisor-health.sock")));
+            if retry_retirement {
+                let cleanup = &requests[requests.len() - 3..];
+                assert!(cleanup[0].starts_with("GET ") && cleanup[0].contains("/sup-1/json"));
+                assert!(cleanup[1].starts_with("DELETE ") && cleanup[1].contains("/sup-1?"));
+                assert!(
+                    cleanup[2].starts_with("DELETE ") && cleanup[2].contains(&old_proxy_secret)
+                );
+            } else if ready {
+                assert!(requests[requests.len() - 2].contains(&rollback));
+                let cleanup = requests.last().unwrap();
+                assert!(cleanup.starts_with("DELETE ") && cleanup.contains("/sup-1?"));
+            } else {
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| !request.starts_with("DELETE "))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_start_requires_durable_snapshot_to_replace_a_stale_supervisor() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "verified-start-missing-snapshot",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"workload","State":"exited"}]"#),
+                image_response("sha256:current-supervisor-image"),
+                StubResponse::new(StatusCode::OK, REFRESH_STOPPED_SUPERVISOR),
+            ],
+        );
+        let mut authentication =
+            decode_launch_authentication(&encoded_launch_authentication()).unwrap();
+        authentication.supervisor.provider_spiffe_id =
+            Some("spiffe://example.test/openshell/gateway/g/sandbox/sandbox-1".into());
+        authentication.supervisor.provider_launch_spiffe_id = Some(
+            "spiffe://example.test/openshell/gateway/g/sandbox/sandbox-1/launch/current".into(),
+        );
+        let error = test_driver(socket)
+            .start_sandbox(
+                "sandbox-1",
+                "generation-1",
+                &serde_json::to_vec(&authentication).unwrap(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("durable sandbox provisioning snapshot")
+        );
+        handle.await.unwrap();
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.starts_with("GET "))
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_start_refreshes_the_mutable_replacement_image() {
+        verify_start_replacement_image_selection(true, StatusCode::NO_CONTENT).await;
+    }
+
+    #[tokio::test]
+    async fn verified_start_reuses_local_images_after_launch_rotation() {
+        verify_start_replacement_image_selection(false, StatusCode::NO_CONTENT).await;
+    }
+
+    #[tokio::test]
+    async fn verified_start_succeeds_when_retired_supervisor_cleanup_fails() {
+        verify_start_replacement_image_selection(false, StatusCode::INTERNAL_SERVER_ERROR).await;
+    }
+
+    async fn verify_start_replacement_image_selection(
+        refresh_supervisor_image: bool,
+        predecessor_cleanup_status: StatusCode,
+    ) {
+        const LOCAL_IMAGE_ID: &str = "sha256:supervisor-image";
+        const REFRESHED_IMAGE_ID: &str = "sha256:updated-supervisor-image";
+        const STOPPED_WORKLOAD: &str = r#"{"Id":"workload-sandbox-1","Name":"workload","Image":"sha256:sandbox","State":{"Status":"exited","Running":false},"Config":{"Image":"app:test"}}"#;
+        let selected_image_id = if refresh_supervisor_image {
+            REFRESHED_IMAGE_ID
+        } else {
+            LOCAL_IMAGE_ID
+        };
+        let trust_generation = if refresh_supervisor_image {
+            "previous-trust-generation"
+        } else {
+            NETWORK_SUPERVISOR_TRUST_GENERATION_NONE
+        };
+        let old_supervisor = serde_json::json!({
+            "Id": "sup-1",
+            "Name": "supervisor",
+            "Image": LOCAL_IMAGE_ID,
+            "State": {"Status": "exited", "Running": false},
+            "Config": {
+                "Image": LOCAL_IMAGE_ID,
+                "Env": ["OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET=/spiffe-workload-api/agent.sock"],
+                "Labels": {
+                    "openshell.ai/provider-spiffe-launch-bundle": "1",
+                    "openshell.ai/provider-launch-spiffe-id": "spiffe://example.test/openshell/gateway/g/sandbox/sandbox-1/launch/previous",
+                    (NETWORK_SUPERVISOR_TRUST_GENERATION_KEY): trust_generation,
+                },
+            },
+            "Mounts": [{"Type": "bind", "Source": "/run/spire", "Destination": "/spiffe-workload-api", "RW": false}],
+        })
+        .to_string();
+        let sandbox_id = "sandbox-1";
+        let previous_proxy_secret = container::proxy_auth_secret_name(sandbox_id);
+        let operation = uuid::Uuid::new_v4();
+        let replacement_secret = format!("{previous_proxy_secret}-{operation}");
+        let mut predecessor = retained_supervisor(sandbox_id);
+        if refresh_supervisor_image {
+            predecessor["Config"]["Secrets"] = serde_json::json!([{"Name": previous_proxy_secret}]);
+        }
+        let (_, mut durable, generation) = refresh_fixture(sandbox_id);
+        durable.spec.as_mut().unwrap().template = Some(DriverSandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "mounts": [{
+                    "type": "image",
+                    "source": "registry.example.test/retained-mount:latest",
+                    "target": "/opt/dataset"
+                }]
+            }))),
+            ..Default::default()
+        });
+        let mut responses = vec![
+            StubResponse::new(
+                StatusCode::OK,
+                r#"[{"Id":"workload-sandbox-1","State":"running","Labels":{"openshell.ai/sandbox-id":"sandbox-1"}}]"#,
+            ),
+            StubResponse::new(StatusCode::OK, REFRESH_STOPPED_SUPERVISOR),
+            image_response(LOCAL_IMAGE_ID),
+            StubResponse::new(StatusCode::OK, old_supervisor),
+        ];
+        if refresh_supervisor_image {
+            responses.extend([
+                StubResponse::new(StatusCode::OK, "{}"), // supervisor pull
+                image_response(REFRESHED_IMAGE_ID),
+            ]);
+        }
+        let process_identity = serde_json::json!({
+            "user": "1234:1235",
+            "groups": ["2345"],
+            "userns": {"nsmode": "host"},
+        });
+        let mut probe_spec_fields = process_identity.clone();
+        probe_spec_fields["command"] = serde_json::json!([
+            PROVIDER_WORKLOAD_IDENTITY_PROBE,
+            "/spiffe-workload-api/agent.sock",
+        ]);
+        probe_spec_fields["mounts"] = serde_json::json!([{
+            "type": "bind",
+            "source": "/run/spire",
+            "destination": "/spiffe-workload-api",
+            "options": ["ro", "rbind"],
+        }]);
+        let account_file = |name: &str, bytes: &[u8]| {
+            let mut archive = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            archive.append_data(&mut header, name, bytes).unwrap();
+            StubResponse::new(StatusCode::OK, archive.into_inner().unwrap())
+        };
+        responses.extend([
+            StubResponse::new(StatusCode::OK, predecessor.to_string()),
+            StubResponse::new(StatusCode::NOT_FOUND, ""), // old token
+            StubResponse::new(StatusCode::OK, STOPPED_WORKLOAD),
+            image_response("sha256:sandbox"),
+            created_response("identity-reader"),
+            StubResponse::new(StatusCode::NOT_FOUND, ""), // reserved hierarchy absent
+            account_file("passwd", b"builder:x:1234:1235::/sandbox:/bin/sh\n"),
+            account_file("group", b"spire:x:2345:builder\n"),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove stopped reader
+            created_response("provider-probe")
+                .with_container_image(selected_image_id)
+                .with_container_spec_fields(probe_spec_fields),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // start probe
+            StubResponse::new(
+                StatusCode::OK,
+                PROVIDER_WORKLOAD_SOCKET_PROBE_PRESENT.to_string(),
+            ),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove probe
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // stop workload
+            StubResponse::new(StatusCode::OK, STOPPED_WORKLOAD),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // rename old supervisor
+            StubResponse::new(StatusCode::OK, "{}"),       // existing resolver secret
+        ]);
+        if refresh_supervisor_image {
+            responses.push(
+                StubResponse::new(StatusCode::CREATED, "{}").with_request_bytes(b"user:pass\n"),
+            );
+        }
+        let mut replacement = created_response("new-supervisor")
+            .with_container_image(selected_image_id)
+            .with_container_spec_fields(process_identity);
+        if refresh_supervisor_image {
+            replacement = replacement.with_container_secret(replacement_secret);
+        }
+        responses.extend([
+            fence_response(),
+            StubResponse::new(StatusCode::OK, consumed_channel_snapshot()),
+            StubResponse::new(StatusCode::OK, "")
+                .with_archive_members(channel_archive_members()),
+            replacement,
+            StubResponse::new(StatusCode::OK, ""), // stage new supervisor archive
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
+            StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"workload-sandbox-1","Name":"workload","State":{"Status":"running","Running":true}}"#,
+            ),
+            StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"new-supervisor","Name":"supervisor","State":{"Status":"running","Running":true}}"#,
+            ),
+            StubResponse::new(StatusCode::OK, ""), // authenticated readiness socket
+            StubResponse::new(predecessor_cleanup_status, ""), // remove old supervisor
+        ]);
+        let auth_file = refresh_supervisor_image.then(|| write_proxy_auth_file("refresh-success"));
+        if auth_file.is_some() {
+            responses.push(StubResponse::new(StatusCode::NO_CONTENT, "")); // remove predecessor's proxy secret
+        }
+        let (socket, requests, handle) = spawn_podman_stub("verified-start-image", responses);
+        let config = PodmanComputeConfig {
+            socket_path: Some(socket),
+            supervisor_image: "quay.io/ai-openshell/supervisor:dev".into(),
+            sandbox_runtime_image: "registry.example.test/retained-runtime:latest".into(),
+            provider_spiffe_workload_api_socket: Some("/run/spire/agent.sock".into()),
+            proxy_auth_file: auth_file
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            https_proxy: auth_file
+                .as_ref()
+                .map(|_| "http://proxy.example.test:3128".to_string()),
+            proxy_auth_allow_insecure: auth_file.as_ref().map(|_| true),
+            ..PodmanComputeConfig::default()
+        };
+        let mut authentication = launch_authentication();
+        authentication.supervisor.provider_spiffe_id =
+            Some("spiffe://example.test/openshell/gateway/g/sandbox/sandbox-1".into());
+        authentication.supervisor.provider_launch_spiffe_id = Some(format!(
+            "spiffe://example.test/openshell/gateway/g/sandbox/sandbox-1/launch/{operation}",
+        ));
+        test_driver_with_config(config)
+            .start_sandbox(
+                sandbox_id,
+                generation.as_str(),
+                &serde_json::to_vec(&authentication).unwrap(),
+                Some(&durable),
+            )
+            .await
+            .expect("verified restart should start the replacement");
+        if let Some(auth_file) = auth_file {
+            let _ = fs::remove_file(auth_file);
+        }
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("stub should receive every scripted request")
+            .expect("stub task should finish");
+
+        let requests = requests.lock().unwrap();
+        let image_requests = requests
+            .iter()
+            .filter(|request| request.contains("quay.io%2Fai-openshell%2Fsupervisor%3Adev"))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let inspect = format!(
+            "GET {}",
+            api_path("/libpod/images/quay.io%2Fai-openshell%2Fsupervisor%3Adev/json")
+        );
+        let pull = format!(
+            "POST {}",
+            api_path(
+                "/libpod/images/pull?reference=quay.io%2Fai-openshell%2Fsupervisor%3Adev&policy=newer"
+            )
+        );
+        let expected_image_requests = if refresh_supervisor_image {
+            vec![inspect.as_str(), pull.as_str(), inspect.as_str()]
+        } else {
+            vec![inspect.as_str()]
+        };
+        assert_eq!(image_requests, expected_image_requests);
+        assert!(
+            requests.iter().all(|request| {
+                !request.contains("retained-runtime") && !request.contains("retained-mount")
+            }),
+            "replacement should reuse the retained workload's runtime and image mounts: {requests:?}"
+        );
+        let selected = requests
+            .iter()
+            .rposition(|request| request == &inspect)
+            .unwrap();
+        let stopped = requests
+            .iter()
+            .position(|request| request.contains("/workload-sandbox-1/stop"))
+            .unwrap();
+        let probe_exit = requests
+            .iter()
+            .position(|request| request.contains("/provider-probe/wait?condition=exited"))
+            .unwrap();
+        assert!(
+            selected < probe_exit && probe_exit < stopped,
+            "resolve and verify the replacement image before stopping the workload"
+        );
+        let readiness = requests
+            .iter()
+            .position(|request| {
+                request.starts_with("HEAD ") && request.contains("supervisor-health.sock")
+            })
+            .unwrap();
+        assert!(
+            requests[readiness + 1].starts_with("DELETE ")
+                && requests[readiness + 1].contains("/sup-1?")
+        );
+        if refresh_supervisor_image {
+            assert!(
+                requests[readiness + 2].starts_with("DELETE ")
+                    && requests[readiness + 2].ends_with(&previous_proxy_secret)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_identity_qualification_rejects_an_insecure_effective_endpoint() {
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.containers.internal:50051".into(),
+            ..PodmanComputeConfig::default()
+        });
+
+        let error = driver
+            .qualify_provider_workload_identity()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ComputeDriverError::Precondition(_)));
+        assert!(error.to_string().contains("HTTPS or a numeric loopback"));
+    }
+
+    #[tokio::test]
+    async fn verified_supervisor_image_can_fall_back_to_a_compatible_cached_image() {
+        const CACHED_IMAGE: &str = "sha256:cached-supervisor";
+        for (exit_code, expected_error) in [
+            (PROVIDER_WORKLOAD_SOCKET_PROBE_UNAVAILABLE, None),
+            (0, Some("Select a matching supervisor image")),
+            (
+                PROVIDER_WORKLOAD_SOCKET_PROBE_PRESENT,
+                Some("Select a matching supervisor image"),
+            ),
+        ] {
+            let (socket, _, handle) = spawn_podman_stub(
+                "verified-supervisor-offline",
+                vec![
+                    StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "registry offline"),
+                    created_response("provider-probe").with_container_image(CACHED_IMAGE),
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // start probe
+                    StubResponse::new(StatusCode::OK, exit_code.to_string()), // wait for probe
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // remove probe
+                ],
+            );
+            let driver = test_driver_with_config(PodmanComputeConfig {
+                socket_path: Some(socket),
+                supervisor_image: "quay.io/ai-openshell/supervisor:dev".into(),
+                provider_spiffe_workload_api_socket: Some("/run/spire/agent.sock".into()),
+                ..PodmanComputeConfig::default()
+            });
+
+            let selected = driver
+                .resolve_provider_supervisor_image(Some(CACHED_IMAGE.to_owned()))
+                .await
+                .unwrap();
+            let qualification = driver.probe_provider_supervisor(&selected, None).await;
+            if let Some(expected_error) = expected_error {
+                let error = qualification.unwrap_err();
+                assert!(matches!(error, ComputeDriverError::Precondition(_)));
+                assert!(error.to_string().contains(expected_error));
+            } else {
+                qualification.unwrap();
+                assert_eq!(selected, CACHED_IMAGE);
+            }
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[test]
@@ -3174,6 +5586,200 @@ mod tests {
         );
 
         let _ = fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn ordered_stop_waits_for_a_paused_workload_to_exit() {
+        use openshell_core::proto::compute::v1::OrderedStart;
+
+        let (socket, requests, handle) = spawn_podman_stub(
+            "ordered-stop-paused",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"paused"}]"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"supervisor-id","Name":"openshell-supervisor-sandbox-1","State":{"Status":"paused","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/isolation-role":"supervisor"}}}"#,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"supervisor-id","Name":"openshell-supervisor-sandbox-1","State":{"Status":"exited","Running":false},"Config":{}}"#,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false},"Config":{}}"#,
+                ),
+            ],
+        );
+        let state = tempfile::tempdir().unwrap();
+        let mut driver = test_driver(socket.clone());
+        driver.provider_launch_state = Some(state.path().to_path_buf());
+        let operation = OrderedStart {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            revision: 1,
+        };
+
+        let request = StopSandboxRequest {
+            sandbox_id: "sandbox-1".to_string(),
+            ordered_stop: Some(operation.clone()),
+            ..Default::default()
+        };
+        let receipt = driver
+            .stop_sandbox_request(request.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .ordered_stop_result
+            .unwrap();
+
+        assert_eq!(receipt.operation, Some(operation));
+        assert_eq!(receipt.code, tonic::Code::Ok as i32);
+        let replay = driver
+            .stop_sandbox_request(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .ordered_stop_result
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, receipt.operation);
+        {
+            let requests = requests.lock().unwrap();
+            let stop_pair = ["supervisor-id", "ctr-1"].map(|id| {
+                [
+                    format!(
+                        "POST {}",
+                        api_path(&format!("/libpod/containers/{id}/kill?signal=SIGKILL"))
+                    ),
+                    format!("GET {}", api_path(&format!("/libpod/containers/{id}/json"))),
+                ]
+            });
+            assert_eq!(requests[2..], stop_pair.concat());
+        }
+        handle.await.unwrap();
+        let _ = fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn ordered_stop_confirms_configured_workload_without_sending_stop() {
+        use openshell_core::proto::compute::v1::OrderedStart;
+
+        let (socket, requests, handle) = spawn_podman_stub(
+            "ordered-stop-configured",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"configured"}]"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"configured","Running":false},"Config":{"Labels":{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/isolation-role":"sandbox"}}}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"supervisor-id","Name":"openshell-supervisor-sandbox-1","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/isolation-role":"supervisor"}}}"#,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"supervisor-id","Name":"openshell-supervisor-sandbox-1","State":{"Status":"exited","Running":false},"Config":{}}"#,
+                ),
+            ],
+        );
+        let state = tempfile::tempdir().unwrap();
+        let mut driver = test_driver(socket.clone());
+        driver.provider_launch_state = Some(state.path().to_path_buf());
+
+        let receipt = driver
+            .stop_sandbox_request(StopSandboxRequest {
+                sandbox_id: "sandbox-1".to_string(),
+                ordered_stop: Some(OrderedStart {
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    revision: 1,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .ordered_stop_result
+            .unwrap();
+
+        assert_eq!(receipt.code, tonic::Code::Ok as i32);
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 5);
+            assert_eq!(
+                requests[1],
+                format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
+            );
+            assert_eq!(
+                requests[3],
+                format!(
+                    "POST {}",
+                    api_path("/libpod/containers/supervisor-id/stop?timeout=10")
+                )
+            );
+        }
+        handle.await.unwrap();
+        let _ = fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn ordered_stop_with_missing_workload_requires_confirmed_supervisor_stop() {
+        use openshell_core::proto::compute::v1::OrderedStart;
+
+        let (socket, requests, handle) = spawn_podman_stub(
+            "ordered-stop-companion",
+            vec![
+                StubResponse::new(StatusCode::OK, "[]"),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"supervisor-id","Name":"openshell-supervisor-sandbox-1","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/isolation-role":"supervisor"}}}"#,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(StatusCode::SERVICE_UNAVAILABLE, "inspect unavailable"),
+            ],
+        );
+        let state = tempfile::tempdir().unwrap();
+        let mut driver = test_driver(socket);
+        driver.provider_launch_state = Some(state.path().to_owned());
+        let request = StopSandboxRequest {
+            sandbox_id: "sandbox-1".into(),
+            ordered_stop: Some(OrderedStart {
+                revision: 1,
+                operation_id: uuid::Uuid::new_v4().to_string(),
+            }),
+            ..Default::default()
+        };
+        let error = driver
+            .stop_sandbox_request(request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(
+            error
+                .message()
+                .contains("supervisor stop outcome is unknown")
+        );
+        handle.await.unwrap();
+        let retry = driver.stop_sandbox_request(request).await.unwrap_err();
+        assert!(retry.message().contains("stop outcome is unknown"));
+        assert_eq!(
+            requests.lock().unwrap()[1..],
+            [
+                format!(
+                    "GET {}",
+                    api_path("/libpod/containers/openshell-supervisor-sandbox-1/json")
+                ),
+                format!(
+                    "POST {}",
+                    api_path(&format!(
+                        "/libpod/containers/supervisor-id/stop?timeout={}",
+                        driver.config.stop_timeout_secs
+                    ))
+                ),
+                format!("GET {}", api_path("/libpod/containers/supervisor-id/json")),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3422,6 +6028,7 @@ mod tests {
         let (delete_socket, _requests, delete_handle) = spawn_podman_stub(
             "trace-delete",
             vec![
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // inspect companion
                 StubResponse::new(StatusCode::NOT_FOUND, ""), // no companion
                 StubResponse::new(StatusCode::NOT_FOUND, ""), // no channel volume
                 StubResponse::new(StatusCode::OK, "[]"),
@@ -4098,6 +6705,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admission_stops_denied_workload_despite_supervisor_inspection_failure() {
+        let sandbox_id = "sandbox-1";
+        let workload = serde_json::json!({
+            "Id": "workload-id",
+            "Name": "workload",
+            "State": {"Status": "running", "Running": true, "StartedAt": "2026-08-12T16:38:00Z"},
+            "Config": {"Labels": {
+                LABEL_SANDBOX_ID: sandbox_id,
+                crate::isolation::LABEL_ROLE: "sandbox",
+                openshell_core::resource_admission::CONFIG_USED_LABEL: "true",
+            }},
+        });
+        let supervisor = serde_json::json!({
+            "Id": "supervisor-id",
+            "Name": "openshell-supervisor-sandbox-1",
+            "State": {"Status": "running", "Running": true},
+            "Config": {"Labels": {
+                LABEL_SANDBOX_ID: sandbox_id,
+                crate::isolation::LABEL_ROLE: "supervisor",
+                LABEL_PROVIDER_LAUNCH_SPIFFE_ID: "spiffe://example.test/launch",
+            }},
+        });
+        let (socket, requests, handle) = spawn_podman_stub(
+            "denied-supervisor-inspection",
+            vec![
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"[{"Id":"workload-id","State":"running"}]"#,
+                ),
+                StubResponse::new(StatusCode::OK, workload.to_string()),
+                StubResponse::new(StatusCode::OK, supervisor.to_string()),
+                StubResponse::new(StatusCode::OK, workload.to_string()),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload-id","Name":"workload","State":{"Status":"exited","Running":false}}"#,
+                ),
+                StubResponse::new(StatusCode::SERVICE_UNAVAILABLE, "inspect unavailable"),
+            ],
+        );
+        let state = tempfile::tempdir().unwrap();
+        let mut driver = test_driver(socket);
+        driver.config.allow_driver_config = false;
+        driver.provider_launch_state = Some(state.path().to_owned());
+        driver.provider_workload_identity_supported = true;
+
+        driver.reconcile_resource_admission().await;
+
+        assert_eq!(
+            requests.lock().unwrap()[4..],
+            [
+                format!(
+                    "POST {}",
+                    api_path("/libpod/containers/workload-id/stop?timeout=0")
+                ),
+                format!("GET {}", api_path("/libpod/containers/workload-id/json")),
+                format!(
+                    "GET {}",
+                    api_path("/libpod/containers/openshell-supervisor-sandbox-1/json")
+                ),
+            ]
+        );
+        handle.await.unwrap();
+        assert!(
+            lock_existing_provider_launch(state.path().join(sandbox_id))
+                .await
+                .unwrap()
+                .is_some(),
+            "confirmed Stop and a failed read leave no unknown engine mutation"
+        );
+    }
+
+    #[tokio::test]
     async fn admission_driver_config_denial_does_not_contact_podman() {
         for enabled in [true, false] {
             let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
@@ -4301,6 +6981,7 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-not-found",
             vec![
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // inspect companion
                 StubResponse::new(StatusCode::NOT_FOUND, ""), // no companion
                 StubResponse::new(StatusCode::NOT_FOUND, ""), // channel volume already gone
                 // list_containers returns empty (container already gone)
@@ -4337,6 +7018,7 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-unowned-not-found",
             vec![
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // inspect companion
                 StubResponse::new(StatusCode::NOT_FOUND, ""), // no companion
                 StubResponse::new(StatusCode::OK, unlabeled_channel.to_string()),
                 StubResponse::new(StatusCode::OK, "[]"), // no workload
@@ -4829,9 +7511,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sandbox_removes_proxy_auth_secret_on_start_failure() {
-        // The container is created but fails to start; the staged credential
-        // secret must still be removed.
+    async fn create_sandbox_reports_unconfirmed_container_removal_on_start_failure() {
+        for (supervisor_removal, workload_removal, expected) in [
+            (
+                StatusCode::NOT_FOUND,
+                StatusCode::NOT_FOUND,
+                tonic::Code::NotFound,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                tonic::Code::Unavailable,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::NOT_FOUND,
+                tonic::Code::Unavailable,
+            ),
+        ] {
+            assert_create_sandbox_start_failure(supervisor_removal, workload_removal, expected)
+                .await;
+        }
+    }
+
+    async fn assert_create_sandbox_start_failure(
+        supervisor_removal: StatusCode,
+        workload_removal: StatusCode,
+        expected: tonic::Code,
+    ) {
         let sandbox_id = "sandbox-sf";
         let auth_file = write_proxy_auth_file("start-fail");
         let (socket_path, request_log, handle) = spawn_podman_stub(
@@ -4840,9 +7547,9 @@ mod tests {
                 .into_iter()
                 .chain(create_launch_responses().into_iter().take(8))
                 .chain([
-                    StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "supervisor start failed"),
-                    StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor
-                    StubResponse::new(StatusCode::NO_CONTENT, ""), // workload
+                    StubResponse::new(StatusCode::NOT_FOUND, "supervisor start failed"),
+                    StubResponse::new(supervisor_removal, ""),
+                    StubResponse::new(workload_removal, ""),
                     owned_volume_response(
                         &crate::isolation::channel_volume_name(sandbox_id),
                         sandbox_id,
@@ -4873,10 +7580,11 @@ mod tests {
             ..DriverSandboxSpec::default()
         });
 
-        driver
+        let error = driver
             .create_sandbox(&sandbox)
             .await
             .expect_err("container start should fail");
+        assert_eq!(Status::from(error).code(), expected);
 
         handle.await.expect("stub task should finish");
         let requests = request_log
@@ -4903,6 +7611,7 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-proxy-auth",
             vec![
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // inspect companion
                 StubResponse::new(StatusCode::NOT_FOUND, ""), // no companion
                 StubResponse::new(StatusCode::NOT_FOUND, ""), // no channel volume
                 StubResponse::new(StatusCode::OK, "[]"),      // list_containers (not found)
@@ -4944,6 +7653,14 @@ mod tests {
         let volume_name = container::volume_name(sandbox_id);
         let channel_volume = crate::isolation::channel_volume_name(sandbox_id);
         let control_volume = crate::isolation::control_volume_name(sandbox_id);
+        let proxy_secret = format!(
+            "{}-{}",
+            container::proxy_auth_secret_name(sandbox_id),
+            uuid::Uuid::new_v4()
+        );
+        let mut supervisor: serde_json::Value =
+            serde_json::from_str(REFRESH_STOPPED_SUPERVISOR).unwrap();
+        supervisor["Config"]["Secrets"] = serde_json::json!([{"Name": proxy_secret}]);
         let list_body = serde_json::json!([{
             "Id": container_id,
             "Names": [container_name],
@@ -4956,7 +7673,9 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-label-lookup",
             vec![
+                StubResponse::new(StatusCode::OK, supervisor.to_string()),
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove the companion's proxy secret
                 owned_volume_response(&channel_volume, sandbox_id, None),
                 StubResponse::new(StatusCode::CONFLICT, ""), // channel still attached
                 // list_containers by label
@@ -4992,6 +7711,11 @@ mod tests {
                 "/libpod/containers/{container_id}?force=true&volumes=true&timeout=10"
             ))
         )));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("DELETE ") && request.ends_with(&proxy_secret))
+        );
         assert_eq!(
             volume_deletes(&request_log),
             [
@@ -5020,6 +7744,7 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-unowned-workspace",
             vec![
+                StubResponse::new(StatusCode::OK, REFRESH_STOPPED_SUPERVISOR),
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
                 owned_volume_response(&channel_volume, sandbox_id, None),
                 StubResponse::new(StatusCode::CONFLICT, ""), // channel still attached

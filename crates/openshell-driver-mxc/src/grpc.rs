@@ -134,7 +134,7 @@ impl ComputeDriver for ComputeDriverService {
             return Err(Status::invalid_argument("name is required"));
         }
         self.backend.stop_sandbox(&req.name).await?;
-        Ok(Response::new(StopSandboxResponse {}))
+        Ok(Response::new(StopSandboxResponse::default()))
     }
 
     async fn start_sandbox(

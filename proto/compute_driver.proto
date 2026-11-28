@@ -532,9 +532,16 @@ message StopSandboxRequest {
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
   string name = 2;
+  // Orders an explicit stop or the stop stage of an automatic provider restart.
+  optional OrderedStart ordered_stop = 3;
 }
 
-message StopSandboxResponse {}
+message StopSandboxResponse {
+  // Durable receipt for the exact ordered stop. An absent receipt or an RPC
+  // error leaves the stop pending.
+  // An explicit stop settles on confirmed success or absence.
+  optional OrderedStartResult ordered_stop_result = 1;
+}
 
 message StartSandboxRequest {
   // Stable sandbox ID stored by the gateway.
@@ -572,6 +579,39 @@ message StartSandboxRequest {
   // output. Older gateways omit the field, preserving the original start
   // contract on the wire.
   optional DriverSandbox sandbox = 9;
+  // Deprecated scalar revision from earlier gateways. Zero means absent.
+  uint64 provider_launch_revision = 10;
+  // Present when the gateway has persisted a replayable provider launch.
+  optional OrderedStart ordered_start = 11;
+  // Reconcile an expired operation without creating or starting resources.
+  bool settle_only = 12;
+  // Requires openshell.compute.ordered-provider-start.receipt-lookup and
+  // ordered_start. Read the exact terminal receipt without changing the
+  // journal or backend. Launch credentials are unnecessary. If the matching
+  // result cannot be read, return a gRPC error. Do not combine with settle_only.
+  bool ordered_start_receipt_only = 13;
+}
+
+message OrderedStart {
+  // Strictly increasing within the sandbox. Zero is reserved.
+  uint64 revision = 1;
+  // Gateway-assigned operation UUID. A launch uses its launch UUID.
+  // An exact retry keeps this UUID and revision.
+  string operation_id = 2;
+}
+
+message OrderedStartResult {
+  OrderedStart operation = 1;
+  // Terminal gRPC status code. Zero means the driver accepted Start or completed Stop.
+  int32 code = 2;
+  // Driver diagnostic for a terminal rejection.
+  string message = 3;
+  // The driver returned a recorded outcome without repeating the operation.
+  bool replayed = 4;
+  // The exact historical operation succeeded, but its launch is inactive.
+  // The gateway can settle it and issue a new launch under a fresh revision.
+  // Used only in responses to Start.
+  bool requires_replacement = 5;
 }
 
 message SuspendSandboxRequest {
@@ -586,6 +626,9 @@ message StartSandboxResponse {
   // Updated opaque runtime identity after a successful start. Required when
   // the driver advertises sandbox authentication support.
   string runtime_identity = 1;
+  // Durable acknowledgment for the exact operation. A transport error or
+  // an absent acknowledgment leaves the outcome unknown to the gateway.
+  optional OrderedStartResult ordered_start_result = 2;
 }
 
 message DeleteSandboxRequest {

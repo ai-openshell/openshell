@@ -19,6 +19,7 @@ use crate::persistence::Store;
 pub const RUNTIME_GENERATION_ANNOTATION: &str = "internal.openshell.ai/runtime-generation";
 pub const AUTH_EPOCH_ANNOTATION: &str = "internal.openshell.ai/auth-epoch";
 pub const GATEWAY_TOKEN_ID_ANNOTATION: &str = "internal.openshell.ai/gateway-token-id";
+const PROVIDER_LAUNCH_ID_ANNOTATION: &str = "internal.openshell.ai/provider-launch-id";
 const PREVIOUS_GATEWAY_TOKEN_ID_ANNOTATION: &str =
     "internal.openshell.ai/previous-gateway-token-id";
 const REFRESH_REPLAY_UNTIL_ANNOTATION: &str = "internal.openshell.ai/refresh-replay-until";
@@ -100,6 +101,7 @@ pub struct PersistedSandboxIdentity {
     pub runtime_generation: SandboxGenerationId,
     pub auth_epoch: CredentialEpoch,
     pub gateway_token_id: Uuid,
+    pub provider_launch_id: Option<Uuid>,
     pub refresh_replay: Option<GatewayRefreshReplay>,
 }
 
@@ -110,6 +112,7 @@ impl PersistedSandboxIdentity {
                 .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?,
             auth_epoch: CredentialEpoch::new(1)?,
             gateway_token_id: Uuid::new_v4(),
+            provider_launch_id: Some(Uuid::new_v4()),
             refresh_replay: None,
         })
     }
@@ -132,6 +135,11 @@ impl PersistedSandboxIdentity {
             .get(GATEWAY_TOKEN_ID_ANNOTATION)
             .ok_or(SessionJwtError::MissingRuntimeIdentity)
             .and_then(|value| Uuid::parse_str(value).map_err(|_| SessionJwtError::InvalidJti))?;
+        let provider_launch_id = annotations
+            .get(PROVIDER_LAUNCH_ID_ANNOTATION)
+            .map(|value| Uuid::parse_str(value))
+            .transpose()
+            .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
         let replay_values = (
             annotations.get(PREVIOUS_GATEWAY_TOKEN_ID_ANNOTATION),
             annotations.get(REFRESH_REQUEST_HASH_ANNOTATION),
@@ -173,6 +181,7 @@ impl PersistedSandboxIdentity {
             runtime_generation,
             auth_epoch,
             gateway_token_id,
+            provider_launch_id,
             refresh_replay,
         })
     }
@@ -190,6 +199,14 @@ impl PersistedSandboxIdentity {
             GATEWAY_TOKEN_ID_ANNOTATION.to_string(),
             self.gateway_token_id.to_string(),
         );
+        if let Some(launch_id) = self.provider_launch_id {
+            annotations.insert(
+                PROVIDER_LAUNCH_ID_ANNOTATION.to_string(),
+                launch_id.to_string(),
+            );
+        } else {
+            annotations.remove(PROVIDER_LAUNCH_ID_ANNOTATION);
+        }
         if let Some(replay) = &self.refresh_replay {
             annotations.insert(
                 PREVIOUS_GATEWAY_TOKEN_ID_ANNOTATION.to_string(),
@@ -235,6 +252,7 @@ impl PersistedSandboxIdentity {
             runtime_generation: self.runtime_generation.clone(),
             auth_epoch: self.auth_epoch,
             gateway_token_id: derive_token_id(rotation_id, b"gateway")?,
+            provider_launch_id: self.provider_launch_id,
             refresh_replay: Some(GatewayRefreshReplay {
                 previous_gateway_token_id: self.gateway_token_id,
                 request_hash,
@@ -243,6 +261,16 @@ impl PersistedSandboxIdentity {
                 rotation_id,
             }),
         })
+    }
+
+    pub(crate) fn replace_provider_launch(&self) -> Self {
+        Self {
+            runtime_generation: self.runtime_generation.clone(),
+            auth_epoch: self.auth_epoch,
+            gateway_token_id: Uuid::new_v4(),
+            provider_launch_id: Some(Uuid::new_v4()),
+            refresh_replay: None,
+        }
     }
 }
 
@@ -321,11 +349,21 @@ pub async fn authorize_persisted(
     store: &Store,
     principal: &AuthenticatedSandboxSession,
 ) -> Result<PersistedSandboxIdentity, AuthRejection> {
-    let (_, identity) = load_identity(store, principal).await?;
+    authorize_persisted_sandbox(store, principal)
+        .await
+        .map(|(_, identity)| identity)
+}
+
+#[allow(clippy::result_large_err)]
+pub async fn authorize_persisted_sandbox(
+    store: &Store,
+    principal: &AuthenticatedSandboxSession,
+) -> Result<(Sandbox, PersistedSandboxIdentity), AuthRejection> {
+    let (sandbox, identity) = load_identity(store, principal).await?;
     if principal.token_id != identity.gateway_token_id {
         return Err(stale_identity());
     }
-    Ok(identity)
+    Ok((sandbox, identity))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -491,6 +529,7 @@ pub async fn advance_identity_for_takeover(
             runtime_generation: current.runtime_generation.clone(),
             auth_epoch,
             gateway_token_id,
+            provider_launch_id: current.provider_launch_id,
             refresh_replay: None,
         };
         match store
@@ -552,6 +591,7 @@ mod tests {
                 .expect("runtime generation"),
             auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
             gateway_token_id: Uuid::from_u128(1),
+            provider_launch_id: None,
             refresh_replay: None,
         };
         let mut metadata = ObjectMeta {
@@ -609,6 +649,7 @@ mod tests {
                         .expect("runtime generation"),
                     auth_epoch: CredentialEpoch::new(2).expect("auth epoch"),
                     gateway_token_id: Uuid::from_u128(2),
+                    provider_launch_id: None,
                     refresh_replay: None,
                 };
                 next.write(&mut sandbox.metadata.as_mut().expect("metadata").annotations);

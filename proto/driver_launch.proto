@@ -59,6 +59,9 @@ message ConfigureRequest {
   // resource labels to the gateway. Empty means the defaults. A typed
   // `resource_admission_policy` is reserved for a later protocol version.
   string resource_admission_policy_json = 7;
+  // Whether the gateway selected verified provider workload identity.
+  // Managed Docker and Podman require an explicit true to qualify for this mode.
+  optional bool verified_provider_workload_identity = 8;
 }
 
 message ConfigureResponse {}

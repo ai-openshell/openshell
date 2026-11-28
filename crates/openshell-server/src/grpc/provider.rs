@@ -4828,6 +4828,11 @@ async fn exchange_provider_subject_token_inner(
         )
         .to_status_with_code(code));
     }
+    if state.compute.provider_workload_identity().is_some() {
+        return Err(token_grant_configuration_status(
+            tonic::Code::FailedPrecondition,
+        ));
+    }
     drop(request);
 
     if req.provider.trim().is_empty()
@@ -4919,7 +4924,7 @@ async fn exchange_provider_subject_token_inner(
         &provider,
         &subject_token.credential,
     )?;
-    let stored_subject_token =
+    let (stored_subject_token, _) =
         resolve_subject_token_credential(&state.credentials, &provider, &subject_token.credential)
             .await?;
 
@@ -5012,29 +5017,30 @@ async fn resolve_subject_token_credential(
     credentials: &crate::credentials::CredentialRuntime,
     provider: &Provider,
     credential_key: &str,
-) -> Result<String, Status> {
+) -> Result<(String, Option<i64>), Status> {
     // Check the provider's expiry before asking a credential driver to resolve
     // a handle; stale stored material cannot authorize another grant attempt.
-    ensure_subject_token_credential_not_expired(provider, credential_key)?;
+    let provider_expires_at_ms =
+        ensure_subject_token_credential_not_expired(provider, credential_key)?;
     if let Some(value) = provider
         .credentials
         .get(credential_key)
         .filter(|value| !value.is_empty())
     {
-        return Ok(value.clone());
+        return Ok((value.clone(), provider_expires_at_ms));
     }
 
     if provider.credential_handles.contains_key(credential_key) {
-        let resolved = credentials
+        let mut resolved = credentials
             .resolve_provider_handles(provider, crate::persistence::current_time_ms())
             .await
             .map_err(token_grant_dependency_status)?;
         if let Some(value) = resolved
             .values
-            .get(credential_key)
+            .remove(credential_key)
             .filter(|value| !value.is_empty())
         {
-            return Ok(value.clone());
+            return Ok((value, resolved.expires_at_ms.get(credential_key).copied()));
         }
     }
 
@@ -5044,12 +5050,12 @@ async fn resolve_subject_token_credential(
 fn ensure_subject_token_credential_not_expired(
     provider: &Provider,
     credential_key: &str,
-) -> Result<(), Status> {
+) -> Result<Option<i64>, Status> {
     let expires_at_ms = provider_credential_expiration_ms(provider, credential_key)?;
     if expires_at_ms.is_some_and(|value| value <= crate::persistence::current_time_ms()) {
         return Err(token_grant_authorization_required_status());
     }
-    Ok(())
+    Ok(expires_at_ms)
 }
 
 /// The user's stored subject credential is absent or expired. Only the user
@@ -6433,8 +6439,11 @@ pub(super) mod tests {
         let error = ensure_subject_token_credential_not_expired(&provider, "SUBJECT_TOKEN")
             .expect_err("the Unix epoch is a present, expired timestamp");
         assert_eq!(error.code(), Code::FailedPrecondition);
-        ensure_subject_token_credential_not_expired(&provider, "UNSET_TOKEN")
-            .expect("an absent expiration remains non-expiring");
+        assert_eq!(
+            ensure_subject_token_credential_not_expired(&provider, "UNSET_TOKEN")
+                .expect("an absent expiration remains non-expiring"),
+            None
+        );
     }
 
     mod token_grant_failures {
@@ -6568,6 +6577,8 @@ pub(super) mod tests {
             let mut request = Request::new(
                 openshell_core::proto::GetSandboxProviderAccessTokenRequest {
                     credential_key: SECRET.to_string(),
+                    jwt_svid: None,
+                    launch_jwt_svid: None,
                 },
             );
             request
@@ -12189,13 +12200,21 @@ pub(super) mod tests {
             .await
             .unwrap();
         provider.credential_handles = handles;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+        provider
+            .credential_handles
+            .get_mut("subject_token")
+            .unwrap()
+            .metadata
+            .insert("test_expiration_ms".into(), expires_at_ms.to_string());
 
-        let subject_token =
+        let (subject_token, subject_expires_at_ms) =
             resolve_subject_token_credential(&credentials, &provider, "subject_token")
                 .await
                 .unwrap();
 
         assert_eq!(subject_token, "user-token");
+        assert_eq!(subject_expires_at_ms, Some(expires_at_ms));
     }
 
     #[tokio::test]

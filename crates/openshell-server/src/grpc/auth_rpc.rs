@@ -1443,6 +1443,7 @@ mod tests {
                 .expect("runtime generation"),
                 auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("auth epoch"),
                 gateway_token_id: uuid::Uuid::new_v4(),
+                provider_launch_id: None,
                 refresh_replay: None,
             },
         )

@@ -32,33 +32,37 @@
 //! Each sandbox instance selects one resolver when its networking starts, from
 //! its [`ProviderIdentitySource`]. A token is never served to another sandbox.
 //!
-//! A dedicated supervisor uses a [`SpiffeTokenGrantResolver`], which presents
-//! the supervisor's own identity from a SPIFFE Workload API socket and owns
-//! the instance's token cache and HTTP client. Without a socket, its grants
-//! fail closed with a configuration failure. A shared supervisor uses a
-//! [`GatewayTokenGrantResolver`], which requests only the final provider access
-//! token from the gateway; the gateway owns SPIRE acquisition, exchange, and
-//! caching.
+//! A dedicated supervisor can use a [`SpiffeTokenGrantResolver`] to perform
+//! the exchange with its local SPIFFE identity. Shared supervisors and
+//! dedicated supervisors with provider workload identity use a
+//! [`GatewayTokenGrantResolver`] to obtain the final access token.
+//! The gateway obtains the SPIFFE assertion for shared supervisors and
+//! verifies both assertions supplied by an opted-in dedicated supervisor.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use openshell_core::grpc_client::{GatewayEndpoint, SandboxProviderTokenClient};
+use openshell_core::grpc_client::{
+    GatewayEndpoint, ProviderWorkloadAssertions, SandboxProviderTokenClient,
+};
 use openshell_core::oauth::{
     self, ACCESS_TOKEN_TYPE, OAuthTokenResponse, TokenExchangeParams, TokenGrantClient,
     TokenGrantParams, effective_client_assertion_type, effective_token_type, token_cache_ttl,
 };
 use openshell_core::proto::ProviderCredentialTokenGrantType;
 use openshell_core::token_grant_failure::{
-    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
+    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage, WORKLOAD_IDENTITY_CALL_TIMEOUT,
 };
-use spiffe::{WorkloadApiClient, WorkloadApiError};
+use spiffe::{JwtSvid, SpiffeId, WorkloadApiClient, WorkloadApiError};
+use tokio::sync::OnceCell;
 
 use crate::l7::token_grant_injection::{TokenGrantRequest, TokenGrantResolver};
+
+const WORKLOAD_ASSERTION_REUSE: Duration = Duration::from_secs(5);
 
 /// Cached access token with expiration metadata.
 #[derive(Clone)]
@@ -112,15 +116,24 @@ pub enum ProviderIdentitySource {
     /// Workload API socket, for a supervisor dedicated to one sandbox.
     /// Without a socket, every grant fails closed.
     WorkloadApi(Option<PathBuf>),
-    /// Request final tokens from the gateway, which owns the sandbox's
-    /// workload identity.
-    Gateway,
+    /// Request final tokens from the gateway. Dedicated supervision supplies
+    /// its own JWT-SVIDs when provider workload identity is enabled.
+    Gateway(Option<ProviderWorkloadIdentity>),
 }
 
 impl Default for ProviderIdentitySource {
     fn default() -> Self {
         Self::WorkloadApi(None)
     }
+}
+
+/// Workload API settings supplied to one dedicated supervisor launch.
+#[derive(Debug)]
+pub struct ProviderWorkloadIdentity {
+    pub workload_api_socket: Option<PathBuf>,
+    pub spiffe_id: String,
+    pub launch_spiffe_id: String,
+    pub launch_audience: String,
 }
 
 /// Provider token grants acquired with this supervisor's SPIFFE identity.
@@ -161,7 +174,11 @@ impl SpiffeTokenGrantResolver {
             .workload_api_socket
             .as_deref()
             .ok_or_else(configuration_failure)?;
-        fetch_jwt_svid_from_socket(socket_path, audience).await
+        connect_workload_api(socket_path)
+            .await?
+            .fetch_jwt_token([audience], None)
+            .await
+            .map_err(workload_api_failure)
     }
 
     /// Obtain an `OAuth2` access token for a provider using JWT client assertion grant.
@@ -286,24 +303,154 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
     }
 }
 
-/// Final provider access tokens from the gateway, for a sandbox instance whose
-/// supervisor holds no workload identity of its own.
+/// Final provider access tokens from the gateway.
 ///
-/// It forwards only the credential key and request ID over the instance's
-/// reused authenticated gateway connection and validates the returned token.
-/// The gateway authorizes, acquires, exchanges, and caches on every request;
-/// this resolver holds no cache, SVID, intermediate token, or HTTP client.
+/// The resolver forwards the credential key and, for dedicated workload
+/// identity, two JWT-SVIDs. The gateway verifies both assertions on every
+/// request, including when this resolver reuses a recently fetched pair.
 pub struct GatewayTokenGrantResolver {
     gateway: SandboxProviderTokenClient,
+    workload_identity: Option<ProviderWorkloadIdentity>,
+    workload_api_client: OnceCell<WorkloadApiClient>,
+    cached_assertions: RwLock<Option<CachedWorkloadAssertions>>,
+}
+
+struct CachedWorkloadAssertions {
+    audience: String,
+    reuse_until: Instant,
+    refresh_at_ms: i64,
+    assertions: ProviderWorkloadAssertions,
+}
+
+impl CachedWorkloadAssertions {
+    fn reusable_for(&self, audience: &str, now: Instant, now_ms: i64) -> bool {
+        self.audience == audience && now < self.reuse_until && now_ms < self.refresh_at_ms
+    }
 }
 
 impl GatewayTokenGrantResolver {
     #[must_use]
-    pub fn new(gateway: GatewayEndpoint) -> Self {
+    pub fn new(
+        gateway: GatewayEndpoint,
+        workload_identity: Option<ProviderWorkloadIdentity>,
+    ) -> Self {
         Self {
             gateway: SandboxProviderTokenClient::new(gateway),
+            workload_identity,
+            workload_api_client: OnceCell::new(),
+            cached_assertions: RwLock::new(None),
         }
     }
+
+    async fn fetch_dedicated_assertions(
+        &self,
+        identity: &ProviderWorkloadIdentity,
+        request: &TokenGrantRequest<'_>,
+    ) -> Result<ProviderWorkloadAssertions, TokenGrantFailure> {
+        self.gateway.require_attested_transport()?;
+        let socket = identity
+            .workload_api_socket
+            .as_deref()
+            .filter(|path| path.is_absolute())
+            .ok_or_else(configuration_failure)?;
+        let spiffe_id =
+            SpiffeId::try_from(identity.spiffe_id.as_str()).map_err(|_| configuration_failure())?;
+        let launch_spiffe_id = SpiffeId::try_from(identity.launch_spiffe_id.as_str())
+            .map_err(|_| configuration_failure())?;
+        let configured_audience = request.jwt_svid_audience;
+        let audience = effective_jwt_svid_audience(
+            request.token_endpoint,
+            if configured_audience.trim().is_empty() {
+                ""
+            } else {
+                configured_audience
+            },
+        );
+        if spiffe_id == launch_spiffe_id || audience == identity.launch_audience {
+            return Err(configuration_failure());
+        }
+        if let Ok(cache) = self.cached_assertions.read()
+            && let Some(cached) = cache.as_ref()
+            && cached.reusable_for(&audience, Instant::now(), current_time_ms())
+        {
+            return Ok(cached.assertions.clone());
+        }
+        tokio::time::timeout(WORKLOAD_IDENTITY_CALL_TIMEOUT, async {
+            let client = self
+                .workload_api_client
+                .get_or_try_init(|| connect_workload_api(socket))
+                .await?;
+            // Workload API attestation controls entitlement to the SPIFFE ID.
+            let (provider_svid, launch_svid) = tokio::try_join!(
+                client.fetch_jwt_svid([audience.as_str()], Some(&spiffe_id)),
+                client.fetch_jwt_svid([identity.launch_audience.as_str()], Some(&launch_spiffe_id)),
+            )
+            .map_err(workload_api_failure)?;
+            let provider_expiry = workload_assertion_expiry(&provider_svid, &spiffe_id, &audience)?;
+            let launch_expiry = workload_assertion_expiry(
+                &launch_svid,
+                &launch_spiffe_id,
+                &identity.launch_audience,
+            )?;
+            let assertions = ProviderWorkloadAssertions {
+                jwt_svid: provider_svid.token().to_owned(),
+                launch_jwt_svid: launch_svid.token().to_owned(),
+            };
+            if assertion_allows_reuse(&assertions.jwt_svid)
+                && assertion_allows_reuse(&assertions.launch_jwt_svid)
+                && let Ok(mut cache) = self.cached_assertions.write()
+            {
+                *cache = Some(CachedWorkloadAssertions {
+                    audience,
+                    reuse_until: Instant::now() + WORKLOAD_ASSERTION_REUSE,
+                    refresh_at_ms: provider_expiry.min(launch_expiry).saturating_sub(1_000),
+                    assertions: assertions.clone(),
+                });
+            }
+            Ok(assertions)
+        })
+        .await
+        .map_err(|_| {
+            TokenGrantFailure::new(
+                TokenGrantFailureKind::Timeout,
+                TokenGrantStage::WorkloadIdentity,
+            )
+        })?
+    }
+}
+
+// An issuer can add a JWT ID for recipients that require a fresh assertion.
+fn assertion_allows_reuse(token: &str) -> bool {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let Some(payload) = token.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(payload) = URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&payload)
+        .is_ok_and(|claims| claims.get("jti").is_none())
+}
+
+// Check the response before local reuse. The gateway verifies both signatures.
+fn workload_assertion_expiry(
+    svid: &JwtSvid,
+    expected_id: &SpiffeId,
+    audience: &str,
+) -> Result<i64, TokenGrantFailure> {
+    let expires_at_ms = svid.expiry().unix_timestamp().saturating_mul(1_000);
+    if svid.spiffe_id() == expected_id
+        && svid.audience() == [audience]
+        && expires_at_ms > current_time_ms()
+    {
+        return Ok(expires_at_ms);
+    }
+    Err(TokenGrantFailure::new(
+        TokenGrantFailureKind::WorkloadIdentityRejected,
+        TokenGrantStage::WorkloadIdentity,
+    ))
 }
 
 impl TokenGrantResolver for GatewayTokenGrantResolver {
@@ -312,9 +459,13 @@ impl TokenGrantResolver for GatewayTokenGrantResolver {
         request: TokenGrantRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>> {
         Box::pin(async move {
+            let assertions = match &self.workload_identity {
+                Some(identity) => Some(self.fetch_dedicated_assertions(identity, &request).await?),
+                None => None,
+            };
             let token = self
                 .gateway
-                .get_access_token(request.provider_key, Some(request.request_id))
+                .get_access_token(request.provider_key, assertions, Some(request.request_id))
                 .await?;
             validate_access_token(&token.access_token)?;
             Ok(token.access_token)
@@ -385,24 +536,11 @@ where
     Ok(token_response.access_token)
 }
 
-/// Fetch a JWT-SVID from the SPIRE agent for token grant authentication.
-///
-/// The JWT-SVID is used as the client assertion in the `OAuth2` grant request.
-async fn fetch_jwt_svid_from_socket(
+async fn connect_workload_api(
     socket_path: &std::path::Path,
-    audience: &str,
-) -> Result<String, TokenGrantFailure> {
+) -> Result<WorkloadApiClient, TokenGrantFailure> {
     let endpoint = openshell_spiffe::workload_api_endpoint(socket_path);
-
-    // Connect to SPIRE agent
-    let client = WorkloadApiClient::connect_to(&endpoint)
-        .await
-        .map_err(workload_api_failure)?;
-
-    // Fetch JWT-SVID with token service audience
-    // None = use the sandbox's default SPIFFE ID
-    client
-        .fetch_jwt_token([audience], None)
+    WorkloadApiClient::connect_to(&endpoint)
         .await
         .map_err(workload_api_failure)
 }
@@ -706,6 +844,35 @@ mod tests {
     use tokio::net::TcpListener;
 
     const TEST_REQUEST_ID: &str = "4f1c2b3a-9d8e-4c7b-a6f5-e4d3c2b1a098";
+
+    #[test]
+    fn assertion_reuse_requires_matching_audience_and_both_lifetimes() {
+        let now = Instant::now();
+        let cached = CachedWorkloadAssertions {
+            audience: "https://issuer.test/token".to_owned(),
+            reuse_until: now + WORKLOAD_ASSERTION_REUSE,
+            refresh_at_ms: 10_000,
+            assertions: ProviderWorkloadAssertions {
+                jwt_svid: "provider-assertion".to_owned(),
+                launch_jwt_svid: "launch-assertion".to_owned(),
+            },
+        };
+        assert!(cached.reusable_for(&cached.audience, now, 9_999));
+        assert!(!cached.reusable_for("https://other.test/token", now, 9_999));
+        assert!(!cached.reusable_for(&cached.audience, now, 10_000));
+        assert!(!cached.reusable_for(&cached.audience, cached.reuse_until, 9_999));
+    }
+
+    #[test]
+    fn assertion_with_a_jwt_id_requires_a_fresh_fetch() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let jwt = |claims: &str| format!("header.{}.signature", URL_SAFE_NO_PAD.encode(claims));
+        let with_jwt_id = jwt(r#"{"exp":100,"jti":"unique"}"#);
+        assert!(assertion_allows_reuse(&jwt(r#"{"exp":100}"#)));
+        assert!(!assertion_allows_reuse(&with_jwt_id));
+    }
 
     fn test_http_client() -> TokenGrantClient {
         TokenGrantClient::new().expect("token grant HTTP client")

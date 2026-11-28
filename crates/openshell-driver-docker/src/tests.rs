@@ -63,6 +63,8 @@ pub fn test_launch_authentication() -> Vec<u8> {
             gateway_expires_at: i64::MAX,
             sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
             sandbox_expires_at: i64::MAX,
+            provider_spiffe_id: None,
+            provider_launch_spiffe_id: None,
             ssh_host_private_key: None,
             traces_otlp_headers: None,
             ocsf_otlp_headers: None,
@@ -79,6 +81,53 @@ pub fn test_launch_authentication() -> Vec<u8> {
         }],
     })
     .unwrap()
+}
+
+#[tokio::test]
+async fn expired_provider_launch_settles_before_docker_mutation() {
+    let directory = TempDir::new().unwrap();
+    let previous = DockerProviderLaunchMutation::new(
+        directory.path(),
+        &OrderedStart {
+            operation_id: "previous-launch".into(),
+            revision: 1,
+        },
+    );
+    previous.record("old-workload-id").await.unwrap();
+    let next = DockerProviderLaunchMutation::new(
+        directory.path(),
+        &OrderedStart {
+            operation_id: "next-launch".into(),
+            revision: 2,
+        },
+    );
+    let mut authentication: SandboxLaunchAuthentication =
+        serde_json::from_slice(&test_launch_authentication()).unwrap();
+    let stable = "spiffe://example.test/gateway/g/sandbox/sb";
+    let launch_spiffe_id = format!("{stable}/launch/next-launch");
+    authentication.supervisor.provider_spiffe_id = Some(stable.into());
+    authentication.supervisor.provider_launch_spiffe_id = Some(launch_spiffe_id.clone());
+    let request = StartSandboxRequest {
+        sandbox_id: "sb".into(),
+        launch_authentication: serde_json::to_vec(&authentication).unwrap(),
+        ..Default::default()
+    };
+    let outcome = test_driver_with_config(runtime_config())
+        .replay_docker_provider_launch(
+            &request,
+            &next,
+            &launch_spiffe_id,
+            ProviderLaunchReplay::Settle,
+        )
+        .await
+        .expect("an expired operation that never modified Docker has a terminal outcome")
+        .unwrap_err();
+    assert_eq!(outcome.code(), tonic::Code::DeadlineExceeded);
+    assert_eq!(
+        previous.recorded_workload().await.unwrap().as_deref(),
+        Some("old-workload-id")
+    );
+    assert!(next.recorded_workload().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -366,6 +415,9 @@ pub fn runtime_config() -> DockerDriverRuntimeConfig {
         proxy_ca_bundle: None,
         ipv6_egress: SupervisorIpv6EgressConfig::default(),
         provider_spiffe_workload_api_socket: None,
+        provider_workload_identity_support: Err(
+            "Docker provider Workload API socket is not configured".to_string(),
+        ),
         app_armor_profile: Some(AppArmorProfile::Unconfined),
         network_trust: None,
     }
@@ -608,6 +660,119 @@ fn capabilities_report_static_resource_support() {
         .unwrap();
     assert!(gpu.default_selection_supported);
     assert!(gpu.count_selection_supported);
+}
+
+#[test]
+fn verified_provider_grants_check_effective_docker_transport() {
+    let mut config = runtime_config();
+    config.supervisor_network_mode = DockerSupervisorNetworkMode::Bridge;
+    config.supervisor_endpoint_explicit = false;
+    let bind_address = "0.0.0.0:8443".parse().unwrap();
+
+    config.bridge_default_endpoint = default_docker_bridge_endpoint(bind_address, false, false);
+    assert!(docker_supervisor_networking(&config).is_ok());
+    let error = validate_docker_provider_grant_transport(&config).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("HTTPS"));
+
+    config.bridge_default_endpoint = default_docker_bridge_endpoint(bind_address, true, false);
+    validate_docker_provider_grant_transport(&config).unwrap();
+
+    config.supervisor_network_mode = DockerSupervisorNetworkMode::Host;
+    config.supervisor_grpc_endpoint = "http://127.0.0.1:8443".to_string();
+    validate_docker_provider_grant_transport(&config).unwrap();
+}
+
+#[tokio::test]
+async fn docker_provider_probe_checks_the_projected_socket_and_rejects_legacy_success() {
+    use crate::workspace::tests::docker_api;
+
+    let mut config = runtime_config();
+    config.provider_spiffe_workload_api_socket = Some("/run/spire/agent.sock".into());
+    for (exit_code, expected_error) in [
+        (PROVIDER_WORKLOAD_SOCKET_PROBE_PRESENT, None),
+        (0, Some("Select a matching supervisor image")),
+        (
+            PROVIDER_WORKLOAD_SOCKET_PROBE_UNAVAILABLE,
+            Some("cannot see the configured Workload API Unix socket"),
+        ),
+    ] {
+        let (docker, engine) = docker_api(vec![
+            (
+                "POST",
+                String::new(),
+                201,
+                serde_json::json!({"Id":"socket-probe","Warnings":[]}),
+            ),
+            ("POST", "/start".into(), 204, serde_json::Value::Null),
+            (
+                "POST",
+                String::new(),
+                200,
+                serde_json::json!({"StatusCode": exit_code}),
+            ),
+            ("DELETE", String::new(), 204, serde_json::Value::Null),
+        ])
+        .await;
+        let result = probe_docker_provider_workload_identity(&docker, &config).await;
+        if let Some(expected_error) = expected_error {
+            assert!(result.unwrap_err().to_string().contains(expected_error));
+        } else {
+            result.unwrap();
+        }
+        let requests = engine.await.unwrap();
+        assert_eq!(
+            requests[0]["Cmd"],
+            serde_json::json!([
+                PROVIDER_WORKLOAD_IDENTITY_PROBE,
+                "/spiffe-workload-api/agent.sock"
+            ])
+        );
+        let mount = &requests[0]["HostConfig"]["Mounts"][0];
+        assert_eq!(
+            requests[0]["User"],
+            format!("{SUPERVISOR_UID}:{SUPERVISOR_GID}")
+        );
+        assert_eq!(requests[0]["HostConfig"]["NetworkMode"], "none");
+        assert_eq!(mount["Source"], "/run/spire");
+        assert_eq!(mount["Target"], "/spiffe-workload-api");
+        assert_eq!(mount["ReadOnly"], true);
+    }
+}
+
+#[tokio::test]
+async fn verified_docker_start_rejects_an_unqualified_supervisor_before_engine_io() {
+    let mut config = runtime_config();
+    config.provider_spiffe_workload_api_socket = Some("/run/spire/agent.sock".into());
+    config.provider_workload_identity_support = Err("selected supervisor failed the probe".into());
+    let driver = test_driver_with_config(config);
+    let capabilities = driver
+        .capabilities()
+        .extension
+        .unwrap()
+        .supported_capabilities;
+    assert!(
+        !capabilities
+            .iter()
+            .any(|value| value == COMPUTE_PROVIDER_WORKLOAD_IDENTITY)
+    );
+
+    let legacy = test_launch_authentication();
+    driver.validate_launch_authentication(&legacy).unwrap();
+    let mut verified = decode_docker_launch_authentication(&legacy).unwrap();
+    verified.supervisor.provider_spiffe_id =
+        Some("spiffe://example.test/openshell/gateway/g/sandbox/sandbox-1".into());
+    verified.supervisor.provider_launch_spiffe_id = Some(
+        "spiffe://example.test/openshell/gateway/g/sandbox/sandbox-1/launch/00000000-0000-4000-8000-000000000001"
+            .into(),
+    );
+    let encoded = serde_json::to_vec(&verified).unwrap();
+    let error = driver
+        .start_sandbox("sandbox-1", "", "generation-1", &encoded, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), "selected supervisor failed the probe");
 }
 
 #[tokio::test]
@@ -3069,7 +3234,8 @@ fn validate_sandbox_auth_requires_launch_authentication() {
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().launch_authentication.clear();
 
-    let err = DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap_err();
+    let driver = test_driver_with_config(runtime_config());
+    let err = driver.validate_sandbox_auth(&sandbox).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
@@ -3081,7 +3247,9 @@ fn validate_sandbox_auth_requires_launch_authentication() {
 #[test]
 fn validate_sandbox_auth_accepts_launch_authentication() {
     let sandbox = test_sandbox();
-    DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap();
+    test_driver_with_config(runtime_config())
+        .validate_sandbox_auth(&sandbox)
+        .unwrap();
 }
 
 #[test]
@@ -4592,6 +4760,163 @@ fn supervisor_workspace_validation_exit_is_reported_explicitly() {
 }
 
 #[tokio::test]
+async fn retired_docker_supervisor_cannot_stop_replacement_workload() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::sync::Notify;
+
+    for current_supervisor in ["new-supervisor", "old-supervisor"] {
+        let state = TempDir::new().unwrap();
+        let launch_lock = try_provider_launch_lock(state.path().to_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let log_requested = Arc::new(Notify::new());
+        let waits = Arc::new(AtomicUsize::new(0));
+        let exact_inspections = Arc::new(AtomicUsize::new(0));
+        let canonical_inspections = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let engine = tokio::spawn({
+            let log_requested = log_requested.clone();
+            let waits = waits.clone();
+            let exact_inspections = exact_inspections.clone();
+            let canonical_inspections = canonical_inspections.clone();
+            let stops = stops.clone();
+            async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut reader = BufReader::new(&mut socket);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap().to_owned();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let (status, body) = if path.contains("/old-supervisor/wait") {
+                        let body = match waits.fetch_add(1, Ordering::SeqCst) {
+                            0 => "",
+                            1 => r#"{"StatusCode":-1,"Error":{"Message":"wait canceled"}}"#,
+                            _ => r#"{"StatusCode":1}"#,
+                        };
+                        ("200 OK", body.to_string())
+                    } else if path.contains("/old-supervisor/json") {
+                        if exact_inspections.fetch_add(1, Ordering::SeqCst) == 0 {
+                            ("503 Service Unavailable", String::new())
+                        } else {
+                            (
+                                "200 OK",
+                                r#"{"Id":"old-supervisor","State":{"Status":"running","Running":true}}"#.to_string(),
+                            )
+                        }
+                    } else if path.contains("/old-supervisor/logs") {
+                        log_requested.notify_one();
+                        ("200 OK", String::new())
+                    } else if path.contains("/canonical-supervisor/json") {
+                        if canonical_inspections.fetch_add(1, Ordering::SeqCst) == 0 {
+                            ("503 Service Unavailable", String::new())
+                        } else {
+                            ("200 OK", format!(r#"{{"Id":"{current_supervisor}"}}"#))
+                        }
+                    } else {
+                        if path.contains("/workload/stop") {
+                            stops.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            assert!(path.contains("/old-supervisor?"), "{path}");
+                        }
+                        ("204 No Content", String::new())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+
+        let driver = test_driver_with_config(runtime_config());
+        let mut context = driver.control_failure_context(test_sandbox(), "workload".into());
+        context.docker = Arc::new(
+            Docker::connect_with_http(&endpoint, 2, bollard::API_DEFAULT_VERSION).unwrap(),
+        );
+        let failures = context.failures.clone();
+        let (wait_lost, startup_wait_lost) = oneshot::channel();
+        let process = monitor_docker_control_process(
+            "old-supervisor".into(),
+            context,
+            Some(DockerProviderSupervisorMonitor {
+                journal_dir: state.path().to_owned(),
+                supervisor_name: "canonical-supervisor".into(),
+                launch_spiffe_id: "spiffe://example.test/launch/old".into(),
+            }),
+            Some(wait_lost),
+        );
+        let timeout = Duration::from_secs(5);
+        tokio::time::timeout(timeout, startup_wait_lost)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(timeout, log_requested.notified())
+            .await
+            .unwrap();
+        assert_eq!(waits.load(Ordering::SeqCst), 3);
+        assert_eq!(exact_inspections.load(Ordering::SeqCst), 3);
+        assert_eq!(canonical_inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        drop(launch_lock);
+        tokio::time::timeout(timeout, process.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canonical_inspections.load(Ordering::SeqCst), 2);
+        let expected_to_stop = current_supervisor == "old-supervisor";
+        assert_eq!(stops.load(Ordering::SeqCst), usize::from(expected_to_stop));
+        assert_eq!(!failures.lock().await.is_empty(), expected_to_stop);
+        engine.abort();
+    }
+}
+
+#[tokio::test]
+async fn stale_docker_admission_failure_cannot_stop_replacement_workload() {
+    let directory = TempDir::new().unwrap();
+    let mut authentication =
+        decode_docker_launch_authentication(&test_launch_authentication()).unwrap();
+    authentication.supervisor.provider_launch_spiffe_id =
+        Some("spiffe://example.test/launch/new".into());
+    fs::write(
+        directory.path().join(SUPERVISOR_AUTH_BUNDLE_FILE),
+        serde_json::to_vec(&authentication.supervisor).unwrap(),
+    )
+    .unwrap();
+    let mut driver = test_driver_with_config(runtime_config());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    driver.docker =
+        Arc::new(Docker::connect_with_http(&endpoint, 1, bollard::API_DEFAULT_VERSION).unwrap());
+    for observed_launch in [Some("spiffe://example.test/launch/old"), None] {
+        let context = driver.control_failure_context(test_sandbox(), "workload".into());
+        driver
+            .contain_observed_admission_failure(
+                context,
+                directory.path().to_path_buf(),
+                observed_launch,
+            )
+            .await;
+    }
+    assert!(driver.runtime_failures.lock().await.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::ZERO, listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn workspace_failure_survives_supervisor_cleanup_before_readiness_inspection() {
     let failures = Arc::new(Mutex::new(HashMap::from([(
         "sandbox-1".to_string(),
@@ -4619,6 +4944,37 @@ async fn workspace_failure_survives_supervisor_cleanup_before_readiness_inspecti
 }
 
 #[test]
+fn ordered_launch_only_confirms_cleanup_for_acknowledged_engine_start_rejections() {
+    let oci_rejection = || BollardError::DockerResponseServerError {
+        status_code: 500,
+        message: "OCI runtime rejected supervisor startup".into(),
+    };
+    let absent = || BollardError::DockerResponseServerError {
+        status_code: 404,
+        message: "no such container".into(),
+    };
+    let rejected = docker_supervisor_engine_start_error(oci_rejection(), Err(absent()), Ok(()));
+    assert_eq!(rejected.status.code(), tonic::Code::Internal);
+    assert!(rejected.rejected_start_removed);
+
+    for ambiguous in [
+        docker_supervisor_engine_start_error(BollardError::RequestTimeoutError, Ok(()), Ok(())),
+        docker_supervisor_engine_start_error(
+            oci_rejection(),
+            Err(BollardError::RequestTimeoutError),
+            Ok(()),
+        ),
+        docker_supervisor_engine_start_error(
+            oci_rejection(),
+            Ok(()),
+            Err(BollardError::RequestTimeoutError),
+        ),
+    ] {
+        assert!(!ambiguous.rejected_start_removed);
+    }
+}
+
+#[test]
 fn concurrent_container_removal_is_idempotent() {
     let removing = BollardError::DockerResponseServerError {
         status_code: 409,
@@ -4631,6 +4987,63 @@ fn concurrent_container_removal_is_idempotent() {
 
     assert!(is_removal_in_progress_error(&removing));
     assert!(!is_removal_in_progress_error(&other_conflict));
+}
+
+#[tokio::test]
+async fn ordered_stop_confirms_auxiliary_removal_by_container_id() {
+    use crate::workspace::tests::docker_api;
+    use serde_json::json;
+
+    for ordered in [false, true] {
+        let mut replies = vec![
+            (
+                "GET",
+                String::new(),
+                200,
+                json!([{
+                    "Id": "retiring-supervisor",
+                    "Names": ["/canonical-supervisor"],
+                    "Labels": {(LABEL_ISOLATION_ROLE): LABEL_ISOLATION_ROLE_SUPERVISOR},
+                }]),
+            ),
+            (
+                "DELETE",
+                "/containers/retiring-supervisor?v=false&force=true&link=false".into(),
+                409,
+                json!({"message":"removal of container retiring-supervisor is already in progress"}),
+            ),
+        ];
+        if ordered {
+            let inspection = "/containers/retiring-supervisor/json";
+            replies.extend([
+                (
+                    "GET",
+                    inspection.into(),
+                    200,
+                    json!({"Id":"retiring-supervisor"}),
+                ),
+                (
+                    "GET",
+                    inspection.into(),
+                    404,
+                    json!({"message":"no such container"}),
+                ),
+            ]);
+        }
+        let (docker, engine) = docker_api(replies).await;
+        let mut driver = test_driver_with_config(runtime_config());
+        driver.docker = Arc::new(docker);
+        assert!(
+            driver
+                .remove_auxiliary_containers_for_sandbox("sandbox-1", ordered)
+                .await
+                .unwrap()
+        );
+        tokio::time::timeout(Duration::from_secs(2), engine)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[tokio::test]

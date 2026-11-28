@@ -1944,7 +1944,7 @@ pub(super) async fn handle_start_sandbox(
     state: &Arc<ServerState>,
     request: Request<StartSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    let result = handle_start_sandbox_inner(state, request).await;
+    let result = Box::pin(handle_start_sandbox_inner(state, request)).await;
     openshell_core::telemetry::emit_lifecycle(
         LifecycleResource::Sandbox,
         LifecycleOperation::Start,
@@ -2047,7 +2047,7 @@ pub(super) async fn handle_resume_sandbox(
     state: &Arc<ServerState>,
     request: Request<ResumeSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    let result = handle_resume_sandbox_inner(state, request).await;
+    let result = Box::pin(handle_resume_sandbox_inner(state, request)).await;
     openshell_core::telemetry::emit_lifecycle(
         LifecycleResource::Sandbox,
         LifecycleOperation::Resume,
@@ -2123,7 +2123,7 @@ pub async fn mint_persisted_authentication(
     let mut with_identity = sandbox.clone();
     state
         .compute
-        .prepare_ssh_identity(&mut with_identity, &mut authentication)
+        .prepare_launch_identity(&mut with_identity, &mut authentication)
         .await?;
     Ok(authentication)
 }

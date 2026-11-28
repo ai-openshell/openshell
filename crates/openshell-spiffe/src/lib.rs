@@ -87,8 +87,7 @@ pub fn trust_domain(subject: &str) -> Option<&str> {
 /// Longest SPIFFE ID the SPIFFE specification permits.
 const MAX_SPIFFE_ID_BYTES: usize = 2048;
 
-/// Operator-configured prefix of the stable SPIFFE IDs the gateway requests
-/// for sandboxes using shared supervision.
+/// Operator-configured prefix of stable sandbox SPIFFE IDs.
 ///
 /// A sandbox's ID is `<prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`.
 /// Both IDs must already be valid SPIFFE path segments; nothing is encoded,
@@ -142,6 +141,24 @@ impl SandboxSpiffeIdPrefix {
         }
         Ok(id)
     }
+
+    /// Build the SPIFFE ID for one supervisor launch.
+    pub fn supervisor_launch_spiffe_id(
+        &self,
+        gateway_id: &str,
+        sandbox_id: &str,
+        launch_id: &str,
+    ) -> Result<String, String> {
+        if !is_spiffe_path_segment(launch_id) {
+            return Err("supervisor launch ID must be a valid SPIFFE path segment".into());
+        }
+        let sandbox = self.sandbox_spiffe_id(gateway_id, sandbox_id)?;
+        let id = format!("{sandbox}/launch/{launch_id}");
+        if id.len() > MAX_SPIFFE_ID_BYTES {
+            return Err("supervisor launch SPIFFE ID exceeds 2048 bytes".into());
+        }
+        Ok(id)
+    }
 }
 
 /// A JWT-SVID verified for a sandbox's stable SPIFFE ID and one audience.
@@ -151,7 +168,7 @@ pub struct SandboxJwtSvid {
     pub spiffe_id: String,
     /// The signed token. It is a credential and never printed.
     pub token: String,
-    /// The verified `exp` claim, in Unix seconds.
+    /// When the verified identity expires for the grant, in Unix seconds.
     pub expires_at: i64,
 }
 
@@ -296,6 +313,12 @@ mod tests {
         assert_eq!(
             prefix.sandbox_spiffe_id("gw", "4f1c2b3a-9d8e").unwrap(),
             "spiffe://example.org/openshell/gateway/gw/sandbox/4f1c2b3a-9d8e"
+        );
+        assert_eq!(
+            prefix
+                .supervisor_launch_spiffe_id("gw", "4f1c2b3a-9d8e", "launch-1")
+                .unwrap(),
+            "spiffe://example.org/openshell/gateway/gw/sandbox/4f1c2b3a-9d8e/launch/launch-1"
         );
         for invalid in [
             "spiffe://Example.org",

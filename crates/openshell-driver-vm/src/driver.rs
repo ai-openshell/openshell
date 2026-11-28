@@ -24,7 +24,7 @@ use crate::rootfs::{
     prepare_sandbox_rootfs_from_image_root, recover_rootfs_image, remove_rootfs_image_file,
     sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
     sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
-    validate_host_supervisor, write_rootfs_image_file,
+    snapshot_host_supervisor, validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -47,6 +47,16 @@ use oci_client::{Reference, RegistryOperation};
 use openshell_core::UpstreamProxyConfig;
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
+use openshell_core::driver_utils::{
+    CONDITION_RUNTIME_RESTART, PROVIDER_WORKLOAD_IDENTITY_PROBE,
+    VM_HOST_GATEWAY_ALIAS as OPENSHELL_HOST_GATEWAY_ALIAS,
+    VM_HOST_LOOPBACK_ALIASES as HOST_LOOPBACK_ALIASES, provider_spiffe_socket_visible,
+    validate_ordered_start_authentication,
+};
+use openshell_core::extension_protocol::{
+    COMPUTE_ORDERED_PROVIDER_START, COMPUTE_ORDERED_PROVIDER_START_RECEIPT_LOOKUP,
+    COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+};
 use openshell_core::gpu::{
     driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
@@ -62,7 +72,7 @@ use openshell_core::proto::compute::v1::{
     DriverSandboxTemplate as SandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceCapabilities, ListSandboxesRequest, ListSandboxesResponse,
-    MemoryResourceCapabilities, ResolvedWorkloadIdentity, ResourceCapabilities,
+    MemoryResourceCapabilities, OrderedStart, ResolvedWorkloadIdentity, ResourceCapabilities,
     StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
     SuspendSandboxRequest, SuspendSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
@@ -72,6 +82,11 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{deserialize_optional_non_empty_string_list, from_struct};
 use openshell_core::{
     NetworkSupervisorTrustBundle, network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES,
+};
+use openshell_driver_sdk::{
+    ProviderLaunchReplay, ProviderStopMutation, legacy_provider_launch_outcome,
+    lookup_provider_launch_receipt, ordered_provider_launch_operation, provider_launch_retired,
+    replay_provider_launch, replay_provider_stop, try_provider_launch_lock,
 };
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
@@ -101,7 +116,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, OnceCell, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -195,12 +210,6 @@ impl VmSandboxDriverConfig {
     }
 }
 
-const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
-const HOST_LOOPBACK_ALIASES: &[&str] = &[
-    OPENSHELL_HOST_GATEWAY_ALIAS,
-    "host.containers.internal",
-    "host.docker.internal",
-];
 #[allow(dead_code)]
 const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_PATH;
 #[allow(dead_code)]
@@ -391,9 +400,13 @@ pub struct VmDriverConfig {
     /// Gateway-host PEM CA bundle staged into the guest overlay for the
     /// corporate proxy and TLS-intercepted server certificates.
     pub proxy_ca_bundle: Option<PathBuf>,
-    /// Guest-reachable SPIFFE Workload API TCP endpoint. A VM cannot safely
-    /// project a host UNIX socket; this must be a deliberately exposed TCP
-    /// listener and requires `provider_spiffe_allow_guest_tcp`.
+    /// SPIFFE Workload API Unix socket used by host supervisors.
+    pub provider_spiffe_workload_api_socket: Option<PathBuf>,
+    /// Verified mode set by a managed gateway. A standalone driver learns the
+    /// mode of each launch from its bundle.
+    #[serde(skip)]
+    pub provider_workload_identity_required: Option<bool>,
+    /// Legacy guest TCP endpoint accepted for configuration compatibility.
     pub provider_spiffe_workload_api_tcp_endpoint: Option<String>,
     #[serde(default)]
     pub provider_spiffe_allow_guest_tcp: bool,
@@ -482,6 +495,10 @@ impl std::fmt::Debug for VmDriverConfig {
             )
             .field("ipv6_egress", &self.ipv6_egress)
             .field(
+                "provider_spiffe_workload_api_socket_configured",
+                &self.provider_spiffe_workload_api_socket.is_some(),
+            )
+            .field(
                 "provider_spiffe_workload_api_tcp_endpoint_configured",
                 &self.provider_spiffe_workload_api_tcp_endpoint.is_some(),
             )
@@ -529,6 +546,8 @@ impl Default for VmDriverConfig {
             upstream_proxy: UpstreamProxyConfig::default(),
             ipv6_egress: openshell_core::SupervisorIpv6EgressConfig::default(),
             proxy_ca_bundle: None,
+            provider_spiffe_workload_api_socket: None,
+            provider_workload_identity_required: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
             gpu_enabled: false,
@@ -564,6 +583,13 @@ impl VmDriverConfig {
             if self.upstream_proxy.https_proxy.is_none() {
                 return Err("proxy_ca_bundle is set but no https_proxy is configured".to_string());
             }
+        }
+        if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
+            openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)?;
+        } else if self.provider_workload_identity_required == Some(true) {
+            return Err(
+                "verified provider workload identity requires a host Workload API socket".into(),
+            );
         }
         if let Some(endpoint) = self.provider_spiffe_workload_api_tcp_endpoint.as_deref() {
             openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
@@ -1060,6 +1086,25 @@ fn host_control_openshell_endpoint(endpoint: &str) -> Result<(String, Option<Str
     Ok((url.into(), Some(host)))
 }
 
+async fn probe_supervisor_provider_workload_identity(binary: &Path) -> Result<(), Status> {
+    let mut command = Command::new(binary);
+    command
+        .arg(PROVIDER_WORKLOAD_IDENTITY_PROBE)
+        .env_clear()
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let probe = tokio::time::timeout(Duration::from_secs(5), command.status()).await;
+    if matches!(probe, Ok(Ok(status)) if status.success()) {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "host supervisor '{}' did not report support for verified provider workload identity; install a matching supervisor",
+        binary.display()
+    )))
+}
+
 #[derive(Debug)]
 struct VmProcess {
     child: Child,
@@ -1161,10 +1206,12 @@ pub struct VmDriver {
     launcher_bin: PathBuf,
     registry: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     image_cache_lock: Arc<Mutex<()>>,
+    provider_supervisor_binary: Arc<OnceCell<PathBuf>>,
     preparation_root: Option<PathBuf>,
     events: broadcast::Sender<WatchSandboxesEvent>,
     gpu_inventory: Option<Arc<std::sync::Mutex<GpuInventory>>>,
     lifecycle_extensions: Arc<LifecycleExtensionRegistry>,
+    state_owner: Option<Arc<fs::File>>,
 }
 
 impl VmDriver {
@@ -1182,6 +1229,11 @@ impl VmDriver {
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
         config.validate_runtime_security_config()?;
+        if config.provider_spiffe_workload_api_tcp_endpoint.is_some() {
+            warn!(
+                "Ignoring legacy VM SPIFFE guest TCP settings. Configure provider_spiffe_workload_api_socket for the host supervisor."
+            );
+        }
         config.validate_bootstrap_image_config()?;
         config.validate_rootfs_tar_config()?;
         if config.grpc_endpoint.trim().is_empty() {
@@ -1204,6 +1256,16 @@ impl VmDriver {
                 state_root.display()
             )
         })?;
+        // A replacement waits for the previous driver and launch processes to
+        // release their state ownership before it restores sandboxes.
+        let owner_path = state_root.join(".driver-owner");
+        let state_owner = preparation::open_lock_file(&owner_path)
+            .map_err(|error| format!("open VM state owner '{}': {error}", owner_path.display()))?;
+        while !preparation::lock(&state_owner, true)
+            .map_err(|error| format!("lock VM state owner '{}': {error}", owner_path.display()))?
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let image_cache_root = image_cache_root_dir(&config.state_dir);
         create_private_dir_all(&image_cache_root)
             .await
@@ -1251,10 +1313,12 @@ impl VmDriver {
             launcher_bin,
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events,
             gpu_inventory,
             lifecycle_extensions: Arc::new(lifecycle_extensions),
+            state_owner: Some(Arc::new(state_owner)),
         };
         preparation::reconcile(&image_cache_root_dir(&driver.config.state_dir))
             .map_err(|error| format!("reconcile image preparation staging: {error}"))?;
@@ -1328,7 +1392,11 @@ impl VmDriver {
         if let Some(configured) = std::env::var_os("OPENSHELL_VM_SUPERVISOR_BIN") {
             let configured = PathBuf::from(configured);
             if configured.is_file() {
-                return Ok(configured);
+                return std::path::absolute(configured).map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "resolve configured host supervisor path: {error}"
+                    ))
+                });
             }
             return Err(Status::failed_precondition(format!(
                 "configured host supervisor does not exist: {}",
@@ -1357,6 +1425,67 @@ impl VmDriver {
         .map_err(Status::failed_precondition)?;
         validate_host_supervisor(&destination).map_err(Status::failed_precondition)?;
         Ok(destination)
+    }
+
+    async fn provider_supervisor_binary(&self) -> Result<&Path, Status> {
+        use openshell_core::grpc_client::{
+            token_grant_gateway_endpoint, validate_attested_token_grant_transport,
+        };
+
+        let Some(socket) = self.config.provider_spiffe_workload_api_socket.as_deref() else {
+            return Err(Status::failed_precondition(
+                "verified provider workload identity requires a host Workload API socket",
+            ));
+        };
+        if !provider_spiffe_socket_visible(socket) {
+            return Err(Status::failed_precondition(
+                "VM host supervisor cannot see the configured Workload API Unix socket",
+            ));
+        }
+        let (endpoint, _) = host_control_openshell_endpoint(&self.config.grpc_endpoint)
+            .map_err(Status::failed_precondition)?;
+        token_grant_gateway_endpoint(&endpoint)
+            .and_then(|endpoint| validate_attested_token_grant_transport(&endpoint))
+            .map_err(|_| {
+                Status::failed_precondition(
+                    "verified provider workload identity requires HTTPS or direct HTTP to a loopback IP for the VM host supervisor",
+                )
+            })?;
+        self.provider_supervisor_binary
+            .get_or_try_init(|| async {
+                let selected = self.host_supervisor_binary().await?;
+                let cache = self.config.state_dir.join("host-runtime/verified");
+                create_private_dir_all(&cache).await.map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "create verified host supervisor cache: {error}"
+                    ))
+                })?;
+                // Keep the probed bytes even if the operator replaces the
+                // override while an admitted launch is being prepared.
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    snapshot_host_supervisor(&selected, &cache)
+                })
+                .await
+                .map_err(|error| Status::internal(format!("snapshot host supervisor: {error}")))?
+                .map_err(Status::failed_precondition)?;
+                probe_supervisor_provider_workload_identity(&snapshot).await?;
+                Ok(snapshot)
+            })
+            .await
+            .map(PathBuf::as_path)
+    }
+
+    async fn validate_provider_workload_identity_launch(
+        &self,
+        auth: &openshell_core::jwt::SupervisorAuthBundle,
+    ) -> Result<(), Status> {
+        match (&auth.provider_spiffe_id, &auth.provider_launch_spiffe_id) {
+            (Some(_), Some(_)) => self.provider_supervisor_binary().await.map(|_| ()),
+            (None, None) if self.config.provider_workload_identity_required != Some(true) => Ok(()),
+            _ => Err(Status::failed_precondition(
+                "verified VM launch requires both provider SPIFFE identities in its launch bundle",
+            )),
+        }
     }
 
     /// Stage the captured destination trust into this sandbox's host-only
@@ -1395,7 +1524,11 @@ impl VmDriver {
             staged_network_trust.as_deref(),
         )
         .map_err(Status::internal)?;
-        let supervisor_binary = self.host_supervisor_binary().await?;
+        let supervisor_binary = if auth_bundle.provider_spiffe_id.is_some() {
+            self.provider_supervisor_binary().await?.to_path_buf()
+        } else {
+            self.host_supervisor_binary().await?
+        };
         let (openshell_endpoint, gateway_tls_server_name) =
             host_control_openshell_endpoint(&self.config.grpc_endpoint)
                 .map_err(Status::failed_precondition)?;
@@ -1435,7 +1568,11 @@ impl VmDriver {
         let upstream_proxy_args = upstream_proxy_cli_args(&self.config)
             .map_err(|error| Status::invalid_argument(format!("render upstream proxy: {error}")))?;
         let mut command = Command::new(&supervisor_binary);
-        isolate_host_control_environment(&mut command);
+        self.configure_runtime_child(&mut command);
+        configure_host_control_environment(
+            &mut command,
+            self.config.provider_spiffe_workload_api_socket.as_deref(),
+        );
         command
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -1524,20 +1661,22 @@ impl VmDriver {
         command
             .stdin(Stdio::from(liveness_read))
             .arg("--parent-liveness-stdin");
-        #[cfg(unix)]
-        unsafe {
-            command.pre_exec(move || {
-                #[cfg(target_os = "linux")]
-                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL).map_err(std::io::Error::other)?;
-                Ok(())
-            });
-        }
         let child = command.spawn().map_err(|error| {
             Status::internal(format!(
                 "start host supervisor '{}': {error}",
                 supervisor_binary.display()
             ))
         })?;
+        if let (Some(launch_spiffe_id), Some(supervisor_pid)) =
+            (&auth_bundle.provider_launch_spiffe_id, child.id())
+        {
+            info!(
+                sandbox_id = %sandbox.id,
+                supervisor_pid,
+                %launch_spiffe_id,
+                "Spawned host supervisor for provider workload identity"
+            );
+        }
         #[cfg(unix)]
         {
             Ok((child, Some(fs::File::from(liveness_write))))
@@ -1548,11 +1687,20 @@ impl VmDriver {
 
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
+        let provider_capabilities = if self.config.provider_spiffe_workload_api_socket.is_some() {
+            vec![
+                COMPUTE_PROVIDER_WORKLOAD_IDENTITY.to_string(),
+                COMPUTE_ORDERED_PROVIDER_START.to_string(),
+                COMPUTE_ORDERED_PROVIDER_START_RECEIPT_LOOKUP.to_string(),
+            ]
+        } else {
+            Vec::new()
+        };
         let mut extension = openshell_core::extension_protocol::extension_metadata(
             openshell_core::extension_protocol::ExtensionFamily::Compute,
             "openshell/vm",
             openshell_core::VERSION,
-            [],
+            provider_capabilities,
         );
         extension
             .required_capabilities
@@ -1621,12 +1769,14 @@ impl VmDriver {
     #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
         self.validate_sandbox(sandbox)?;
-        decode_launch_authentication(
+        let authentication = decode_launch_authentication(
             sandbox
                 .spec
                 .as_ref()
                 .map_or(&[], |spec| spec.launch_authentication.as_slice()),
         )?;
+        self.validate_provider_workload_identity_launch(&authentication.supervisor)
+            .await?;
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
@@ -2152,6 +2302,7 @@ impl VmDriver {
         .map_err(|error| Status::internal(format!("persist VM boundary generation: {error}")))?;
         let runtime_descriptor = provisioning.runtime_descriptor;
         let mut command = Command::new(&self.launcher_bin);
+        self.configure_runtime_child(&mut command);
         command.kill_on_drop(true);
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
@@ -2354,6 +2505,16 @@ impl VmDriver {
     }
 
     pub async fn stop_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+        self.stop_sandbox_with_mutation(sandbox_id, sandbox_name, None)
+            .await
+    }
+
+    async fn stop_sandbox_with_mutation(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        mutation: Option<ProviderStopMutation>,
+    ) -> Result<(), Status> {
         if !sandbox_id.is_empty() {
             validate_sandbox_id(sandbox_id)?;
         }
@@ -2372,6 +2533,9 @@ impl VmDriver {
                 .clone()
         };
 
+        if let Some(mutation) = mutation {
+            mutation.begin().await?;
+        }
         // Persist intent before detaching process handles or releasing host
         // allocations. If this write fails, the live record remains intact.
         tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
@@ -2453,6 +2617,11 @@ impl VmDriver {
             let record = registry
                 .get(&id)
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            if record.deleting {
+                return Err(Status::failed_precondition(
+                    "VM sandbox deletion is in progress",
+                ));
+            }
             if record.preparation.is_some() && record.provisioning_task.is_none() {
                 return Err(Status::failed_precondition(
                     "image preparation cleanup is still in progress",
@@ -2464,34 +2633,56 @@ impl VmDriver {
                 record.process.is_some() || record.provisioning_task.is_some(),
             )
         };
+        // An invalid replacement must not stop the active VM or remove the
+        // previous generation's credentials.
+        let authentication = if already_running && launch_authentication.is_empty() {
+            None
+        } else {
+            Some(decode_launch_authentication(&launch_authentication)?)
+        };
+        let saved = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE)).await;
         if already_running {
-            let active_generation =
-                tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
-                    .await
-                    .map_err(|error| {
-                        Status::failed_precondition(format!(
-                            "read active VM sandbox generation: {error}"
-                        ))
-                    })?;
+            let active_generation = match &saved {
+                Ok(sandbox) => saved_launch_authentication(sandbox)?
+                    .supervisor
+                    .runtime_generation
+                    .to_string(),
+                // An empty replay has no authentication to replace. Preserve
+                // the original no-op for records without saved provenance.
+                Err(error)
+                    if authentication.is_none() && error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
+                        .await
+                        .map_err(|error| {
+                            Status::failed_precondition(format!(
+                                "read active VM sandbox generation: {error}"
+                            ))
+                        })?
+                }
+                Err(error) => {
+                    return Err(Status::failed_precondition(format!(
+                        "read VM admission provenance: {error}"
+                    )));
+                }
+            };
             if active_generation.trim() != generation.as_str() {
                 return Err(Status::failed_precondition(format!(
                     "VM sandbox is already running generation {}",
                     active_generation.trim()
                 )));
             }
-            if launch_authentication.is_empty() {
+            if authentication.is_none() {
                 return Ok(());
             }
         }
-        // An invalid replacement must not stop the active VM or remove the
-        // previous generation's credentials. Preserve the empty idempotent
-        // replay above, which does not request a new launch.
-        decode_launch_authentication(&launch_authentication)?;
-        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
-            .await
-            .map_err(|error| {
-                Status::failed_precondition(format!("read VM admission provenance: {error}"))
-            })?;
+        if let Some(authentication) = authentication {
+            self.validate_provider_workload_identity_launch(&authentication.supervisor)
+                .await?;
+        }
+        let mut sandbox = saved.map_err(|error| {
+            Status::failed_precondition(format!("read VM admission provenance: {error}"))
+        })?;
         self.validate_sandbox(&sandbox)?;
         if already_running {
             // The gateway keeps launch sessions in memory. A non-empty bundle
@@ -2546,6 +2737,202 @@ impl VmDriver {
         Ok(())
     }
 
+    async fn start_tracked_provider_launch(
+        &self,
+        request: StartSandboxRequest,
+        operation: OrderedStart,
+        authentication: openshell_core::jwt::SandboxLaunchAuthentication,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        validate_sandbox_id(&request.sandbox_id)?;
+        validate_ordered_start_authentication(
+            &request.sandbox_id,
+            &request.generation_id,
+            &operation,
+            &authentication,
+        )?;
+        let launch_identity = authentication
+            .supervisor
+            .provider_launch_spiffe_id
+            .ok_or_else(|| Status::invalid_argument("provider launch SPIFFE ID is required"))?;
+        let state_dir = sandbox_state_dir(&self.config.state_dir, &request.sandbox_id)?;
+        let journal_dir = provider_launch_dir(&self.config.state_dir, &request.sandbox_id);
+        let driver = self.clone();
+        replay_provider_launch(
+            journal_dir,
+            operation,
+            request.settle_only,
+            move |replay| async move {
+                // Record a missing Start under the same lock as a live one.
+                // The gateway can create the VM with this launch's credentials
+                // after receiving NotFound, so an exact retry must replay it.
+                if !tokio::fs::try_exists(state_dir.join(SANDBOX_REQUEST_FILE))
+                    .await
+                    .map_err(|error| {
+                        Status::unavailable(format!("inspect saved VM sandbox: {error}"))
+                    })?
+                {
+                    if driver
+                        .registry
+                        .lock()
+                        .await
+                        .contains_key(&request.sandbox_id)
+                    {
+                        return Err(Status::unavailable("VM sandbox state is changing"));
+                    }
+                    return Ok(Err(Status::not_found("sandbox not found")));
+                }
+                if matches!(replay, ProviderLaunchReplay::Start) {
+                    return Ok(Box::pin(driver.start_sandbox(
+                        &request.sandbox_id,
+                        &request.name,
+                        &request.generation_id,
+                        request.launch_authentication,
+                    ))
+                    .await
+                    .map(|()| StartSandboxResponse::default()));
+                }
+
+                if driver
+                    .provider_launch_is_active(
+                        &request.sandbox_id,
+                        &request.generation_id,
+                        &launch_identity,
+                    )
+                    .await?
+                {
+                    return Ok(Ok(StartSandboxResponse::default()));
+                }
+
+                // VM launchers and host supervisors exit with their owning driver.
+                // Replay must never create a second process for an accepted launch ID.
+                if matches!(replay, ProviderLaunchReplay::ObserveCompleted) {
+                    return Ok(Err(Status::not_found(
+                        "the accepted VM provider launch is no longer active",
+                    )));
+                }
+                Ok(Ok(provider_launch_retired()))
+            },
+        )
+        .await
+    }
+
+    async fn provider_launch_is_active(
+        &self,
+        sandbox_id: &str,
+        generation: &str,
+        launch_identity: &str,
+    ) -> Result<bool, Status> {
+        let (state_dir, stopped, pending, process) = {
+            let registry = self.registry.lock().await;
+            let Some(record) = registry.get(sandbox_id) else {
+                return Ok(false);
+            };
+            if record.deleting {
+                return Err(Status::unavailable("VM sandbox deletion is in progress"));
+            }
+            (
+                record.state_dir.clone(),
+                record.snapshot.status.as_ref().is_some_and(|status| {
+                    status
+                        .conditions
+                        .iter()
+                        .any(|condition| condition.r#type == "Stopped")
+                }),
+                record
+                    .provisioning_task
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished()),
+                record.process.clone(),
+            )
+        };
+        let inspect_failed = |error| {
+            Status::unavailable(format!("could not inspect the accepted VM launch: {error}"))
+        };
+        if !pending {
+            let Some(process) = process else {
+                // Stop detaches the handles before it confirms process exit.
+                if !stopped
+                    && tokio::fs::try_exists(state_dir.join(SANDBOX_STOPPED_FILE))
+                        .await
+                        .map_err(inspect_failed)?
+                {
+                    return Err(Status::unavailable("VM sandbox stop has not completed"));
+                }
+                return Ok(false);
+            };
+            let mut process = process.lock().await;
+            if process.child.try_wait().map_err(inspect_failed)?.is_some()
+                || process
+                    .supervisor
+                    .try_wait()
+                    .map_err(inspect_failed)?
+                    .is_some()
+            {
+                return Ok(false);
+            }
+            if process.deleting {
+                return Err(Status::unavailable("VM sandbox stop has not completed"));
+            }
+        }
+        let sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|error| Status::unavailable(format!("read accepted VM launch: {error}")))?;
+        let authentication = saved_launch_authentication(&sandbox)
+            .map_err(|error| Status::unavailable(error.message()))?;
+        Ok(
+            authentication.supervisor.runtime_generation.as_str() == generation
+                && authentication
+                    .supervisor
+                    .provider_launch_spiffe_id
+                    .as_deref()
+                    == Some(launch_identity),
+        )
+    }
+
+    async fn lock_lifecycle_provider_launch(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<Option<fs::File>, Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+        let record = {
+            let registry = self.registry.lock().await;
+            resolve_record_id(&registry, sandbox_id, sandbox_name)?
+                .and_then(|id| registry.get(&id))
+                .map(|record| (record.snapshot.id.clone(), record.state_dir.clone()))
+        };
+        let Some(id) = record
+            .as_ref()
+            .map(|(id, _)| id.as_str())
+            .or_else(|| (!sandbox_id.is_empty()).then_some(sandbox_id))
+        else {
+            return Ok(None);
+        };
+        let journal_dir = provider_launch_dir(&self.config.state_dir, id);
+        let inspect_failed =
+            |error| Status::unavailable(format!("inspect saved VM sandbox: {error}"));
+        if !tokio::fs::try_exists(&journal_dir)
+            .await
+            .map_err(inspect_failed)?
+        {
+            let Some((_, state_dir)) = record else {
+                return Ok(None);
+            };
+            if !tokio::fs::try_exists(state_dir.join(SANDBOX_REQUEST_FILE))
+                .await
+                .map_err(inspect_failed)?
+            {
+                return Ok(None);
+            }
+        }
+        let lock = try_provider_launch_lock(journal_dir)
+            .await?
+            .ok_or_else(|| Status::unavailable("VM sandbox has a provider launch in progress"))?;
+        Ok(Some(lock))
+    }
+
     #[tracing::instrument(
         name = "vm.teardown",
         skip(self),
@@ -2572,6 +2959,9 @@ impl VmDriver {
         };
 
         let Some(record_id) = record_id else {
+            if !sandbox_id.is_empty() {
+                remove_provider_launch_journal(&self.config.state_dir, sandbox_id).await?;
+            }
             return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
         };
 
@@ -2623,6 +3013,7 @@ impl VmDriver {
 
         remove_sandbox_state_dir(&self.config.state_dir, &state_dir).await?;
         remove_sandbox_socket_dir(&self.socket_root_fd, &record_id);
+        remove_provider_launch_journal(&self.config.state_dir, &record_id).await?;
 
         {
             let mut registry = self.registry.lock().await;
@@ -2756,6 +3147,23 @@ impl VmDriver {
                 Some(error_condition(
                     "ProcessExited",
                     "Canonical main process exited before VM driver restart",
+                ))
+            } else if self
+                .config
+                .provider_workload_identity_required
+                .unwrap_or(self.config.provider_spiffe_workload_api_socket.is_some())
+                || sandbox
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| decode_launch_authentication(&spec.launch_authentication).ok())
+                    .is_some_and(|authentication| {
+                        authentication.supervisor.provider_spiffe_id.is_some()
+                    })
+            {
+                // A new host supervisor needs a new launch identity from the gateway.
+                Some(error_condition(
+                    CONDITION_RUNTIME_RESTART,
+                    "VM restart requires a fresh gateway launch",
                 ))
             } else {
                 None
@@ -2964,6 +3372,25 @@ impl VmDriver {
             task.abort();
         }
         true
+    }
+
+    fn configure_runtime_child(&self, command: &mut Command) {
+        let owner_fd = self.state_owner.as_ref().map(|owner| owner.as_raw_fd());
+        #[cfg(target_os = "linux")]
+        let expected_parent = nix::unistd::getpid();
+        // SAFETY: The callback only uses syscalls and constructs raw OS errors.
+        unsafe {
+            command.pre_exec(move || {
+                #[cfg(target_os = "linux")]
+                crate::procguard::arm_linux_parent_death_signal(expected_parent)?;
+                if let Some(fd) = owner_fd
+                    && libc::fcntl(fd, libc::F_SETFD, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     /// Best-effort removal of the per-driver socket root. VM children are
@@ -5238,10 +5665,12 @@ pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), Str
         launcher_bin,
         registry: Arc::new(Mutex::new(HashMap::new())),
         image_cache_lock: Arc::new(Mutex::new(())),
+        provider_supervisor_binary: Arc::default(),
         preparation_root: Some(directory),
         events,
         gpu_inventory: None,
         lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+        state_owner: None,
     };
     let prepare = async {
         if let Some(overlay) = request.overlay {
@@ -5331,7 +5760,7 @@ impl ComputeDriver for VmDriver {
         &self,
         request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        let capabilities = self.capabilities();
+        let mut capabilities = self.capabilities();
         openshell_core::extension_protocol::validate_gateway_metadata(
             openshell_core::extension_protocol::ExtensionFamily::Compute,
             DRIVER_NAME,
@@ -5339,6 +5768,21 @@ impl ComputeDriver for VmDriver {
             request.into_inner().gateway,
         )
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if self.config.provider_spiffe_workload_api_socket.is_some()
+            && let Err(error) = self.provider_supervisor_binary().await
+        {
+            if self.config.provider_workload_identity_required == Some(true) {
+                return Err(error);
+            }
+            warn!(reason = %error.message(), "VM provider workload identity is unavailable");
+            if let Some(extension) = capabilities.extension.as_mut() {
+                extension.supported_capabilities.retain(|capability| {
+                    capability != COMPUTE_PROVIDER_WORKLOAD_IDENTITY
+                        && capability != COMPUTE_ORDERED_PROVIDER_START
+                        && capability != COMPUTE_ORDERED_PROVIDER_START_RECEIPT_LOOKUP
+                });
+            }
+        }
         Ok(Response::new(capabilities))
     }
 
@@ -5415,10 +5859,37 @@ impl ComputeDriver for VmDriver {
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        let request = request.into_inner();
+        let mut request = request.into_inner();
+        if let Some(operation) = request.ordered_stop.take() {
+            let state_dir = sandbox_state_dir(&self.config.state_dir, &request.sandbox_id)?;
+            let journal_dir = provider_launch_dir(&self.config.state_dir, &request.sandbox_id);
+            let driver = self.clone();
+            return replay_provider_stop(journal_dir, operation, move |mutation| async move {
+                if !tokio::fs::try_exists(&state_dir).await.map_err(|error| {
+                    Status::unavailable(format!("inspect saved VM sandbox: {error}"))
+                })? && driver
+                    .registry
+                    .lock()
+                    .await
+                    .contains_key(&request.sandbox_id)
+                {
+                    return Err(Status::unavailable("VM sandbox state is changing"));
+                }
+                Box::pin(driver.stop_sandbox_with_mutation(
+                    &request.sandbox_id,
+                    &request.name,
+                    Some(mutation),
+                ))
+                .await
+            })
+            .await;
+        }
+        let _launch = self
+            .lock_lifecycle_provider_launch(&request.sandbox_id, &request.name)
+            .await?;
         self.stop_sandbox(&request.sandbox_id, &request.name)
             .await?;
-        Ok(Response::new(StopSandboxResponse {}))
+        Ok(Response::new(StopSandboxResponse::default()))
     }
 
     async fn start_sandbox(
@@ -5426,6 +5897,39 @@ impl ComputeDriver for VmDriver {
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
         let request = request.into_inner();
+        if request.ordered_start_receipt_only {
+            validate_sandbox_id(&request.sandbox_id)?;
+            let journal = provider_launch_dir(&self.config.state_dir, &request.sandbox_id);
+            return lookup_provider_launch_receipt(journal, request).await;
+        }
+        let authentication = if request.launch_authentication.is_empty() {
+            None
+        } else {
+            Some(decode_launch_authentication(
+                &request.launch_authentication,
+            )?)
+        };
+        let launch_identity = authentication
+            .as_ref()
+            .and_then(|auth| auth.supervisor.provider_launch_spiffe_id.as_deref());
+        if let Some((operation, legacy)) =
+            ordered_provider_launch_operation(&request, launch_identity)?
+        {
+            let authentication = authentication.ok_or_else(|| {
+                Status::invalid_argument("VM provider launch authentication is required")
+            })?;
+            let response = self
+                .start_tracked_provider_launch(request, operation, authentication)
+                .await?;
+            return if legacy {
+                legacy_provider_launch_outcome(response)
+            } else {
+                Ok(response)
+            };
+        }
+        let _launch = self
+            .lock_lifecycle_provider_launch(&request.sandbox_id, &request.name)
+            .await?;
         self.start_sandbox(
             &request.sandbox_id,
             &request.name,
@@ -5441,6 +5945,9 @@ impl ComputeDriver for VmDriver {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
+        let _launch = self
+            .lock_lifecycle_provider_launch(&request.sandbox_id, &request.name)
+            .await?;
         let response = self
             .delete_sandbox(&request.sandbox_id, &request.name)
             .await?;
@@ -5554,6 +6061,18 @@ fn decode_launch_authentication(
         Status::failed_precondition("VM sandbox launch authentication has invalid fields")
     })?;
     Ok(authentication)
+}
+
+#[allow(clippy::result_large_err)]
+fn saved_launch_authentication(
+    sandbox: &Sandbox,
+) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
+    decode_launch_authentication(
+        sandbox
+            .spec
+            .as_ref()
+            .map_or(&[], |spec| spec.launch_authentication.as_slice()),
+    )
 }
 
 #[allow(clippy::result_large_err)]
@@ -6775,6 +7294,20 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
 
 fn sandboxes_root_dir(root: &Path) -> PathBuf {
     root.join("sandboxes")
+}
+
+fn provider_launch_dir(root: &Path, sandbox_id: &str) -> PathBuf {
+    root.join("provider-launches").join(sandbox_id)
+}
+
+async fn remove_provider_launch_journal(root: &Path, sandbox_id: &str) -> Result<(), Status> {
+    match tokio::fs::remove_dir_all(provider_launch_dir(root, sandbox_id)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Status::internal(format!(
+            "remove VM provider launch journal: {error}"
+        ))),
+    }
 }
 
 async fn create_private_dir_all(path: &Path) -> Result<(), std::io::Error> {
@@ -8080,8 +8613,17 @@ fn absolute_state_dir(state_dir: &Path) -> Result<PathBuf, String> {
         .map_err(|err| format!("failed to resolve VM driver state directory: {err}"))
 }
 
-fn isolate_host_control_environment(command: &mut Command) {
+fn configure_host_control_environment(
+    command: &mut Command,
+    provider_spiffe_socket: Option<&Path>,
+) {
     command.env_clear();
+    if let Some(socket) = provider_spiffe_socket {
+        command.env(
+            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+            socket,
+        );
+    }
 }
 
 /// Environment that lets the supervisor export spans, joining the current
@@ -8940,6 +9482,7 @@ mod tests {
                 .stop_sandbox(request_with_traceparent(StopSandboxRequest {
                     sandbox_id: String::new(),
                     name: String::new(),
+                    ..Default::default()
                 }))
                 .await
                 .is_err()
@@ -9211,6 +9754,153 @@ mod tests {
     #[tokio::test]
     async fn terminal_restore_retains_persisted_workload_identity() {
         assert_inactive_restore_retains_identity(MAIN_PROCESS_EXITED_FILE, "ProcessExited").await;
+    }
+
+    #[tokio::test]
+    async fn provider_workload_identity_restore_waits_for_gateway_launch() {
+        for (managed_mode, has_socket, verified_saved_bundle) in [
+            (Some(true), true, false),
+            (None, true, false),
+            (Some(false), false, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+            driver.config.state_dir = temp.path().to_path_buf();
+            driver.config.provider_workload_identity_required = managed_mode;
+            driver.config.provider_spiffe_workload_api_socket =
+                has_socket.then(|| "/run/spire/agent.sock".into());
+            let mut authentication =
+                decode_launch_authentication(&test_launch_authentication("previous-launch").0)
+                    .unwrap();
+            if verified_saved_bundle {
+                let stable = "spiffe://example.test/gateway/gateway-a/sandbox/sb-provider-restore";
+                authentication.supervisor.provider_spiffe_id = Some(stable.into());
+                authentication.supervisor.provider_launch_spiffe_id = Some(format!(
+                    "{stable}/launch/00000000-0000-4000-8000-000000000001"
+                ));
+            }
+            let sandbox = Sandbox {
+                id: "sb-provider-restore".into(),
+                name: "provider-restore".into(),
+                spec: Some(SandboxSpec {
+                    launch_authentication: serde_json::to_vec(&authentication).unwrap(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let state_dir = sandboxes_root_dir(temp.path()).join(&sandbox.id);
+            create_private_dir_all(&state_dir).await.unwrap();
+            write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+
+            driver.restore_persisted_sandboxes().await;
+
+            let registry = driver.registry.lock().await;
+            let record = registry.get(&sandbox.id).expect("retained VM record");
+            assert!(record.process.is_none());
+            assert!(record.provisioning_task.is_none());
+            assert_eq!(
+                record.snapshot.status.as_ref().unwrap().conditions[0].reason,
+                CONDITION_RUNTIME_RESTART
+            );
+            drop(registry);
+            assert_eq!(
+                read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+                    .await
+                    .unwrap(),
+                sandbox
+            );
+
+            if managed_mode == Some(true) {
+                let error = driver
+                    .start_sandbox(
+                        &sandbox.id,
+                        &sandbox.name,
+                        "generation-1",
+                        sandbox.spec.unwrap().launch_authentication,
+                    )
+                    .await
+                    .expect_err("a legacy bundle must not launch in verified mode");
+                assert_eq!(error.code(), Code::FailedPrecondition);
+                assert!(error.message().contains("both provider SPIFFE identities"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_vm_capabilities_require_a_visible_host_workload_api_socket() {
+        use openshell_core::extension_protocol::has_capability;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("agent.sock");
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.grpc_endpoint = "http://127.0.0.1:8080".to_string();
+        driver.config.provider_workload_identity_required = Some(true);
+        driver.config.provider_spiffe_workload_api_socket = Some(socket.clone());
+        driver
+            .provider_supervisor_binary
+            .set(directory.path().join("supervisor"))
+            .unwrap();
+        let request = || {
+            Request::new(GetCapabilitiesRequest {
+                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                )),
+            })
+        };
+
+        for path_exists in [false, true] {
+            if path_exists {
+                fs::write(&socket, b"regular file").unwrap();
+            }
+            let error = driver.get_capabilities(request()).await.unwrap_err();
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert!(
+                error
+                    .message()
+                    .contains("cannot see the configured Workload API Unix socket")
+            );
+        }
+        fs::remove_file(&socket).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let capabilities = driver
+            .get_capabilities(request())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(has_capability(
+            &capabilities.extension.unwrap().supported_capabilities,
+            COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_probe_checks_the_selected_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("openshell-supervisor");
+        fs::write(&binary, "#!/bin/sh\nexit 2\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = probe_supervisor_provider_workload_identity(&binary)
+            .await
+            .expect_err("baseline supervisors reject the probe");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = \"{PROVIDER_WORKLOAD_IDENTITY_PROBE}\" ]\n"
+            ),
+        )
+        .unwrap();
+        let snapshot = snapshot_host_supervisor(&binary, temp.path()).unwrap();
+        probe_supervisor_provider_workload_identity(&snapshot)
+            .await
+            .expect("compatible supervisor accepts the probe");
+        fs::write(&binary, "#!/bin/sh\nexit 2\n").unwrap();
+        probe_supervisor_provider_workload_identity(&snapshot)
+            .await
+            .expect("launch still uses the probed executable after override replacement");
     }
 
     #[tokio::test]
@@ -10906,6 +11596,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_observes_the_saved_vm_launch_until_the_driver_loses_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let operation = OrderedStart {
+            operation_id: "b925c7d2-cc98-4cf2-855b-36b311a61179".into(),
+            revision: 2,
+        };
+        let mut authentication =
+            decode_launch_authentication(&test_launch_authentication("active").0).unwrap();
+        let sandbox_id = "9e9158d6-8e36-49b6-af32-5365426e9a47";
+        let subject = format!("spiffe://example.test/gateway/gateway-a/sandbox/{sandbox_id}");
+        authentication.supervisor.provider_launch_spiffe_id =
+            Some(format!("{subject}/launch/{}", operation.operation_id));
+        authentication.supervisor.provider_spiffe_id = Some(subject);
+        let bundle = serde_json::to_vec(&authentication).unwrap();
+        let sandbox = Sandbox {
+            id: sandbox_id.into(),
+            name: "active".into(),
+            spec: Some(SandboxSpec {
+                launch_authentication: bundle.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state_dir = sandbox_state_dir(temp.path(), &sandbox.id).unwrap();
+        create_private_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        tokio::fs::write(
+            state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
+            b"unrelated-fresh-boundary-generation",
+        )
+        .await
+        .unwrap();
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot: sandbox_snapshot(&sandbox, provisioning_condition(), false),
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: Some(tokio::spawn(std::future::pending())),
+                preparation: None,
+                gpu_bdf: None,
+                deleting: false,
+            },
+        );
+        driver
+            .start_sandbox(&sandbox.id, &sandbox.name, "generation-1", Vec::new())
+            .await
+            .expect("the saved gateway generation identifies a freshly created VM");
+
+        replay_provider_launch(
+            provider_launch_dir(temp.path(), &sandbox.id),
+            operation.clone(),
+            false,
+            |replay| async move {
+                assert_eq!(replay, ProviderLaunchReplay::Start);
+                Ok(Ok(StartSandboxResponse::default()))
+            },
+        )
+        .await
+        .unwrap();
+        let request = StartSandboxRequest {
+            sandbox_id: sandbox.id.clone(),
+            name: sandbox.name.clone(),
+            generation_id: "generation-1".into(),
+            launch_authentication: bundle,
+            ordered_start: Some(operation),
+            ..Default::default()
+        };
+        let outcome = |response: Response<StartSandboxResponse>| {
+            response.into_inner().ordered_start_result.unwrap()
+        };
+        let mut untracked = request.clone();
+        untracked.ordered_start = None;
+        assert_eq!(
+            ComputeDriver::start_sandbox(&driver, Request::new(untracked))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition,
+        );
+        let mut superseded = request.clone();
+        superseded.ordered_start.as_mut().unwrap().revision = 1;
+        assert_eq!(
+            ComputeDriver::start_sandbox(&driver, Request::new(superseded))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Aborted,
+        );
+        let repeated = ComputeDriver::start_sandbox(&driver, Request::new(request.clone()))
+            .await
+            .unwrap();
+        assert!(!outcome(repeated).requires_replacement);
+        let mut legacy = request.clone();
+        legacy.provider_launch_revision = legacy.ordered_start.take().unwrap().revision;
+        let repeated = ComputeDriver::start_sandbox(&driver, Request::new(legacy))
+            .await
+            .unwrap();
+        assert!(repeated.into_inner().ordered_start_result.is_none());
+
+        driver
+            .registry
+            .lock()
+            .await
+            .get_mut(&sandbox.id)
+            .unwrap()
+            .provisioning_task
+            .take()
+            .unwrap()
+            .abort();
+        let retired = ComputeDriver::start_sandbox(&driver, Request::new(request.clone()))
+            .await
+            .unwrap();
+        assert!(outcome(retired).requires_replacement);
+
+        let stop = StopSandboxRequest {
+            sandbox_id: sandbox.id.clone(),
+            name: sandbox.name.clone(),
+            ordered_stop: Some(OrderedStart {
+                operation_id: "automatic-restart".into(),
+                revision: 3,
+            }),
+        };
+        let stopped = ComputeDriver::stop_sandbox(&driver, Request::new(stop.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+            .ordered_stop_result
+            .unwrap();
+        assert_eq!(stopped.operation, stop.ordered_stop);
+        assert_eq!(stopped.code, i32::from(Code::Ok));
+        let stopped_marker = state_dir.join(SANDBOX_STOPPED_FILE);
+        tokio::fs::remove_file(&stopped_marker).await.unwrap();
+        let replayed = ComputeDriver::stop_sandbox(&driver, Request::new(stop))
+            .await
+            .unwrap()
+            .into_inner()
+            .ordered_stop_result
+            .unwrap();
+        assert!(replayed.replayed);
+        assert!(!stopped_marker.exists());
+
+        driver
+            .delete_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap();
+        let operation = request.ordered_start.clone();
+        let missing = ComputeDriver::start_sandbox(&driver, Request::new(request.clone()))
+            .await
+            .unwrap();
+        let missing = outcome(missing);
+        assert_eq!(missing.operation, operation);
+        assert_eq!(missing.code, i32::from(Code::NotFound));
+        assert!(!state_dir.exists(), "replay must not recreate a deleted VM");
+
+        // Gateway fallback Create accepts the same launch bundle into a new
+        // runtime directory. A delayed Start must replay the original absence.
+        create_private_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot: sandbox_snapshot(&sandbox, provisioning_condition(), false),
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                preparation: None,
+                gpu_bdf: None,
+                deleting: false,
+            },
+        );
+        let replayed = ComputeDriver::start_sandbox(&driver, Request::new(request.clone()))
+            .await
+            .unwrap();
+        let replayed = outcome(replayed);
+        assert!(replayed.replayed);
+        assert_eq!(replayed.code, missing.code);
+
+        driver
+            .fail_provisioning(&sandbox.id, &state_dir, "ProvisioningFailed", "test", true)
+            .await;
+        assert!(!state_dir.exists(), "failed Create must clean up VM state");
+        let replayed = ComputeDriver::start_sandbox(&driver, Request::new(request))
+            .await
+            .unwrap();
+        assert_eq!(outcome(replayed).code, missing.code);
+    }
+
+    #[tokio::test]
     async fn blocked_worker_does_not_delay_independent_image_and_overlay_requests() {
         let root = tempfile::tempdir().unwrap();
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
@@ -11173,6 +12054,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vm_state_owner_remains_locked_until_child_exits() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner_path = directory.path().join("driver-owner");
+        let owner = preparation::open_lock_file(&owner_path).unwrap();
+        assert!(preparation::lock(&owner, true).unwrap());
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.state_owner = Some(Arc::new(owner));
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "read line || true"])
+            .stdin(Stdio::piped())
+            .kill_on_drop(true);
+        driver.configure_runtime_child(&mut command);
+        let mut child = command.spawn().unwrap();
+        drop(driver);
+
+        let contender = preparation::open_lock_file(&owner_path).unwrap();
+        assert!(!preparation::lock(&contender, true).unwrap());
+        drop(child.stdin.take());
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(preparation::lock(&contender, true).unwrap());
+    }
+
+    #[tokio::test]
     async fn malformed_start_preserves_active_and_stopped_generation_material() {
         for active in [false, true] {
             let directory = tempfile::tempdir().unwrap();
@@ -11265,6 +12174,8 @@ mod tests {
                 gateway_expires_at: 1,
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
+                provider_spiffe_id: None,
+                provider_launch_spiffe_id: None,
                 ssh_host_private_key: None,
                 traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
@@ -11364,9 +12275,11 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_report_configured_default_image() {
+    fn capabilities_report_driver_configuration() {
+        use openshell_core::extension_protocol::has_capability;
+
         let (socket_root, socket_root_fd) = test_socket_root();
-        let driver = VmDriver {
+        let mut driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:dev".to_string(),
                 ..Default::default()
@@ -11376,10 +12289,12 @@ mod tests {
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         };
 
         assert_eq!(driver.capabilities().default_image, "openshell/sandbox:dev");
@@ -11396,6 +12311,21 @@ mod tests {
         assert!(negotiated.required_capabilities.iter().any(|capability| {
             capability == openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION
         }));
+        driver.config.provider_spiffe_workload_api_socket = Some("/run/spire/agent.sock".into());
+        let extension = driver.capabilities().extension.unwrap();
+        for capability in [
+            COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+            COMPUTE_ORDERED_PROVIDER_START,
+        ] {
+            assert!(!has_capability(
+                &negotiated.supported_capabilities,
+                capability
+            ));
+            assert!(has_capability(
+                &extension.supported_capabilities,
+                capability
+            ));
+        }
     }
 
     #[tokio::test]
@@ -11638,10 +12568,12 @@ mod tests {
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         };
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
@@ -11673,10 +12605,12 @@ mod tests {
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         };
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
@@ -11702,10 +12636,12 @@ mod tests {
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         };
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
@@ -11732,10 +12668,12 @@ mod tests {
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         };
 
         assert_eq!(
@@ -11757,10 +12695,12 @@ mod tests {
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         };
 
         assert_eq!(
@@ -11779,10 +12719,12 @@ mod tests {
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         };
 
         let error = driver
@@ -12594,10 +13536,11 @@ mod tests {
     }
 
     #[test]
-    fn build_guest_environment_keeps_tls_paths_host_side() {
+    fn build_guest_environment_keeps_tls_and_spiffe_paths_host_side() {
         let config = VmDriverConfig {
             grpc_endpoint: "https://127.0.0.1:8443".to_string(),
             guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
+            provider_spiffe_workload_api_socket: Some(PathBuf::from("/run/spire/agent.sock")),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -12609,6 +13552,9 @@ mod tests {
 
         let env = build_guest_environment(&sandbox, &config);
         assert!(!env.iter().any(|entry| entry.starts_with("OPENSHELL_TLS_")));
+        assert!(!env.iter().any(|entry| {
+            entry.starts_with(openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET)
+        }));
     }
 
     #[test]
@@ -12639,10 +13585,12 @@ mod tests {
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         };
 
         let state_file = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
@@ -12705,10 +13653,12 @@ mod tests {
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         };
 
         let state_dir = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
@@ -12761,10 +13711,12 @@ mod tests {
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         };
 
         let state_dir = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
@@ -12983,18 +13935,37 @@ mod tests {
 
     #[test]
     fn host_control_environment_contains_only_explicit_values() {
-        let mut command = Command::new("openshell-sandbox");
-        command.env("UNTRUSTED_PARENT_VALUE", "must-not-leak");
-        isolate_host_control_environment(&mut command);
-        command.env("DRIVER_OWNED_VALUE", "kept");
+        use std::ffi::OsStr;
 
-        let environment = command.as_std().get_envs().collect::<Vec<_>>();
-        assert_eq!(environment.len(), 1);
-        assert_eq!(environment[0].0, "DRIVER_OWNED_VALUE");
-        assert_eq!(
-            environment[0].1.and_then(std::ffi::OsStr::to_str),
-            Some("kept")
-        );
+        use openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET;
+
+        for configured_socket in [None, Some(Path::new("/run/spire/agent.sock"))] {
+            let mut command = Command::new("openshell-supervisor");
+            command.env("UNTRUSTED_PARENT_VALUE", "must-not-leak");
+            command.env(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET, "/untrusted/agent.sock");
+            configure_host_control_environment(&mut command, configured_socket);
+            command.env("DRIVER_OWNED_VALUE", "kept");
+
+            let environment = command.as_std().get_envs().collect::<HashMap<_, _>>();
+            assert_eq!(
+                environment.len(),
+                1 + usize::from(configured_socket.is_some())
+            );
+            assert_eq!(
+                environment
+                    .get(OsStr::new("DRIVER_OWNED_VALUE"))
+                    .copied()
+                    .flatten(),
+                Some(OsStr::new("kept"))
+            );
+            assert_eq!(
+                environment
+                    .get(OsStr::new(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET))
+                    .copied()
+                    .flatten(),
+                configured_socket.map(Path::as_os_str)
+            );
+        }
     }
 
     #[test]
@@ -13419,10 +14390,12 @@ while :; do sleep 0.05; done"#,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+            state_owner: None,
         }
     }
 
@@ -13767,10 +14740,12 @@ while :; do sleep 0.05; done"#,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            provider_supervisor_binary: Arc::default(),
             preparation_root: None,
             events,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(extensions),
+            state_owner: None,
         }
     }
 

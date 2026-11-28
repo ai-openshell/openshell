@@ -449,7 +449,7 @@ impl compute_driver_server::ComputeDriver for DriverService {
         {
             self.stop_entry(entry).await?;
         }
-        Ok(Response::new(StopSandboxResponse {}))
+        Ok(Response::new(StopSandboxResponse::default()))
     }
     async fn suspend_sandbox(
         &self,
@@ -495,6 +495,7 @@ impl compute_driver_server::ComputeDriver for DriverService {
         {
             return Ok(Response::new(StartSandboxResponse {
                 runtime_identity: q.sandbox_id,
+                ..Default::default()
             }));
         }
         self.stop_entry(current).await?;
@@ -506,6 +507,7 @@ impl compute_driver_server::ComputeDriver for DriverService {
         *entry = Some(launched);
         Ok(Response::new(StartSandboxResponse {
             runtime_identity: q.sandbox_id,
+            ..Default::default()
         }))
     }
     type WatchSandboxesStream = std::pin::Pin<

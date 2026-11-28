@@ -100,6 +100,14 @@ binary extraction path. `supervisor_image` supplies the dynamically linked
 glibc `/openshell-supervisor` binary outside the workload. Image and request
 environment belong to agent children, never the supervisor process.
 
+With verified SPIFFE provider grants, a restart that only changes the launch
+identity recreates the supervisor with the same local image. If the image or
+other launch settings have changed, the driver refreshes mutable tags before
+selecting and verifying a replacement image.
+To upgrade an otherwise compatible supervisor, pull the updated tag into
+the Podman service used by OpenShell or configure a new `supervisor_image`
+digest before restarting.
+
 ## OCI working directory
 
 OpenShell reads `WORKDIR` from the workload image. If it is unset, `/`, or
@@ -153,6 +161,9 @@ root cannot be replaced. User-owned volumes are never created or deleted.
 See [gateway configuration](../../docs/how-it-works/gateways/configuration.mdx) for
 operator settings and [NETWORKING.md](NETWORKING.md) for supervisor networking.
 The supervisor uses Podman's host network and owns the upstream proxy settings.
+When OpenShell replaces a supervisor and retains the workload, it reuses the
+sandbox's upstream proxy secret. To use updated proxy credentials, update
+`proxy_auth_file` and create a new sandbox.
 Omit `health_check_interval_secs` to disable Podman's periodic health command.
 Explicit zero is invalid. OpenShell still gates readiness on the supervisor's
 authenticated health signal.

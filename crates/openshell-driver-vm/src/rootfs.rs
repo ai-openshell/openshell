@@ -66,6 +66,39 @@ pub fn validate_host_supervisor(path: &Path) -> Result<(), String> {
     validate_host_supervisor_digest(path, embedded_host_supervisor_digest()?)
 }
 
+pub(crate) fn snapshot_host_supervisor(source: &Path, cache: &Path) -> Result<PathBuf, String> {
+    let mut file = File::open(source)
+        .map_err(|error| format!("open host supervisor {}: {error}", source.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect host supervisor {}: {error}", source.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "host supervisor {} is not a regular file",
+            source.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "host supervisor {} is not executable",
+                source.display()
+            ));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read host supervisor {}: {error}", source.display()))?;
+    let digest = Sha256::digest(&bytes);
+    let snapshot = cache.join(format!("openshell-supervisor-{digest:x}"));
+    if validate_host_supervisor_digest(&snapshot, digest.into()).is_err() {
+        install_host_supervisor_atomically(&snapshot, &bytes)?;
+    }
+    Ok(snapshot)
+}
+
 fn validate_host_supervisor_digest(path: &Path, expected: [u8; 32]) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect cached host supervisor {}: {error}", path.display()))?;

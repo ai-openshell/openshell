@@ -97,7 +97,6 @@ where
 
 #[cfg(target_os = "linux")]
 fn install_linux_pdeathsig() -> Result<(), String> {
-    use nix::sys::signal::Signal;
     use nix::unistd::getppid;
 
     // Race: if the parent already died between fork/exec and this call,
@@ -108,16 +107,53 @@ fn install_linux_pdeathsig() -> Result<(), String> {
         return Err("process was already orphaned before procguard armed".to_string());
     }
 
-    nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
-        .map_err(|err| format!("prctl(PR_SET_PDEATHSIG) failed: {err}"))?;
+    arm_linux_parent_death_signal(original_ppid).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            "parent exited before procguard could arm".to_string()
+        } else {
+            format!("prctl(PR_SET_PDEATHSIG) failed: {error}")
+        }
+    })
+}
 
-    // Re-check after arming: the parent may have died between getppid()
-    // and prctl(). If so, PR_SET_PDEATHSIG missed its window.
-    if getppid() != original_ppid {
-        return Err("parent exited before procguard could arm".to_string());
+#[cfg(target_os = "linux")]
+pub(crate) fn arm_linux_parent_death_signal(
+    expected_parent: nix::unistd::Pid,
+) -> std::io::Result<()> {
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+        .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+    // An already reparented child missed the parent's death signal.
+    if nix::unistd::getppid() != expected_parent {
+        return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
     }
-
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::arm_linux_parent_death_signal;
+    use nix::unistd::{getpid, getppid};
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Command;
+
+    #[test]
+    fn linux_parent_guard_rejects_reparented_child_before_exec() {
+        // A different parent PID represents the child after reparenting,
+        // without depending on fork scheduling or a real hypervisor.
+        for (expected_parent, should_start) in [(getpid(), true), (getppid(), false)] {
+            let mut child = Command::new("/bin/true");
+            // SAFETY: The callback only arms the signal and checks the parent PID.
+            unsafe {
+                child.pre_exec(move || arm_linux_parent_death_signal(expected_parent));
+            }
+            let result = child.status();
+            if should_start {
+                assert!(result.unwrap().success());
+            } else {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECHILD));
+            }
+        }
+    }
 }
 
 #[cfg(any(

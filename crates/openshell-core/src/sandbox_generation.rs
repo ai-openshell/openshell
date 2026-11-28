@@ -55,6 +55,12 @@ impl SandboxGenerationId {
         &self.0
     }
 
+    /// Audience requested for the JWT-SVID that accompanies the OAuth assertion.
+    #[must_use]
+    pub fn provider_spiffe_audience(&self) -> String {
+        format!("urn:openshell:provider-grants:launch:{self}")
+    }
+
     #[must_use]
     pub fn into_string(self) -> String {
         self.0

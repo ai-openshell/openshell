@@ -116,7 +116,7 @@ async fn run(
     });
 
     info!(socket = %args.bind_socket.display(), "Starting Podman compute driver");
-    tonic::transport::Server::builder()
+    let result = tonic::transport::Server::builder()
         .layer(openshell_otel::compute_driver_rpc_layer())
         .add_service(launch.into_server())
         .add_service(deferred)
@@ -129,8 +129,9 @@ async fn run(
                 openshell_driver_sdk::EXTERNAL_STOP_GRACE,
             ),
         )
-        .await
-        .map_err(|error| StartResult::error(format!("serve: {error}")))
+        .await;
+    openshell_driver_sdk::drain_provider_launches().await;
+    result.map_err(|error| StartResult::error(format!("serve: {error}")))
 }
 
 /// Build the driver from the operator's settings and the gateway's metadata.
@@ -160,9 +161,13 @@ async fn apply_configure(
     )?;
     config.allow_driver_config = admission.allow_driver_config;
     config.resource_admission = admission.resource_admission;
-    let driver = PodmanComputeDriver::new(config, network_trust)
-        .await
-        .map_err(|error| Status::internal(error.to_string()))?;
+    let driver = PodmanComputeDriver::new_with_verified_provider_identity(
+        config,
+        network_trust,
+        Some(request.verified_provider_workload_identity == Some(true)),
+    )
+    .await
+    .map_err(|error| Status::internal(error.to_string()))?;
     Ok(ComputeDriverService::new(driver))
 }
 

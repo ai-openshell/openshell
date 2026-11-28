@@ -10,9 +10,13 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hyper_util::rt::TokioIo;
+use openshell_core::extension_protocol::{
+    COMPUTE_PROVIDER_WORKLOAD_IDENTITY, ExtensionFamily, gateway_metadata, has_capability,
+};
 use openshell_core::proto::compute::v1::GetCapabilitiesRequest;
 use openshell_core::proto::compute::v1::compute_driver_client::ComputeDriverClient;
 use openshell_driver_sdk::launch::proto::driver_launch_client::DriverLaunchClient;
@@ -45,14 +49,26 @@ fn run(args: &[&str], table: &str) -> Output {
 
 /// A Podman API that answers every request with `200 OK`.
 fn fake_podman(path: &Path) {
+    fake_podman_with(path, |_| ("200 OK", "OK"));
+}
+
+fn fake_podman_with(
+    path: &Path,
+    response: impl Fn(&str) -> (&'static str, &'static str) + Send + 'static,
+) {
     let listener = UnixListener::bind(path).unwrap();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut buffer = [0_u8; 4096];
-            let _ = stream.read(&mut buffer);
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+            let read = stream.read(&mut buffer).unwrap_or_default();
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let (status, body) = response(request.lines().next().unwrap_or_default());
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
         }
     });
 }
@@ -88,8 +104,12 @@ async fn serve() -> Serving {
     let dir = tempfile::tempdir().unwrap();
     let podman = dir.path().join("podman.sock");
     fake_podman(&podman);
-    let socket = dir.path().join("driver.sock");
     let table = format!("socket_path = \"{}\"\n", podman.display());
+    serve_with_table(dir, &table).await
+}
+
+async fn serve_with_table(dir: tempfile::TempDir, table: &str) -> Serving {
+    let socket = dir.path().join("driver.sock");
     let mut child = command(
         &[
             "serve",
@@ -98,9 +118,10 @@ async fn serve() -> Serving {
             "--expected-peer-pid",
             &std::process::id().to_string(),
         ],
-        &table,
+        table,
         dir.path(),
     )
+    .env("XDG_STATE_HOME", dir.path().join("state"))
     .spawn()
     .unwrap();
     let deadline = Instant::now() + Duration::from_mins(1);
@@ -128,6 +149,79 @@ fn configure(version: u32) -> ConfigureRequest {
         protocol_version: version,
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn direct_provider_mode_configures_without_qualifying_the_supervisor_image() {
+    for verified_provider_workload_identity in [None, Some(false)] {
+        check_direct_provider_mode_configure(verified_provider_workload_identity).await;
+    }
+}
+
+async fn check_direct_provider_mode_configure(verified_provider_workload_identity: Option<bool>) {
+    let dir = tempfile::tempdir().unwrap();
+    let podman = dir.path().join("podman.sock");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    fake_podman_with(&podman, {
+        let requests = Arc::clone(&requests);
+        move |request| {
+            requests.lock().unwrap().push(request.to_string());
+            if request.contains("/libpod/info") {
+                ("200 OK", r#"{"host":{"cgroupVersion":"v2"}}"#)
+            } else if request.contains("/libpod/networks/create") {
+                ("201 Created", "{}")
+            } else if request.contains("/libpod/containers/json") {
+                ("200 OK", "[]")
+            } else if request.contains("/libpod/images/pull") {
+                ("503 Service Unavailable", "registry unavailable")
+            } else if request.contains("/libpod/images/") {
+                ("200 OK", r#"{"Id":"sha256:cached-supervisor"}"#)
+            } else if request.contains("/_ping") {
+                ("200 OK", "OK")
+            } else {
+                ("404 Not Found", "")
+            }
+        }
+    });
+    let table = format!(
+        "socket_path = \"{}\"\n\
+         grpc_endpoint = \"http://127.0.0.1:8080\"\n\
+         provider_spiffe_workload_api_socket = \"/run/spire/agent.sock\"\n\
+         supervisor_image = \"example.test/openshell-supervisor:latest\"\n",
+        podman.display(),
+    );
+    let serving = serve_with_table(dir, &table).await;
+    let mut request = configure(PROTOCOL_VERSION);
+    request.verified_provider_workload_identity = verified_provider_workload_identity;
+    DriverLaunchClient::new(serving.channel.clone())
+        .configure(request)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "Configure failed: {error}; Podman requests: {:?}",
+                requests.lock().unwrap()
+            )
+        });
+    let capabilities = ComputeDriverClient::new(serving.channel.clone())
+        .get_capabilities(GetCapabilitiesRequest {
+            gateway: Some(gateway_metadata(ExtensionFamily::Compute)),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .extension
+        .unwrap();
+    assert!(!has_capability(
+        &capabilities.supported_capabilities,
+        COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+    ));
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests.iter().all(|request| {
+            !request.contains("/libpod/images/") && !request.contains("/libpod/containers/create")
+        }),
+        "{verified_provider_workload_identity:?}: {requests:?}"
+    );
 }
 
 #[tokio::test]

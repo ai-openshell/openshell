@@ -16,6 +16,7 @@ use openshell_core::jwt::{
 };
 use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_isolation_interface::contract::BackendDescriptor;
+use openshell_supervisor_network::run::{ProviderIdentitySource, ProviderWorkloadIdentity};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
@@ -498,7 +499,25 @@ fn validate_main_exit_marker(marker: Option<&Path>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    use openshell_core::driver_utils::{
+        PROVIDER_WORKLOAD_IDENTITY_PROBE, PROVIDER_WORKLOAD_SOCKET_PROBE_PRESENT,
+        PROVIDER_WORKLOAD_SOCKET_PROBE_UNAVAILABLE, provider_spiffe_socket_visible,
+    };
+
     let raw_args = std::env::args().collect::<Vec<_>>();
+    if raw_args.get(1).map(String::as_str) == Some(PROVIDER_WORKLOAD_IDENTITY_PROBE) {
+        return match &raw_args[2..] {
+            [] => Ok(()),
+            [socket] => std::process::exit(if provider_spiffe_socket_visible(Path::new(socket)) {
+                PROVIDER_WORKLOAD_SOCKET_PROBE_PRESENT
+            } else {
+                PROVIDER_WORKLOAD_SOCKET_PROBE_UNAVAILABLE
+            }),
+            _ => Err(miette::miette!(
+                "provider workload identity probe accepts one socket path"
+            )),
+        };
+    }
     if raw_args.get(1).map(String::as_str) == Some(DEBUG_RPC_SUBCOMMAND) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -698,6 +717,28 @@ fn main() -> Result<()> {
                     .map(openshell_supervisor::app_listener::Config::bind)
                     .transpose()?
                     .map(openshell_supervisor::app_listener::BoundListener::start);
+                let workload_api_socket = std::env::var_os(
+                    openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+                )
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from);
+                let provider_identity = match &auth_bundle.provider_spiffe_id {
+                    Some(spiffe_id) => {
+                        let launch_spiffe_id = auth_bundle
+                            .provider_launch_spiffe_id
+                            .clone()
+                            .ok_or_else(|| miette::miette!("missing provider launch SPIFFE ID"))?;
+                        ProviderIdentitySource::Gateway(Some(ProviderWorkloadIdentity {
+                            workload_api_socket,
+                            spiffe_id: spiffe_id.clone(),
+                            launch_spiffe_id,
+                            launch_audience: auth_bundle
+                                .runtime_generation
+                                .provider_spiffe_audience(),
+                        }))
+                    }
+                    None => ProviderIdentitySource::WorkloadApi(workload_api_socket),
+                };
                 let config = openshell_supervisor::SandboxInstanceConfig {
                     app_router: app_host
                         .as_ref()
@@ -734,14 +775,7 @@ fn main() -> Result<()> {
                         args.attach_request_timeout_seconds,
                     ),
                     trace_context: openshell_supervisor::trace_context_from_environment(),
-                    provider_identity:
-                        openshell_supervisor_network::run::ProviderIdentitySource::WorkloadApi(
-                            std::env::var_os(
-                                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-                            )
-                            .filter(|path| !path.is_empty())
-                            .map(PathBuf::from),
-                        ),
+                    provider_identity,
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
                     takeover: None,
                     supervisor_recovery_timeout_secs: None,
@@ -1283,6 +1317,8 @@ mod tests {
             gateway_expires_at: 0,
             sandbox_token: SecretJwt::parse("test-sandbox-token").unwrap(),
             sandbox_expires_at: 0,
+            provider_spiffe_id: None,
+            provider_launch_spiffe_id: None,
             ssh_host_private_key: None,
             traces_otlp_headers: secret("lane=traces"),
             ocsf_otlp_headers: secret("lane=ocsf"),
