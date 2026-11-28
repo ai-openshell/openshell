@@ -1040,16 +1040,24 @@ async fn parent_policy_copy(
 }
 
 /// Under the child-create lock, copy the root's latest policy revision.
+///
+/// A root started under a global policy has no revision, because its startup
+/// upload is refused. Its child gets none either: both run the global policy,
+/// and the sync copies the root's policy once it has one.
 async fn copy_parent_policy(
     state: &ServerState,
     parent: &openshell_core::proto::SandboxParent,
-) -> Result<ParentPolicyCopy, Status> {
-    parent_policy_copy(state, &parent.id).await?.ok_or_else(|| {
-        Status::failed_precondition(format!(
-            "parent sandbox '{}' has no policy yet; try again once it is running",
-            parent.name
-        ))
-    })
+) -> Result<Option<ParentPolicyCopy>, Status> {
+    if let Some(copy) = parent_policy_copy(state, &parent.id).await? {
+        return Ok(Some(copy));
+    }
+    if super::policy::global_policy_is_set(state.store.as_ref()).await? {
+        return Ok(None);
+    }
+    Err(Status::failed_precondition(format!(
+        "parent sandbox '{}' has no policy yet; try again once it is running",
+        parent.name
+    )))
 }
 
 /// Bring each live child of a root up to it: detach providers the root no
@@ -1454,7 +1462,9 @@ async fn handle_create_sandbox_inner(
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
     if let Some(parent) = &parent {
         check_parent_has_room(state, &workspace, parent, &spec.providers).await?;
-        spec.policy = Some(copy_parent_policy(state, parent).await?.policy);
+        spec.policy = copy_parent_policy(state, parent)
+            .await?
+            .map(|copy| copy.policy);
     }
 
     // Validate provider names exist (fail fast).
@@ -9090,6 +9100,56 @@ mod tests {
             "{}",
             err.message()
         );
+    }
+
+    #[tokio::test]
+    async fn child_of_a_root_started_under_a_global_policy_gets_its_policy_later() {
+        let state = child_sandboxes_state().await;
+        let lead_id = uuid::Uuid::new_v4().to_string();
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: lead_id.clone(),
+                    name: "lead".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec::default()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let global = super::super::StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                super::super::policy::POLICY_SETTING_KEY.to_string(),
+                super::super::StoredSettingValue::Bytes(hex::encode(
+                    openshell_policy::restrictive_default_policy().encode_to_vec(),
+                )),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        super::super::policy::save_global_settings(state.store.as_ref(), &global)
+            .await
+            .unwrap();
+
+        let worker = create_child(&state, "worker1", "lead").await;
+        let worker_id = worker.object_id().to_string();
+        assert!(worker.spec.unwrap().policy.is_none());
+        assert!(
+            state
+                .store
+                .get_latest_policy(&worker_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        put_policy_revision_with_status(&state, &lead_id, 1, &lead_policy(false), "loaded").await;
+        sync_children(&state, &lead_id).await.unwrap();
+        assert!(holds_parent_latest(&state, &worker_id, &lead_id).await);
     }
 
     #[tokio::test]

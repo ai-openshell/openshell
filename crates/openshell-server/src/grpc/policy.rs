@@ -8348,6 +8348,13 @@ pub(super) async fn load_global_settings(store: &Store) -> Result<StoredSettings
     load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, "", GLOBAL_SETTINGS_NAME).await
 }
 
+pub(super) async fn global_policy_is_set(store: &Store) -> Result<bool, Status> {
+    Ok(load_global_settings(store)
+        .await?
+        .settings
+        .contains_key(POLICY_SETTING_KEY))
+}
+
 pub(super) async fn save_global_settings(
     store: &Store,
     settings: &StoredSettings,

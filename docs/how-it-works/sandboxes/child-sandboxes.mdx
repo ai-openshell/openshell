@@ -43,6 +43,8 @@ openshell sandbox list --parent lead
 
 A child always uses its parent's policy. When it is created, the gateway copies the parent's latest policy into the child. When the parent's policy changes, the gateway copies the new version into each child at the same time and delivers it to the parent and the children as it delivers any policy update. It does not wait for the parent to load the policy first. A copy that fails is made again within about 30 seconds.
 
+While a global policy is set, every sandbox runs it, children included. A root created without `--policy` under a global policy has no policy of its own, so its children start without one too. After the global policy is deleted, the root and its children block all network traffic until the root gets its own policy, when it restarts or through `openshell policy set`. The gateway then copies that policy into the children.
+
 You cannot give a child a policy of its own or change its policy. `sandbox create --parent` refuses `--policy` with `child sandboxes use their parent's policy; omit --policy`, and ignores `OPENSHELL_SANDBOX_POLICY` with a note. Policy updates, approvals and proposals for a child are refused. To change what a child can do, change its parent's policy.
 
 The parent's policy names the parent's filesystem paths, program paths and process user. A child that runs a different image, from `--from` or a template, needs the same user and folder layout as its parent's image. Paths the child's image lacks are skipped, which only removes access, so a child with a different layout can fail to start or find its programs denied. Read the child's startup errors and denials with `openshell logs` or the MCP `logs` tool.
